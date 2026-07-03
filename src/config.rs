@@ -65,6 +65,17 @@ pub enum SyncMode {
     Interval,
 }
 
+impl SyncMode {
+    pub fn from_u8(v: u8) -> Option<SyncMode> {
+        Some(match v {
+            0 => SyncMode::None,
+            1 => SyncMode::Full,
+            2 => SyncMode::Interval,
+            _ => return None,
+        })
+    }
+}
+
 /// Transaction isolation level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -231,6 +242,12 @@ impl ColumnFamilyConfig {
         append_u32(&mut b, self.l1_file_count_trigger);
         append_u32(&mut b, self.l0_queue_stall_threshold);
         b.push(u8::from(self.use_btree));
+        // Appended after the original durable subset: manifests written by older
+        // versions lack these trailing bytes, so `decode_into` (which stops early
+        // on a short blob via `?`) reconstructs them as the struct defaults —
+        // backward compatible in both directions.
+        b.push(self.sync_mode as u8);
+        append_u64(&mut b, self.sync_interval.as_micros() as u64);
         b
     }
 
@@ -287,6 +304,12 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     cfg.l1_file_count_trigger = u32v(&mut p)?;
     cfg.l0_queue_stall_threshold = u32v(&mut p)?;
     cfg.use_btree = byte(&mut p)? != 0;
+    // Trailing fields added later; an older manifest ends here and keeps the
+    // struct defaults for these (the `?` returns before overwriting them).
+    if let Some(sm) = SyncMode::from_u8(byte(&mut p)?) {
+        cfg.sync_mode = sm;
+    }
+    cfg.sync_interval = std::time::Duration::from_micros(u64v(&mut p)?);
     Some(())
 }
 
@@ -345,5 +368,45 @@ mod tests {
             assert_eq!(Compression::parse(c.as_str()), Some(c));
             assert_eq!(Compression::from_u8(c as u8), Some(c));
         }
+    }
+
+    #[test]
+    fn sync_mode_roundtrip() {
+        for sm in [SyncMode::None, SyncMode::Full, SyncMode::Interval] {
+            assert_eq!(SyncMode::from_u8(sm as u8), Some(sm));
+        }
+    }
+
+    #[test]
+    fn cf_config_persists_sync_mode_and_interval() {
+        for sm in [SyncMode::Full, SyncMode::Interval] {
+            let c = ColumnFamilyConfig {
+                sync_mode: sm,
+                sync_interval: Duration::from_micros(250_000),
+                ..ColumnFamilyConfig::default()
+            };
+            let d = ColumnFamilyConfig::decode(&c.encode());
+            assert_eq!(d.sync_mode, sm, "sync_mode must survive a manifest round-trip");
+            assert_eq!(d.sync_interval, Duration::from_micros(250_000));
+        }
+    }
+
+    #[test]
+    fn legacy_blob_without_sync_fields_decodes_to_defaults() {
+        // Simulate a manifest written before sync_mode/sync_interval were
+        // persisted: encode, then truncate off the two trailing fields
+        // (1 byte sync_mode + 8 bytes sync_interval).
+        let c = ColumnFamilyConfig {
+            sync_mode: SyncMode::Full,
+            comparator_name: "uint64".into(),
+            ..ColumnFamilyConfig::default()
+        };
+        let full = c.encode();
+        let legacy = &full[..full.len() - 9];
+        let d = ColumnFamilyConfig::decode(legacy);
+        // Older fields still decode; the missing sync fields fall back to default.
+        assert_eq!(d.comparator_name, "uint64");
+        assert_eq!(d.sync_mode, SyncMode::None);
+        assert_eq!(d.sync_interval, ColumnFamilyConfig::default().sync_interval);
     }
 }
