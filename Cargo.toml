@@ -1,0 +1,62 @@
+[package]
+name = "ondadb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MPL-2.0"
+description = "ondaDB — a safe, performance-focused Rust key/value LSM storage engine"
+repository = "https://github.com/local/ondadb"
+
+[lib]
+name = "ondadb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "onda_bench"
+path = "src/bin/onda_bench.rs"
+
+[features]
+default = []
+# Object-store (S3) support pulls in network deps; gated so the core build stays lean.
+s3 = ["dep:rust-s3", "dep:tokio"]
+# Opt-in performance fast path that uses localized `unsafe`: mmap'd zero-copy
+# SSTable reads and an arena-backed skip-list memtable. The default build forbids
+# unsafe entirely; enabling this lifts that for the fast-path modules only.
+unsafe-fastpath = ["dep:memmap2"]
+
+[dependencies]
+crossbeam-skiplist = "0.1"
+crossbeam-channel = "0.5"
+# Safe self-referential struct: lets a read iterator own `Arc<Memtable>` and, in
+# the same struct, hold `crossbeam_skiplist::Entry` cursors borrowing from inside
+# it. Macro-only (no proc-macro), and its `unsafe` lives in its own crate, so the
+# default build stays `#![forbid(unsafe_code)]`.
+self_cell = "1"
+parking_lot = "0.12"
+lru = "0.12"
+crc32fast = "1.4"
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh3"] }
+lz4_flex = "0.11"
+zstd = "0.13"
+snap = "1.1"
+flate2 = "1.0"
+rust-ini = "0.21"
+sha2 = "0.10"
+hmac = "0.12"
+rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tokio-rustls-tls"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
