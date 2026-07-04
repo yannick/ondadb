@@ -9,7 +9,7 @@ type/function names — grep for them; line numbers rot.
 
 | Module | Role |
 |---|---|
-| `db.rs` | `DB`/`DbInner`: CF registry, global sequence + publish machinery, snapshot refcounts, background flush/compaction workers, recovery, manifest persistence, deferred SST deletion |
+| `db.rs` | `DB`/`DbInner`: CF registry, global sequence + publish machinery, snapshot refcounts, background flush/compaction workers, recovery, manifest persistence, deferred SST deletion, `LOCK` file, fail-stop poisoning |
 | `column_family.rs` | `ColumnFamily`: per-CF memtable + WAL + LSM levels; commit application, memtable rotation, flush to L0, point reads, iterator construction |
 | `txn.rs` | `Txn`: arena-buffered writes, five isolation levels, conflict detection, savepoints; also the `DB::put/get/delete` single-op helpers |
 | `memtable.rs` | Sharded (256) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath) |
@@ -17,7 +17,8 @@ type/function names — grep for them; line numbers rot.
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
 | `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse and pinned-block borrowed keys/values |
-| `compaction.rs` | Leveled compaction: pick level, k-way merge, version collapse, tombstone/TTL GC |
+| `compaction.rs` | Leveled compaction: pick level, k-way merge, version collapse, tombstone/TTL GC, compaction filters; FIFO style (oldest-table eviction) |
+| `ingest.rs` | Bulk ingestion: pre-sorted stream → L0 SSTables directly (no WAL/memtable); atomic install at `finish()` |
 | `manifest.rs` | Durable catalog (`MANIFEST`): next file id, global seq, per-CF config blob + SST set; crash-atomic save |
 | `unified.rs` | Optional shared memtable+WAL across CFs (8-byte CF-id key prefix); split flush |
 | `block.rs` | Block framing: `[alg][comp_len][raw_len][crc]payload`, compress-if-shrinks |

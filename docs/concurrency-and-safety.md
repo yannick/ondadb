@@ -6,6 +6,18 @@ lifts that for exactly two modules — `memtable_arena.rs` and the mmap paths in
 `unsafe` anywhere else needs a documented contract here and a strong measured
 justification.
 
+## Fail-stop poisoning (`util::Poison`)
+
+After a failed fsync the kernel may have dropped the dirty pages it could not
+persist, so retrying can silently lose already-acknowledged data. Any
+durability failure — WAL fsync (group commit, interval thread, manual
+`sync_wal`), a background flush, or a manifest persist — trips one DB-wide
+flag. From then on every `Txn::commit` / `apply_commit` fails with
+`OndaError::Poisoned` (reads keep working); `DB::poisoned()` reports the first
+failure's reason. The only recovery is reopening the database. Exception: a
+flush that fails because its CF was dropped/cleared mid-flight does not poison
+(the failure is expected — its directory is gone).
+
 ## MVCC
 
 - `DbInner::next_seq` (AtomicU64): commit reserves `[start, start+n)` via
