@@ -168,7 +168,7 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
             if writer.is_none() {
                 let id = db.next_file_id();
                 let klog = cf.klog_path(id);
-                let w = Writer::new(&klog, cf_writer_opts(cf, &cmp))?;
+                let w = Writer::new(&klog, cf_writer_opts(cf, &cmp, target as u32))?;
                 writer = Some((w, klog, id, 0));
             }
             let w = writer.as_mut().unwrap();
@@ -249,9 +249,13 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
     Ok(())
 }
 
-fn cf_writer_opts(cf: &Arc<ColumnFamily>, cmp: &ComparatorRef) -> crate::sst::WriterOptions {
+fn cf_writer_opts(
+    cf: &Arc<ColumnFamily>,
+    cmp: &ComparatorRef,
+    target_level: u32,
+) -> crate::sst::WriterOptions {
     crate::sst::WriterOptions {
-        compression: cf.opts.compression,
+        compression: cf.opts.compression_for_level(target_level),
         cmp: cmp.clone(),
         enable_bloom: cf.opts.enable_bloom_filter,
         bloom_fpr: cf.opts.bloom_fpr,

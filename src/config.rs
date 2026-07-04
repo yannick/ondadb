@@ -175,6 +175,11 @@ pub struct ColumnFamilyConfig {
     pub dividing_level_offset: i32,
     pub klog_value_threshold: usize,
     pub compression: Compression,
+    /// Per-level override of `compression`. Empty = use `compression` for
+    /// every level. Otherwise level L uses `compression_per_level[min(L,
+    /// len-1)]` — the last entry repeats for all deeper levels (so
+    /// `[None, None, Zstd]` = hot L0/L1 uncompressed, everything below Zstd).
+    pub compression_per_level: Vec<Compression>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
     pub enable_block_indexes: bool,
@@ -204,6 +209,7 @@ impl Default for ColumnFamilyConfig {
             dividing_level_offset: 1,
             klog_value_threshold: 512, // WiscKey separation threshold
             compression: Compression::None,
+            compression_per_level: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
             enable_block_indexes: true,
@@ -227,6 +233,15 @@ impl Default for ColumnFamilyConfig {
 }
 
 impl ColumnFamilyConfig {
+    /// Compression algorithm for SSTables written at `level` (see
+    /// `compression_per_level`).
+    pub fn compression_for_level(&self, level: u32) -> Compression {
+        match self.compression_per_level.as_slice() {
+            [] => self.compression,
+            v => v[(level as usize).min(v.len() - 1)],
+        }
+    }
+
     /// Serialize the durable subset of the config for the manifest blob.
     pub fn encode(&self) -> Vec<u8> {
         use crate::encoding::{append_u32, append_u64, append_uvarint};
@@ -248,6 +263,10 @@ impl ColumnFamilyConfig {
         // backward compatible in both directions.
         b.push(self.sync_mode as u8);
         append_u64(&mut b, self.sync_interval.as_micros() as u64);
+        b.push(self.compression_per_level.len().min(255) as u8);
+        for c in self.compression_per_level.iter().take(255) {
+            b.push(*c as u8);
+        }
         b
     }
 
@@ -310,6 +329,12 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         cfg.sync_mode = sm;
     }
     cfg.sync_interval = std::time::Duration::from_micros(u64v(&mut p)?);
+    let n_levels = byte(&mut p)?;
+    let mut per_level = Vec::with_capacity(n_levels as usize);
+    for _ in 0..n_levels {
+        per_level.push(Compression::from_u8(byte(&mut p)?)?);
+    }
+    cfg.compression_per_level = per_level;
     Some(())
 }
 
@@ -328,6 +353,7 @@ mod tests {
         };
         let d = ColumnFamilyConfig::decode(&c.encode());
         assert_eq!(d.comparator_name, "uint64");
+        assert!(d.compression_per_level.is_empty());
         assert_eq!(d.compression, Compression::Zstd);
         assert_eq!(d.write_buffer_size, 123456);
         assert!(!d.enable_bloom_filter);
@@ -393,20 +419,53 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_sync_fields_decodes_to_defaults() {
-        // Simulate a manifest written before sync_mode/sync_interval were
-        // persisted: encode, then truncate off the two trailing fields
-        // (1 byte sync_mode + 8 bytes sync_interval).
+        // Simulate a manifest written before sync_mode/sync_interval (and the
+        // later compression_per_level count) were persisted: encode, then
+        // truncate off the trailing fields (1 byte sync_mode + 8 bytes
+        // sync_interval + 1 byte per-level count).
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        let legacy = &full[..full.len() - 9];
+        let legacy = &full[..full.len() - 10];
         let d = ColumnFamilyConfig::decode(legacy);
         // Older fields still decode; the missing sync fields fall back to default.
         assert_eq!(d.comparator_name, "uint64");
         assert_eq!(d.sync_mode, SyncMode::None);
         assert_eq!(d.sync_interval, ColumnFamilyConfig::default().sync_interval);
+    }
+}
+
+#[cfg(test)]
+mod per_level_tests {
+    use super::*;
+
+    #[test]
+    fn compression_per_level_roundtrip_and_selection() {
+        let c = ColumnFamilyConfig {
+            compression: Compression::Snappy,
+            compression_per_level: vec![
+                Compression::None,
+                Compression::None,
+                Compression::Zstd,
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.compression_per_level, c.compression_per_level);
+        assert_eq!(d.compression_for_level(0), Compression::None);
+        assert_eq!(d.compression_for_level(1), Compression::None);
+        assert_eq!(d.compression_for_level(2), Compression::Zstd);
+        assert_eq!(d.compression_for_level(9), Compression::Zstd); // last repeats
+
+        // Empty policy falls back to the uniform setting.
+        let u = ColumnFamilyConfig {
+            compression: Compression::Lz4,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(u.compression_for_level(0), Compression::Lz4);
+        assert_eq!(u.compression_for_level(5), Compression::Lz4);
     }
 }
