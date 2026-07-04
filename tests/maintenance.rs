@@ -178,3 +178,69 @@ fn approximate_len_and_read_stats() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn compaction_filter_removes_and_respects_snapshots() {
+    use std::sync::Arc;
+
+    use ondadb::FilterDecision;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    // trigger=1 so every flushed L0 file makes compact() actually rewrite.
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                l1_file_count_trigger: 1,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    for i in 0..100u32 {
+        let v: &[u8] = if i % 2 == 0 { b"purge" } else { b"keep" };
+        db.put(&cf, format!("k{i:03}").as_bytes(), v, Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+
+    cf.set_compaction_filter(Some(Arc::new(|_k: &[u8], v: &[u8]| {
+        if v == b"purge" {
+            FilterDecision::Remove
+        } else {
+            FilterDecision::Keep
+        }
+    })));
+
+    // A version written after this point is newer than the filter's snapshot
+    // horizon during compaction only if a snapshot pins it — hold one.
+    let snap = db.begin();
+    db.put(&cf, b"k000", b"purge", Duration::ZERO).unwrap(); // newer, protected
+    db.flush_memtable(&cf).unwrap();
+
+    db.compact(&cf).unwrap();
+
+    // Old "purge" versions are gone; "keep" survives.
+    assert!(db.get(&cf, b"k002").is_err(), "filtered key must be gone");
+    assert_eq!(db.get(&cf, b"k001").unwrap(), b"keep");
+    // k000's newer version was written after the snapshot => protected.
+    assert_eq!(db.get(&cf, b"k000").unwrap(), b"purge");
+    drop(snap);
+
+    // Without the snapshot the rewrite is now eligible. Push a fresh L0 file
+    // overlapping the key range so compact() merges L1 through the filter
+    // (non-overlapping next-level tables are retained, not rewritten).
+    db.put(&cf, b"k050x", b"keep", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    assert!(db.get(&cf, b"k000").is_err());
+
+    // Clearing the filter stops removals.
+    cf.set_compaction_filter(None);
+    db.put(&cf, b"again", b"purge", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    assert_eq!(db.get(&cf, b"again").unwrap(), b"purge");
+    db.close().unwrap();
+}

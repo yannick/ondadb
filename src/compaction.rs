@@ -95,6 +95,7 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
     };
     let oldest_snapshot = db.oldest_snapshot();
     let now = now_nanos();
+    let filter = cf.compaction_filter();
 
     // Merge-iterate all inputs and write new output SSTables.
     let mut its: Vec<SstIterator> = inputs.iter().map(|t| t.reader.iter()).collect();
@@ -165,18 +166,37 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
 
         if keep {
             let value = its[bi].value()?;
-            if writer.is_none() {
-                let id = db.next_file_id();
-                let klog = cf.klog_path(id);
-                let w = Writer::new(&klog, cf_writer_opts(cf, &cmp, target as u32))?;
-                writer = Some((w, klog, id, 0));
+            // Compaction filter: only the newest surviving non-tombstone
+            // version at or below the oldest snapshot is eligible (newer
+            // versions stay protected; older ones were dropped above).
+            let mut write_tomb = tomb;
+            if !tomb && seq <= oldest_snapshot && (ttl == 0 || ttl > now) {
+                if let Some(f) = &filter {
+                    if f(&uk, &value) == crate::column_family::FilterDecision::Remove {
+                        if bottom {
+                            keep = false; // nothing below can resurface
+                        } else {
+                            // Emit a tombstone so versions in lower levels
+                            // stay shadowed until they compact away.
+                            write_tomb = true;
+                        }
+                    }
+                }
             }
-            let w = writer.as_mut().unwrap();
-            w.0.add(&uk, &value, seq, ttl, tomb, its[bi].is_single_delete())?;
-            w.3 += (uk.len() + value.len()) as u64;
-            if w.3 >= target_bytes {
-                let (wr, _klog, id, _bytes) = writer.take().unwrap();
-                outputs.push(wr.finish()?.to_sst_meta(id, target as u32));
+            if keep {
+                if writer.is_none() {
+                    let id = db.next_file_id();
+                    let klog = cf.klog_path(id);
+                    let w = Writer::new(&klog, cf_writer_opts(cf, &cmp, target as u32))?;
+                    writer = Some((w, klog, id, 0));
+                }
+                let w = writer.as_mut().unwrap();
+                w.0.add(&uk, &value, seq, ttl, write_tomb, its[bi].is_single_delete())?;
+                w.3 += (uk.len() + value.len()) as u64;
+                if w.3 >= target_bytes {
+                    let (wr, _klog, id, _bytes) = writer.take().unwrap();
+                    outputs.push(wr.finish()?.to_sst_meta(id, target as u32));
+                }
             }
         }
 
