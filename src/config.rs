@@ -54,6 +54,31 @@ impl Compression {
     }
 }
 
+/// How a column family reclaims space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionStyle {
+    /// Classic leveled compaction (the default).
+    #[default]
+    Leveled = 0,
+    /// FIFO: data stays in L0 and is never merged. Once the CF exceeds
+    /// `fifo_max_bytes` (and/or a table's file age exceeds `fifo_ttl`), the
+    /// **oldest tables are deleted whole** — cache semantics, not a KV store:
+    /// old data disappears by design, including from live snapshots. Age is
+    /// taken from the klog file's modification time (approximate; a restore
+    /// that rewrites files resets it).
+    Fifo = 1,
+}
+
+impl CompactionStyle {
+    pub fn from_u8(v: u8) -> Option<CompactionStyle> {
+        match v {
+            0 => Some(CompactionStyle::Leveled),
+            1 => Some(CompactionStyle::Fifo),
+            _ => None,
+        }
+    }
+}
+
 /// WAL durability mode (mirrors `TDB_SYNC_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -198,6 +223,13 @@ pub struct ColumnFamilyConfig {
     pub tombstone_density_trigger: f64,
     pub tombstone_density_min_entries: u64,
     pub use_btree: bool,
+    pub compaction_style: CompactionStyle,
+    /// FIFO only: evict oldest tables once the CF's total bytes exceed this
+    /// (0 = no size limit).
+    pub fifo_max_bytes: u64,
+    /// FIFO only: evict tables whose klog file is older than this
+    /// (zero = no age limit).
+    pub fifo_ttl: Duration,
 }
 
 impl Default for ColumnFamilyConfig {
@@ -228,6 +260,9 @@ impl Default for ColumnFamilyConfig {
             tombstone_density_trigger: 0.0, // disabled
             tombstone_density_min_entries: 0,
             use_btree: false,
+            compaction_style: CompactionStyle::Leveled,
+            fifo_max_bytes: 0,
+            fifo_ttl: Duration::ZERO,
         }
     }
 }
@@ -267,6 +302,9 @@ impl ColumnFamilyConfig {
         for c in self.compression_per_level.iter().take(255) {
             b.push(*c as u8);
         }
+        b.push(self.compaction_style as u8);
+        append_u64(&mut b, self.fifo_max_bytes);
+        append_u64(&mut b, self.fifo_ttl.as_micros() as u64);
         b
     }
 
@@ -335,6 +373,11 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         per_level.push(Compression::from_u8(byte(&mut p)?)?);
     }
     cfg.compression_per_level = per_level;
+    if let Some(style) = CompactionStyle::from_u8(byte(&mut p)?) {
+        cfg.compaction_style = style;
+    }
+    cfg.fifo_max_bytes = u64v(&mut p)?;
+    cfg.fifo_ttl = std::time::Duration::from_micros(u64v(&mut p)?);
     Some(())
 }
 
@@ -419,17 +462,17 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_sync_fields_decodes_to_defaults() {
-        // Simulate a manifest written before sync_mode/sync_interval (and the
-        // later compression_per_level count) were persisted: encode, then
-        // truncate off the trailing fields (1 byte sync_mode + 8 bytes
-        // sync_interval + 1 byte per-level count).
+        // Simulate a manifest written before the appended-tail fields
+        // (sync_mode/sync_interval, compression_per_level, FIFO settings)
+        // were persisted: encode, then truncate the whole tail (9 bytes sync
+        // + 1 byte per-level count + 17 bytes FIFO).
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        let legacy = &full[..full.len() - 10];
+        let legacy = &full[..full.len() - 27];
         let d = ColumnFamilyConfig::decode(legacy);
         // Older fields still decode; the missing sync fields fall back to default.
         assert_eq!(d.comparator_name, "uint64");
