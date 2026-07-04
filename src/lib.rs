@@ -41,7 +41,7 @@ pub mod unified;
 pub mod util;
 pub mod wal;
 
-pub use column_family::{ColumnFamily, CommitHookFn, CommitOp};
+pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
 pub use config::{ColumnFamilyConfig, Compression, IsolationLevel, LogLevel, Options, SyncMode};
 pub use db::DB;

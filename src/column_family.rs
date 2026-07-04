@@ -37,6 +37,27 @@ pub struct CommitOp {
 /// Post-commit callback invoked after each committed batch touching the CF.
 pub type CommitHookFn = Arc<dyn Fn(u64, &[CommitOp]) + Send + Sync>;
 
+/// Verdict returned by a [`CompactionFilterFn`] for one key/value pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterDecision {
+    /// Keep the entry.
+    Keep,
+    /// Drop the entry (at the bottom level) or replace it with a tombstone
+    /// (above the bottom, so older versions in lower levels stay shadowed).
+    Remove,
+}
+
+/// Compaction filter: `(key, value) -> FilterDecision`, consulted during
+/// compaction for the newest surviving non-tombstone version of each key at
+/// or below the oldest live snapshot. Must be deterministic — it runs at
+/// unpredictable times, possibly repeatedly for the same key.
+///
+/// Removals are **not snapshot-consistent** (same caveat as RocksDB): once a
+/// compaction lands, new reads at older snapshots no longer see filtered
+/// keys. Open iterators are unaffected — they pin the pre-compaction files.
+/// Versions newer than the oldest live snapshot are never filtered.
+pub type CompactionFilterFn = Arc<dyn Fn(&[u8], &[u8]) -> FilterDecision + Send + Sync>;
+
 /// A finished SSTable plus its open reader.
 #[derive(Debug)]
 pub struct SstHandle {
@@ -115,6 +136,7 @@ pub struct ColumnFamily {
     pub(crate) flushing: AtomicBool,
     pub(crate) compacting: AtomicBool,
     commit_hook: Mutex<Option<CommitHookFn>>,
+    compaction_filter: Mutex<Option<CompactionFilterFn>>,
     /// Mirrors `commit_hook.is_some()`; lets the commit path skip building hook
     /// payloads (a per-op key+value clone) with a relaxed load instead of a lock.
     hook_set: AtomicBool,
@@ -186,6 +208,7 @@ impl ColumnFamily {
             flushing: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             commit_hook: Mutex::new(None),
+            compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
@@ -275,6 +298,7 @@ impl ColumnFamily {
             flushing: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             commit_hook: Mutex::new(None),
+            compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
@@ -295,6 +319,16 @@ impl ColumnFamily {
     }
 
     /// Install a post-commit hook.
+    /// Install (or clear) the compaction filter. Applies to compactions that
+    /// start after the call; not persisted (re-install after reopen).
+    pub fn set_compaction_filter(&self, f: Option<CompactionFilterFn>) {
+        *self.compaction_filter.lock() = f;
+    }
+
+    pub(crate) fn compaction_filter(&self) -> Option<CompactionFilterFn> {
+        self.compaction_filter.lock().clone()
+    }
+
     pub fn set_commit_hook(&self, hook: Option<CommitHookFn>) {
         let mut g = self.commit_hook.lock();
         self.hook_set.store(hook.is_some(), Ordering::Release);
