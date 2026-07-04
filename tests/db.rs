@@ -525,3 +525,37 @@ fn sync_wal_durability_point() {
     assert_eq!(db.get(&cf, b"a").unwrap(), b"1");
     db.close().unwrap();
 }
+
+#[test]
+fn clear_column_family_empties_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+
+    // Data both flushed to SSTables and live in the memtable.
+    for i in 0..100u32 {
+        db.put(&cf, format!("k{i:03}").as_bytes(), b"v", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.put(&cf, b"in-memtable", b"v", Duration::ZERO).unwrap();
+
+    let cf = db.clear_column_family("default").unwrap();
+    assert!(db.get(&cf, b"k000").is_err());
+    assert!(db.get(&cf, b"in-memtable").is_err());
+
+    // The cleared CF is immediately writable and the clear is durable.
+    db.put(&cf, b"after", b"1", Duration::ZERO).unwrap();
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").expect("cf survives clear");
+    assert!(db.get(&cf, b"k000").is_err());
+    assert_eq!(db.get(&cf, b"after").unwrap(), b"1");
+    assert!(matches!(
+        db.clear_column_family("missing"),
+        Err(ondadb::OndaError::NotFound)
+    ));
+    db.close().unwrap();
+}
