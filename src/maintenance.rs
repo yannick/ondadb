@@ -18,8 +18,18 @@ pub struct CfStats {
     pub levels: Vec<(usize, u64)>,
     pub num_entries: u64,
     pub num_tombstones: u64,
+    /// Entries in the active + sealed memtables.
+    pub memtable_entries: u64,
+    /// `num_entries + memtable_entries` (see `ColumnFamily::approximate_len`).
+    pub approximate_len: u64,
     pub flush_count: u64,
     pub compaction_count: u64,
+    /// Point lookups served by this CF.
+    pub point_reads: u64,
+    /// SSTable probes skipped by a bloom-filter negative.
+    pub bloom_skips: u64,
+    /// SSTable probes actually issued.
+    pub sst_probes: u64,
 }
 
 /// Database-wide statistics.
@@ -42,10 +52,15 @@ impl ColumnFamily {
             num_levels: levels.len(),
             num_entries: entries,
             num_tombstones: tombs,
+            memtable_entries: self.memtable_entries(),
+            approximate_len: entries + self.memtable_entries(),
             flush_count: self.flush_count.load(std::sync::atomic::Ordering::Relaxed),
             compaction_count: self
                 .compaction_count
                 .load(std::sync::atomic::Ordering::Relaxed),
+            point_reads: self.point_reads.load(std::sync::atomic::Ordering::Relaxed),
+            bloom_skips: self.bloom_skips.load(std::sync::atomic::Ordering::Relaxed),
+            sst_probes: self.sst_probes.load(std::sync::atomic::Ordering::Relaxed),
             levels,
         }
     }

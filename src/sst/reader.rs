@@ -350,6 +350,11 @@ impl Reader {
         lo
     }
 
+    /// Whether the bloom filter admits `user_key` (`true` when no filter).
+    pub(crate) fn bloom_may_contain(&self, user_key: &[u8]) -> bool {
+        self.bloom.as_ref().is_none_or(|b| b.may_contain(user_key))
+    }
+
     /// Resolve `user_key` as of `read_seq`. `found` indicates a version exists in
     /// this SSTable; `deleted` indicates a tombstone or expired entry.
     pub fn get(

@@ -133,3 +133,48 @@ fn clone_column_family_shares_data() {
     assert!(db.get(&src, b"only-dst").is_err());
     db.close().unwrap();
 }
+
+#[test]
+fn approximate_len_and_read_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .unwrap();
+
+    for i in 0..500u32 {
+        db.put(&cf, format!("k{i:04}").as_bytes(), b"v", Duration::ZERO)
+            .unwrap();
+    }
+    // All 500 still in the memtable.
+    let s = cf.stats();
+    assert_eq!(s.memtable_entries, 500);
+    assert_eq!(s.approximate_len, 500);
+    assert_eq!(cf.approximate_len(), 500);
+
+    db.flush_memtable(&cf).unwrap();
+    let s = cf.stats();
+    assert_eq!(s.memtable_entries, 0);
+    assert_eq!(s.num_entries, 500);
+    assert_eq!(s.approximate_len, 500);
+
+    // Point reads hit the SSTable; misses should be answered by the bloom
+    // filter without probing.
+    for i in 0..100u32 {
+        assert!(db.get(&cf, format!("k{i:04}").as_bytes()).is_ok());
+    }
+    // Misses chosen inside the SSTable's [min,max] key range, so they pass
+    // range filtering and are answered by the bloom filter.
+    for i in 0..100u32 {
+        let _ = db.get(&cf, format!("k{i:04}miss").as_bytes());
+    }
+    let s = cf.stats();
+    assert_eq!(s.point_reads, 200);
+    assert!(s.sst_probes >= 100, "hits must probe: {}", s.sst_probes);
+    assert!(
+        s.bloom_skips >= 90,
+        "most misses should be bloom-skipped: {}",
+        s.bloom_skips
+    );
+    db.close().unwrap();
+}

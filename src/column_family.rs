@@ -121,6 +121,11 @@ pub struct ColumnFamily {
 
     pub(crate) flush_count: AtomicU64,
     pub(crate) compaction_count: AtomicU64,
+
+    // Read-path counters (relaxed; observability only).
+    pub(crate) point_reads: AtomicU64,
+    pub(crate) bloom_skips: AtomicU64,
+    pub(crate) sst_probes: AtomicU64,
 }
 
 impl std::fmt::Debug for ColumnFamily {
@@ -184,6 +189,9 @@ impl ColumnFamily {
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
+            point_reads: AtomicU64::new(0),
+            bloom_skips: AtomicU64::new(0),
+            sst_probes: AtomicU64::new(0),
         });
         Ok(cf)
     }
@@ -270,6 +278,9 @@ impl ColumnFamily {
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
+            point_reads: AtomicU64::new(0),
+            bloom_skips: AtomicU64::new(0),
+            sst_probes: AtomicU64::new(0),
         });
         Ok((cf, max_seq))
     }
@@ -597,6 +608,7 @@ impl ColumnFamily {
 
     /// Resolve `user_key` as of `read_seq`. Returns the value, or `NotFound`.
     pub(crate) fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
+        self.point_reads.fetch_add(1, Ordering::Relaxed);
         let now = now_nanos();
         let (mem, imms, tables) = {
             let s = self.state.read();
@@ -648,6 +660,13 @@ impl ColumnFamily {
             }
         }
         for th in &tables {
+            // Hoisted bloom check so skips are countable; Reader::get would
+            // reject the probe anyway.
+            if !th.reader.bloom_may_contain(user_key) {
+                self.bloom_skips.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            self.sst_probes.fetch_add(1, Ordering::Relaxed);
             let (v, seq, found, deleted) = th.reader.get(user_key, read_seq, now)?;
             if found && (!best_found || seq > best_seq) {
                 best_found = true;
@@ -835,6 +854,26 @@ impl ColumnFamily {
     }
 
     /// Total entries and tombstones across all SSTables.
+    /// Entries currently in the active and sealed memtables.
+    pub(crate) fn memtable_entries(&self) -> u64 {
+        let s = self.state.read();
+        let mut n = s.mem.num_entries().max(0) as u64;
+        for imm in &s.imm {
+            n += imm.mem.num_entries().max(0) as u64;
+        }
+        n
+    }
+
+    /// Approximate number of entries: per-SSTable entry counts (which still
+    /// include not-yet-compacted old versions and tombstones) plus the active
+    /// and sealed memtables. O(levels), no I/O. In unified-memtable mode,
+    /// entries still in the shared memtable are not counted (they are only
+    /// attributed to a CF at flush time).
+    pub fn approximate_len(&self) -> u64 {
+        let (entries, _) = self.entry_counts();
+        entries + self.memtable_entries()
+    }
+
     pub(crate) fn entry_counts(&self) -> (u64, u64) {
         let s = self.state.read();
         let mut entries = 0;
