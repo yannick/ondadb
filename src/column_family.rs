@@ -944,6 +944,55 @@ impl ColumnFamily {
         (entries, tombs)
     }
 
+    /// FIFO eviction: remove the oldest L0 tables until the CF is back under
+    /// `max_bytes`, plus any table whose klog file age exceeds `ttl`. Returns
+    /// the removed handles (caller persists the manifest, then deletes files).
+    pub(crate) fn take_fifo_victims(
+        &self,
+        max_bytes: u64,
+        ttl: std::time::Duration,
+    ) -> Vec<Arc<SstHandle>> {
+        let now = std::time::SystemTime::now();
+        let mut s = self.state.write();
+        // File ids are allocated monotonically: smallest id = oldest table.
+        let mut by_age: Vec<Arc<SstHandle>> = s.levels[0].clone();
+        by_age.sort_by_key(|t| t.meta.id);
+
+        let mut victims: Vec<Arc<SstHandle>> = Vec::new();
+        if !ttl.is_zero() {
+            for t in &by_age {
+                let path = self.klog_path(t.meta.id);
+                let expired = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mt| now.duration_since(mt).ok())
+                    .is_some_and(|age| age > ttl);
+                if expired {
+                    victims.push(t.clone());
+                }
+            }
+        }
+        if max_bytes > 0 {
+            let mut total: u64 = by_age
+                .iter()
+                .map(|t| t.meta.klog_size + t.meta.vlog_size)
+                .sum();
+            for t in &by_age {
+                if total <= max_bytes {
+                    break;
+                }
+                if !victims.iter().any(|v| Arc::ptr_eq(v, t)) {
+                    victims.push(t.clone());
+                }
+                total -= t.meta.klog_size + t.meta.vlog_size;
+            }
+        }
+        if !victims.is_empty() {
+            s.levels[0].retain(|t| !victims.iter().any(|v| Arc::ptr_eq(v, t)));
+        }
+        victims
+    }
+
     /// Install pre-built level handles (used by clone).
     pub(crate) fn install_levels(&self, levels: Vec<Vec<Arc<SstHandle>>>) {
         self.replace_levels(levels);

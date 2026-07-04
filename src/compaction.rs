@@ -22,6 +22,9 @@ use crate::util::now_nanos;
 
 /// Run compaction on `cf` until no level is over its trigger.
 pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
+    if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
+        return run_fifo(db, cf);
+    }
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
@@ -30,6 +33,31 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
             cf.compaction_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        Ok(())
+    })();
+    cf.compacting
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    res
+}
+
+/// FIFO "compaction": never merges — evicts the oldest L0 tables past the
+/// CF's size/age limits. Manifest is persisted before any file is unlinked
+/// (the same ordering the merge path uses).
+fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
+    cf.compacting
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let res = (|| {
+        let victims = cf.take_fifo_victims(cf.opts.fifo_max_bytes, cf.opts.fifo_ttl);
+        if victims.is_empty() {
+            return Ok(());
+        }
+        db.persist_manifest()?;
+        for t in &victims {
+            db.remove_sst_file(&cf.klog_path(t.meta.id));
+            db.remove_sst_file(&format!("{}/{}.vlog", cf.dir(), t.meta.id));
+        }
+        cf.compaction_count
+            .fetch_add(victims.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     })();
     cf.compacting

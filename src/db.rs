@@ -627,8 +627,12 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                                 crate::wal::remove_wal_files(p);
                             }
                         }
+                        // FIFO CFs enforce their size/age limit after every
+                        // flush; leveled CFs wait for the L0 file trigger.
+                        let fifo = cf.opts.compaction_style
+                            == crate::config::CompactionStyle::Fifo;
                         if !db.closing.load(Ordering::Relaxed)
-                            && cf.l0_len() >= cf.opts.l1_file_count_trigger as usize
+                            && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
                         {
                             let _ = db.ctx.compact_tx.send(cf.clone());
                         }
@@ -660,8 +664,12 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                         if let Err(e) = cf.ingest_l0(entries, file_id) {
                             db.poison.set(format!("unified flush failed: {e}"));
                         }
+                        // FIFO CFs enforce their size/age limit after every
+                        // flush; leveled CFs wait for the L0 file trigger.
+                        let fifo = cf.opts.compaction_style
+                            == crate::config::CompactionStyle::Fifo;
                         if !db.closing.load(Ordering::Relaxed)
-                            && cf.l0_len() >= cf.opts.l1_file_count_trigger as usize
+                            && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
                         {
                             let _ = db.ctx.compact_tx.send(cf.clone());
                         }

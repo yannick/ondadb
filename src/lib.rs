@@ -43,7 +43,9 @@ pub mod wal;
 
 pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
-pub use config::{ColumnFamilyConfig, Compression, IsolationLevel, LogLevel, Options, SyncMode};
+pub use config::{
+    ColumnFamilyConfig, CompactionStyle, Compression, IsolationLevel, LogLevel, Options, SyncMode,
+};
 pub use db::DB;
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;

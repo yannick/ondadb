@@ -244,3 +244,85 @@ fn compaction_filter_removes_and_respects_snapshots() {
     assert_eq!(db.get(&cf, b"again").unwrap(), b"purge");
     db.close().unwrap();
 }
+
+#[test]
+fn fifo_compaction_evicts_oldest_tables() {
+    use ondadb::CompactionStyle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "fifo",
+            ColumnFamilyConfig {
+                compaction_style: CompactionStyle::Fifo,
+                fifo_max_bytes: 8 * 1024, // a few small tables
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    // 8 generations of ~2 KiB tables; the size cap keeps only the newest few.
+    for gen in 0..8u32 {
+        for i in 0..20u32 {
+            db.put(
+                &cf,
+                format!("g{gen}-k{i:02}").as_bytes(),
+                &[b'v'; 100],
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+    }
+    db.compact(&cf).unwrap();
+
+    let s = cf.stats();
+    let l0_bytes: u64 = s.levels.first().map(|(_, b)| *b).unwrap_or(0);
+    assert!(
+        l0_bytes <= 8 * 1024,
+        "size cap must hold after eviction: {l0_bytes}"
+    );
+    // Newest generation survives, oldest is gone (cache semantics).
+    assert_eq!(db.get(&cf, b"g7-k00").unwrap(), [b'v'; 100]);
+    assert!(db.get(&cf, b"g0-k00").is_err(), "oldest gen must be evicted");
+
+    // Eviction is durable (manifest persisted before file deletion).
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("fifo").unwrap();
+    assert_eq!(db.get(&cf, b"g7-k00").unwrap(), [b'v'; 100]);
+    assert!(db.get(&cf, b"g0-k00").is_err());
+    db.close().unwrap();
+}
+
+#[test]
+fn fifo_ttl_evicts_aged_tables() {
+    use ondadb::CompactionStyle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "fifo",
+            ColumnFamilyConfig {
+                compaction_style: CompactionStyle::Fifo,
+                fifo_ttl: Duration::from_millis(400),
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    db.put(&cf, b"old", b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    db.put(&cf, b"new", b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    db.compact(&cf).unwrap();
+    assert!(db.get(&cf, b"old").is_err(), "aged table must be evicted");
+    assert_eq!(db.get(&cf, b"new").unwrap(), b"v");
+    db.close().unwrap();
+}
