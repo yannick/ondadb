@@ -559,3 +559,72 @@ fn clear_column_family_empties_and_survives_reopen() {
     ));
     db.close().unwrap();
 }
+
+#[test]
+fn bulk_ingestion_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+
+    // Pre-existing data that ingestion must shadow / coexist with.
+    db.put(&cf, b"k00500", b"old", Duration::ZERO).unwrap();
+    db.put(&cf, b"pre", b"kept", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let mut ing = db.start_ingestion(&cf).unwrap();
+    for i in 0..10_000u32 {
+        ing.write(format!("k{i:05}").as_bytes(), b"ingested", Duration::ZERO)
+            .unwrap();
+    }
+    // Out-of-order write must be rejected without corrupting the stream.
+    assert!(ing.write(b"k00000", b"dup", Duration::ZERO).is_err());
+    assert_eq!(ing.finish().unwrap(), 10_000);
+
+    // Ingested data visible, newer than the pre-existing version.
+    assert_eq!(db.get(&cf, b"k00000").unwrap(), b"ingested");
+    assert_eq!(db.get(&cf, b"k00500").unwrap(), b"ingested");
+    assert_eq!(db.get(&cf, b"pre").unwrap(), b"kept");
+
+    // Durable across reopen (no WAL involved — manifest only).
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(db.get(&cf, b"k09999").unwrap(), b"ingested");
+    assert_eq!(db.get(&cf, b"k00500").unwrap(), b"ingested");
+
+    // Iteration sees exactly 10_000 ingested keys + "pre".
+    let txn = db.begin();
+    let mut it = txn.new_iterator(&cf);
+    let mut n = 0;
+    it.seek_to_first();
+    while it.valid() {
+        n += 1;
+        it.next();
+    }
+    assert_eq!(n, 10_001);
+    db.close().unwrap();
+}
+
+#[test]
+fn bulk_ingestion_abort_leaves_no_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    {
+        let mut ing = db.start_ingestion(&cf).unwrap();
+        for i in 0..1000u32 {
+            ing.write(format!("k{i:04}").as_bytes(), b"v", Duration::ZERO)
+                .unwrap();
+        }
+        // dropped without finish
+    }
+    assert!(db.get(&cf, b"k0000").is_err());
+    // Ingestion tombstones shadow existing keys.
+    db.put(&cf, b"gone", b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    let mut ing = db.start_ingestion(&cf).unwrap();
+    ing.write_tombstone(b"gone").unwrap();
+    ing.finish().unwrap();
+    assert!(db.get(&cf, b"gone").is_err());
+    db.close().unwrap();
+}

@@ -482,8 +482,12 @@ impl ColumnFamily {
         Ok(imm.wal_paths.clone())
     }
 
-    /// Finish `w` and register the resulting SSTable as the newest L0 file.
-    fn install_l0(&self, w: Writer, file_id: u64) -> Result<()> {
+    /// Finish `w` (fsync + footer) and open a reader, without installing it.
+    pub(crate) fn finish_writer_to_handle(
+        &self,
+        w: Writer,
+        file_id: u64,
+    ) -> Result<Arc<SstHandle>> {
         let klog = self.klog_path(file_id);
         let meta = w.finish()?.to_sst_meta(file_id, 0);
         let reader = Reader::open(
@@ -493,9 +497,27 @@ impl ColumnFamily {
             file_id,
             self.cmp.clone(),
         )?;
-        let handle = Arc::new(SstHandle { meta, reader });
-        self.state.write().levels[0].insert(0, handle); // newest first
+        Ok(Arc::new(SstHandle { meta, reader }))
+    }
+
+    /// Register already-finished SSTables as the newest L0 files, atomically.
+    pub(crate) fn install_handles_l0(&self, handles: Vec<Arc<SstHandle>>) {
+        let mut s = self.state.write();
+        for h in handles {
+            s.levels[0].insert(0, h); // newest first
+        }
+    }
+
+    /// Finish `w` and register the resulting SSTable as the newest L0 file.
+    fn install_l0(&self, w: Writer, file_id: u64) -> Result<()> {
+        let handle = self.finish_writer_to_handle(w, file_id)?;
+        self.install_handles_l0(vec![handle]);
         Ok(())
+    }
+
+    /// Open a fresh SSTable writer for this CF (used by bulk ingestion).
+    pub(crate) fn new_sst_writer(&self, file_id: u64, expected: usize) -> Result<Writer> {
+        Writer::new(&self.klog_path(file_id), self.writer_opts(expected))
     }
 
     /// Stream a sealed memtable to a new L0 SSTable without materializing

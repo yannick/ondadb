@@ -16,7 +16,6 @@
 //! Not ported (feature absent or fjall-internal — see the gap report):
 //! - `keyspace_visible_seqno`, `keyspace_torn_read`, `seqno_recovery`,
 //!   `write_buffer_size`: poke fjall's seqno/write-buffer internals.
-//! - `ingest_recovery`: ondaDB has no bulk-ingestion API.
 //! - `keyspace_recover`, `compaction_filter`, `fifo_dirty_read`: fjall
 //!   config-persistence internals, compaction filters and FIFO compaction.
 //! - `keyspace_v1/v2_load_fixture`, `recovery_*_mac`,
@@ -210,8 +209,6 @@ fn db_lock() {
 }
 
 // ------------------------------------------------------- keyspace_clear.rs
-// fjall's `tree.clear()` has no ondaDB equivalent; the closest durable
-// operation is drop_column_family + recreate.
 
 #[test]
 fn clear_recover() {
@@ -702,4 +699,27 @@ fn keyspace_iter_lifetime() {
     };
     assert_eq!(3, counter.execute());
     db.close().unwrap();
+}
+
+// ----------------------------------------------------- ingest_recovery.rs
+
+#[test]
+fn ingest_recovery() {
+    let folder = tempfile::tempdir().unwrap();
+    {
+        let db = open(folder.path());
+        let tree = keyspace(&db, "default");
+        let mut ing = db.start_ingestion(&tree).unwrap();
+        for x in 0u64..1000 {
+            ing.write(&x.to_be_bytes(), b"v", ZERO).unwrap();
+        }
+        assert_eq!(ing.finish().unwrap(), 1000);
+        db.close().unwrap();
+    }
+    {
+        let db = open(folder.path());
+        let tree = db.get_column_family("default").unwrap();
+        assert_eq!(len(&db, &tree), 1000);
+        db.close().unwrap();
+    }
 }
