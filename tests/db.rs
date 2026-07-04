@@ -506,3 +506,22 @@ fn lock_file_excludes_second_writer_but_shares_readers() {
     let db = ro(false).unwrap();
     db.close().unwrap();
 }
+
+#[test]
+fn sync_wal_durability_point() {
+    // Default CFs run SyncMode::None; sync_wal() is the explicit fsync.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    db.put(&cf, b"a", b"1", Duration::ZERO).unwrap();
+    db.sync_wal().unwrap();
+    db.sync_wal().unwrap(); // idempotent
+    assert_eq!(db.get(&cf, b"a").unwrap(), b"1");
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(db.get(&cf, b"a").unwrap(), b"1");
+    db.close().unwrap();
+}

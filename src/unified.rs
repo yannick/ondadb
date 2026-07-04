@@ -337,6 +337,15 @@ impl UnifiedStore {
         }
     }
 
+    /// fsync the active WAL (no-op when read-only / WAL-less).
+    pub(crate) fn sync_wal(&self) -> crate::error::Result<()> {
+        let wal = self.state.read().wal.clone();
+        match wal {
+            Some(w) => w.sync(),
+            None => Ok(()),
+        }
+    }
+
     /// Close the active WAL (called on database close, after the queue drains).
     pub(crate) fn close(&self) {
         let mut s = self.state.write();
