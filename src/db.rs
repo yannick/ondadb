@@ -106,9 +106,50 @@ pub struct DB {
     pub(crate) inner: Arc<DbInner>,
 }
 
+thread_local! {
+    /// Highest sequence committed BY THIS THREAD, per DB instance.
+    ///
+    /// `visible_seq` advances gap-free: while an earlier-reserved commit
+    /// from another thread is still in flight, a thread's OWN completed
+    /// commit sits above the watermark and a read at `visible_seq` misses
+    /// it — breaking read-your-own-writes for read-modify-write callers
+    /// (found by marekvs's chaos suite: INCR under concurrent load silently
+    /// lost ~2-6% of increments). ReadCommitted reads therefore use
+    /// `max(visible_seq, own floor)`. Keyed by DbInner address; entries
+    /// die with the thread.
+    static THREAD_COMMIT_FLOOR: std::cell::RefCell<std::collections::HashMap<usize, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 impl DbInner {
     pub(crate) fn reserve_seq(&self, n: u64) -> u64 {
         self.next_seq.fetch_add(n, Ordering::SeqCst)
+    }
+
+    fn db_key(&self) -> usize {
+        self as *const DbInner as usize
+    }
+
+    /// Record that this thread committed up to `seq` (called post-publish).
+    pub(crate) fn note_thread_commit(&self, seq: u64) {
+        let k = self.db_key();
+        THREAD_COMMIT_FLOOR.with(|f| {
+            let mut m = f.borrow_mut();
+            let e = m.entry(k).or_insert(0);
+            if seq > *e {
+                *e = seq;
+            }
+        });
+    }
+
+    /// Read sequence for ReadCommitted point reads: the published watermark,
+    /// raised to this thread's own last commit (read-your-own-writes).
+    /// Fixed-snapshot transactions keep `visible_seq` — the floor may sit
+    /// inside a publication gap, which is fine for read-committed semantics
+    /// but not for a repeatable snapshot.
+    pub(crate) fn read_floor_seq(&self) -> u64 {
+        let own = THREAD_COMMIT_FLOOR.with(|f| f.borrow().get(&self.db_key()).copied());
+        self.visible_seq().max(own.unwrap_or(0))
     }
 
     /// Mark `[start, end)` committed; advance the visible sequence gap-free.

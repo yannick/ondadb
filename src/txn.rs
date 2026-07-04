@@ -105,7 +105,13 @@ impl DB {
                 | IsolationLevel::Snapshot
                 | IsolationLevel::Serializable
         );
-        let read_seq = self.inner.visible_seq();
+        // ReadCommitted floats on the read floor (read-your-own-writes);
+        // fixed-snapshot levels pin the gap-free published watermark.
+        let read_seq = if fixed {
+            self.inner.visible_seq()
+        } else {
+            self.inner.read_floor_seq()
+        };
         if fixed {
             self.inner.acquire_snapshot(read_seq);
         }
@@ -137,9 +143,10 @@ impl DB {
         t.commit()
     }
 
-    /// Get a single key at the latest committed sequence.
+    /// Get a single key at the latest committed sequence (raised to this
+    /// thread's own last commit — read-your-own-writes).
     pub fn get(&self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<Vec<u8>> {
-        cf.get(key, self.inner.visible_seq())
+        cf.get(key, self.inner.read_floor_seq())
     }
 
     /// Delete a single key (auto-committed at ReadCommitted).
@@ -232,7 +239,7 @@ impl Txn {
         let rs = if self.fixed {
             self.read_seq
         } else {
-            self.db.visible_seq()
+            self.db.read_floor_seq()
         };
         cf.get(key, rs)
     }
@@ -243,7 +250,7 @@ impl Txn {
         let rs = if self.fixed {
             self.read_seq
         } else {
-            self.db.visible_seq()
+            self.db.read_floor_seq()
         };
         let id = cf_id(cf);
         let overlay: Option<Arc<Memtable>> = {
@@ -453,6 +460,7 @@ impl Txn {
             }
         }
         self.db.publish_range(start, start + n);
+        self.db.note_thread_commit(start + n - 1);
         drop(_guard);
 
         for (cf, ops) in &applied {
