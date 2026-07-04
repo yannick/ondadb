@@ -591,7 +591,8 @@ impl ColumnFamily {
 
     fn writer_opts(&self, expected: usize) -> WriterOptions {
         WriterOptions {
-            compression: self.opts.compression,
+            // Flush and ingestion always write L0.
+            compression: self.opts.compression_for_level(0),
             cmp: self.cmp.clone(),
             enable_bloom: self.opts.enable_bloom_filter,
             bloom_fpr: self.opts.bloom_fpr,

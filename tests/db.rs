@@ -628,3 +628,53 @@ fn bulk_ingestion_abort_leaves_no_trace() {
     assert!(db.get(&cf, b"gone").is_err());
     db.close().unwrap();
 }
+
+#[test]
+fn per_level_compression_end_to_end() {
+    use ondadb::Compression;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    // L0 uncompressed, everything deeper Zstd.
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                compression_per_level: vec![Compression::None, Compression::Zstd],
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    // Compressible values so a Zstd level actually exercises the codec.
+    let value = "abcdefgh".repeat(32);
+    for i in 0..2000u32 {
+        db.put(&cf, format!("k{i:05}").as_bytes(), value.as_bytes(), Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap(); // L0 (None)
+    db.compact(&cf).unwrap(); // pushes down => Zstd blocks
+
+    for i in (0..2000u32).step_by(37) {
+        assert_eq!(
+            db.get(&cf, format!("k{i:05}").as_bytes()).unwrap(),
+            value.as_bytes()
+        );
+    }
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+
+    // Policy is persisted in the manifest: after reopen the data reads back
+    // and new writes keep working.
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(
+        db.get(&cf, b"k00000").unwrap(),
+        value.as_bytes()
+    );
+    db.put(&cf, b"new", b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    assert_eq!(db.get(&cf, b"new").unwrap(), b"v");
+    db.close().unwrap();
+}
