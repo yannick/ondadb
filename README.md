@@ -37,7 +37,30 @@ LSM storage engine.
 - **B+tree hybrid klog** (`use_btree`) — see below.
 - **Unified memtable** (`unified_memtable`) — see below.
 - **Compression**: none / snappy / lz4 / zstd / lz4fast / flate (per column
-  family, per SSTable block).
+  family, per SSTable block), with an optional **per-level policy**
+  (`compression_per_level`, e.g. `[None, Zstd]` = hot L0 uncompressed,
+  everything below Zstd).
+- **Fail-stop durability (poisoning)** — any fsync/flush/manifest failure
+  fail-stops the database: writes are rejected with `OndaError::Poisoned`
+  (reads keep working, `DB::poisoned()` reports why) instead of silently
+  retrying after the kernel may have dropped dirty pages.
+- **Single-process lock** — a `LOCK` file (exclusive for read-write, shared
+  for read-only opens) makes a second open fail with `OndaError::Locked`.
+- **`sync_wal()`** — an explicit durability point for `SyncMode::None` /
+  `Interval`: fsyncs every WAL; on `Ok`, everything committed before the call
+  is on disk.
+- **Bulk ingestion** — `DB::start_ingestion(&cf)` streams pre-sorted entries
+  straight into L0 SSTables (no WAL, no memtable), rolls files at
+  `write_buffer_size`, and installs them atomically at `finish()`.
+- **Compaction filters** — `cf.set_compaction_filter(|key, value| ...)`
+  drops (or tombstones) entries during compaction for custom GC/expiry.
+- **FIFO compaction style** — `compaction_style: Fifo` with `fifo_max_bytes`
+  / `fifo_ttl`: never merges, evicts the oldest tables whole (cache
+  semantics, RocksDB-FIFO-style).
+- **`clear_column_family()`** — atomically empty a CF, preserving its
+  configuration.
+- **Observability** — `approximate_len()` plus per-CF read counters
+  (point reads, bloom-filter skips, SSTable probes) and cache hit/miss stats.
 
 Not implemented: the S3 / object-store connector and read replicas (intentionally
 out of scope).
@@ -54,7 +77,7 @@ ondaDB ships two configurations:
 ```sh
 cargo build                              # safe build
 cargo build --features unsafe-fastpath   # performance build
-cargo test                               # 88 tests, safe build
+cargo test                               # 137 tests, safe build
 cargo test --features unsafe-fastpath    # same suite over the fast path
 ```
 
@@ -191,7 +214,8 @@ src/
   memtable_arena.rs  arena skip-list shard (unsafe-fastpath only)
   sst/             SSTable writer/reader/iterator (+ B+tree hybrid klog)
   column_family.rs read path, rotation, flush, levels
-  compaction.rs    leveled compaction
+  compaction.rs    leveled compaction (+ filters) and FIFO eviction
+  ingest.rs        bulk ingestion (sorted stream -> L0, no WAL/memtable)
   flush.rs / db.rs DB lifecycle, workers, sequence/snapshot mgmt, recovery
   txn.rs           transactions + single-op API
   iterator.rs      merging MVCC iterator
@@ -209,6 +233,11 @@ cargo clippy --all-targets                  # clean
 cargo clippy --features unsafe-fastpath --all-targets
 cargo fmt --check
 ```
+
+The integration suite includes a port of [fjall](https://github.com/fjall-rs/fjall)'s
+engine-generic tests ([`tests/fjall_suite.rs`](tests/fjall_suite.rs)) — batch
+atomicity, recovery loops, snapshot isolation, prefix scans, large-value WAL
+replay, DB locking — kept name-for-name so the two suites diff side by side.
 
 
 ## Benchmarks
