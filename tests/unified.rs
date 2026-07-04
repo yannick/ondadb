@@ -143,3 +143,16 @@ fn unified_concurrent_writers() {
     }
     db.close().unwrap();
 }
+
+#[test]
+fn unified_sync_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_unified(dir.path().to_str().unwrap());
+    let a = db
+        .create_column_family("a", ColumnFamilyConfig::default())
+        .unwrap();
+    db.put(&a, b"k", b"v", Duration::ZERO).unwrap();
+    db.sync_wal().unwrap();
+    assert_eq!(db.get(&a, b"k").unwrap(), b"v");
+    db.close().unwrap();
+}

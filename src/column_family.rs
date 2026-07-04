@@ -764,6 +764,15 @@ impl ColumnFamily {
         out
     }
 
+    /// fsync this CF's active WAL (no-op when read-only / WAL-less).
+    pub(crate) fn sync_wal(&self) -> Result<()> {
+        let wal = self.state.read().wal.clone();
+        match wal {
+            Some(w) => w.sync(),
+            None => Ok(()),
+        }
+    }
+
     /// Whether a flush is in progress.
     pub fn is_flushing(&self) -> bool {
         self.flushing.load(Ordering::Relaxed)

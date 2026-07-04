@@ -438,6 +438,26 @@ impl DB {
         compaction::run(&self.inner, cf)
     }
 
+    /// Force an fsync of every write-ahead log (all column families plus the
+    /// unified store, when enabled).
+    ///
+    /// Gives [`SyncMode::None`](crate::SyncMode::None) /
+    /// [`SyncMode::Interval`](crate::SyncMode::Interval) users an explicit
+    /// durability point: when this returns `Ok`, every write committed before
+    /// the call is on disk. A failed sync fail-stops the database (see
+    /// [`poisoned`](Self::poisoned)).
+    pub fn sync_wal(&self) -> Result<()> {
+        self.inner.poison.check()?;
+        if let Some(u) = &self.inner.unified {
+            u.sync_wal()?;
+        }
+        let cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
+        for cf in &cfs {
+            cf.sync_wal()?;
+        }
+        Ok(())
+    }
+
     /// If the database has fail-stopped after a durability failure (failed
     /// fsync, background flush, or manifest persist), returns the reason.
     /// While poisoned, every write commit fails with
