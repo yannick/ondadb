@@ -9,7 +9,7 @@
 //! | `db.keyspace(name, opts)`      | `create_column_family` / `get_column_family` |
 //! | `db.batch()` / `db.write_tx()` | `db.begin()` (`Txn`)                     |
 //! | `db.snapshot()` / `read_tx()`  | `db.begin()` (Snapshot isolation)        |
-//! | `tree.clear()`                 | `drop_column_family` + recreate          |
+//! | `tree.clear()`                 | `clear_column_family`                    |
 //! | KV separation (blob)           | vlog (`klog_value_threshold`)            |
 //! | `rotate_memtable_and_wait()`   | `flush_memtable`                         |
 //!
@@ -224,8 +224,7 @@ fn clear_recover() {
         db.put(&tree, b"a", b"a", ZERO).unwrap();
         assert!(contains(&db, &tree, b"a"));
 
-        db.drop_column_family("default").unwrap();
-        let tree = keyspace(&db, "default");
+        let tree = db.clear_column_family("default").unwrap();
         assert_eq!(len(&db, &tree), 0);
         db.close().unwrap();
     }
@@ -246,8 +245,7 @@ fn clear_recover_multi_tree() {
         let _other = keyspace(&db, "other");
 
         db.put(&tree, b"a", b"a", ZERO).unwrap();
-        db.drop_column_family("default").unwrap();
-        let tree = keyspace(&db, "default");
+        let tree = db.clear_column_family("default").unwrap();
         assert_eq!(len(&db, &tree), 0);
 
         let other = db.get_column_family("other").unwrap();
@@ -259,8 +257,7 @@ fn clear_recover_multi_tree() {
         let tree = keyspace(&db, "default");
         assert_eq!(len(&db, &tree), 0);
 
-        db.drop_column_family("other").unwrap();
-        let other = keyspace(&db, "other");
+        let other = db.clear_column_family("other").unwrap();
         assert_eq!(len(&db, &other), 0);
 
         db.put(&tree, b"a", b"a", ZERO).unwrap();

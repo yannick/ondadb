@@ -423,6 +423,48 @@ impl DB {
         Ok(())
     }
 
+    /// Atomically empty a column family, preserving its configuration.
+    ///
+    /// Implemented as drop + recreate under the registry lock, so concurrent
+    /// `get_column_family` callers always see either the full old CF or the
+    /// empty new one. Returns the fresh handle; previously obtained handles
+    /// become stale (their writes fail), exactly as after
+    /// [`drop_column_family`](Self::drop_column_family) + re-create.
+    ///
+    /// Not supported in unified-memtable mode: the shared memtable still holds
+    /// the old entries under the same CF id, so they would resurface.
+    pub fn clear_column_family(&self, name: &str) -> Result<Arc<ColumnFamily>> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        if self.inner.unified.is_some() {
+            return Err(OndaError::InvalidArgs(
+                "clear_column_family is not supported in unified-memtable mode".into(),
+            ));
+        }
+        let mut cfs = self.inner.cfs.write();
+        let old = cfs.remove(name).ok_or(OndaError::NotFound)?;
+        let cfg = old.opts.clone();
+        let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
+            OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
+        })?;
+        old.close_resources();
+        let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
+        let cf = ColumnFamily::create(
+            self.inner.ctx.clone(),
+            name.to_string(),
+            self.inner.cf_dir(name),
+            cfg,
+            cmp,
+        )?;
+        cfs.insert(name.to_string(), cf.clone());
+        drop(cfs);
+        // Same name => same stable id, so this replaces the old routing entry.
+        self.inner.cf_by_id.write().insert(cf.id(), cf.clone());
+        self.inner.persist_manifest()?;
+        Ok(cf)
+    }
+
     /// Flush a column family's active memtable to an SSTable (blocks until the
     /// flush is enqueued and drained).
     pub fn flush_memtable(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
@@ -594,8 +636,18 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                     Err(e) => {
                         // The data is still in the WAL, but a failed background
                         // flush (SST write/fsync) means durability can no longer
-                        // be promised for new writes — fail-stop.
-                        db.poison.set(format!("background flush failed: {e}"));
+                        // be promised for new writes — fail-stop. Exception: if
+                        // the CF was dropped or cleared while this job was in
+                        // flight, the failure is expected (its directory is
+                        // gone) and poisoning would take down a healthy DB.
+                        let live = db
+                            .cfs
+                            .read()
+                            .get(cf.name())
+                            .is_some_and(|c| Arc::ptr_eq(c, &cf));
+                        if live {
+                            db.poison.set(format!("background flush failed: {e}"));
+                        }
                     }
                 }
                 db.pending_flush.fetch_sub(1, Ordering::SeqCst);
