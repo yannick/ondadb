@@ -175,6 +175,17 @@ struct Shared {
     size: AtomicI64,
     dirty: AtomicBool,
     qstate: Mutex<QueueState>,
+    /// DB-wide fail-stop flag, tripped on any fsync failure (see
+    /// [`crate::util::Poison`]). `None` only for standalone WALs in tests.
+    poison: Mutex<Option<Arc<crate::util::Poison>>>,
+}
+
+impl Shared {
+    fn poison(&self, why: String) {
+        if let Some(p) = self.poison.lock().as_ref() {
+            p.set(why);
+        }
+    }
 }
 
 /// An append-only write-ahead log with configurable durability.
@@ -223,6 +234,7 @@ impl Wal {
                 queue: Vec::new(),
                 flushing: false,
             }),
+            poison: Mutex::new(None),
         });
         let (mut stop_tx, mut bg) = (None, None);
         if mode == SyncMode::Interval {
@@ -245,6 +257,12 @@ impl Wal {
             stop_tx: Mutex::new(stop_tx),
             bg: Mutex::new(bg),
         })
+    }
+
+    /// Wire this WAL to the DB-wide fail-stop flag; fsync failures (group
+    /// commit, interval sync, manual sync) will trip it.
+    pub(crate) fn set_poison(&self, p: Arc<crate::util::Poison>) {
+        *self.shared.poison.lock() = Some(p);
     }
 
     /// Append a single record.
@@ -343,6 +361,9 @@ impl Wal {
         match self.shared.sync {
             SyncMode::Full => {
                 if let Err(e) = f.sync_data() {
+                    // The kernel may have dropped the dirty pages it failed to
+                    // persist; earlier acknowledged commits could be gone.
+                    self.shared.poison(format!("wal group-commit fsync failed: {e}"));
                     return OndaError::from(e).code();
                 }
             }
@@ -360,7 +381,12 @@ impl Wal {
         for file in &self.shared.files {
             let guard = file.lock();
             match guard.as_ref() {
-                Some(f) => f.sync_data()?,
+                Some(f) => {
+                    if let Err(e) = f.sync_data() {
+                        self.shared.poison(format!("wal fsync failed: {e}"));
+                        return Err(e.into());
+                    }
+                }
                 None => return Err(OndaError::InvalidDb("wal closed".into())),
             }
         }
@@ -504,7 +530,12 @@ fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
                 if shared.dirty.swap(false, Ordering::Relaxed) {
                     for file in &shared.files {
                         if let Some(f) = file.lock().as_ref() {
-                            let _ = f.sync_data();
+                            if let Err(e) = f.sync_data() {
+                                // Commits acknowledged since the last successful
+                                // sync may be lost — fail-stop the DB rather
+                                // than silently dropping the error.
+                                shared.poison(format!("wal interval fsync failed: {e}"));
+                            }
                         }
                     }
                 }

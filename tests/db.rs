@@ -464,3 +464,45 @@ fn concurrent_writers() {
     }
     db.close().unwrap();
 }
+
+#[test]
+fn lock_file_excludes_second_writer_but_shares_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+
+    // A second read-write open of a live database must fail with Locked.
+    match DB::open(Options::new(dir.path().to_str().unwrap())) {
+        Err(ondadb::OndaError::Locked(_)) => {}
+        other => panic!("expected Locked, got {other:?}"),
+    }
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+
+    // After a clean close the lock is released: read-only opens take a shared
+    // lock, so two of them coexist...
+    let ro = |ro: bool| {
+        let mut o = Options::new(dir.path().to_str().unwrap());
+        o.read_only = ro;
+        DB::open(o)
+    };
+    let r1 = ro(true).unwrap();
+    let r2 = ro(true).unwrap();
+    assert_eq!(r1.get(&r1.get_column_family("default").unwrap(), b"k").unwrap(), b"v");
+
+    // ...but a writer is excluded while any reader holds the shared lock.
+    match ro(false) {
+        Err(ondadb::OndaError::Locked(_)) => {}
+        other => panic!("expected Locked while readers live, got {other:?}"),
+    }
+
+    r1.close().unwrap();
+    r2.close().unwrap();
+    drop(r1);
+    drop(r2);
+
+    // All handles released: a writer can open again.
+    let db = ro(false).unwrap();
+    db.close().unwrap();
+}

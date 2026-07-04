@@ -311,6 +311,9 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
+        // Fail-stop: after a durability failure no new commit may be
+        // acknowledged. The transaction stays usable for rollback.
+        self.db.poison.check()?;
         self.done = true;
         let needs_check = matches!(
             self.isolation,

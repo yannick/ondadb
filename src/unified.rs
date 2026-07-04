@@ -78,6 +78,8 @@ pub(crate) struct UnifiedStore {
     /// Reserved for close-time backpressure bypass (parity with the per-CF path).
     #[allow(dead_code)]
     closing: Arc<AtomicBool>,
+    /// DB-wide fail-stop flag, wired into every WAL this store opens.
+    poison: Arc<crate::util::Poison>,
 }
 
 impl std::fmt::Debug for UnifiedStore {
@@ -101,6 +103,7 @@ impl UnifiedStore {
         flush_tx: Sender<FlushJob>,
         pending_flush: Arc<AtomicUsize>,
         closing: Arc<AtomicBool>,
+        poison: Arc<crate::util::Poison>,
     ) -> Result<(Arc<UnifiedStore>, u64)> {
         let mem = Memtable::new(default_comparator());
         let mut max_seq = 0;
@@ -139,11 +142,13 @@ impl UnifiedStore {
             (None, replay_paths)
         } else {
             let p = wal_path(dir, next_gen);
-            let w = Arc::new(Wal::open(
+            let w = Wal::open(
                 &p,
                 opts.unified_memtable_sync_mode,
                 opts.unified_memtable_sync_interval,
-            )?);
+            )?;
+            w.set_poison(poison.clone());
+            let w = Arc::new(w);
             let mut pend = replay_paths;
             pend.push(p);
             (Some(w), pend)
@@ -169,6 +174,7 @@ impl UnifiedStore {
             flush_tx,
             pending_flush,
             closing,
+            poison,
         });
         Ok((store, max_seq))
     }
@@ -303,7 +309,10 @@ impl UnifiedStore {
                 } else {
                     Wal::open(&new_path, self.sync_mode, self.sync_interval)
                         .ok()
-                        .map(Arc::new)
+                        .map(|w| {
+                            w.set_poison(self.poison.clone());
+                            Arc::new(w)
+                        })
                 };
                 s.pending_wals = vec![new_path];
             }

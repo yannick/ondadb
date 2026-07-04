@@ -70,6 +70,15 @@ pub struct DbInner {
     file_deletion: Mutex<FileDeletionState>,
 
     workers: Mutex<Vec<JoinHandle<()>>>,
+
+    /// Holds the OS advisory lock on `<dir>/LOCK` for the lifetime of the open
+    /// database (exclusive for read-write, shared for read-only). Dropped — and
+    /// thereby released — at the end of `close()`.
+    lock_file: Mutex<Option<std::fs::File>>,
+
+    /// Fail-stop flag: tripped by any durability failure (WAL fsync, background
+    /// flush, manifest persist); checked at every write commit.
+    pub(crate) poison: Arc<crate::util::Poison>,
 }
 
 /// RAII guard that pauses obsolete-SSTable deletion while held (see
@@ -197,7 +206,14 @@ impl DbInner {
                 sstables: cf.snapshot_ssts(),
             });
         }
-        m.save(manifest_path(&self.dir))
+        let res = m.save(manifest_path(&self.dir));
+        if let Err(e) = &res {
+            // A failed manifest write is a durability failure: fsync may have
+            // dropped pages, and every caller's WAL-reclaim / file-delete step
+            // depends on this succeeding. Fail-stop rather than limp on.
+            self.poison.set(format!("manifest persist failed: {e}"));
+        }
+        res
     }
 
     pub(crate) fn cf_dir(&self, name: &str) -> String {
@@ -249,11 +265,19 @@ impl DB {
         std::fs::create_dir_all(&opts.path)?;
         let dir = opts.path.clone();
 
+        // Single-process guard: hold an advisory lock on <dir>/LOCK for the
+        // lifetime of the DB. Read-write opens take it exclusive; read-only
+        // opens take it shared so concurrent readers coexist but a writer is
+        // excluded. The lock dies with the fd, so a crashed process never
+        // leaves a stale lock behind.
+        let lock_file = acquire_dir_lock(&dir, opts.read_only)?;
+
         let fc = Arc::new(FileCache::new(opts.max_open_sstables.max(1)));
         let bc = Arc::new(BlockCache::new(opts.block_cache_size as i64));
 
         let (flush_tx, flush_rx) = unbounded::<FlushJob>();
         let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
+        let poison = Arc::new(crate::util::Poison::new());
         let closing = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let pending_flush = Arc::new(AtomicUsize::new(0));
@@ -267,6 +291,7 @@ impl DB {
                 flush_tx.clone(),
                 pending_flush.clone(),
                 closing.clone(),
+                poison.clone(),
             )?;
             unified_max_seq = max_seq;
             Some(store)
@@ -283,6 +308,7 @@ impl DB {
             read_only: opts.read_only,
             pending_flush: pending_flush.clone(),
             unified: unified.clone(),
+            poison: poison.clone(),
         });
 
         let manifest = Manifest::load(manifest_path(&dir))?;
@@ -309,6 +335,8 @@ impl DB {
             manifest_mu: Mutex::new(()),
             file_deletion: Mutex::new(FileDeletionState::default()),
             workers: Mutex::new(Vec::new()),
+            lock_file: Mutex::new(Some(lock_file)),
+            poison,
         });
         inner.observe_seq(unified_max_seq);
 
@@ -410,6 +438,15 @@ impl DB {
         compaction::run(&self.inner, cf)
     }
 
+    /// If the database has fail-stopped after a durability failure (failed
+    /// fsync, background flush, or manifest persist), returns the reason.
+    /// While poisoned, every write commit fails with
+    /// [`OndaError::Poisoned`](crate::OndaError::Poisoned); reads keep working.
+    /// The only recovery is to reopen the database.
+    pub fn poisoned(&self) -> Option<String> {
+        self.inner.poison.reason()
+    }
+
     /// Close the database: flush all memtables, stop workers, fsync, persist.
     pub fn close(&self) -> Result<()> {
         if self.inner.closing.swap(true, Ordering::SeqCst) {
@@ -441,7 +478,34 @@ impl DB {
         for cf in &cfs {
             cf.close_resources();
         }
+        // Release the directory lock last, once all state is durable, so a
+        // concurrent open never sees a half-closed database.
+        *self.inner.lock_file.lock() = None;
         Ok(())
+    }
+}
+
+/// Acquire the advisory lock on `<dir>/LOCK` (exclusive unless `read_only`).
+fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
+    use std::fs::TryLockError;
+    let path = std::path::Path::new(dir).join("LOCK");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    let res = if read_only {
+        f.try_lock_shared()
+    } else {
+        f.try_lock()
+    };
+    match res {
+        Ok(()) => Ok(f),
+        Err(TryLockError::WouldBlock) => Err(OndaError::Locked(format!(
+            "database at {dir} is locked by another process or handle"
+        ))),
+        Err(TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
@@ -507,7 +571,12 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                             let _ = db.ctx.compact_tx.send(cf.clone());
                         }
                     }
-                    Err(_e) => { /* surfaced on next op; data still in WAL */ }
+                    Err(e) => {
+                        // The data is still in the WAL, but a failed background
+                        // flush (SST write/fsync) means durability can no longer
+                        // be promised for new writes — fail-stop.
+                        db.poison.set(format!("background flush failed: {e}"));
+                    }
                 }
                 db.pending_flush.fetch_sub(1, Ordering::SeqCst);
             }
@@ -516,7 +585,9 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                 for (cf_id, entries) in crate::unified::split_by_cf(&imm) {
                     if let Some(cf) = db.cf_by_id.read().get(&cf_id).cloned() {
                         let file_id = db.next_file_id();
-                        let _ = cf.ingest_l0(entries, file_id);
+                        if let Err(e) = cf.ingest_l0(entries, file_id) {
+                            db.poison.set(format!("unified flush failed: {e}"));
+                        }
                         if !db.closing.load(Ordering::Relaxed)
                             && cf.l0_len() >= cf.opts.l1_file_count_trigger as usize
                         {
@@ -558,5 +629,32 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_db_rejects_writes_allows_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        assert!(db.poisoned().is_none());
+
+        db.inner.poison.set("simulated fsync failure".into());
+
+        match db.put(&cf, b"k2", b"v", Duration::ZERO) {
+            Err(OndaError::Poisoned(m)) => assert!(m.contains("simulated")),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+        assert_eq!(db.poisoned().as_deref(), Some("simulated fsync failure"));
+        // Reads keep working on a poisoned DB; only new commits are refused.
+        assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+        db.close().unwrap();
     }
 }

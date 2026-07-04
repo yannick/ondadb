@@ -2,7 +2,7 @@
 name = "ondadb"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89" # std::fs::File advisory locking (DB LOCK file)
 license = "MPL-2.0"
 description = "ondaDB — a safe, performance-focused Rust key/value LSM storage engine"
 repository = "https://github.com/local/ondadb"

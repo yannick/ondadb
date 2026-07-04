@@ -62,6 +62,9 @@ pub(crate) struct CfCtx {
     pub pending_flush: Arc<std::sync::atomic::AtomicUsize>,
     /// Set in unified-memtable mode; CFs route writes/reads through it.
     pub unified: Option<Arc<crate::unified::UnifiedStore>>,
+    /// DB-wide fail-stop flag; write commits check it, WALs and background
+    /// workers trip it on durability failures.
+    pub poison: Arc<crate::util::Poison>,
 }
 
 impl std::fmt::Debug for CfCtx {
@@ -151,11 +154,9 @@ impl ColumnFamily {
         let wal = if ctx.read_only {
             None
         } else {
-            Some(Arc::new(Wal::open(
-                &wal0,
-                opts.sync_mode,
-                opts.sync_interval,
-            )?))
+            let w = Wal::open(&wal0, opts.sync_mode, opts.sync_interval)?;
+            w.set_poison(ctx.poison.clone());
+            Some(Arc::new(w))
         };
         let cf = Arc::new(ColumnFamily {
             ctx,
@@ -235,7 +236,9 @@ impl ColumnFamily {
             (None, replay_paths)
         } else {
             let p = format!("{dir}/wal-{next_gen}.log");
-            let w = Arc::new(Wal::open(&p, opts.sync_mode, opts.sync_interval)?);
+            let w = Wal::open(&p, opts.sync_mode, opts.sync_interval)?;
+            w.set_poison(ctx.poison.clone());
+            let w = Arc::new(w);
             let mut pend = replay_paths;
             pend.push(p);
             (Some(w), pend)
@@ -302,6 +305,7 @@ impl ColumnFamily {
     /// then rotate if the memtable is full. Records borrow the transaction's
     /// buffer; both the WAL and the memtable copy what they need.
     pub(crate) fn apply_commit(self: &Arc<Self>, recs: &[wal::RecordRef<'_>]) -> Result<()> {
+        self.ctx.poison.check()?;
         let threshold = self.opts.l0_queue_stall_threshold as usize;
         {
             let mut g = self.rot.lock();
@@ -388,7 +392,10 @@ impl ColumnFamily {
             } else {
                 Wal::open(&new_path, self.opts.sync_mode, self.opts.sync_interval)
                     .ok()
-                    .map(Arc::new)
+                    .map(|w| {
+                        w.set_poison(self.ctx.poison.clone());
+                        Arc::new(w)
+                    })
             };
             let mut g = self.rot.lock();
             while g.active_writers > 0 {

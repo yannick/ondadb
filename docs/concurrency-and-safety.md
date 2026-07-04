@@ -39,6 +39,7 @@ justification.
 | `Wal::qstate` / per-stripe file mutexes | group-commit queue / file appends | one frame write |
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
 | `commit_hook` (Mutex) | hook fn | hook invocation |
+| `<dir>/LOCK` (OS advisory file lock) | whole DB directory against other processes/handles | entire open→close lifetime; exclusive for read-write, shared for read-only opens; second open fails with `OndaError::Locked` |
 
 Safe patterns used: `create/drop_column_family` release the `cfs` write lock
 before `persist_manifest`; rotation drops `rot` while opening the next WAL

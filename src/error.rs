@@ -38,6 +38,10 @@ pub enum OndaError {
     ReadOnly(String),
     /// A resource is busy (e.g. compaction in progress).
     Busy(String),
+    /// The database hit an unrecoverable durability failure (a failed fsync or
+    /// background flush) and fail-stopped: writes are rejected until the
+    /// database is reopened. Reads keep working.
+    Poisoned(String),
     /// Unclassified error.
     Unknown(String),
 }
@@ -60,6 +64,7 @@ impl OndaError {
             OndaError::Locked(_) => -12,
             OndaError::ReadOnly(_) => -13,
             OndaError::Busy(_) => -14,
+            OndaError::Poisoned(_) => -15,
         }
     }
 
@@ -81,6 +86,7 @@ impl OndaError {
             -12 => OndaError::Locked(String::new()),
             -13 => OndaError::ReadOnly(String::new()),
             -14 => OndaError::Busy(String::new()),
+            -15 => OndaError::Poisoned(String::new()),
             _ => OndaError::Unknown(format!("code {code}")),
         }
     }
@@ -101,6 +107,7 @@ impl OndaError {
             OndaError::Locked(_) => "locked",
             OndaError::ReadOnly(_) => "readonly",
             OndaError::Busy(_) => "busy",
+            OndaError::Poisoned(_) => "poisoned",
             OndaError::Unknown(_) => "unknown",
         }
     }
@@ -122,6 +129,7 @@ impl fmt::Display for OndaError {
             OndaError::Locked(m) => write!(f, "locked: {m}"),
             OndaError::ReadOnly(m) => write!(f, "read-only: {m}"),
             OndaError::Busy(m) => write!(f, "busy: {m}"),
+            OndaError::Poisoned(m) => write!(f, "poisoned (fail-stop after durability failure): {m}"),
             OndaError::Unknown(m) => write!(f, "unknown error: {m}"),
         }
     }
