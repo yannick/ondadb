@@ -250,6 +250,30 @@ impl MergingIter {
         self.rebuild();
     }
 
+    /// Position every child at its last entry with user key strictly below
+    /// `k` (used when iteration flips forward->backward: the children sit at
+    /// or past the current group and must all be walked back behind it).
+    fn seek_lt(&mut self, k: &[u8]) {
+        self.dir = -1;
+        for c in &mut self.children {
+            // (k, MAX) sorts before every live version of k (seq is ordered
+            // descending), so seek_le lands strictly below the group already;
+            // the loop only guards against a lenient child seek.
+            c.seek_le(k, u64::MAX);
+            while c.valid() && {
+                let key = c.user_key();
+                if self.bytewise {
+                    key == k
+                } else {
+                    self.cmp.compare(key, k).is_eq()
+                }
+            } {
+                c.prev();
+            }
+        }
+        self.rebuild();
+    }
+
     fn valid(&self) -> bool {
         !self.heap.is_empty()
     }
@@ -482,9 +506,22 @@ impl Iterator {
         self.advance_backward();
     }
     pub fn next(&mut self) {
+        // Direction switch backward->forward: the children sit below the
+        // current group (and forward-exhausted ones were dropped from the
+        // heap), so reposition everyone just past it. (k, seq 0) sorts after
+        // every live version of k — sequences start at 1.
+        if self.valid && self.m.dir < 0 {
+            let k = self.key().to_vec();
+            self.m.seek_ge(&k, 0);
+        }
         self.advance_forward();
     }
     pub fn prev(&mut self) {
+        // Direction switch forward->backward: mirror of `next`.
+        if self.valid && self.m.dir > 0 {
+            let k = self.key().to_vec();
+            self.m.seek_lt(&k);
+        }
         self.advance_backward();
     }
 
