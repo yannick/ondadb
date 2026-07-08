@@ -356,6 +356,11 @@ impl Memtable {
     /// TTL expiry evaluation.
     #[cfg_attr(feature = "unsafe-fastpath", allow(clippy::needless_return))]
     pub fn get(&self, user_key: &[u8], read_seq: u64, now_nanos: i64) -> Lookup {
+        // Cold-read fast path: a fresh (or drained) memtable holds nothing, so
+        // skip the shard hash entirely — it hashes the whole key.
+        if self.num_entries.load(AtOrd::Relaxed) == 0 {
+            return Lookup::default();
+        }
         let shard = &self.shards[shard_index(user_key)];
         #[cfg(feature = "unsafe-fastpath")]
         {

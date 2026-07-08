@@ -717,14 +717,15 @@ impl ColumnFamily {
             }
         }
         for th in &tables {
-            // Hoisted bloom check so skips are countable; Reader::get would
-            // reject the probe anyway.
-            if !th.reader.bloom_may_contain(user_key) {
+            // One bloom hash + one check per table; the probe below skips the
+            // filter (it was just consulted).
+            let h = th.reader.bloom_hash(user_key);
+            if !th.reader.bloom_may_contain_hash(h) {
                 self.bloom_skips.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
-            let (v, seq, found, deleted) = th.reader.get(user_key, read_seq, now)?;
+            let (v, seq, found, deleted) = th.reader.get_unfiltered(user_key, read_seq, now)?;
             if found && (!best_found || seq > best_seq) {
                 best_found = true;
                 best_seq = seq;

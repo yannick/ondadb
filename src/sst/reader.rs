@@ -355,6 +355,23 @@ impl Reader {
         self.bloom.as_ref().is_none_or(|b| b.may_contain(user_key))
     }
 
+    /// This table's bloom hash of `user_key`, or `None` when it has no filter.
+    /// Compute once and pass to [`bloom_may_contain_hash`](Self::bloom_may_contain_hash).
+    #[inline]
+    pub(crate) fn bloom_hash(&self, user_key: &[u8]) -> Option<u64> {
+        self.bloom.as_ref().map(|b| b.hash_of(user_key))
+    }
+
+    /// Whether the bloom filter admits a key by its precomputed
+    /// [`bloom_hash`](Self::bloom_hash) (`true` when there is no filter).
+    #[inline]
+    pub(crate) fn bloom_may_contain_hash(&self, h: Option<u64>) -> bool {
+        match (&self.bloom, h) {
+            (Some(b), Some(h)) => b.may_contain_hash(h),
+            _ => true,
+        }
+    }
+
     /// Resolve `user_key` as of `read_seq`. `found` indicates a version exists in
     /// this SSTable; `deleted` indicates a tombstone or expired entry.
     pub fn get(
@@ -368,6 +385,17 @@ impl Reader {
                 return Ok((None, 0, false, false));
             }
         }
+        self.get_unfiltered(user_key, read_seq, now)
+    }
+
+    /// [`get`](Self::get) without the bloom check, for callers that have
+    /// already consulted the filter (see `ColumnFamily::get`).
+    pub(crate) fn get_unfiltered(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) -> Result<(Option<Vec<u8>>, u64, bool, bool)> {
         let bi = self.find_block(user_key, read_seq);
         if bi >= self.index.len() {
             return Ok((None, 0, false, false));
@@ -493,4 +521,57 @@ fn read_block_at(f: &std::fs::File, off: u64, length: u64) -> Result<Vec<u8>> {
     f.read_exact_at(&mut buf, off)?;
     let (raw, _) = read_block(&buf)?;
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{BlockCache, FileCache};
+    use crate::comparator::default_comparator;
+    use crate::config::Compression;
+    use crate::sst::{Writer, WriterOptions};
+
+    fn small_reader(dir: &std::path::Path, n: usize) -> Arc<Reader> {
+        let klog = dir.join("t.klog");
+        let klog = klog.to_str().unwrap();
+        let mut w = Writer::new(
+            klog,
+            WriterOptions {
+                compression: Compression::None,
+                cmp: default_comparator(),
+                enable_bloom: true,
+                bloom_fpr: 0.01,
+                klog_value_threshold: 512,
+                block_size: 512,
+                expected_entries: n,
+                use_btree: false,
+            },
+        )
+        .unwrap();
+        for i in 0..n {
+            let k = format!("key{i:06}");
+            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+                .unwrap();
+        }
+        w.finish().unwrap();
+        Reader::open(
+            klog,
+            Arc::new(FileCache::new(4)),
+            Arc::new(BlockCache::new(1 << 20)),
+            1,
+            default_comparator(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn get_after_bloom_equivalent() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = small_reader(dir.path(), 500);
+        for probe in ["key000000", "key000499", "key000250", "nope", "zzz"] {
+            let a = r.get(probe.as_bytes(), u64::MAX, 0).unwrap();
+            let b = r.get_unfiltered(probe.as_bytes(), u64::MAX, 0).unwrap();
+            assert_eq!(a, b, "get vs get_unfiltered diverge for {probe}");
+        }
+    }
 }
