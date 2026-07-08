@@ -83,6 +83,42 @@ fn cf_id(cf: &Arc<ColumnFamily>) -> usize {
     Arc::as_ptr(cf) as usize
 }
 
+thread_local! {
+    /// Recycled transaction write buffers. A fresh `Vec` grows by doubling —
+    /// re-copying the accumulated payload — on every batch; a recycled buffer
+    /// arrives with yesterday's capacity and never grows again in steady
+    /// state.
+    static BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Buffer-pool retention caps: don't pin unboundedly large one-off buffers,
+/// and keep at most a few per thread.
+const BUF_POOL_MAX_CAP: usize = 32 << 20;
+const BUF_POOL_MAX_LEN: usize = 4;
+
+fn take_buf() -> Vec<u8> {
+    BUF_POOL
+        .with(|p| p.borrow_mut().pop())
+        .map(|mut b| {
+            b.clear();
+            b
+        })
+        .unwrap_or_default()
+}
+
+fn put_buf(buf: Vec<u8>) {
+    if buf.capacity() == 0 || buf.capacity() > BUF_POOL_MAX_CAP {
+        return;
+    }
+    BUF_POOL.with(|p| {
+        let mut g = p.borrow_mut();
+        if g.len() < BUF_POOL_MAX_LEN {
+            g.push(buf);
+        }
+    });
+}
+
 fn ttl_to_abs(ttl: Duration) -> i64 {
     if ttl.is_zero() {
         0
@@ -121,7 +157,7 @@ impl DB {
             read_seq,
             fixed,
             snapshot_held: fixed,
-            buf: Vec::new(),
+            buf: take_buf(),
             writes: Vec::new(),
             read_set: HashSet::new(),
             read_cfs: HashMap::new(),
@@ -466,6 +502,8 @@ impl Txn {
         for (cf, ops) in &applied {
             cf.run_commit_hook(commit_seq, ops);
         }
+        self.writes.clear();
+        put_buf(std::mem::take(&mut self.buf));
         self.release();
         Ok(())
     }
@@ -477,7 +515,7 @@ impl Txn {
         }
         self.done = true;
         self.writes.clear();
-        self.buf.clear();
+        put_buf(std::mem::take(&mut self.buf));
         self.release();
         Ok(())
     }
@@ -502,7 +540,11 @@ impl Txn {
         self.fixed = fixed;
         self.snapshot_held = fixed;
         self.writes.clear();
-        self.buf.clear();
+        if self.buf.capacity() == 0 {
+            self.buf = take_buf();
+        } else {
+            self.buf.clear();
+        }
         self.read_set.clear();
         self.read_cfs.clear();
         self.savepoints.clear();
@@ -520,10 +562,43 @@ impl Txn {
 
 impl Drop for Txn {
     fn drop(&mut self) {
-        if !self.done {
-            self.writes.clear();
-            self.buf.clear();
-        }
+        self.writes.clear();
+        put_buf(std::mem::take(&mut self.buf));
         self.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ColumnFamilyConfig;
+    use crate::Options;
+
+    #[test]
+    fn txn_buf_reused_across_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        // First batch grows a fresh buffer...
+        let mut t = db.begin_with_isolation(IsolationLevel::ReadCommitted);
+        assert_eq!(t.buf.capacity(), 0, "first txn on this thread starts cold");
+        for i in 0..1000u32 {
+            t.put(&cf, &i.to_be_bytes(), &[0u8; 100], Duration::ZERO)
+                .unwrap();
+        }
+        let grown = t.buf.capacity();
+        assert!(grown >= 1000 * 104);
+        t.commit().unwrap();
+        // ...the second arrives with that capacity from the pool: no growth.
+        let mut t2 = db.begin_with_isolation(IsolationLevel::ReadCommitted);
+        assert_eq!(t2.buf.capacity(), grown, "buffer not recycled");
+        for i in 0..1000u32 {
+            t2.put(&cf, &i.to_be_bytes(), &[0u8; 100], Duration::ZERO)
+                .unwrap();
+        }
+        assert_eq!(t2.buf.capacity(), grown, "recycled buffer regrew");
+        t2.commit().unwrap();
     }
 }

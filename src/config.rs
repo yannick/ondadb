@@ -171,7 +171,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             path: String::new(),
-            num_flush_threads: 2,
+            num_flush_threads: 4,
             num_compaction_threads: 2,
             log_level: LogLevel::None,
             block_cache_size: 64 << 20, // 64 MiB
@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(o.path, "/tmp/x");
         assert_eq!(o.block_cache_size, 64 << 20);
         assert_eq!(o.max_open_sstables, 256);
-        assert_eq!(o.num_flush_threads, 2);
+        assert_eq!(o.num_flush_threads, 4);
     }
 
     #[test]
