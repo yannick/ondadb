@@ -9,12 +9,23 @@
 use crate::encoding::{append_u64, append_uvarint, read_u64, uvarint};
 use crate::error::{OndaError, Result};
 
+/// Which hash function a filter's bits were built with. Legacy filters
+/// (encoded without a trailing hash tag) use byte-at-a-time FNV-1a; new
+/// filters use xxh3, which processes the key in wide lanes and is several
+/// times cheaper for long keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashKind {
+    Fnv,
+    Xxh3,
+}
+
 /// A built or loaded Bloom filter.
 #[derive(Debug, Clone)]
 pub struct Bloom {
     bits: Vec<u64>,
     m: u64, // number of bits
     k: u32, // number of hash functions
+    hash: HashKind,
 }
 
 /// Compute `(m, k)` for `n` expected entries at false-positive rate `fpr`.
@@ -53,13 +64,23 @@ impl Bloom {
             bits: vec![0u64; words as usize],
             m,
             k,
+            hash: HashKind::Xxh3,
         }
     }
 
-    /// Bit positions touched by `key`, computed from `m`/`k` only (no borrow of
+    /// Hash `key` with this filter's hash function. Callers that consult the
+    /// filter and then probe the SSTable can compute this once and reuse it.
+    #[inline]
+    pub fn hash_of(&self, key: &[u8]) -> u64 {
+        match self.hash {
+            HashKind::Fnv => hash_key(key),
+            HashKind::Xxh3 => xxhash_rust::xxh3::xxh3_64(key),
+        }
+    }
+
+    /// Bit positions derived from a precomputed key hash `h` (no borrow of
     /// `self.bits`, so callers may mutate it while iterating).
-    fn positions(m: u64, k: u32, key: &[u8]) -> impl Iterator<Item = usize> {
-        let h = hash_key(key);
+    fn positions(m: u64, k: u32, h: u64) -> impl Iterator<Item = usize> {
         let h1 = h as u32;
         let h2 = (h >> 32) as u32;
         let m = m as u32;
@@ -68,7 +89,12 @@ impl Bloom {
 
     /// Insert `key`.
     pub fn add(&mut self, key: &[u8]) {
-        for bit in Bloom::positions(self.m, self.k, key) {
+        self.add_hash(self.hash_of(key));
+    }
+
+    /// Insert a key by its precomputed [`hash_of`](Bloom::hash_of) value.
+    pub fn add_hash(&mut self, h: u64) {
+        for bit in Bloom::positions(self.m, self.k, h) {
             self.bits[bit / 64] |= 1 << (bit % 64);
         }
     }
@@ -76,7 +102,13 @@ impl Bloom {
     /// Return `true` if `key` may be present (false positives possible), `false`
     /// if it is definitely absent.
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        Bloom::positions(self.m, self.k, key)
+        self.may_contain_hash(self.hash_of(key))
+    }
+
+    /// [`may_contain`](Bloom::may_contain) by a precomputed
+    /// [`hash_of`](Bloom::hash_of) value.
+    pub fn may_contain_hash(&self, h: u64) -> bool {
+        Bloom::positions(self.m, self.k, h)
             .all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
     }
 
@@ -90,14 +122,17 @@ impl Bloom {
         self.m
     }
 
-    /// Dense serialization: `m(uvarint) | k(uvarint) | words(LE u64...)`.
+    /// Dense serialization: `m(uvarint) | k(uvarint) | words(LE u64...) |
+    /// hash_id(u8)`. The trailing hash tag is absent in legacy encodings, which
+    /// implies FNV; decoders that predate it ignore trailing bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut dst = Vec::with_capacity(16 + self.bits.len() * 8);
+        let mut dst = Vec::with_capacity(17 + self.bits.len() * 8);
         append_uvarint(&mut dst, self.m);
         append_uvarint(&mut dst, u64::from(self.k));
         for &w in &self.bits {
             append_u64(&mut dst, w);
         }
+        dst.push(hash_id(self.hash));
         dst
     }
 
@@ -116,10 +151,12 @@ impl Bloom {
         for (i, slot) in bits.iter_mut().enumerate() {
             *slot = read_u64(&p[i * 8..]);
         }
+        let hash = hash_kind(p.get(words * 8).copied())?;
         Ok(Bloom {
             bits,
             m,
             k: k as u32,
+            hash,
         })
     }
 
@@ -127,7 +164,8 @@ impl Bloom {
     /// each preceded by its index.  Far smaller for mostly-empty filters.
     ///
     /// Format: `m(uvarint) | k(uvarint) | total_words(uvarint) |
-    /// nonzero_count(uvarint) | [idx(uvarint) word(LE u64)]...`
+    /// nonzero_count(uvarint) | [idx(uvarint) word(LE u64)]... | hash_id(u8)`
+    /// (the trailing hash tag is absent in legacy encodings, implying FNV).
     pub fn encode_sparse(&self) -> Vec<u8> {
         let nonzero: Vec<(usize, u64)> = self
             .bits
@@ -145,6 +183,7 @@ impl Bloom {
             append_uvarint(&mut dst, i as u64);
             append_u64(&mut dst, w);
         }
+        dst.push(hash_id(self.hash));
         dst
     }
 
@@ -169,7 +208,27 @@ impl Bloom {
             bits[idx] = read_u64(p);
             p = &p[8..];
         }
-        Ok(Bloom { bits, m, k })
+        let hash = hash_kind(p.first().copied())?;
+        Ok(Bloom { bits, m, k, hash })
+    }
+}
+
+fn hash_id(h: HashKind) -> u8 {
+    match h {
+        HashKind::Fnv => 0,
+        HashKind::Xxh3 => 1,
+    }
+}
+
+/// Map an encoded hash tag back to a [`HashKind`]; `None` (no trailing byte)
+/// is the legacy FNV encoding.
+fn hash_kind(id: Option<u8>) -> Result<HashKind> {
+    match id {
+        None | Some(0) => Ok(HashKind::Fnv),
+        Some(1) => Ok(HashKind::Xxh3),
+        Some(other) => Err(OndaError::Corruption(format!(
+            "bloom: unknown hash id {other}"
+        ))),
     }
 }
 
@@ -244,6 +303,55 @@ mod tests {
     fn decode_rejects_truncation() {
         let b = Bloom::new(64, 0.01);
         let enc = b.encode();
-        assert!(Bloom::decode(&enc[..enc.len() - 1]).is_err());
+        // Truncating into the bit words is corruption...
+        assert!(Bloom::decode(&enc[..enc.len() - 9]).is_err());
+        // ...but stripping only the trailing hash tag is a valid LEGACY (FNV)
+        // encoding, by construction.
+        let legacy = Bloom::decode(&enc[..enc.len() - 1]).unwrap();
+        assert_eq!(legacy.hash, HashKind::Fnv);
+    }
+
+    #[test]
+    fn legacy_decode_uses_fnv() {
+        // Build under FNV (as a pre-tag writer would have), encode WITHOUT the
+        // tag byte, and verify decode finds every key — no false negatives.
+        let mut b = Bloom::new(1000, 0.01);
+        b.hash = HashKind::Fnv;
+        for i in 0..1000u32 {
+            b.add(&i.to_be_bytes());
+        }
+        let mut enc = b.encode();
+        enc.pop(); // strip the hash tag -> legacy format
+        let d = Bloom::decode(&enc).unwrap();
+        assert_eq!(d.hash, HashKind::Fnv);
+        for i in 0..1000u32 {
+            assert!(d.may_contain(&i.to_be_bytes()), "missing {i}");
+        }
+    }
+
+    #[test]
+    fn hash_once_api() {
+        let mut b = Bloom::new(100, 0.01);
+        for i in 0..100u32 {
+            b.add(&i.to_be_bytes());
+        }
+        for i in 0..200u32 {
+            let key = i.to_be_bytes();
+            let h = b.hash_of(&key);
+            assert_eq!(b.may_contain_hash(h), b.may_contain(&key));
+        }
+    }
+
+    #[test]
+    fn sparse_tag_round_trip() {
+        let mut b = Bloom::new(100_000, 0.01);
+        for i in 0..50u32 {
+            b.add(&i.to_le_bytes());
+        }
+        let d = Bloom::decode_sparse(&b.encode_sparse()).unwrap();
+        assert_eq!(d.hash, HashKind::Xxh3);
+        for i in 0..50u32 {
+            assert!(d.may_contain(&i.to_le_bytes()));
+        }
     }
 }
