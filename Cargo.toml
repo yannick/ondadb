@@ -46,6 +46,7 @@ hmac = "0.12"
 rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tokio-rustls-tls"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 memmap2 = { version = "0.9", optional = true }
+smallvec = "1.15.2"
 
 [dev-dependencies]
 tempfile = "3"

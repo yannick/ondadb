@@ -827,6 +827,7 @@ dependencies = [
  "rust-s3",
  "self_cell",
  "sha2",
+ "smallvec",
  "snap",
  "tempfile",
  "tokio",

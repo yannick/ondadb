@@ -120,9 +120,6 @@ impl Block {
             Block::Mapped { mmap, start, len } => &mmap[*start..*start + *len],
         }
     }
-    pub(crate) fn len(&self) -> usize {
-        self.bytes().len()
-    }
 
     /// Whether two handles view the same underlying block (same allocation and,
     /// for mmaps, the same window). Used to reuse a pinned block instead of

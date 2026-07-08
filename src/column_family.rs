@@ -20,6 +20,7 @@ use crate::iterator::{ChildIter, Iterator};
 use crate::manifest::SstMeta;
 use crate::memtable::Memtable;
 use crate::sst::{Reader, Writer, WriterOptions};
+use smallvec::SmallVec;
 use crate::util::now_nanos;
 use crate::wal::{self, Wal};
 
@@ -672,7 +673,7 @@ impl ColumnFamily {
             let s = self.state.read();
             let mem = s.mem.clone();
             let imms: Vec<Arc<ImmMemtable>> = s.imm.clone();
-            let mut tables: Vec<Arc<SstHandle>> = Vec::new();
+            let mut tables: SmallVec<[Arc<SstHandle>; 4]> = SmallVec::new();
             for th in &s.levels[0] {
                 if Self::key_in_range(th, &self.cmp, user_key) {
                     tables.push(th.clone());
@@ -749,7 +750,7 @@ impl ColumnFamily {
         let now = now_nanos();
         let (mem, imms, tables) = {
             let s = self.state.read();
-            let mut tables: Vec<Arc<SstHandle>> = Vec::new();
+            let mut tables: SmallVec<[Arc<SstHandle>; 4]> = SmallVec::new();
             for th in &s.levels[0] {
                 if Self::key_in_range(th, &self.cmp, user_key) {
                     tables.push(th.clone());

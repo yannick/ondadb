@@ -61,6 +61,25 @@ fn corrupt() -> OndaError {
     OndaError::Corruption("sst: corruption detected".into())
 }
 
+/// A data block borrowed for the duration of one point read: either an owned
+/// (cached/decompressed) block or, under `unsafe-fastpath`, a plain slice into
+/// the reader's mmap — no refcount traffic per get.
+pub(crate) enum BlockRef<'a> {
+    Owned(Arc<[u8]>),
+    #[allow(dead_code)] // only constructed under unsafe-fastpath
+    Mapped(&'a [u8]),
+}
+
+impl BlockRef<'_> {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            BlockRef::Owned(a) => a,
+            BlockRef::Mapped(s) => s,
+        }
+    }
+}
+
 impl Reader {
     /// Open the SSTable at `klog_path`. `file_id` must be unique per file for
     /// block-cache keying.
@@ -339,6 +358,41 @@ impl Reader {
         Ok(Block::Owned(arc))
     }
 
+    /// Like [`read_data_block`](Self::read_data_block), but for callers that
+    /// consume the block within the reader's lifetime: the mmap fast path
+    /// returns a borrowed slice instead of bumping the mmap's `Arc` refcount
+    /// on every point read.
+    pub(crate) fn read_data_block_local(&self, i: usize) -> Result<BlockRef<'_>> {
+        #[cfg(feature = "unsafe-fastpath")]
+        if let Some(mmap) = &self.klog_mmap {
+            use std::sync::atomic::Ordering as AtOrd;
+            let h = self.index[i].handle;
+            let start = h.offset as usize;
+            let end = start + h.length as usize;
+            let (word, bit) = (i / 64, 1u64 << (i % 64));
+            let seen = self.verified[word].load(AtOrd::Acquire) & bit != 0;
+            let parsed = if seen {
+                crate::block::block_payload_preverified(&mmap[start..end])?
+            } else {
+                let p = crate::block::block_payload(&mmap[start..end])?;
+                self.verified[word].fetch_or(bit, AtOrd::AcqRel);
+                p
+            };
+            let (alg, _payload, raw_len, _total) = parsed;
+            if alg == Compression::None {
+                let payload_start = start + crate::block::BLOCK_HEADER;
+                return Ok(BlockRef::Mapped(
+                    &mmap[payload_start..payload_start + raw_len],
+                ));
+            }
+        }
+        self.read_data_block(i).map(|b| match b {
+            Block::Owned(a) => BlockRef::Owned(a),
+            #[cfg(feature = "unsafe-fastpath")]
+            Block::Mapped { .. } => unreachable!("uncompressed mmap handled above"),
+        })
+    }
+
     /// Split a data block's decompressed bytes into its entries region and its
     /// restart-offset array (empty for legacy blocks without the trailer).
     pub(crate) fn split_block<'a>(&self, raw: &'a [u8]) -> Result<(&'a [u8], &'a [u8])> {
@@ -371,11 +425,6 @@ impl Reader {
             }
         }
         lo
-    }
-
-    /// Whether the bloom filter admits `user_key` (`true` when no filter).
-    pub(crate) fn bloom_may_contain(&self, user_key: &[u8]) -> bool {
-        self.bloom.as_ref().is_none_or(|b| b.may_contain(user_key))
     }
 
     /// This table's bloom hash of `user_key`, or `None` when it has no filter.
@@ -423,7 +472,7 @@ impl Reader {
         if bi >= self.index.len() {
             return Ok((None, 0, false, false));
         }
-        let block = self.read_data_block(bi)?;
+        let block = self.read_data_block_local(bi)?;
         let (raw, restarts) = self.split_block(block.bytes())?;
         let mut off = 0;
         if restarts.len() >= 8 {
