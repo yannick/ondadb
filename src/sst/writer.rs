@@ -52,6 +52,11 @@ pub struct Writer {
 
     cur_block: Vec<u8>,
     index: Vec<IndexEntry>,
+    /// A flushed block whose index separator is deferred until the next key is
+    /// known: `(block_last_key, block_last_seq, handle)`. With the following
+    /// block's first key in hand, the separator can be shortened (bytewise
+    /// comparators only) instead of storing the full last key.
+    pending_index: Option<(Vec<u8>, u64, BlockHandle)>,
     klog_off: u64,
     vlog_off: u64,
 
@@ -103,6 +108,7 @@ impl Writer {
             opts,
             cur_block: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
             index: Vec::new(),
+            pending_index: None,
             klog_off: 0,
             vlog_off: 0,
             bloom,
@@ -127,6 +133,26 @@ impl Writer {
         tombstone: bool,
         single_delete: bool,
     ) -> Result<()> {
+        if let Some((last_key, last_seq, handle)) = self.pending_index.take() {
+            // The previous block's separator only has to satisfy
+            // `last_key <= sep < user_key`; a shortened separator keeps the
+            // resident index small and its binary-search comparisons cheap.
+            let sep = if self.opts.cmp.is_bytewise() {
+                shortest_separator(&last_key, user_key)
+            } else {
+                last_key.clone()
+            };
+            // seq is only consulted on exact key equality (`cmp_internal`); a
+            // strictly-greater synthetic separator never equals a stored key,
+            // so 0 is inert. An unshortened separator IS the last key and
+            // keeps its real seq, exactly as before.
+            let seq = if sep == last_key { last_seq } else { 0 };
+            self.index.push(IndexEntry {
+                user_key: sep,
+                seq,
+                handle,
+            });
+        }
         if self.min_key.is_none() {
             self.min_key = Some(user_key.to_vec());
         }
@@ -203,14 +229,17 @@ impl Writer {
             &self.cur_block,
         )?;
         self.klog.as_mut().unwrap().write_all(&framed)?;
-        self.index.push(IndexEntry {
-            user_key: self.last_user_key.clone(),
-            seq: self.last_seq,
-            handle: BlockHandle {
+        // Defer the index entry: `add` shortens the separator once the next
+        // block's first key is known; `finish` stores the full last key so the
+        // reader's `max_key` stays exact.
+        self.pending_index = Some((
+            self.last_user_key.clone(),
+            self.last_seq,
+            BlockHandle {
                 offset: self.klog_off,
                 length: n as u64,
             },
-        });
+        ));
         self.klog_off += n as u64;
         self.cur_block.clear();
         self.pending_block = false;
@@ -312,6 +341,13 @@ impl Writer {
         if self.pending_block {
             self.flush_block()?;
         }
+        if let Some((last_key, last_seq, handle)) = self.pending_index.take() {
+            self.index.push(IndexEntry {
+                user_key: last_key,
+                seq: last_seq,
+                handle,
+            });
+        }
 
         let mut footer_flags = 0u8;
         let mut bloom_handle = BlockHandle::default();
@@ -383,6 +419,33 @@ impl Writer {
     }
 }
 
+/// Shortest bytewise separator `s` with `a <= s < b` (requires `a < b`).
+/// Returns `a` verbatim when no shorter separator exists (`a` is a prefix of
+/// `b`, or the diverging byte cannot be incremented under `b`).
+pub(crate) fn shortest_separator(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    if i >= n {
+        return a.to_vec(); // a is a prefix of b (or equal)
+    }
+    if a[i] < 0xff && a[i] + 1 < b[i] {
+        let mut s = a[..=i].to_vec();
+        s[i] += 1; // a < s < b, length i+1
+        return s;
+    }
+    // a[i]+1 == b[i]: s equals b's first i+1 bytes, so s < b only when b
+    // extends past i; s > a because s[i] > a[i].
+    if a[i] < 0xff && a[i] + 1 == b[i] && b.len() > i + 1 {
+        let mut s = a[..=i].to_vec();
+        s[i] += 1;
+        return s;
+    }
+    a.to_vec()
+}
+
 /// fsync the parent directory of `file_path`, making a just-created file's
 /// directory entry durable. A missing parent is treated as success.
 fn sync_parent_dir(file_path: &str) -> Result<()> {
@@ -395,4 +458,98 @@ fn sync_parent_dir(file_path: &str) -> Result<()> {
         d.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{BlockCache, FileCache};
+    use crate::comparator::default_comparator;
+    use crate::config::Compression;
+    use crate::sst::Reader;
+    use std::sync::Arc;
+
+    #[test]
+    fn separator_properties() {
+        // Deterministic cases.
+        assert_eq!(shortest_separator(b"abcXYZ", b"abd000"), b"abd".to_vec());
+        assert_eq!(shortest_separator(b"abc", b"abcd"), b"abc".to_vec()); // prefix
+        assert_eq!(
+            shortest_separator(&[0xff, 0xff], &[0xff, 0xff, 0x01]),
+            vec![0xff, 0xff]
+        ); // increment overflow -> unshortened
+        // a[i]+1 == b[i] with b extending past i -> can shorten.
+        assert_eq!(shortest_separator(b"aa", b"ab0"), b"ab".to_vec());
+        // a[i]+1 == b[i] with b NOT extending -> cannot (s would equal b).
+        assert_eq!(shortest_separator(b"aa", b"ab"), b"aa".to_vec());
+
+        // Property check over pseudo-random pairs: a <= s < b, or s == a.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..10_000 {
+            let la = (rnd() % 12 + 1) as usize;
+            let lb = (rnd() % 12 + 1) as usize;
+            let a: Vec<u8> = (0..la).map(|_| (rnd() % 6) as u8 + b'a').collect();
+            let b: Vec<u8> = (0..lb).map(|_| (rnd() % 6) as u8 + b'a').collect();
+            let (a, b) = if a < b { (a, b) } else if b < a { (b, a) } else { continue };
+            let s = shortest_separator(&a, &b);
+            assert!(a.as_slice() <= s.as_slice(), "a={a:?} b={b:?} s={s:?}");
+            assert!(s.as_slice() < b.as_slice(), "a={a:?} b={b:?} s={s:?}");
+            assert!(s.len() <= a.len().max(1), "separator longer than a");
+        }
+    }
+
+    #[test]
+    fn large_key_index_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("big.klog");
+        let klog = klog.to_str().unwrap();
+        let n = 500usize;
+        let mut w = Writer::new(
+            klog,
+            WriterOptions {
+                compression: Compression::None,
+                cmp: default_comparator(),
+                enable_bloom: false,
+                bloom_fpr: 0.01,
+                klog_value_threshold: 1 << 20, // keep values inline
+                block_size: 4 << 10,
+                expected_entries: n,
+                use_btree: false,
+            },
+        )
+        .unwrap();
+        let val = vec![b'v'; 100];
+        for i in 0..n {
+            // 2 KiB keys: 16-byte ordered prefix + 2032 bytes of padding.
+            let mut k = format!("{i:016}").into_bytes();
+            k.resize(2048, b'x');
+            w.add(&k, &val, (i + 1) as u64, 0, false, false).unwrap();
+        }
+        w.finish().unwrap();
+        let r = Reader::open(
+            klog,
+            Arc::new(FileCache::new(4)),
+            Arc::new(BlockCache::new(1 << 20)),
+            7,
+            default_comparator(),
+        )
+        .unwrap();
+        assert!(r.index.len() > 100, "expected many blocks with 2 KiB keys");
+        let total_sep_bytes: usize = r.index.iter().map(|e| e.user_key.len()).sum();
+        let full = r.index.len() * 2048;
+        // All but the final separator shorten to ~17 bytes (the diverging
+        // digit position + 1); the last block keeps its full 2 KiB key.
+        assert!(
+            total_sep_bytes < full / 10,
+            "index not shortened: {total_sep_bytes} of {full} bytes"
+        );
+        // max_key must remain the exact full last key.
+        assert_eq!(r.max_key().len(), 2048);
+    }
 }
