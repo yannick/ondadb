@@ -233,6 +233,7 @@ impl Wal {
             let f = OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(false) // reopening an existing WAL must keep it for replay
                 .open(stripe_path(path.as_ref(), k))?;
             let len = f.metadata()?.len();
             size += len as i64;
