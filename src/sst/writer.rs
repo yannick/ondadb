@@ -178,7 +178,7 @@ impl Writer {
             has_vlog = true;
         }
 
-        if self.opts.restart_interval > 0 && self.cur_entries % self.opts.restart_interval == 0 {
+        if self.opts.restart_interval > 0 && self.cur_entries.is_multiple_of(self.opts.restart_interval) {
             self.cur_restarts.push(self.cur_block.len() as u32);
         }
         self.cur_entries += 1;
