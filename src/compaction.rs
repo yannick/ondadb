@@ -219,7 +219,14 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
                     writer = Some((w, klog, id, 0));
                 }
                 let w = writer.as_mut().unwrap();
-                w.0.add(&uk, &value, seq, ttl, write_tomb, its[bi].is_single_delete())?;
+                w.0.add(
+                    &uk,
+                    &value,
+                    seq,
+                    ttl,
+                    write_tomb,
+                    its[bi].is_single_delete(),
+                )?;
                 w.3 += (uk.len() + value.len()) as u64;
                 if w.3 >= target_bytes {
                     let (wr, _klog, id, _bytes) = writer.take().unwrap();

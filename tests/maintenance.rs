@@ -285,7 +285,10 @@ fn fifo_compaction_evicts_oldest_tables() {
     );
     // Newest generation survives, oldest is gone (cache semantics).
     assert_eq!(db.get(&cf, b"g7-k00").unwrap(), [b'v'; 100]);
-    assert!(db.get(&cf, b"g0-k00").is_err(), "oldest gen must be evicted");
+    assert!(
+        db.get(&cf, b"g0-k00").is_err(),
+        "oldest gen must be evicted"
+    );
 
     // Eviction is durable (manifest persisted before file deletion).
     db.close().unwrap();

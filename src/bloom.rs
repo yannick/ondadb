@@ -4,7 +4,7 @@
 //! hashing derived from a single 64-bit FNV-1a key hash.  It
 //! is built during SSTable construction and consulted before reading data
 //! blocks.  Two serializations are provided: a dense form and a sparse form
-//! (only non-zero words, with indices) 
+//! (only non-zero words, with indices)
 
 use crate::encoding::{append_u64, append_uvarint, read_u64, uvarint};
 use crate::error::{OndaError, Result};

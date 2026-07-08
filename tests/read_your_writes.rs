@@ -23,7 +23,8 @@ fn get_sees_own_put_under_concurrent_writes() {
             let mut i = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let k = format!("noise-{i}");
-                db.put(&cf, k.as_bytes(), b"x", std::time::Duration::ZERO).unwrap();
+                db.put(&cf, k.as_bytes(), b"x", std::time::Duration::ZERO)
+                    .unwrap();
                 i += 1;
             }
         })
@@ -32,7 +33,8 @@ fn get_sees_own_put_under_concurrent_writes() {
     let mut lost = 0usize;
     for i in 0..50_000u64 {
         let v = i.to_be_bytes();
-        db.put(&cf, b"rmw-key", &v, std::time::Duration::ZERO).unwrap();
+        db.put(&cf, b"rmw-key", &v, std::time::Duration::ZERO)
+            .unwrap();
         match db.get(&cf, b"rmw-key") {
             Ok(read) if read == v => {}
             Ok(read) => {
@@ -50,5 +52,8 @@ fn get_sees_own_put_under_concurrent_writes() {
     }
     stop.store(true, Ordering::Relaxed);
     noise.join().unwrap();
-    assert_eq!(lost, 0, "{lost} of 50000 reads missed the write that preceded them on the same thread");
+    assert_eq!(
+        lost, 0,
+        "{lost} of 50000 reads missed the write that preceded them on the same thread"
+    );
 }

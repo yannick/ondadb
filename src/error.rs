@@ -129,7 +129,9 @@ impl fmt::Display for OndaError {
             OndaError::Locked(m) => write!(f, "locked: {m}"),
             OndaError::ReadOnly(m) => write!(f, "read-only: {m}"),
             OndaError::Busy(m) => write!(f, "busy: {m}"),
-            OndaError::Poisoned(m) => write!(f, "poisoned (fail-stop after durability failure): {m}"),
+            OndaError::Poisoned(m) => {
+                write!(f, "poisoned (fail-stop after durability failure): {m}")
+            }
             OndaError::Unknown(m) => write!(f, "unknown error: {m}"),
         }
     }

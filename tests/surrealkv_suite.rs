@@ -188,8 +188,8 @@ fn binary_keys_roundtrip_and_order() {
         vec![0x00, 0x00],
         vec![0x00, 0xff],
         vec![0x7f],
-        vec![0x80, 0x81],           // invalid UTF-8
-        vec![0xc3, 0x28],           // invalid UTF-8 sequence
+        vec![0x80, 0x81], // invalid UTF-8
+        vec![0xc3, 0x28], // invalid UTF-8 sequence
         vec![0xff],
         vec![0xff, 0x00],
         vec![0xff, 0xff, 0xff],
@@ -231,7 +231,8 @@ fn reverse_iteration_over_tombstone_runs() {
     let (db, cf) = open(dir.path());
 
     for i in 0..10_000u32 {
-        db.put(&cf, format!("k{i:05}").as_bytes(), b"v", ZERO).unwrap();
+        db.put(&cf, format!("k{i:05}").as_bytes(), b"v", ZERO)
+            .unwrap();
     }
     // Delete everything except the two ends: a 9,998-tombstone run in the
     // middle that reverse iteration has to step over.

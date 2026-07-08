@@ -489,7 +489,11 @@ fn lock_file_excludes_second_writer_but_shares_readers() {
     };
     let r1 = ro(true).unwrap();
     let r2 = ro(true).unwrap();
-    assert_eq!(r1.get(&r1.get_column_family("default").unwrap(), b"k").unwrap(), b"v");
+    assert_eq!(
+        r1.get(&r1.get_column_family("default").unwrap(), b"k")
+            .unwrap(),
+        b"v"
+    );
 
     // ...but a writer is excluded while any reader holds the shared lock.
     match ro(false) {
@@ -648,8 +652,13 @@ fn per_level_compression_end_to_end() {
     // Compressible values so a Zstd level actually exercises the codec.
     let value = "abcdefgh".repeat(32);
     for i in 0..2000u32 {
-        db.put(&cf, format!("k{i:05}").as_bytes(), value.as_bytes(), Duration::ZERO)
-            .unwrap();
+        db.put(
+            &cf,
+            format!("k{i:05}").as_bytes(),
+            value.as_bytes(),
+            Duration::ZERO,
+        )
+        .unwrap();
     }
     db.flush_memtable(&cf).unwrap(); // L0 (None)
     db.compact(&cf).unwrap(); // pushes down => Zstd blocks
@@ -668,10 +677,7 @@ fn per_level_compression_end_to_end() {
     // and new writes keep working.
     let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
     let cf = db.get_column_family("default").unwrap();
-    assert_eq!(
-        db.get(&cf, b"k00000").unwrap(),
-        value.as_bytes()
-    );
+    assert_eq!(db.get(&cf, b"k00000").unwrap(), value.as_bytes());
     db.put(&cf, b"new", b"v", Duration::ZERO).unwrap();
     db.flush_memtable(&cf).unwrap();
     db.compact(&cf).unwrap();

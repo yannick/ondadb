@@ -363,7 +363,8 @@ impl Wal {
                 if let Err(e) = f.sync_data() {
                     // The kernel may have dropped the dirty pages it failed to
                     // persist; earlier acknowledged commits could be gone.
-                    self.shared.poison(format!("wal group-commit fsync failed: {e}"));
+                    self.shared
+                        .poison(format!("wal group-commit fsync failed: {e}"));
                     return OndaError::from(e).code();
                 }
             }

@@ -1,7 +1,7 @@
 //! SSTable block framing.
 //!
 //! Each block (data, index, or bloom) is independently compressed and
-//! checksummed. 
+//! checksummed.
 //!
 //! ```text
 //! [alg u8][comp_len u32 LE][raw_len u32 LE][crc32c u32 LE][compressed bytes]

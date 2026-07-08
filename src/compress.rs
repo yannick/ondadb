@@ -1,7 +1,7 @@
 //! Block compression codecs for SSTable klog/vlog blocks (the WAL is never
 //! compressed).  Codecs are stateless and safe for concurrent use.
 //!
-//! dependency — ondaDB ships a real LZ4 codec (`lz4_flex`), 
+//! dependency — ondaDB ships a real LZ4 codec (`lz4_flex`),
 //! algorithm set: none / snappy / lz4 / zstd / lz4fast / flate.
 
 use std::io::{Read, Write};

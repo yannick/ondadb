@@ -670,8 +670,7 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                         }
                         // FIFO CFs enforce their size/age limit after every
                         // flush; leveled CFs wait for the L0 file trigger.
-                        let fifo = cf.opts.compaction_style
-                            == crate::config::CompactionStyle::Fifo;
+                        let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
                         if !db.closing.load(Ordering::Relaxed)
                             && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
                         {
@@ -707,8 +706,7 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                         }
                         // FIFO CFs enforce their size/age limit after every
                         // flush; leveled CFs wait for the L0 file trigger.
-                        let fifo = cf.opts.compaction_style
-                            == crate::config::CompactionStyle::Fifo;
+                        let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
                         if !db.closing.load(Ordering::Relaxed)
                             && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
                         {

@@ -1,7 +1,6 @@
 //! Configuration types for ondaDB.
 //!
 
-
 use std::time::Duration;
 
 /// Compression algorithm applied per SSTable block (never to the WAL).
@@ -455,7 +454,10 @@ mod tests {
                 ..ColumnFamilyConfig::default()
             };
             let d = ColumnFamilyConfig::decode(&c.encode());
-            assert_eq!(d.sync_mode, sm, "sync_mode must survive a manifest round-trip");
+            assert_eq!(
+                d.sync_mode, sm,
+                "sync_mode must survive a manifest round-trip"
+            );
             assert_eq!(d.sync_interval, Duration::from_micros(250_000));
         }
     }
@@ -489,11 +491,7 @@ mod per_level_tests {
     fn compression_per_level_roundtrip_and_selection() {
         let c = ColumnFamilyConfig {
             compression: Compression::Snappy,
-            compression_per_level: vec![
-                Compression::None,
-                Compression::None,
-                Compression::Zstd,
-            ],
+            compression_per_level: vec![Compression::None, Compression::None, Compression::Zstd],
             ..ColumnFamilyConfig::default()
         };
         let d = ColumnFamilyConfig::decode(&c.encode());
