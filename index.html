@@ -1,0 +1,1108 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage-engine benchmark matrix</title>
+<style>
+:root {
+  --page: #f9f9f7; --surface: #fcfcfb; --ink-1: #0b0b0b; --ink-2: #52514e;
+  --ink-3: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --row: #f3f2ee;
+  --ring: rgba(11,11,11,.10); --best: #006300;
+  --c-ondadb: #2a78d6;--c-tidesdb: #1baf7a;--c-fjall: #eda100;--c-badger: #008300;--c-wavesdb: #4a3aa7;--c-rocksdb: #e34948;--c-surrealkv: #e87ba4;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --page: #0d0d0d; --surface: #1a1a19; --ink-1: #ffffff; --ink-2: #c3c2b7;
+  --ink-3: #898781; --grid: #2c2c2a; --axis: #383835; --row: #232322;
+  --ring: rgba(255,255,255,.10); --best: #0ca30c;
+  --c-ondadb: #3987e5;--c-tidesdb: #199e70;--c-fjall: #c98500;--c-badger: #008300;--c-wavesdb: #9085e9;--c-rocksdb: #e66767;--c-surrealkv: #d55181;
+} }
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --ink-1: #ffffff; --ink-2: #c3c2b7;
+  --ink-3: #898781; --grid: #2c2c2a; --axis: #383835; --row: #232322;
+  --ring: rgba(255,255,255,.10); --best: #0ca30c;
+  --c-ondadb: #3987e5;--c-tidesdb: #199e70;--c-fjall: #c98500;--c-badger: #008300;--c-wavesdb: #9085e9;--c-rocksdb: #e66767;--c-surrealkv: #d55181;
+}
+* { box-sizing: border-box; }
+html { background: var(--page); color: var(--ink-1);
+       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { max-width: 1060px; margin: 0 auto; padding: 0 20px 64px; }
+header.page { position: sticky; top: 0; z-index: 5; background: var(--page);
+  padding: 18px 0 10px; border-bottom: 1px solid var(--grid);
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+h1 { font-size: 21px; margin: 0; }
+.sub { color: var(--ink-2); font-size: 13px; margin: 0; flex: 1 1 320px; }
+#theme { margin-left: auto; background: none; border: 1px solid var(--axis);
+  color: var(--ink-2); border-radius: 8px; padding: 4px 10px; font-size: 12px;
+  cursor: pointer; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+  margin: 14px 0 6px; }
+.lg { display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+  color: var(--ink-2); cursor: pointer; user-select: none; white-space: nowrap; }
+.lg input { position: absolute; opacity: 0; pointer-events: none; }
+.lg.off { opacity: .35; }
+.chip { display: inline-block; width: 12px; height: 12px; border-radius: 3px; }
+.scale { margin-left: auto; display: inline-flex; border: 1px solid var(--axis);
+  border-radius: 8px; overflow: hidden; }
+.scale button { background: none; border: 0; color: var(--ink-2); font-size: 12px;
+  padding: 4px 12px; cursor: pointer; }
+.scale button.on { background: var(--ink-1); color: var(--surface); }
+section.card { background: var(--surface); border: 1px solid var(--ring);
+  border-radius: 12px; padding: 18px 20px 14px; margin: 18px 0; }
+h2 { font-size: 16px; margin: 0 0 2px; }
+.unit { color: var(--ink-3); font-size: 12.5px; margin: 0 0 10px; }
+svg { width: 100%; height: auto; display: block; }
+.grid { stroke: var(--grid); stroke-width: 1; }
+.axis { stroke: var(--axis); stroke-width: 1; }
+.whisk { stroke: var(--ink-3); stroke-width: 1; }
+.ylab, .xsub { fill: var(--ink-3); font-size: 11px; }
+.xlab { fill: var(--ink-2); font-size: 12.5px; }
+.vlab { fill: var(--ink-2); font-size: 11.5px; }
+.vlab .dim { fill: var(--ink-3); }
+.bar { outline: none; }
+.bar:hover, .bar:focus { opacity: .82; }
+.s-ondadb { fill: var(--c-ondadb); } .chip.s-ondadb { background: var(--c-ondadb); }
+.s-tidesdb { fill: var(--c-tidesdb); } .chip.s-tidesdb { background: var(--c-tidesdb); }
+.s-fjall { fill: var(--c-fjall); } .chip.s-fjall { background: var(--c-fjall); }
+.s-badger { fill: var(--c-badger); } .chip.s-badger { background: var(--c-badger); }
+.s-wavesdb { fill: var(--c-wavesdb); } .chip.s-wavesdb { background: var(--c-wavesdb); }
+.s-rocksdb { fill: var(--c-rocksdb); } .chip.s-rocksdb { background: var(--c-rocksdb); }
+.s-surrealkv { fill: var(--c-surrealkv); } .chip.s-surrealkv { background: var(--c-surrealkv); }
+
+.tblwrap { overflow-x: auto; margin-top: 12px; }
+table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+th, td { text-align: right; padding: 5px 10px; font-variant-numeric: tabular-nums; }
+th:first-child, td:first-child, tbody th { text-align: left; }
+thead th { color: var(--ink-2); font-weight: 600; border-bottom: 1px solid var(--axis);
+  white-space: nowrap; }
+thead th .chip { width: 9px; height: 9px; margin-right: 5px; }
+tbody tr:nth-child(even) { background: var(--row); }
+tbody th { font-weight: 600; color: var(--ink-2); }
+td.best { font-weight: 700; color: var(--best); }
+td.best::after { content: " ●"; font-size: 8px; vertical-align: 2px; }
+td.coloff, th.coloff { opacity: .3; }
+footer { color: var(--ink-3); font-size: 12.5px; margin-top: 26px; }
+#tip { position: fixed; pointer-events: none; background: var(--ink-1);
+  color: var(--surface); padding: 7px 10px; border-radius: 8px; font-size: 12px;
+  display: none; z-index: 9; max-width: 360px; white-space: pre-line; }
+#tip b { font-size: 13px; }
+@media print { header.page { position: static; } .controls { display: none; } }
+</style></head>
+<body>
+<header class="page"><h1>Storage-engine benchmark matrix</h1>
+<p class="sub">6 threads, random keys, compression=none, mean of 2 runs — Linux 6.19, xfs on NVMe, Intel i5-8500B (6 cores)</p>
+<button id="theme" type="button">theme: auto</button></header>
+<p class="sub" style="margin:10px 0 0">ondaDB benchmark suite — dataset: <strong>Linux / xfs</strong> · <a href="m2ultra.html" style="color:inherit">Apple M2 Ultra dataset →</a> · <a href="results_matrix_linux.csv" style="color:inherit">raw CSV</a></p>
+<div class="controls"><label class="lg"><input type="checkbox" checked data-eng="ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</label><label class="lg"><input type="checkbox" checked data-eng="tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</label><label class="lg"><input type="checkbox" checked data-eng="fjall"><span class="chip s-fjall"></span>fjall (Rust)</label><label class="lg"><input type="checkbox" checked data-eng="badger"><span class="chip s-badger"></span>BadgerDB (Go)</label><label class="lg"><input type="checkbox" checked data-eng="wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</label><label class="lg"><input type="checkbox" checked data-eng="rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</label><label class="lg"><input type="checkbox" checked data-eng="surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</label><span class="scale"><button class="on" data-scale="linear">linear</button><button data-scale="log">log</button></span></div>
+<section class="card"><h2>Summary across all configurations</h2><p class="unit">geometric mean of (engine ÷ fastest) over every config × phase cell (35 cells); 1.00× = fastest everywhere</p><div class="chart" id="score"><svg viewBox="0 0 980 272" role="img"><line x1="180.0" y1="8" x2="180.0" y2="248" class="grid"/><text x="180.0" y="264" class="ylab" text-anchor="middle">0.00×</text><line x1="390.7" y1="8" x2="390.7" y2="248" class="grid"/><text x="390.7" y="264" class="ylab" text-anchor="middle">0.20×</text><line x1="601.3" y1="8" x2="601.3" y2="248" class="grid"/><text x="601.3" y="264" class="ylab" text-anchor="middle">0.40×</text><line x1="812.0" y1="8" x2="812.0" y2="248" class="grid"/><text x="812.0" y="264" class="ylab" text-anchor="middle">0.60×</text><line x1="180" y1="8" x2="180" y2="248" class="axis"/><text x="170" y="23.0" class="xlab" text-anchor="end">ondaDB (Rust)</text><path d="M180.0,8.0 L787.5,8.0 Q791.5,8.0 791.5,12.0 L791.5,26.0 Q791.5,30.0 787.5,30.0 L180.0,30.0 Z" class="bar s-ondadb" tabindex="0" data-tip="0.58× (geomean vs fastest)
+ondaDB (Rust)
+1.00× of fastest"/><text x="799.5" y="23.0" class="vlab">0.58×</text><text x="170" y="57.0" class="xlab" text-anchor="end">TidesDB (C)</text><path d="M180.0,42.0 L711.4,42.0 Q715.4,42.0 715.4,46.0 L715.4,60.0 Q715.4,64.0 711.4,64.0 L180.0,64.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="0.51× (geomean vs fastest)
+TidesDB (C)
+0.88× of fastest"/><text x="723.4" y="57.0" class="vlab">0.51×</text><text x="170" y="91.0" class="xlab" text-anchor="end">wavesdb (Go)</text><path d="M180.0,76.0 L620.8,76.0 Q624.8,76.0 624.8,80.0 L624.8,94.0 Q624.8,98.0 620.8,98.0 L180.0,98.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="0.42× (geomean vs fastest)
+wavesdb (Go)
+0.73× of fastest"/><text x="632.8" y="91.0" class="vlab">0.42×</text><text x="170" y="125.0" class="xlab" text-anchor="end">RocksDB (C++)</text><path d="M180.0,110.0 L605.9,110.0 Q609.9,110.0 609.9,114.0 L609.9,128.0 Q609.9,132.0 605.9,132.0 L180.0,132.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="0.41× (geomean vs fastest)
+RocksDB (C++)
+0.70× of fastest"/><text x="617.9" y="125.0" class="vlab">0.41×</text><text x="170" y="159.0" class="xlab" text-anchor="end">BadgerDB (Go)</text><path d="M180.0,144.0 L562.1,144.0 Q566.1,144.0 566.1,148.0 L566.1,162.0 Q566.1,166.0 562.1,166.0 L180.0,166.0 Z" class="bar s-badger" tabindex="0" data-tip="0.37× (geomean vs fastest)
+BadgerDB (Go)
+0.63× of fastest"/><text x="574.1" y="159.0" class="vlab">0.37×</text><text x="170" y="193.0" class="xlab" text-anchor="end">fjall (Rust)</text><path d="M180.0,178.0 L410.5,178.0 Q414.5,178.0 414.5,182.0 L414.5,196.0 Q414.5,200.0 410.5,200.0 L180.0,200.0 Z" class="bar s-fjall" tabindex="0" data-tip="0.22× (geomean vs fastest)
+fjall (Rust)
+0.38× of fastest"/><text x="422.5" y="193.0" class="vlab">0.22×</text><text x="170" y="227.0" class="xlab" text-anchor="end">surrealkv (Rust)</text><path d="M180.0,212.0 L261.8,212.0 Q265.8,212.0 265.8,216.0 L265.8,230.0 Q265.8,234.0 261.8,234.0 L180.0,234.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="0.08× (geomean vs fastest)
+surrealkv (Rust)
+0.14× of fastest"/><text x="273.8" y="227.0" class="vlab">0.08×</text></svg><script type="application/json">{"type":"hbar","unit":"score","vfmt":"score","rows":[{"eng":"ondadb","label":"ondaDB (Rust)","mean":0.5805647939881352,"lo":0.5805647939881352,"hi":0.5805647939881352,"runs":[0.5805647939881352]},{"eng":"tidesdb","label":"TidesDB (C)","mean":0.5082577770823652,"lo":0.5082577770823652,"hi":0.5082577770823652,"runs":[0.5082577770823652]},{"eng":"wavesdb","label":"wavesdb (Go)","mean":0.4222413601802529,"lo":0.4222413601802529,"hi":0.4222413601802529,"runs":[0.4222413601802529]},{"eng":"rocksdb","label":"RocksDB (C++)","mean":0.408126509334956,"lo":0.408126509334956,"hi":0.408126509334956,"runs":[0.408126509334956]},{"eng":"badger","label":"BadgerDB (Go)","mean":0.36657176147980125,"lo":0.36657176147980125,"hi":0.36657176147980125,"runs":[0.36657176147980125]},{"eng":"fjall","label":"fjall (Rust)","mean":0.22266455155515366,"lo":0.22266455155515366,"hi":0.22266455155515366,"runs":[0.22266455155515366]},{"eng":"surrealkv","label":"surrealkv (Rust)","mean":0.08143290269355591,"lo":0.08143290269355591,"hi":0.08143290269355591,"runs":[0.08143290269355591]}]}</script></div><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>score (geomean)</th><td class="c-ondadb best">0.58</td><td class="c-tidesdb">0.51</td><td class="c-fjall">0.22</td><td class="c-badger">0.37</td><td class="c-wavesdb">0.42</td><td class="c-rocksdb">0.41</td><td class="c-surrealkv">0.08</td></tr><tr><th>cell wins</th><td class="c-ondadb best">13</td><td class="c-tidesdb best">13</td><td class="c-fjall">2</td><td class="c-badger">3</td><td class="c-wavesdb">4</td><td class="c-rocksdb">0</td><td class="c-surrealkv">0</td></tr></tbody></table></div></section><section class="card"><h2>Logical throughput (MB/s, key+value bytes)</h2><p class="unit">ops/sec × (key size + value size) — how much payload each engine moves per second; makes the value-size sweep comparable</p><h2>Put (batched, multi-threaded)</h2><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb">64</td><td class="c-tidesdb best">158</td><td class="c-fjall">35</td><td class="c-badger">69</td><td class="c-wavesdb">152</td><td class="c-rocksdb">125</td><td class="c-surrealkv">112</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb">205</td><td class="c-tidesdb best">702</td><td class="c-fjall">135</td><td class="c-badger">275</td><td class="c-wavesdb">371</td><td class="c-rocksdb">261</td><td class="c-surrealkv">216</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb">219</td><td class="c-tidesdb best">832</td><td class="c-fjall">171</td><td class="c-badger">468</td><td class="c-wavesdb">430</td><td class="c-rocksdb">266</td><td class="c-surrealkv">248</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb">283</td><td class="c-tidesdb best">644</td><td class="c-fjall">563</td><td class="c-badger">637</td><td class="c-wavesdb">523</td><td class="c-rocksdb">461</td><td class="c-surrealkv">314</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb">339</td><td class="c-tidesdb">705</td><td class="c-fjall">533</td><td class="c-badger best">751</td><td class="c-wavesdb">421</td><td class="c-rocksdb">577</td><td class="c-surrealkv">344</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb">229</td><td class="c-tidesdb best">987</td><td class="c-fjall">166</td><td class="c-badger">448</td><td class="c-wavesdb">517</td><td class="c-rocksdb">271</td><td class="c-surrealkv">301</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb">222</td><td class="c-tidesdb best">653</td><td class="c-fjall">163</td><td class="c-badger">520</td><td class="c-wavesdb">353</td><td class="c-rocksdb">238</td><td class="c-surrealkv">196</td></tr></tbody></table></div><h2>Get (cold, multi-threaded)</h2><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb">99</td><td class="c-tidesdb">113</td><td class="c-fjall">35</td><td class="c-badger">109</td><td class="c-wavesdb best">289</td><td class="c-rocksdb">201</td><td class="c-surrealkv">2</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb best">1,493</td><td class="c-tidesdb">1,251</td><td class="c-fjall">99</td><td class="c-badger">423</td><td class="c-wavesdb">855</td><td class="c-rocksdb">633</td><td class="c-surrealkv">10</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb best">2,777</td><td class="c-tidesdb">1,396</td><td class="c-fjall">826</td><td class="c-badger">687</td><td class="c-wavesdb">1,439</td><td class="c-rocksdb">940</td><td class="c-surrealkv">16</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb">4,049</td><td class="c-tidesdb">2,501</td><td class="c-fjall best">9,080</td><td class="c-badger">1,154</td><td class="c-wavesdb">2,501</td><td class="c-rocksdb">1,164</td><td class="c-surrealkv">62</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb">7,189</td><td class="c-tidesdb">4,558</td><td class="c-fjall best">31,860</td><td class="c-badger">1,206</td><td class="c-wavesdb">2,947</td><td class="c-rocksdb">1,441</td><td class="c-surrealkv">229</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb best">2,270</td><td class="c-tidesdb">1,719</td><td class="c-fjall">2</td><td class="c-badger">642</td><td class="c-wavesdb">782</td><td class="c-rocksdb">945</td><td class="c-surrealkv">19</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb best">2,709</td><td class="c-tidesdb">1,774</td><td class="c-fjall">34</td><td class="c-badger">796</td><td class="c-wavesdb">732</td><td class="c-rocksdb">1,127</td><td class="c-surrealkv">30</td></tr></tbody></table></div></section><section class="card"><h2>Put (batched, multi-threaded)</h2><p class="unit">ops/sec — higher is better; whiskers span min–max across runs; the group leader is value-labeled</p><div class="chart" id="ph-Put"><svg viewBox="0 0 980 320" role="img"><line x1="74" y1="268.0" x2="964" y2="268.0" class="grid"/><text x="66" y="272.0" class="ylab" text-anchor="end">0</text><line x1="74" y1="204.5" x2="964" y2="204.5" class="grid"/><text x="66" y="208.5" class="ylab" text-anchor="end">500k</text><line x1="74" y1="141.0" x2="964" y2="141.0" class="grid"/><text x="66" y="145.0" class="ylab" text-anchor="end">1M</text><line x1="74" y1="77.5" x2="964" y2="77.5" class="grid"/><text x="66" y="81.5" class="ylab" text-anchor="end">1.50M</text><line x1="74" y1="14.0" x2="964" y2="14.0" class="grid"/><text x="66" y="18.0" class="ylab" text-anchor="end">2M</text><line x1="74" y1="268.0" x2="964" y2="268.0" class="axis"/><path d="M86.7,268.0 L86.7,202.0 Q86.7,198.0 90.7,198.0 L95.5,198.0 Q99.5,198.0 99.5,202.0 L99.5,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="551,536 ops/sec
+ondaDB (Rust)
+runs: 553k, 550k (min 550k – max 553k)
+16 B / 100 B — 0.40× of group best"/><line x1="93.1" y1="197.8" x2="93.1" y2="198.1" class="whisk"/><line x1="90.1" y1="197.8" x2="96.1" y2="197.8" class="whisk"/><line x1="90.1" y1="198.1" x2="96.1" y2="198.1" class="whisk"/><path d="M101.5,268.0 L101.5,98.6 Q101.5,94.6 105.5,94.6 L110.3,94.6 Q114.3,94.6 114.3,98.6 L114.3,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,365,727 ops/sec
+TidesDB (C)
+runs: 1.52M, 1.21M (min 1.21M – max 1.52M)
+16 B / 100 B — 1.00× of group best"/><line x1="107.9" y1="74.8" x2="107.9" y2="114.3" class="whisk"/><line x1="104.9" y1="74.8" x2="110.9" y2="74.8" class="whisk"/><line x1="104.9" y1="114.3" x2="110.9" y2="114.3" class="whisk"/><text x="107.9" y="69.8" class="vlab" text-anchor="middle">1.37M</text><path d="M116.3,268.0 L116.3,233.6 Q116.3,229.6 120.3,229.6 L125.2,229.6 Q129.2,229.6 129.2,233.6 L129.2,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="302,392 ops/sec
+fjall (Rust)
+runs: 336k, 269k (min 269k – max 336k)
+16 B / 100 B — 0.22× of group best"/><line x1="122.8" y1="225.3" x2="122.8" y2="233.9" class="whisk"/><line x1="119.8" y1="225.3" x2="125.8" y2="225.3" class="whisk"/><line x1="119.8" y1="233.9" x2="125.8" y2="233.9" class="whisk"/><path d="M131.2,268.0 L131.2,196.9 Q131.2,192.9 135.2,192.9 L140.0,192.9 Q144.0,192.9 144.0,196.9 L144.0,268.0 Z" class="bar s-badger" tabindex="0" data-tip="591,062 ops/sec
+BadgerDB (Go)
+runs: 599k, 583k (min 583k – max 599k)
+16 B / 100 B — 0.43× of group best"/><line x1="137.6" y1="191.9" x2="137.6" y2="194.0" class="whisk"/><line x1="134.6" y1="191.9" x2="140.6" y2="191.9" class="whisk"/><line x1="134.6" y1="194.0" x2="140.6" y2="194.0" class="whisk"/><path d="M146.0,268.0 L146.0,105.1 Q146.0,101.1 150.0,101.1 L154.8,101.1 Q158.8,101.1 158.8,105.1 L158.8,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="1,314,148 ops/sec
+wavesdb (Go)
+runs: 1.44M, 1.19M (min 1.19M – max 1.44M)
+16 B / 100 B — 0.96× of group best"/><line x1="152.4" y1="85.8" x2="152.4" y2="116.5" class="whisk"/><line x1="149.4" y1="85.8" x2="155.4" y2="85.8" class="whisk"/><line x1="149.4" y1="116.5" x2="155.4" y2="116.5" class="whisk"/><path d="M160.8,268.0 L160.8,135.4 Q160.8,131.4 164.8,131.4 L169.6,131.4 Q173.6,131.4 173.6,135.4 L173.6,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,075,742 ops/sec
+RocksDB (C++)
+runs: 1.05M, 1.10M (min 1.05M – max 1.10M)
+16 B / 100 B — 0.79× of group best"/><line x1="167.2" y1="128.6" x2="167.2" y2="134.2" class="whisk"/><line x1="164.2" y1="128.6" x2="170.2" y2="128.6" class="whisk"/><line x1="164.2" y1="134.2" x2="170.2" y2="134.2" class="whisk"/><path d="M175.6,268.0 L175.6,148.9 Q175.6,144.9 179.6,144.9 L184.4,144.9 Q188.4,144.9 188.4,148.9 L188.4,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="969,563 ops/sec
+surrealkv (Rust)
+runs: 944k, 996k (min 944k – max 996k)
+16 B / 100 B — 0.71× of group best"/><line x1="182.0" y1="141.6" x2="182.0" y2="148.2" class="whisk"/><line x1="179.0" y1="141.6" x2="185.0" y2="141.6" class="whisk"/><line x1="179.0" y1="148.2" x2="185.0" y2="148.2" class="whisk"/><text x="137.6" y="286" class="xlab" text-anchor="middle">16 B / 100 B</text><text x="137.6" y="302" class="xsub" text-anchor="middle">1M ops</text><path d="M213.9,268.0 L213.9,226.9 Q213.9,222.9 217.9,222.9 L222.7,222.9 Q226.7,222.9 226.7,226.9 L226.7,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="355,390 ops/sec
+ondaDB (Rust)
+runs: 357k, 354k (min 354k – max 357k)
+64 B / 512 B — 0.29× of group best"/><line x1="220.3" y1="222.7" x2="220.3" y2="223.0" class="whisk"/><line x1="217.3" y1="222.7" x2="223.3" y2="222.7" class="whisk"/><line x1="217.3" y1="223.0" x2="223.3" y2="223.0" class="whisk"/><path d="M228.7,268.0 L228.7,117.2 Q228.7,113.2 232.7,113.2 L237.5,113.2 Q241.5,113.2 241.5,117.2 L241.5,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,219,228 ops/sec
+TidesDB (C)
+runs: 1.31M, 1.13M (min 1.13M – max 1.31M)
+64 B / 512 B — 1.00× of group best"/><line x1="235.1" y1="101.4" x2="235.1" y2="124.9" class="whisk"/><line x1="232.1" y1="101.4" x2="238.1" y2="101.4" class="whisk"/><line x1="232.1" y1="124.9" x2="238.1" y2="124.9" class="whisk"/><text x="235.1" y="96.4" class="vlab" text-anchor="middle">1.22M</text><path d="M243.5,268.0 L243.5,242.3 Q243.5,238.3 247.5,238.3 L252.3,238.3 Q256.3,238.3 256.3,242.3 L256.3,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="233,962 ops/sec
+fjall (Rust)
+runs: 200k, 268k (min 200k – max 268k)
+64 B / 512 B — 0.19× of group best"/><line x1="249.9" y1="234.0" x2="249.9" y2="242.6" class="whisk"/><line x1="246.9" y1="234.0" x2="252.9" y2="234.0" class="whisk"/><line x1="246.9" y1="242.6" x2="252.9" y2="242.6" class="whisk"/><path d="M258.3,268.0 L258.3,211.4 Q258.3,207.4 262.3,207.4 L267.1,207.4 Q271.1,207.4 271.1,211.4 L271.1,268.0 Z" class="bar s-badger" tabindex="0" data-tip="476,980 ops/sec
+BadgerDB (Go)
+runs: 432k, 522k (min 432k – max 522k)
+64 B / 512 B — 0.39× of group best"/><line x1="264.7" y1="201.7" x2="264.7" y2="213.1" class="whisk"/><line x1="261.7" y1="201.7" x2="267.7" y2="201.7" class="whisk"/><line x1="261.7" y1="213.1" x2="267.7" y2="213.1" class="whisk"/><path d="M273.1,268.0 L273.1,190.1 Q273.1,186.1 277.1,186.1 L281.9,186.1 Q285.9,186.1 285.9,190.1 L285.9,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="644,727 ops/sec
+wavesdb (Go)
+runs: 580k, 709k (min 580k – max 709k)
+64 B / 512 B — 0.53× of group best"/><line x1="279.5" y1="177.9" x2="279.5" y2="194.3" class="whisk"/><line x1="276.5" y1="177.9" x2="282.5" y2="177.9" class="whisk"/><line x1="276.5" y1="194.3" x2="282.5" y2="194.3" class="whisk"/><path d="M287.9,268.0 L287.9,214.4 Q287.9,210.4 291.9,210.4 L296.8,210.4 Q300.8,210.4 300.8,214.4 L300.8,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="453,450 ops/sec
+RocksDB (C++)
+runs: 487k, 420k (min 420k – max 487k)
+64 B / 512 B — 0.37× of group best"/><line x1="294.3" y1="206.2" x2="294.3" y2="214.7" class="whisk"/><line x1="291.3" y1="206.2" x2="297.3" y2="206.2" class="whisk"/><line x1="291.3" y1="214.7" x2="297.3" y2="214.7" class="whisk"/><path d="M302.8,268.0 L302.8,224.4 Q302.8,220.4 306.8,220.4 L311.6,220.4 Q315.6,220.4 315.6,224.4 L315.6,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="375,114 ops/sec
+surrealkv (Rust)
+runs: 404k, 346k (min 346k – max 404k)
+64 B / 512 B — 0.31× of group best"/><line x1="309.2" y1="216.7" x2="309.2" y2="224.1" class="whisk"/><line x1="306.2" y1="216.7" x2="312.2" y2="216.7" class="whisk"/><line x1="306.2" y1="224.1" x2="312.2" y2="224.1" class="whisk"/><text x="264.7" y="286" class="xlab" text-anchor="middle">64 B / 512 B</text><text x="264.7" y="302" class="xsub" text-anchor="middle">400k ops</text><path d="M341.0,268.0 L341.0,245.3 Q341.0,241.3 345.0,241.3 L349.8,241.3 Q353.8,241.3 353.8,245.3 L353.8,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="210,159 ops/sec
+ondaDB (Rust)
+runs: 209k, 212k (min 209k – max 212k)
+16 B / 1 KiB — 0.26× of group best"/><line x1="347.4" y1="241.1" x2="347.4" y2="241.5" class="whisk"/><line x1="344.4" y1="241.1" x2="350.4" y2="241.1" class="whisk"/><line x1="344.4" y1="241.5" x2="350.4" y2="241.5" class="whisk"/><path d="M355.8,268.0 L355.8,170.4 Q355.8,166.4 359.8,166.4 L364.6,166.4 Q368.6,166.4 368.6,170.4 L368.6,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="799,667 ops/sec
+TidesDB (C)
+runs: 635k, 965k (min 635k – max 965k)
+16 B / 1 KiB — 1.00× of group best"/><line x1="362.2" y1="145.5" x2="362.2" y2="187.4" class="whisk"/><line x1="359.2" y1="145.5" x2="365.2" y2="145.5" class="whisk"/><line x1="359.2" y1="187.4" x2="365.2" y2="187.4" class="whisk"/><text x="362.2" y="140.5" class="vlab" text-anchor="middle">800k</text><path d="M370.6,268.0 L370.6,251.1 Q370.6,247.1 374.6,247.1 L379.4,247.1 Q383.4,247.1 383.4,251.1 L383.4,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="164,429 ops/sec
+fjall (Rust)
+runs: 166k, 163k (min 163k – max 166k)
+16 B / 1 KiB — 0.21× of group best"/><line x1="377.0" y1="247.0" x2="377.0" y2="247.3" class="whisk"/><line x1="374.0" y1="247.0" x2="380.0" y2="247.0" class="whisk"/><line x1="374.0" y1="247.3" x2="380.0" y2="247.3" class="whisk"/><path d="M385.4,268.0 L385.4,214.9 Q385.4,210.9 389.4,210.9 L394.3,210.9 Q398.3,210.9 398.3,214.9 L398.3,268.0 Z" class="bar s-badger" tabindex="0" data-tip="449,891 ops/sec
+BadgerDB (Go)
+runs: 498k, 401k (min 401k – max 498k)
+16 B / 1 KiB — 0.56× of group best"/><line x1="391.9" y1="204.7" x2="391.9" y2="217.0" class="whisk"/><line x1="388.9" y1="204.7" x2="394.9" y2="204.7" class="whisk"/><line x1="388.9" y1="217.0" x2="394.9" y2="217.0" class="whisk"/><path d="M400.3,268.0 L400.3,219.5 Q400.3,215.5 404.3,215.5 L409.1,215.5 Q413.1,215.5 413.1,219.5 L413.1,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="413,714 ops/sec
+wavesdb (Go)
+runs: 422k, 405k (min 405k – max 422k)
+16 B / 1 KiB — 0.52× of group best"/><line x1="406.7" y1="214.4" x2="406.7" y2="216.5" class="whisk"/><line x1="403.7" y1="214.4" x2="409.7" y2="214.4" class="whisk"/><line x1="403.7" y1="216.5" x2="409.7" y2="216.5" class="whisk"/><path d="M415.1,268.0 L415.1,239.5 Q415.1,235.5 419.1,235.5 L423.9,235.5 Q427.9,235.5 427.9,239.5 L427.9,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="256,156 ops/sec
+RocksDB (C++)
+runs: 278k, 234k (min 234k – max 278k)
+16 B / 1 KiB — 0.32× of group best"/><line x1="421.5" y1="232.7" x2="421.5" y2="238.3" class="whisk"/><line x1="418.5" y1="232.7" x2="424.5" y2="232.7" class="whisk"/><line x1="418.5" y1="238.3" x2="424.5" y2="238.3" class="whisk"/><path d="M429.9,268.0 L429.9,241.7 Q429.9,237.7 433.9,237.7 L438.7,237.7 Q442.7,237.7 442.7,241.7 L442.7,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="238,898 ops/sec
+surrealkv (Rust)
+runs: 254k, 224k (min 224k – max 254k)
+16 B / 1 KiB — 0.30× of group best"/><line x1="436.3" y1="235.7" x2="436.3" y2="239.6" class="whisk"/><line x1="433.3" y1="235.7" x2="439.3" y2="235.7" class="whisk"/><line x1="433.3" y1="239.6" x2="439.3" y2="239.6" class="whisk"/><text x="391.9" y="286" class="xlab" text-anchor="middle">16 B / 1 KiB</text><text x="391.9" y="302" class="xsub" text-anchor="middle">250k ops</text><path d="M468.1,268.0 L468.1,263.3 Q468.1,259.3 472.1,259.3 L477.0,259.3 Q481.0,259.3 481.0,263.3 L481.0,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="68,814 ops/sec
+ondaDB (Rust)
+runs: 60k, 77k (min 60k – max 77k)
+16 B / 4 KiB — 0.44× of group best"/><line x1="474.6" y1="258.2" x2="474.6" y2="260.3" class="whisk"/><line x1="471.6" y1="258.2" x2="477.6" y2="258.2" class="whisk"/><line x1="471.6" y1="260.3" x2="477.6" y2="260.3" class="whisk"/><path d="M483.0,268.0 L483.0,252.1 Q483.0,248.1 487.0,248.1 L491.8,248.1 Q495.8,248.1 495.8,252.1 L495.8,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="156,628 ops/sec
+TidesDB (C)
+runs: 167k, 146k (min 146k – max 167k)
+16 B / 4 KiB — 1.00× of group best"/><line x1="489.4" y1="246.8" x2="489.4" y2="249.5" class="whisk"/><line x1="486.4" y1="246.8" x2="492.4" y2="246.8" class="whisk"/><line x1="486.4" y1="249.5" x2="492.4" y2="249.5" class="whisk"/><text x="489.4" y="241.8" class="vlab" text-anchor="middle">157k</text><path d="M497.8,268.0 L497.8,254.6 Q497.8,250.6 501.8,250.6 L506.6,250.6 Q510.6,250.6 510.6,254.6 L510.6,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="136,814 ops/sec
+fjall (Rust)
+runs: 145k, 129k (min 129k – max 145k)
+16 B / 4 KiB — 0.87× of group best"/><line x1="504.2" y1="249.6" x2="504.2" y2="251.7" class="whisk"/><line x1="501.2" y1="249.6" x2="507.2" y2="249.6" class="whisk"/><line x1="501.2" y1="251.7" x2="507.2" y2="251.7" class="whisk"/><path d="M512.6,268.0 L512.6,252.3 Q512.6,248.3 516.6,248.3 L521.4,248.3 Q525.4,248.3 525.4,252.3 L525.4,268.0 Z" class="bar s-badger" tabindex="0" data-tip="154,923 ops/sec
+BadgerDB (Go)
+runs: 168k, 142k (min 142k – max 168k)
+16 B / 4 KiB — 0.99× of group best"/><line x1="519.0" y1="246.7" x2="519.0" y2="249.9" class="whisk"/><line x1="516.0" y1="246.7" x2="522.0" y2="246.7" class="whisk"/><line x1="516.0" y1="249.9" x2="522.0" y2="249.9" class="whisk"/><path d="M527.4,268.0 L527.4,255.8 Q527.4,251.8 531.4,251.8 L536.2,251.8 Q540.2,251.8 540.2,255.8 L540.2,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="127,300 ops/sec
+wavesdb (Go)
+runs: 135k, 119k (min 119k – max 135k)
+16 B / 4 KiB — 0.81× of group best"/><line x1="533.8" y1="250.8" x2="533.8" y2="252.8" class="whisk"/><line x1="530.8" y1="250.8" x2="536.8" y2="250.8" class="whisk"/><line x1="530.8" y1="252.8" x2="536.8" y2="252.8" class="whisk"/><path d="M542.2,268.0 L542.2,257.8 Q542.2,253.8 546.2,253.8 L551.0,253.8 Q555.0,253.8 555.0,257.8 L555.0,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="112,184 ops/sec
+RocksDB (C++)
+runs: 97k, 127k (min 97k – max 127k)
+16 B / 4 KiB — 0.72× of group best"/><line x1="548.6" y1="251.8" x2="548.6" y2="255.7" class="whisk"/><line x1="545.6" y1="251.8" x2="551.6" y2="251.8" class="whisk"/><line x1="545.6" y1="255.7" x2="551.6" y2="255.7" class="whisk"/><path d="M557.0,268.0 L557.0,262.3 Q557.0,258.3 561.0,258.3 L565.9,258.3 Q569.9,258.3 569.9,262.3 L569.9,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="76,276 ops/sec
+surrealkv (Rust)
+runs: 78k, 75k (min 75k – max 78k)
+16 B / 4 KiB — 0.49× of group best"/><line x1="563.4" y1="258.1" x2="563.4" y2="258.5" class="whisk"/><line x1="560.4" y1="258.1" x2="566.4" y2="258.1" class="whisk"/><line x1="560.4" y1="258.5" x2="566.4" y2="258.5" class="whisk"/><text x="519.0" y="286" class="xlab" text-anchor="middle">16 B / 4 KiB</text><text x="519.0" y="302" class="xsub" text-anchor="middle">30k ops</text><path d="M595.3,268.0 L595.3,268.0 Q595.3,265.4 597.9,265.4 L605.5,265.4 Q608.1,265.4 608.1,268.0 L608.1,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="20,661 ops/sec
+ondaDB (Rust)
+runs: 21k, 20k (min 20k – max 21k)
+16 B / 16 KiB — 0.45× of group best"/><line x1="601.7" y1="265.3" x2="601.7" y2="265.4" class="whisk"/><line x1="598.7" y1="265.3" x2="604.7" y2="265.3" class="whisk"/><line x1="598.7" y1="265.4" x2="604.7" y2="265.4" class="whisk"/><path d="M610.1,268.0 L610.1,266.5 Q610.1,262.5 614.1,262.5 L618.9,262.5 Q622.9,262.5 622.9,266.5 L622.9,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="42,974 ops/sec
+TidesDB (C)
+runs: 47k, 39k (min 39k – max 47k)
+16 B / 16 KiB — 0.94× of group best"/><line x1="616.5" y1="262.1" x2="616.5" y2="263.0" class="whisk"/><line x1="613.5" y1="262.1" x2="619.5" y2="262.1" class="whisk"/><line x1="613.5" y1="263.0" x2="619.5" y2="263.0" class="whisk"/><path d="M624.9,268.0 L624.9,267.9 Q624.9,263.9 628.9,263.9 L633.7,263.9 Q637.7,263.9 637.7,267.9 L637.7,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="32,484 ops/sec
+fjall (Rust)
+runs: 37k, 28k (min 28k – max 37k)
+16 B / 16 KiB — 0.71× of group best"/><line x1="631.3" y1="263.2" x2="631.3" y2="264.5" class="whisk"/><line x1="628.3" y1="263.2" x2="634.3" y2="263.2" class="whisk"/><line x1="628.3" y1="264.5" x2="634.3" y2="264.5" class="whisk"/><path d="M639.7,268.0 L639.7,266.2 Q639.7,262.2 643.7,262.2 L648.6,262.2 Q652.6,262.2 652.6,266.2 L652.6,268.0 Z" class="bar s-badger" tabindex="0" data-tip="45,812 ops/sec
+BadgerDB (Go)
+runs: 46k, 46k (min 46k – max 46k)
+16 B / 16 KiB — 1.00× of group best"/><line x1="646.1" y1="262.2" x2="646.1" y2="262.2" class="whisk"/><line x1="643.1" y1="262.2" x2="649.1" y2="262.2" class="whisk"/><line x1="643.1" y1="262.2" x2="649.1" y2="262.2" class="whisk"/><text x="646.1" y="257.2" class="vlab" text-anchor="middle">46k</text><path d="M654.6,268.0 L654.6,268.0 Q654.6,264.7 657.8,264.7 L664.1,264.7 Q667.4,264.7 667.4,268.0 L667.4,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="25,694 ops/sec
+wavesdb (Go)
+runs: 26k, 26k (min 26k – max 26k)
+16 B / 16 KiB — 0.56× of group best"/><line x1="661.0" y1="264.7" x2="661.0" y2="264.8" class="whisk"/><line x1="658.0" y1="264.7" x2="664.0" y2="264.7" class="whisk"/><line x1="658.0" y1="264.8" x2="664.0" y2="264.8" class="whisk"/><path d="M669.4,268.0 L669.4,267.5 Q669.4,263.5 673.4,263.5 L678.2,263.5 Q682.2,263.5 682.2,267.5 L682.2,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="35,188 ops/sec
+RocksDB (C++)
+runs: 35k, 35k (min 35k – max 35k)
+16 B / 16 KiB — 0.77× of group best"/><line x1="675.8" y1="263.5" x2="675.8" y2="263.6" class="whisk"/><line x1="672.8" y1="263.5" x2="678.8" y2="263.5" class="whisk"/><line x1="672.8" y1="263.6" x2="678.8" y2="263.6" class="whisk"/><path d="M684.2,268.0 L684.2,268.0 Q684.2,265.3 686.8,265.3 L694.3,265.3 Q697.0,265.3 697.0,268.0 L697.0,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="20,963 ops/sec
+surrealkv (Rust)
+runs: 17k, 24k (min 17k – max 24k)
+16 B / 16 KiB — 0.46× of group best"/><line x1="690.6" y1="264.9" x2="690.6" y2="265.8" class="whisk"/><line x1="687.6" y1="264.9" x2="693.6" y2="264.9" class="whisk"/><line x1="687.6" y1="265.8" x2="693.6" y2="265.8" class="whisk"/><text x="646.1" y="286" class="xlab" text-anchor="middle">16 B / 16 KiB</text><text x="646.1" y="302" class="xsub" text-anchor="middle">8k ops</text><path d="M722.4,268.0 L722.4,249.3 Q722.4,245.3 726.4,245.3 L731.2,245.3 Q735.2,245.3 735.2,249.3 L735.2,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="178,542 ops/sec
+ondaDB (Rust)
+runs: 175k, 182k (min 175k – max 182k)
+1 KiB / 256 B — 0.23× of group best"/><line x1="728.8" y1="244.9" x2="728.8" y2="245.7" class="whisk"/><line x1="725.8" y1="244.9" x2="731.8" y2="244.9" class="whisk"/><line x1="725.8" y1="245.7" x2="731.8" y2="245.7" class="whisk"/><path d="M737.2,268.0 L737.2,174.1 Q737.2,170.1 741.2,170.1 L746.1,170.1 Q750.1,170.1 750.1,174.1 L750.1,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="771,080 ops/sec
+TidesDB (C)
+runs: 770k, 772k (min 770k – max 772k)
+1 KiB / 256 B — 1.00× of group best"/><line x1="743.7" y1="169.9" x2="743.7" y2="170.2" class="whisk"/><line x1="740.7" y1="169.9" x2="746.7" y2="169.9" class="whisk"/><line x1="740.7" y1="170.2" x2="746.7" y2="170.2" class="whisk"/><text x="743.7" y="164.9" class="vlab" text-anchor="middle">771k</text><path d="M752.1,268.0 L752.1,255.5 Q752.1,251.5 756.1,251.5 L760.9,251.5 Q764.9,251.5 764.9,255.5 L764.9,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="129,832 ops/sec
+fjall (Rust)
+runs: 120k, 140k (min 120k – max 140k)
+1 KiB / 256 B — 0.17× of group best"/><line x1="758.5" y1="250.2" x2="758.5" y2="252.8" class="whisk"/><line x1="755.5" y1="250.2" x2="761.5" y2="250.2" class="whisk"/><line x1="755.5" y1="252.8" x2="761.5" y2="252.8" class="whisk"/><path d="M766.9,268.0 L766.9,227.5 Q766.9,223.5 770.9,223.5 L775.7,223.5 Q779.7,223.5 779.7,227.5 L779.7,268.0 Z" class="bar s-badger" tabindex="0" data-tip="350,150 ops/sec
+BadgerDB (Go)
+runs: 363k, 337k (min 337k – max 363k)
+1 KiB / 256 B — 0.45× of group best"/><line x1="773.3" y1="221.9" x2="773.3" y2="225.1" class="whisk"/><line x1="770.3" y1="221.9" x2="776.3" y2="221.9" class="whisk"/><line x1="770.3" y1="225.1" x2="776.3" y2="225.1" class="whisk"/><path d="M781.7,268.0 L781.7,220.7 Q781.7,216.7 785.7,216.7 L790.5,216.7 Q794.5,216.7 794.5,220.7 L794.5,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="403,788 ops/sec
+wavesdb (Go)
+runs: 397k, 410k (min 397k – max 410k)
+1 KiB / 256 B — 0.52× of group best"/><line x1="788.1" y1="215.9" x2="788.1" y2="217.6" class="whisk"/><line x1="785.1" y1="215.9" x2="791.1" y2="215.9" class="whisk"/><line x1="785.1" y1="217.6" x2="791.1" y2="217.6" class="whisk"/><path d="M796.5,268.0 L796.5,245.1 Q796.5,241.1 800.5,241.1 L805.3,241.1 Q809.3,241.1 809.3,245.1 L809.3,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="211,893 ops/sec
+RocksDB (C++)
+runs: 209k, 215k (min 209k – max 215k)
+1 KiB / 256 B — 0.27× of group best"/><line x1="802.9" y1="240.7" x2="802.9" y2="241.5" class="whisk"/><line x1="799.9" y1="240.7" x2="805.9" y2="240.7" class="whisk"/><line x1="799.9" y1="241.5" x2="805.9" y2="241.5" class="whisk"/><path d="M811.3,268.0 L811.3,242.2 Q811.3,238.2 815.3,238.2 L820.1,238.2 Q824.1,238.2 824.1,242.2 L824.1,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="234,823 ops/sec
+surrealkv (Rust)
+runs: 246k, 223k (min 223k – max 246k)
+1 KiB / 256 B — 0.30× of group best"/><line x1="817.7" y1="236.7" x2="817.7" y2="239.6" class="whisk"/><line x1="814.7" y1="236.7" x2="820.7" y2="236.7" class="whisk"/><line x1="814.7" y1="239.6" x2="820.7" y2="239.6" class="whisk"/><text x="773.3" y="286" class="xlab" text-anchor="middle">1 KiB / 256 B</text><text x="773.3" y="302" class="xsub" text-anchor="middle">150k ops</text><path d="M849.6,268.0 L849.6,259.8 Q849.6,255.8 853.6,255.8 L858.4,255.8 Q862.4,255.8 862.4,259.8 L862.4,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="96,139 ops/sec
+ondaDB (Rust)
+runs: 95k, 97k (min 95k – max 97k)
+2 KiB / 256 B — 0.34× of group best"/><line x1="856.0" y1="255.7" x2="856.0" y2="255.9" class="whisk"/><line x1="853.0" y1="255.7" x2="859.0" y2="255.7" class="whisk"/><line x1="853.0" y1="255.9" x2="859.0" y2="255.9" class="whisk"/><path d="M864.4,268.0 L864.4,236.0 Q864.4,232.0 868.4,232.0 L873.2,232.0 Q877.2,232.0 877.2,236.0 L877.2,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="283,533 ops/sec
+TidesDB (C)
+runs: 322k, 246k (min 246k – max 322k)
+2 KiB / 256 B — 1.00× of group best"/><line x1="870.8" y1="227.2" x2="870.8" y2="236.8" class="whisk"/><line x1="867.8" y1="227.2" x2="873.8" y2="227.2" class="whisk"/><line x1="867.8" y1="236.8" x2="873.8" y2="236.8" class="whisk"/><text x="870.8" y="222.2" class="vlab" text-anchor="middle">284k</text><path d="M879.2,268.0 L879.2,263.0 Q879.2,259.0 883.2,259.0 L888.0,259.0 Q892.0,259.0 892.0,263.0 L892.0,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="70,670 ops/sec
+fjall (Rust)
+runs: 81k, 60k (min 60k – max 81k)
+2 KiB / 256 B — 0.25× of group best"/><line x1="885.6" y1="257.7" x2="885.6" y2="260.4" class="whisk"/><line x1="882.6" y1="257.7" x2="888.6" y2="257.7" class="whisk"/><line x1="882.6" y1="260.4" x2="888.6" y2="260.4" class="whisk"/><path d="M894.0,268.0 L894.0,243.3 Q894.0,239.3 898.0,239.3 L902.8,239.3 Q906.8,239.3 906.8,243.3 L906.8,268.0 Z" class="bar s-badger" tabindex="0" data-tip="225,619 ops/sec
+BadgerDB (Go)
+runs: 215k, 236k (min 215k – max 236k)
+2 KiB / 256 B — 0.80× of group best"/><line x1="900.4" y1="238.0" x2="900.4" y2="240.7" class="whisk"/><line x1="897.4" y1="238.0" x2="903.4" y2="238.0" class="whisk"/><line x1="897.4" y1="240.7" x2="903.4" y2="240.7" class="whisk"/><path d="M908.8,268.0 L908.8,252.6 Q908.8,248.6 912.8,248.6 L917.7,248.6 Q921.7,248.6 921.7,252.6 L921.7,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="153,130 ops/sec
+wavesdb (Go)
+runs: 176k, 130k (min 130k – max 176k)
+2 KiB / 256 B — 0.54× of group best"/><line x1="915.2" y1="245.6" x2="915.2" y2="251.5" class="whisk"/><line x1="912.2" y1="245.6" x2="918.2" y2="245.6" class="whisk"/><line x1="912.2" y1="251.5" x2="918.2" y2="251.5" class="whisk"/><path d="M923.7,268.0 L923.7,258.9 Q923.7,254.9 927.7,254.9 L932.5,254.9 Q936.5,254.9 936.5,258.9 L936.5,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="103,133 ops/sec
+RocksDB (C++)
+runs: 115k, 92k (min 92k – max 115k)
+2 KiB / 256 B — 0.36× of group best"/><line x1="930.1" y1="253.5" x2="930.1" y2="256.4" class="whisk"/><line x1="927.1" y1="253.5" x2="933.1" y2="253.5" class="whisk"/><line x1="927.1" y1="256.4" x2="933.1" y2="256.4" class="whisk"/><path d="M938.5,268.0 L938.5,261.2 Q938.5,257.2 942.5,257.2 L947.3,257.2 Q951.3,257.2 951.3,261.2 L951.3,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="85,202 ops/sec
+surrealkv (Rust)
+runs: 84k, 87k (min 84k – max 87k)
+2 KiB / 256 B — 0.30× of group best"/><line x1="944.9" y1="257.0" x2="944.9" y2="257.4" class="whisk"/><line x1="941.9" y1="257.0" x2="947.9" y2="257.0" class="whisk"/><line x1="941.9" y1="257.4" x2="947.9" y2="257.4" class="whisk"/><text x="900.4" y="286" class="xlab" text-anchor="middle">2 KiB / 256 B</text><text x="900.4" y="302" class="xsub" text-anchor="middle">100k ops</text></svg><script type="application/json">{"type":"vbar","unit":"ops/sec","vfmt":"ops","groups":[{"label":"16 B / 100 B","sub":"1M ops"},{"label":"64 B / 512 B","sub":"400k ops"},{"label":"16 B / 1 KiB","sub":"250k ops"},{"label":"16 B / 4 KiB","sub":"30k ops"},{"label":"16 B / 16 KiB","sub":"8k ops"},{"label":"1 KiB / 256 B","sub":"150k ops"},{"label":"2 KiB / 256 B","sub":"100k ops"}],"series":[{"eng":"ondadb","label":"ondaDB (Rust)","values":[{"mean":551536.0,"lo":550342.0,"hi":552730.0,"runs":[552730.0,550342.0]},{"mean":355389.5,"lo":354232.0,"hi":356547.0,"runs":[356547.0,354232.0]},{"mean":210159.0,"lo":208685.0,"hi":211633.0,"runs":[208685.0,211633.0]},{"mean":68813.5,"lo":60495.0,"hi":77132.0,"runs":[60495.0,77132.0]},{"mean":20661.0,"lo":20100.0,"hi":21222.0,"runs":[21222.0,20100.0]},{"mean":178541.5,"lo":175363.0,"hi":181720.0,"runs":[175363.0,181720.0]},{"mean":96139.0,"lo":95295.0,"hi":96983.0,"runs":[95295.0,96983.0]}]},{"eng":"tidesdb","label":"TidesDB (C)","values":[{"mean":1365727.4649999999,"lo":1210429.43,"hi":1521025.5,"runs":[1521025.5,1210429.43]},{"mean":1219228.255,"lo":1126757.46,"hi":1311699.05,"runs":[1311699.05,1126757.46]},{"mean":799667.395,"lo":634832.07,"hi":964502.72,"runs":[634832.07,964502.72]},{"mean":156628.03,"lo":145935.12,"hi":167320.94,"runs":[167320.94,145935.12]},{"mean":42974.12,"lo":39158.33,"hi":46789.91,"runs":[46789.91,39158.33]},{"mean":771079.8200000001,"lo":769910.34,"hi":772249.3,"runs":[769910.34,772249.3]},{"mean":283533.18,"lo":245518.66,"hi":321547.7,"runs":[321547.7,245518.66]}]},{"eng":"fjall","label":"fjall (Rust)","values":[{"mean":302392.0,"lo":268507.0,"hi":336277.0,"runs":[336277.0,268507.0]},{"mean":233961.5,"lo":200373.0,"hi":267550.0,"runs":[200373.0,267550.0]},{"mean":164429.0,"lo":163329.0,"hi":165529.0,"runs":[165529.0,163329.0]},{"mean":136814.5,"lo":128534.0,"hi":145095.0,"runs":[145095.0,128534.0]},{"mean":32483.5,"lo":27529.0,"hi":37438.0,"runs":[37438.0,27529.0]},{"mean":129832.5,"lo":119652.0,"hi":140013.0,"runs":[119652.0,140013.0]},{"mean":70670.5,"lo":60109.0,"hi":81232.0,"runs":[81232.0,60109.0]}]},{"eng":"badger","label":"BadgerDB (Go)","values":[{"mean":591062.5,"lo":582639.0,"hi":599486.0,"runs":[599486.0,582639.0]},{"mean":476979.5,"lo":432065.0,"hi":521894.0,"runs":[432065.0,521894.0]},{"mean":449891.0,"lo":401482.0,"hi":498300.0,"runs":[498300.0,401482.0]},{"mean":154923.0,"lo":142287.0,"hi":167559.0,"runs":[167559.0,142287.0]},{"mean":45811.5,"lo":45639.0,"hi":45984.0,"runs":[45984.0,45639.0]},{"mean":350150.0,"lo":337411.0,"hi":362889.0,"runs":[362889.0,337411.0]},{"mean":225619.0,"lo":215122.0,"hi":236116.0,"runs":[215122.0,236116.0]}]},{"eng":"wavesdb","label":"wavesdb (Go)","values":[{"mean":1314148.5,"lo":1193271.0,"hi":1435026.0,"runs":[1435026.0,1193271.0]},{"mean":644727.0,"lo":580019.0,"hi":709435.0,"runs":[580019.0,709435.0]},{"mean":413713.5,"lo":405432.0,"hi":421995.0,"runs":[421995.0,405432.0]},{"mean":127300.5,"lo":119431.0,"hi":135170.0,"runs":[135170.0,119431.0]},{"mean":25693.5,"lo":25590.0,"hi":25797.0,"runs":[25590.0,25797.0]},{"mean":403788.0,"lo":397183.0,"hi":410393.0,"runs":[397183.0,410393.0]},{"mean":153130.5,"lo":130229.0,"hi":176032.0,"runs":[176032.0,130229.0]}]},{"eng":"rocksdb","label":"RocksDB (C++)","values":[{"mean":1075742.5,"lo":1053779.0,"hi":1097706.0,"runs":[1053779.0,1097706.0]},{"mean":453450.5,"lo":419996.0,"hi":486905.0,"runs":[486905.0,419996.0]},{"mean":256155.5,"lo":234011.0,"hi":278300.0,"runs":[278300.0,234011.0]},{"mean":112184.0,"lo":97014.0,"hi":127354.0,"runs":[97014.0,127354.0]},{"mean":35188.0,"lo":34999.0,"hi":35377.0,"runs":[35377.0,34999.0]},{"mean":211893.0,"lo":208893.0,"hi":214893.0,"runs":[208893.0,214893.0]},{"mean":103133.0,"lo":91707.0,"hi":114559.0,"runs":[114559.0,91707.0]}]},{"eng":"surrealkv","label":"surrealkv (Rust)","values":[{"mean":969563.0,"lo":943576.0,"hi":995550.0,"runs":[943576.0,995550.0]},{"mean":375113.5,"lo":346029.0,"hi":404198.0,"runs":[404198.0,346029.0]},{"mean":238898.0,"lo":223682.0,"hi":254114.0,"runs":[254114.0,223682.0]},{"mean":76276.5,"lo":74581.0,"hi":77972.0,"runs":[77972.0,74581.0]},{"mean":20963.0,"lo":17457.0,"hi":24469.0,"runs":[17457.0,24469.0]},{"mean":234823.0,"lo":223397.0,"hi":246249.0,"runs":[246249.0,223397.0]},{"mean":85201.5,"lo":83694.0,"hi":86709.0,"runs":[83694.0,86709.0]}]}]}</script></div><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb">551,536</td><td class="c-tidesdb best">1,365,727</td><td class="c-fjall">302,392</td><td class="c-badger">591,062</td><td class="c-wavesdb">1,314,148</td><td class="c-rocksdb">1,075,742</td><td class="c-surrealkv">969,563</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb">355,390</td><td class="c-tidesdb best">1,219,228</td><td class="c-fjall">233,962</td><td class="c-badger">476,980</td><td class="c-wavesdb">644,727</td><td class="c-rocksdb">453,450</td><td class="c-surrealkv">375,114</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb">210,159</td><td class="c-tidesdb best">799,667</td><td class="c-fjall">164,429</td><td class="c-badger">449,891</td><td class="c-wavesdb">413,714</td><td class="c-rocksdb">256,156</td><td class="c-surrealkv">238,898</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb">68,814</td><td class="c-tidesdb best">156,628</td><td class="c-fjall">136,814</td><td class="c-badger">154,923</td><td class="c-wavesdb">127,300</td><td class="c-rocksdb">112,184</td><td class="c-surrealkv">76,276</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb">20,661</td><td class="c-tidesdb">42,974</td><td class="c-fjall">32,484</td><td class="c-badger best">45,812</td><td class="c-wavesdb">25,694</td><td class="c-rocksdb">35,188</td><td class="c-surrealkv">20,963</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb">178,542</td><td class="c-tidesdb best">771,080</td><td class="c-fjall">129,832</td><td class="c-badger">350,150</td><td class="c-wavesdb">403,788</td><td class="c-rocksdb">211,893</td><td class="c-surrealkv">234,823</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb">96,139</td><td class="c-tidesdb best">283,533</td><td class="c-fjall">70,670</td><td class="c-badger">225,619</td><td class="c-wavesdb">153,130</td><td class="c-rocksdb">103,133</td><td class="c-surrealkv">85,202</td></tr></tbody></table></div></section><section class="card"><h2>Get (cold, multi-threaded)</h2><p class="unit">ops/sec — higher is better; whiskers span min–max across runs; the group leader is value-labeled</p><div class="chart" id="ph-Get"><svg viewBox="0 0 980 320" role="img"><line x1="74" y1="268.0" x2="964" y2="268.0" class="grid"/><text x="66" y="272.0" class="ylab" text-anchor="end">0</text><line x1="74" y1="204.5" x2="964" y2="204.5" class="grid"/><text x="66" y="208.5" class="ylab" text-anchor="end">1M</text><line x1="74" y1="141.0" x2="964" y2="141.0" class="grid"/><text x="66" y="145.0" class="ylab" text-anchor="end">2M</text><line x1="74" y1="77.5" x2="964" y2="77.5" class="grid"/><text x="66" y="81.5" class="ylab" text-anchor="end">3M</text><line x1="74" y1="14.0" x2="964" y2="14.0" class="grid"/><text x="66" y="18.0" class="ylab" text-anchor="end">4M</text><line x1="74" y1="268.0" x2="964" y2="268.0" class="axis"/><path d="M86.7,268.0 L86.7,217.6 Q86.7,213.6 90.7,213.6 L95.5,213.6 Q99.5,213.6 99.5,217.6 L99.5,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="857,096 ops/sec
+ondaDB (Rust)
+runs: 769k, 946k (min 769k – max 946k)
+16 B / 100 B — 0.34× of group best"/><line x1="93.1" y1="208.0" x2="93.1" y2="219.2" class="whisk"/><line x1="90.1" y1="208.0" x2="96.1" y2="208.0" class="whisk"/><line x1="90.1" y1="219.2" x2="96.1" y2="219.2" class="whisk"/><path d="M101.5,268.0 L101.5,209.9 Q101.5,205.9 105.5,205.9 L110.3,205.9 Q114.3,205.9 114.3,209.9 L114.3,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="978,143 ops/sec
+TidesDB (C)
+runs: 706k, 1.25M (min 706k – max 1.25M)
+16 B / 100 B — 0.39× of group best"/><line x1="107.9" y1="188.6" x2="107.9" y2="223.2" class="whisk"/><line x1="104.9" y1="188.6" x2="110.9" y2="188.6" class="whisk"/><line x1="104.9" y1="223.2" x2="110.9" y2="223.2" class="whisk"/><path d="M116.3,268.0 L116.3,253.1 Q116.3,249.1 120.3,249.1 L125.2,249.1 Q129.2,249.1 129.2,253.1 L129.2,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="298,042 ops/sec
+fjall (Rust)
+runs: 591k, 5k (min 5k – max 591k)
+16 B / 100 B — 0.12× of group best"/><line x1="122.8" y1="230.5" x2="122.8" y2="267.7" class="whisk"/><line x1="119.8" y1="230.5" x2="125.8" y2="230.5" class="whisk"/><line x1="119.8" y1="267.7" x2="125.8" y2="267.7" class="whisk"/><path d="M131.2,268.0 L131.2,212.4 Q131.2,208.4 135.2,208.4 L140.0,208.4 Q144.0,208.4 144.0,212.4 L144.0,268.0 Z" class="bar s-badger" tabindex="0" data-tip="938,386 ops/sec
+BadgerDB (Go)
+runs: 958k, 919k (min 919k – max 958k)
+16 B / 100 B — 0.38× of group best"/><line x1="137.6" y1="207.2" x2="137.6" y2="209.7" class="whisk"/><line x1="134.6" y1="207.2" x2="140.6" y2="207.2" class="whisk"/><line x1="134.6" y1="209.7" x2="140.6" y2="209.7" class="whisk"/><path d="M146.0,268.0 L146.0,113.5 Q146.0,109.5 150.0,109.5 L154.8,109.5 Q158.8,109.5 158.8,113.5 L158.8,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="2,495,488 ops/sec
+wavesdb (Go)
+runs: 2.44M, 2.55M (min 2.44M – max 2.55M)
+16 B / 100 B — 1.00× of group best"/><line x1="152.4" y1="106.0" x2="152.4" y2="113.1" class="whisk"/><line x1="149.4" y1="106.0" x2="155.4" y2="106.0" class="whisk"/><line x1="149.4" y1="113.1" x2="155.4" y2="113.1" class="whisk"/><text x="152.4" y="101.0" class="vlab" text-anchor="middle">2.50M</text><path d="M160.8,268.0 L160.8,161.9 Q160.8,157.9 164.8,157.9 L169.6,157.9 Q173.6,157.9 173.6,161.9 L173.6,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,733,918 ops/sec
+RocksDB (C++)
+runs: 1.66M, 1.81M (min 1.66M – max 1.81M)
+16 B / 100 B — 0.69× of group best"/><line x1="167.2" y1="153.0" x2="167.2" y2="162.8" class="whisk"/><line x1="164.2" y1="153.0" x2="170.2" y2="153.0" class="whisk"/><line x1="164.2" y1="162.8" x2="170.2" y2="162.8" class="whisk"/><path d="M175.6,268.0 L175.6,268.0 Q175.6,266.9 176.7,266.9 L187.3,266.9 Q188.4,266.9 188.4,268.0 L188.4,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="17,555 ops/sec
+surrealkv (Rust)
+runs: 18k, 17k (min 17k – max 18k)
+16 B / 100 B — 0.01× of group best"/><line x1="182.0" y1="266.9" x2="182.0" y2="266.9" class="whisk"/><line x1="179.0" y1="266.9" x2="185.0" y2="266.9" class="whisk"/><line x1="179.0" y1="266.9" x2="185.0" y2="266.9" class="whisk"/><text x="137.6" y="286" class="xlab" text-anchor="middle">16 B / 100 B</text><text x="137.6" y="302" class="xsub" text-anchor="middle">1M ops</text><path d="M213.9,268.0 L213.9,107.4 Q213.9,103.4 217.9,103.4 L222.7,103.4 Q226.7,103.4 226.7,107.4 L226.7,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="2,591,897 ops/sec
+ondaDB (Rust)
+runs: 2.65M, 2.54M (min 2.54M – max 2.65M)
+64 B / 512 B — 1.00× of group best"/><line x1="220.3" y1="99.9" x2="220.3" y2="106.9" class="whisk"/><line x1="217.3" y1="99.9" x2="223.3" y2="99.9" class="whisk"/><line x1="217.3" y1="106.9" x2="223.3" y2="106.9" class="whisk"/><text x="220.3" y="94.9" class="vlab" text-anchor="middle">2.59M</text><path d="M228.7,268.0 L228.7,134.0 Q228.7,130.0 232.7,130.0 L237.5,130.0 Q241.5,130.0 241.5,134.0 L241.5,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="2,172,577 ops/sec
+TidesDB (C)
+runs: 2.11M, 2.24M (min 2.11M – max 2.24M)
+64 B / 512 B — 0.84× of group best"/><line x1="235.1" y1="125.8" x2="235.1" y2="134.2" class="whisk"/><line x1="232.1" y1="125.8" x2="238.1" y2="125.8" class="whisk"/><line x1="232.1" y1="134.2" x2="238.1" y2="134.2" class="whisk"/><path d="M243.5,268.0 L243.5,261.1 Q243.5,257.1 247.5,257.1 L252.3,257.1 Q256.3,257.1 256.3,261.1 L256.3,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="171,070 ops/sec
+fjall (Rust)
+runs: 160k, 182k (min 160k – max 182k)
+64 B / 512 B — 0.07× of group best"/><line x1="249.9" y1="256.4" x2="249.9" y2="257.8" class="whisk"/><line x1="246.9" y1="256.4" x2="252.9" y2="256.4" class="whisk"/><line x1="246.9" y1="257.8" x2="252.9" y2="257.8" class="whisk"/><path d="M258.3,268.0 L258.3,225.4 Q258.3,221.4 262.3,221.4 L267.1,221.4 Q271.1,221.4 271.1,225.4 L271.1,268.0 Z" class="bar s-badger" tabindex="0" data-tip="734,231 ops/sec
+BadgerDB (Go)
+runs: 712k, 757k (min 712k – max 757k)
+64 B / 512 B — 0.28× of group best"/><line x1="264.7" y1="219.9" x2="264.7" y2="222.8" class="whisk"/><line x1="261.7" y1="219.9" x2="267.7" y2="219.9" class="whisk"/><line x1="261.7" y1="222.8" x2="267.7" y2="222.8" class="whisk"/><path d="M273.1,268.0 L273.1,177.7 Q273.1,173.7 277.1,173.7 L281.9,173.7 Q285.9,173.7 285.9,177.7 L285.9,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="1,485,044 ops/sec
+wavesdb (Go)
+runs: 1.43M, 1.54M (min 1.43M – max 1.54M)
+64 B / 512 B — 0.57× of group best"/><line x1="279.5" y1="170.3" x2="279.5" y2="177.1" class="whisk"/><line x1="276.5" y1="170.3" x2="282.5" y2="170.3" class="whisk"/><line x1="276.5" y1="177.1" x2="282.5" y2="177.1" class="whisk"/><path d="M287.9,268.0 L287.9,202.2 Q287.9,198.2 291.9,198.2 L296.8,198.2 Q300.8,198.2 300.8,202.2 L300.8,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,098,844 ops/sec
+RocksDB (C++)
+runs: 1.13M, 1.06M (min 1.06M – max 1.13M)
+64 B / 512 B — 0.42× of group best"/><line x1="294.3" y1="196.0" x2="294.3" y2="200.4" class="whisk"/><line x1="291.3" y1="196.0" x2="297.3" y2="196.0" class="whisk"/><line x1="291.3" y1="200.4" x2="297.3" y2="200.4" class="whisk"/><path d="M302.8,268.0 L302.8,268.0 Q302.8,266.9 303.9,266.9 L314.5,266.9 Q315.6,266.9 315.6,268.0 L315.6,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="17,489 ops/sec
+surrealkv (Rust)
+runs: 18k, 17k (min 17k – max 18k)
+64 B / 512 B — 0.01× of group best"/><line x1="309.2" y1="266.9" x2="309.2" y2="266.9" class="whisk"/><line x1="306.2" y1="266.9" x2="312.2" y2="266.9" class="whisk"/><line x1="306.2" y1="266.9" x2="312.2" y2="266.9" class="whisk"/><text x="264.7" y="286" class="xlab" text-anchor="middle">64 B / 512 B</text><text x="264.7" y="302" class="xsub" text-anchor="middle">400k ops</text><path d="M341.0,268.0 L341.0,102.5 Q341.0,98.5 345.0,98.5 L349.8,98.5 Q353.8,98.5 353.8,102.5 L353.8,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="2,669,796 ops/sec
+ondaDB (Rust)
+runs: 2.98M, 2.36M (min 2.36M – max 2.98M)
+16 B / 1 KiB — 1.00× of group best"/><line x1="347.4" y1="78.5" x2="347.4" y2="118.4" class="whisk"/><line x1="344.4" y1="78.5" x2="350.4" y2="78.5" class="whisk"/><line x1="344.4" y1="118.4" x2="350.4" y2="118.4" class="whisk"/><text x="347.4" y="73.5" class="vlab" text-anchor="middle">2.67M</text><path d="M355.8,268.0 L355.8,186.8 Q355.8,182.8 359.8,182.8 L364.6,182.8 Q368.6,182.8 368.6,186.8 L368.6,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,342,162 ops/sec
+TidesDB (C)
+runs: 1.35M, 1.33M (min 1.33M – max 1.35M)
+16 B / 1 KiB — 0.50× of group best"/><line x1="362.2" y1="182.2" x2="362.2" y2="183.4" class="whisk"/><line x1="359.2" y1="182.2" x2="365.2" y2="182.2" class="whisk"/><line x1="359.2" y1="183.4" x2="365.2" y2="183.4" class="whisk"/><path d="M370.6,268.0 L370.6,221.5 Q370.6,217.5 374.6,217.5 L379.4,217.5 Q383.4,217.5 383.4,221.5 L383.4,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="794,602 ops/sec
+fjall (Rust)
+runs: 542k, 1.05M (min 542k – max 1.05M)
+16 B / 1 KiB — 0.30× of group best"/><line x1="377.0" y1="201.5" x2="377.0" y2="233.6" class="whisk"/><line x1="374.0" y1="201.5" x2="380.0" y2="201.5" class="whisk"/><line x1="374.0" y1="233.6" x2="380.0" y2="233.6" class="whisk"/><path d="M385.4,268.0 L385.4,230.1 Q385.4,226.1 389.4,226.1 L394.3,226.1 Q398.3,226.1 398.3,230.1 L398.3,268.0 Z" class="bar s-badger" tabindex="0" data-tip="660,622 ops/sec
+BadgerDB (Go)
+runs: 682k, 639k (min 639k – max 682k)
+16 B / 1 KiB — 0.25× of group best"/><line x1="391.9" y1="224.7" x2="391.9" y2="227.4" class="whisk"/><line x1="388.9" y1="224.7" x2="394.9" y2="224.7" class="whisk"/><line x1="388.9" y1="227.4" x2="394.9" y2="227.4" class="whisk"/><path d="M400.3,268.0 L400.3,184.2 Q400.3,180.2 404.3,180.2 L409.1,180.2 Q413.1,180.2 413.1,184.2 L413.1,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="1,383,420 ops/sec
+wavesdb (Go)
+runs: 1.38M, 1.39M (min 1.38M – max 1.39M)
+16 B / 1 KiB — 0.52× of group best"/><line x1="406.7" y1="179.7" x2="406.7" y2="180.6" class="whisk"/><line x1="403.7" y1="179.7" x2="409.7" y2="179.7" class="whisk"/><line x1="403.7" y1="180.6" x2="409.7" y2="180.6" class="whisk"/><path d="M415.1,268.0 L415.1,214.6 Q415.1,210.6 419.1,210.6 L423.9,210.6 Q427.9,210.6 427.9,214.6 L427.9,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="903,802 ops/sec
+RocksDB (C++)
+runs: 891k, 917k (min 891k – max 917k)
+16 B / 1 KiB — 0.34× of group best"/><line x1="421.5" y1="209.8" x2="421.5" y2="211.4" class="whisk"/><line x1="418.5" y1="209.8" x2="424.5" y2="209.8" class="whisk"/><line x1="418.5" y1="211.4" x2="424.5" y2="211.4" class="whisk"/><path d="M429.9,268.0 L429.9,268.0 Q429.9,267.0 430.9,267.0 L441.7,267.0 Q442.7,267.0 442.7,268.0 L442.7,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="15,864 ops/sec
+surrealkv (Rust)
+runs: 16k, 16k (min 16k – max 16k)
+16 B / 1 KiB — 0.01× of group best"/><line x1="436.3" y1="267.0" x2="436.3" y2="267.0" class="whisk"/><line x1="433.3" y1="267.0" x2="439.3" y2="267.0" class="whisk"/><line x1="433.3" y1="267.0" x2="439.3" y2="267.0" class="whisk"/><text x="391.9" y="286" class="xlab" text-anchor="middle">16 B / 1 KiB</text><text x="391.9" y="302" class="xsub" text-anchor="middle">250k ops</text><path d="M468.1,268.0 L468.1,209.5 Q468.1,205.5 472.1,205.5 L477.0,205.5 Q481.0,205.5 481.0,209.5 L481.0,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="984,622 ops/sec
+ondaDB (Rust)
+runs: 980k, 990k (min 980k – max 990k)
+16 B / 4 KiB — 0.45× of group best"/><line x1="474.6" y1="205.2" x2="474.6" y2="205.8" class="whisk"/><line x1="471.6" y1="205.2" x2="477.6" y2="205.2" class="whisk"/><line x1="471.6" y1="205.8" x2="477.6" y2="205.8" class="whisk"/><path d="M483.0,268.0 L483.0,233.4 Q483.0,229.4 487.0,229.4 L491.8,229.4 Q495.8,229.4 495.8,233.4 L495.8,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="608,289 ops/sec
+TidesDB (C)
+runs: 586k, 631k (min 586k – max 631k)
+16 B / 4 KiB — 0.28× of group best"/><line x1="489.4" y1="228.0" x2="489.4" y2="230.8" class="whisk"/><line x1="486.4" y1="228.0" x2="492.4" y2="228.0" class="whisk"/><line x1="486.4" y1="230.8" x2="492.4" y2="230.8" class="whisk"/><path d="M497.8,268.0 L497.8,131.8 Q497.8,127.8 501.8,127.8 L506.6,127.8 Q510.6,127.8 510.6,131.8 L510.6,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="2,208,288 ops/sec
+fjall (Rust)
+runs: 3.14M, 1.28M (min 1.28M – max 3.14M)
+16 B / 4 KiB — 1.00× of group best"/><line x1="504.2" y1="68.8" x2="504.2" y2="186.8" class="whisk"/><line x1="501.2" y1="68.8" x2="507.2" y2="68.8" class="whisk"/><line x1="501.2" y1="186.8" x2="507.2" y2="186.8" class="whisk"/><text x="504.2" y="63.8" class="vlab" text-anchor="middle">2.21M</text><path d="M512.6,268.0 L512.6,254.2 Q512.6,250.2 516.6,250.2 L521.4,250.2 Q525.4,250.2 525.4,254.2 L525.4,268.0 Z" class="bar s-badger" tabindex="0" data-tip="280,556 ops/sec
+BadgerDB (Go)
+runs: 317k, 244k (min 244k – max 317k)
+16 B / 4 KiB — 0.13× of group best"/><line x1="519.0" y1="247.9" x2="519.0" y2="252.5" class="whisk"/><line x1="516.0" y1="247.9" x2="522.0" y2="247.9" class="whisk"/><line x1="516.0" y1="252.5" x2="522.0" y2="252.5" class="whisk"/><path d="M527.4,268.0 L527.4,233.4 Q527.4,229.4 531.4,229.4 L536.2,229.4 Q540.2,229.4 540.2,233.4 L540.2,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="608,157 ops/sec
+wavesdb (Go)
+runs: 631k, 585k (min 585k – max 631k)
+16 B / 4 KiB — 0.28× of group best"/><line x1="533.8" y1="227.9" x2="533.8" y2="230.9" class="whisk"/><line x1="530.8" y1="227.9" x2="536.8" y2="227.9" class="whisk"/><line x1="530.8" y1="230.9" x2="536.8" y2="230.9" class="whisk"/><path d="M542.2,268.0 L542.2,254.0 Q542.2,250.0 546.2,250.0 L551.0,250.0 Q555.0,250.0 555.0,254.0 L555.0,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="282,953 ops/sec
+RocksDB (C++)
+runs: 266k, 300k (min 266k – max 300k)
+16 B / 4 KiB — 0.13× of group best"/><line x1="548.6" y1="249.0" x2="548.6" y2="251.1" class="whisk"/><line x1="545.6" y1="249.0" x2="551.6" y2="249.0" class="whisk"/><line x1="545.6" y1="251.1" x2="551.6" y2="251.1" class="whisk"/><path d="M557.0,268.0 L557.0,268.0 Q557.0,267.1 558.0,267.1 L568.9,267.1 Q569.9,267.1 569.9,268.0 L569.9,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="14,957 ops/sec
+surrealkv (Rust)
+runs: 15k, 15k (min 15k – max 15k)
+16 B / 4 KiB — 0.01× of group best"/><line x1="563.4" y1="267.0" x2="563.4" y2="267.1" class="whisk"/><line x1="560.4" y1="267.0" x2="566.4" y2="267.0" class="whisk"/><line x1="560.4" y1="267.1" x2="566.4" y2="267.1" class="whisk"/><text x="519.0" y="286" class="xlab" text-anchor="middle">16 B / 4 KiB</text><text x="519.0" y="302" class="xsub" text-anchor="middle">30k ops</text><path d="M595.3,268.0 L595.3,244.2 Q595.3,240.2 599.3,240.2 L604.1,240.2 Q608.1,240.2 608.1,244.2 L608.1,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="438,335 ops/sec
+ondaDB (Rust)
+runs: 414k, 463k (min 414k – max 463k)
+16 B / 16 KiB — 0.23× of group best"/><line x1="601.7" y1="238.6" x2="601.7" y2="241.7" class="whisk"/><line x1="598.7" y1="238.6" x2="604.7" y2="238.6" class="whisk"/><line x1="598.7" y1="241.7" x2="604.7" y2="241.7" class="whisk"/><path d="M610.1,268.0 L610.1,254.4 Q610.1,250.4 614.1,250.4 L618.9,250.4 Q622.9,250.4 622.9,254.4 L622.9,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="277,946 ops/sec
+TidesDB (C)
+runs: 317k, 239k (min 239k – max 317k)
+16 B / 16 KiB — 0.14× of group best"/><line x1="616.5" y1="247.9" x2="616.5" y2="252.8" class="whisk"/><line x1="613.5" y1="247.9" x2="619.5" y2="247.9" class="whisk"/><line x1="613.5" y1="252.8" x2="619.5" y2="252.8" class="whisk"/><path d="M624.9,268.0 L624.9,148.6 Q624.9,144.6 628.9,144.6 L633.7,144.6 Q637.7,144.6 637.7,148.6 L637.7,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,942,690 ops/sec
+fjall (Rust)
+runs: 1.98M, 1.91M (min 1.91M – max 1.98M)
+16 B / 16 KiB — 1.00× of group best"/><line x1="631.3" y1="142.3" x2="631.3" y2="146.9" class="whisk"/><line x1="628.3" y1="142.3" x2="634.3" y2="142.3" class="whisk"/><line x1="628.3" y1="146.9" x2="634.3" y2="146.9" class="whisk"/><text x="631.3" y="137.3" class="vlab" text-anchor="middle">1.94M</text><path d="M639.7,268.0 L639.7,267.3 Q639.7,263.3 643.7,263.3 L648.6,263.3 Q652.6,263.3 652.6,267.3 L652.6,268.0 Z" class="bar s-badger" tabindex="0" data-tip="73,527 ops/sec
+BadgerDB (Go)
+runs: 78k, 69k (min 69k – max 78k)
+16 B / 16 KiB — 0.04× of group best"/><line x1="646.1" y1="263.0" x2="646.1" y2="263.6" class="whisk"/><line x1="643.1" y1="263.0" x2="649.1" y2="263.0" class="whisk"/><line x1="643.1" y1="263.6" x2="649.1" y2="263.6" class="whisk"/><path d="M654.6,268.0 L654.6,260.6 Q654.6,256.6 658.6,256.6 L663.4,256.6 Q667.4,256.6 667.4,260.6 L667.4,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="179,684 ops/sec
+wavesdb (Go)
+runs: 151k, 208k (min 151k – max 208k)
+16 B / 16 KiB — 0.09× of group best"/><line x1="661.0" y1="254.8" x2="661.0" y2="258.4" class="whisk"/><line x1="658.0" y1="254.8" x2="664.0" y2="254.8" class="whisk"/><line x1="658.0" y1="258.4" x2="664.0" y2="258.4" class="whisk"/><path d="M669.4,268.0 L669.4,266.4 Q669.4,262.4 673.4,262.4 L678.2,262.4 Q682.2,262.4 682.2,266.4 L682.2,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="87,842 ops/sec
+RocksDB (C++)
+runs: 98k, 78k (min 78k – max 98k)
+16 B / 16 KiB — 0.05× of group best"/><line x1="675.8" y1="261.8" x2="675.8" y2="263.0" class="whisk"/><line x1="672.8" y1="261.8" x2="678.8" y2="261.8" class="whisk"/><line x1="672.8" y1="263.0" x2="678.8" y2="263.0" class="whisk"/><path d="M684.2,268.0 L684.2,268.0 Q684.2,267.1 685.1,267.1 L696.1,267.1 Q697.0,267.1 697.0,268.0 L697.0,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="13,956 ops/sec
+surrealkv (Rust)
+runs: 14k, 13k (min 13k – max 14k)
+16 B / 16 KiB — 0.01× of group best"/><line x1="690.6" y1="267.1" x2="690.6" y2="267.1" class="whisk"/><line x1="687.6" y1="267.1" x2="693.6" y2="267.1" class="whisk"/><line x1="687.6" y1="267.1" x2="693.6" y2="267.1" class="whisk"/><text x="646.1" y="286" class="xlab" text-anchor="middle">16 B / 16 KiB</text><text x="646.1" y="302" class="xsub" text-anchor="middle">8k ops</text><path d="M722.4,268.0 L722.4,159.4 Q722.4,155.4 726.4,155.4 L731.2,155.4 Q735.2,155.4 735.2,159.4 L735.2,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="1,773,444 ops/sec
+ondaDB (Rust)
+runs: 1.71M, 1.83M (min 1.71M – max 1.83M)
+1 KiB / 256 B — 1.00× of group best"/><line x1="728.8" y1="151.6" x2="728.8" y2="159.2" class="whisk"/><line x1="725.8" y1="151.6" x2="731.8" y2="151.6" class="whisk"/><line x1="725.8" y1="159.2" x2="731.8" y2="159.2" class="whisk"/><text x="728.8" y="146.6" class="vlab" text-anchor="middle">1.77M</text><path d="M737.2,268.0 L737.2,186.7 Q737.2,182.7 741.2,182.7 L746.1,182.7 Q750.1,182.7 750.1,186.7 L750.1,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,342,767 ops/sec
+TidesDB (C)
+runs: 1.39M, 1.29M (min 1.29M – max 1.39M)
+1 KiB / 256 B — 0.76× of group best"/><line x1="743.7" y1="179.4" x2="743.7" y2="186.0" class="whisk"/><line x1="740.7" y1="179.4" x2="746.7" y2="179.4" class="whisk"/><line x1="740.7" y1="186.0" x2="746.7" y2="186.0" class="whisk"/><path d="M752.1,268.0 L752.1,268.0 Q752.1,267.9 752.2,267.9 L764.8,267.9 Q764.9,267.9 764.9,268.0 L764.9,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,508 ops/sec
+fjall (Rust)
+runs: 2k, 1k (min 1k – max 2k)
+1 KiB / 256 B — 0.00× of group best"/><line x1="758.5" y1="267.9" x2="758.5" y2="267.9" class="whisk"/><line x1="755.5" y1="267.9" x2="761.5" y2="267.9" class="whisk"/><line x1="755.5" y1="267.9" x2="761.5" y2="267.9" class="whisk"/><path d="M766.9,268.0 L766.9,240.2 Q766.9,236.2 770.9,236.2 L775.7,236.2 Q779.7,236.2 779.7,240.2 L779.7,268.0 Z" class="bar s-badger" tabindex="0" data-tip="501,300 ops/sec
+BadgerDB (Go)
+runs: 501k, 501k (min 501k – max 501k)
+1 KiB / 256 B — 0.28× of group best"/><line x1="773.3" y1="236.2" x2="773.3" y2="236.2" class="whisk"/><line x1="770.3" y1="236.2" x2="776.3" y2="236.2" class="whisk"/><line x1="770.3" y1="236.2" x2="776.3" y2="236.2" class="whisk"/><path d="M781.7,268.0 L781.7,233.2 Q781.7,229.2 785.7,229.2 L790.5,229.2 Q794.5,229.2 794.5,233.2 L794.5,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="610,567 ops/sec
+wavesdb (Go)
+runs: 600k, 621k (min 600k – max 621k)
+1 KiB / 256 B — 0.34× of group best"/><line x1="788.1" y1="228.6" x2="788.1" y2="229.9" class="whisk"/><line x1="785.1" y1="228.6" x2="791.1" y2="228.6" class="whisk"/><line x1="785.1" y1="229.9" x2="791.1" y2="229.9" class="whisk"/><path d="M796.5,268.0 L796.5,225.1 Q796.5,221.1 800.5,221.1 L805.3,221.1 Q809.3,221.1 809.3,225.1 L809.3,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="738,103 ops/sec
+RocksDB (C++)
+runs: 697k, 779k (min 697k – max 779k)
+1 KiB / 256 B — 0.42× of group best"/><line x1="802.9" y1="218.5" x2="802.9" y2="223.8" class="whisk"/><line x1="799.9" y1="218.5" x2="805.9" y2="218.5" class="whisk"/><line x1="799.9" y1="223.8" x2="805.9" y2="223.8" class="whisk"/><path d="M811.3,268.0 L811.3,268.0 Q811.3,267.0 812.3,267.0 L823.2,267.0 Q824.1,267.0 824.1,268.0 L824.1,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="15,040 ops/sec
+surrealkv (Rust)
+runs: 15k, 15k (min 15k – max 15k)
+1 KiB / 256 B — 0.01× of group best"/><line x1="817.7" y1="267.0" x2="817.7" y2="267.1" class="whisk"/><line x1="814.7" y1="267.0" x2="820.7" y2="267.0" class="whisk"/><line x1="814.7" y1="267.1" x2="820.7" y2="267.1" class="whisk"/><text x="773.3" y="286" class="xlab" text-anchor="middle">1 KiB / 256 B</text><text x="773.3" y="302" class="xsub" text-anchor="middle">150k ops</text><path d="M849.6,268.0 L849.6,197.3 Q849.6,193.3 853.6,193.3 L858.4,193.3 Q862.4,193.3 862.4,197.3 L862.4,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="1,175,832 ops/sec
+ondaDB (Rust)
+runs: 1.10M, 1.25M (min 1.10M – max 1.25M)
+2 KiB / 256 B — 1.00× of group best"/><line x1="856.0" y1="188.7" x2="856.0" y2="198.0" class="whisk"/><line x1="853.0" y1="188.7" x2="859.0" y2="188.7" class="whisk"/><line x1="853.0" y1="198.0" x2="859.0" y2="198.0" class="whisk"/><text x="856.0" y="183.7" class="vlab" text-anchor="middle">1.18M</text><path d="M864.4,268.0 L864.4,223.1 Q864.4,219.1 868.4,219.1 L873.2,219.1 Q877.2,219.1 877.2,223.1 L877.2,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="769,868 ops/sec
+TidesDB (C)
+runs: 777k, 763k (min 763k – max 777k)
+2 KiB / 256 B — 0.65× of group best"/><line x1="870.8" y1="218.7" x2="870.8" y2="219.5" class="whisk"/><line x1="867.8" y1="218.7" x2="873.8" y2="218.7" class="whisk"/><line x1="867.8" y1="219.5" x2="873.8" y2="219.5" class="whisk"/><path d="M879.2,268.0 L879.2,268.0 Q879.2,267.1 880.1,267.1 L891.1,267.1 Q892.0,267.1 892.0,268.0 L892.0,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="14,624 ops/sec
+fjall (Rust)
+runs: 28k, 812 (min 812 – max 28k)
+2 KiB / 256 B — 0.01× of group best"/><line x1="885.6" y1="266.2" x2="885.6" y2="267.9" class="whisk"/><line x1="882.6" y1="266.2" x2="888.6" y2="266.2" class="whisk"/><line x1="882.6" y1="267.9" x2="888.6" y2="267.9" class="whisk"/><path d="M894.0,268.0 L894.0,250.1 Q894.0,246.1 898.0,246.1 L902.8,246.1 Q906.8,246.1 906.8,250.1 L906.8,268.0 Z" class="bar s-badger" tabindex="0" data-tip="345,599 ops/sec
+BadgerDB (Go)
+runs: 339k, 352k (min 339k – max 352k)
+2 KiB / 256 B — 0.29× of group best"/><line x1="900.4" y1="245.6" x2="900.4" y2="246.5" class="whisk"/><line x1="897.4" y1="245.6" x2="903.4" y2="245.6" class="whisk"/><line x1="897.4" y1="246.5" x2="903.4" y2="246.5" class="whisk"/><path d="M908.8,268.0 L908.8,251.8 Q908.8,247.8 912.8,247.8 L917.7,247.8 Q921.7,247.8 921.7,251.8 L921.7,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="317,882 ops/sec
+wavesdb (Go)
+runs: 320k, 316k (min 316k – max 320k)
+2 KiB / 256 B — 0.27× of group best"/><line x1="915.2" y1="247.7" x2="915.2" y2="247.9" class="whisk"/><line x1="912.2" y1="247.7" x2="918.2" y2="247.7" class="whisk"/><line x1="912.2" y1="247.9" x2="918.2" y2="247.9" class="whisk"/><path d="M923.7,268.0 L923.7,240.9 Q923.7,236.9 927.7,236.9 L932.5,236.9 Q936.5,236.9 936.5,240.9 L936.5,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="489,226 ops/sec
+RocksDB (C++)
+runs: 496k, 482k (min 482k – max 496k)
+2 KiB / 256 B — 0.42× of group best"/><line x1="930.1" y1="236.5" x2="930.1" y2="237.4" class="whisk"/><line x1="927.1" y1="236.5" x2="933.1" y2="236.5" class="whisk"/><line x1="927.1" y1="237.4" x2="933.1" y2="237.4" class="whisk"/><path d="M938.5,268.0 L938.5,268.0 Q938.5,267.2 939.3,267.2 L950.5,267.2 Q951.3,267.2 951.3,268.0 L951.3,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="13,081 ops/sec
+surrealkv (Rust)
+runs: 14k, 12k (min 12k – max 14k)
+2 KiB / 256 B — 0.01× of group best"/><line x1="944.9" y1="267.1" x2="944.9" y2="267.2" class="whisk"/><line x1="941.9" y1="267.1" x2="947.9" y2="267.1" class="whisk"/><line x1="941.9" y1="267.2" x2="947.9" y2="267.2" class="whisk"/><text x="900.4" y="286" class="xlab" text-anchor="middle">2 KiB / 256 B</text><text x="900.4" y="302" class="xsub" text-anchor="middle">100k ops</text></svg><script type="application/json">{"type":"vbar","unit":"ops/sec","vfmt":"ops","groups":[{"label":"16 B / 100 B","sub":"1M ops"},{"label":"64 B / 512 B","sub":"400k ops"},{"label":"16 B / 1 KiB","sub":"250k ops"},{"label":"16 B / 4 KiB","sub":"30k ops"},{"label":"16 B / 16 KiB","sub":"8k ops"},{"label":"1 KiB / 256 B","sub":"150k ops"},{"label":"2 KiB / 256 B","sub":"100k ops"}],"series":[{"eng":"ondadb","label":"ondaDB (Rust)","values":[{"mean":857095.5,"lo":768667.0,"hi":945524.0,"runs":[768667.0,945524.0]},{"mean":2591897.0,"lo":2536513.0,"hi":2647281.0,"runs":[2647281.0,2536513.0]},{"mean":2669796.5,"lo":2356119.0,"hi":2983474.0,"runs":[2983474.0,2356119.0]},{"mean":984622.5,"lo":979553.0,"hi":989692.0,"runs":[979553.0,989692.0]},{"mean":438335.0,"lo":413695.0,"hi":462975.0,"runs":[413695.0,462975.0]},{"mean":1773444.0,"lo":1713742.0,"hi":1833146.0,"runs":[1713742.0,1833146.0]},{"mean":1175831.5,"lo":1102297.0,"hi":1249366.0,"runs":[1102297.0,1249366.0]}]},{"eng":"tidesdb","label":"TidesDB (C)","values":[{"mean":978142.9949999999,"lo":705936.08,"hi":1250349.91,"runs":[705936.08,1250349.91]},{"mean":2172577.045,"lo":2106437.85,"hi":2238716.24,"runs":[2106437.85,2238716.24]},{"mean":1342161.6400000001,"lo":1332986.2,"hi":1351337.08,"runs":[1351337.08,1332986.2]},{"mean":608289.025,"lo":586075.0,"hi":630503.05,"runs":[586075.0,630503.05]},{"mean":277945.94,"lo":238906.95,"hi":316984.93,"runs":[316984.93,238906.95]},{"mean":1342766.52,"lo":1290975.99,"hi":1394557.05,"runs":[1394557.05,1290975.99]},{"mean":769868.2050000001,"lo":763078.62,"hi":776657.79,"runs":[776657.79,763078.62]}]},{"eng":"fjall","label":"fjall (Rust)","values":[{"mean":298042.0,"lo":4935.0,"hi":591149.0,"runs":[591149.0,4935.0]},{"mean":171069.5,"lo":159873.0,"hi":182266.0,"runs":[159873.0,182266.0]},{"mean":794601.5,"lo":541899.0,"hi":1047304.0,"runs":[541899.0,1047304.0]},{"mean":2208288.5,"lo":1279109.0,"hi":3137468.0,"runs":[3137468.0,1279109.0]},{"mean":1942690.0,"lo":1906528.0,"hi":1978852.0,"runs":[1978852.0,1906528.0]},{"mean":1508.5,"lo":1485.0,"hi":1532.0,"runs":[1532.0,1485.0]},{"mean":14624.5,"lo":812.0,"hi":28437.0,"runs":[28437.0,812.0]}]},{"eng":"badger","label":"BadgerDB (Go)","values":[{"mean":938386.0,"lo":918870.0,"hi":957902.0,"runs":[957902.0,918870.0]},{"mean":734231.0,"lo":711633.0,"hi":756829.0,"runs":[711633.0,756829.0]},{"mean":660622.5,"lo":638820.0,"hi":682425.0,"runs":[682425.0,638820.0]},{"mean":280556.0,"lo":244210.0,"hi":316902.0,"runs":[316902.0,244210.0]},{"mean":73527.0,"lo":68678.0,"hi":78376.0,"runs":[78376.0,68678.0]},{"mean":501300.0,"lo":501262.0,"hi":501338.0,"runs":[501338.0,501262.0]},{"mean":345599.0,"lo":339033.0,"hi":352165.0,"runs":[339033.0,352165.0]}]},{"eng":"wavesdb","label":"wavesdb (Go)","values":[{"mean":2495488.5,"lo":2439722.0,"hi":2551255.0,"runs":[2439722.0,2551255.0]},{"mean":1485043.5,"lo":1432038.0,"hi":1538049.0,"runs":[1432038.0,1538049.0]},{"mean":1383419.5,"lo":1376914.0,"hi":1389925.0,"runs":[1376914.0,1389925.0]},{"mean":608157.0,"lo":584879.0,"hi":631435.0,"runs":[631435.0,584879.0]},{"mean":179684.5,"lo":151442.0,"hi":207927.0,"runs":[151442.0,207927.0]},{"mean":610567.0,"lo":600443.0,"hi":620691.0,"runs":[600443.0,620691.0]},{"mean":317882.0,"lo":316104.0,"hi":319660.0,"runs":[319660.0,316104.0]}]},{"eng":"rocksdb","label":"RocksDB (C++)","values":[{"mean":1733918.0,"lo":1657346.0,"hi":1810490.0,"runs":[1657346.0,1810490.0]},{"mean":1098844.0,"lo":1063787.0,"hi":1133901.0,"runs":[1133901.0,1063787.0]},{"mean":903802.5,"lo":890961.0,"hi":916644.0,"runs":[890961.0,916644.0]},{"mean":282953.0,"lo":266328.0,"hi":299578.0,"runs":[266328.0,299578.0]},{"mean":87842.0,"lo":78009.0,"hi":97675.0,"runs":[97675.0,78009.0]},{"mean":738103.0,"lo":696799.0,"hi":779407.0,"runs":[696799.0,779407.0]},{"mean":489226.5,"lo":482448.0,"hi":496005.0,"runs":[496005.0,482448.0]}]},{"eng":"surrealkv","label":"surrealkv (Rust)","values":[{"mean":17555.0,"lo":17437.0,"hi":17673.0,"runs":[17673.0,17437.0]},{"mean":17489.0,"lo":17346.0,"hi":17632.0,"runs":[17632.0,17346.0]},{"mean":15863.5,"lo":15689.0,"hi":16038.0,"runs":[16038.0,15689.0]},{"mean":14957.0,"lo":14774.0,"hi":15140.0,"runs":[14774.0,15140.0]},{"mean":13956.0,"lo":13477.0,"hi":14435.0,"runs":[14435.0,13477.0]},{"mean":15039.5,"lo":14614.0,"hi":15465.0,"runs":[14614.0,15465.0]},{"mean":13081.0,"lo":12120.0,"hi":14042.0,"runs":[14042.0,12120.0]}]}]}</script></div><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb">857,096</td><td class="c-tidesdb">978,143</td><td class="c-fjall">298,042</td><td class="c-badger">938,386</td><td class="c-wavesdb best">2,495,488</td><td class="c-rocksdb">1,733,918</td><td class="c-surrealkv">17,555</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb best">2,591,897</td><td class="c-tidesdb">2,172,577</td><td class="c-fjall">171,070</td><td class="c-badger">734,231</td><td class="c-wavesdb">1,485,044</td><td class="c-rocksdb">1,098,844</td><td class="c-surrealkv">17,489</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb best">2,669,796</td><td class="c-tidesdb">1,342,162</td><td class="c-fjall">794,602</td><td class="c-badger">660,622</td><td class="c-wavesdb">1,383,420</td><td class="c-rocksdb">903,802</td><td class="c-surrealkv">15,864</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb">984,622</td><td class="c-tidesdb">608,289</td><td class="c-fjall best">2,208,288</td><td class="c-badger">280,556</td><td class="c-wavesdb">608,157</td><td class="c-rocksdb">282,953</td><td class="c-surrealkv">14,957</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb">438,335</td><td class="c-tidesdb">277,946</td><td class="c-fjall best">1,942,690</td><td class="c-badger">73,527</td><td class="c-wavesdb">179,684</td><td class="c-rocksdb">87,842</td><td class="c-surrealkv">13,956</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb best">1,773,444</td><td class="c-tidesdb">1,342,767</td><td class="c-fjall">1,508</td><td class="c-badger">501,300</td><td class="c-wavesdb">610,567</td><td class="c-rocksdb">738,103</td><td class="c-surrealkv">15,040</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb best">1,175,832</td><td class="c-tidesdb">769,868</td><td class="c-fjall">14,624</td><td class="c-badger">345,599</td><td class="c-wavesdb">317,882</td><td class="c-rocksdb">489,226</td><td class="c-surrealkv">13,081</td></tr></tbody></table></div></section><section class="card"><h2>Delete (batched, multi-threaded)</h2><p class="unit">ops/sec — higher is better; whiskers span min–max across runs; the group leader is value-labeled</p><div class="chart" id="ph-Delete"><svg viewBox="0 0 980 320" role="img"><line x1="74" y1="268.0" x2="964" y2="268.0" class="grid"/><text x="66" y="272.0" class="ylab" text-anchor="end">0</text><line x1="74" y1="204.5" x2="964" y2="204.5" class="grid"/><text x="66" y="208.5" class="ylab" text-anchor="end">2M</text><line x1="74" y1="141.0" x2="964" y2="141.0" class="grid"/><text x="66" y="145.0" class="ylab" text-anchor="end">4M</text><line x1="74" y1="77.5" x2="964" y2="77.5" class="grid"/><text x="66" y="81.5" class="ylab" text-anchor="end">6M</text><line x1="74" y1="14.0" x2="964" y2="14.0" class="grid"/><text x="66" y="18.0" class="ylab" text-anchor="end">8M</text><line x1="74" y1="268.0" x2="964" y2="268.0" class="axis"/><path d="M86.7,268.0 L86.7,242.7 Q86.7,238.7 90.7,238.7 L95.5,238.7 Q99.5,238.7 99.5,242.7 L99.5,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="922,602 ops/sec
+ondaDB (Rust)
+runs: 747k, 1.10M (min 747k – max 1.10M)
+16 B / 100 B — 0.36× of group best"/><line x1="93.1" y1="233.1" x2="93.1" y2="244.3" class="whisk"/><line x1="90.1" y1="233.1" x2="96.1" y2="233.1" class="whisk"/><line x1="90.1" y1="244.3" x2="96.1" y2="244.3" class="whisk"/><path d="M101.5,268.0 L101.5,265.0 Q101.5,261.0 105.5,261.0 L110.3,261.0 Q114.3,261.0 114.3,265.0 L114.3,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="221,376 ops/sec
+TidesDB (C)
+runs: 208k, 235k (min 208k – max 235k)
+16 B / 100 B — 0.09× of group best"/><line x1="107.9" y1="260.5" x2="107.9" y2="261.4" class="whisk"/><line x1="104.9" y1="260.5" x2="110.9" y2="260.5" class="whisk"/><line x1="104.9" y1="261.4" x2="110.9" y2="261.4" class="whisk"/><path d="M116.3,268.0 L116.3,262.2 Q116.3,258.2 120.3,258.2 L125.2,258.2 Q129.2,258.2 129.2,262.2 L129.2,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="309,308 ops/sec
+fjall (Rust)
+runs: 297k, 322k (min 297k – max 322k)
+16 B / 100 B — 0.12× of group best"/><line x1="122.8" y1="257.8" x2="122.8" y2="258.6" class="whisk"/><line x1="119.8" y1="257.8" x2="125.8" y2="257.8" class="whisk"/><line x1="119.8" y1="258.6" x2="125.8" y2="258.6" class="whisk"/><path d="M131.2,268.0 L131.2,255.3 Q131.2,251.3 135.2,251.3 L140.0,251.3 Q144.0,251.3 144.0,255.3 L144.0,268.0 Z" class="bar s-badger" tabindex="0" data-tip="525,772 ops/sec
+BadgerDB (Go)
+runs: 507k, 545k (min 507k – max 545k)
+16 B / 100 B — 0.20× of group best"/><line x1="137.6" y1="250.7" x2="137.6" y2="251.9" class="whisk"/><line x1="134.6" y1="250.7" x2="140.6" y2="250.7" class="whisk"/><line x1="134.6" y1="251.9" x2="140.6" y2="251.9" class="whisk"/><path d="M146.0,268.0 L146.0,189.7 Q146.0,185.7 150.0,185.7 L154.8,185.7 Q158.8,185.7 158.8,189.7 L158.8,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="2,592,025 ops/sec
+wavesdb (Go)
+runs: 2.68M, 2.50M (min 2.50M – max 2.68M)
+16 B / 100 B — 1.00× of group best"/><line x1="152.4" y1="182.9" x2="152.4" y2="188.5" class="whisk"/><line x1="149.4" y1="182.9" x2="155.4" y2="182.9" class="whisk"/><line x1="149.4" y1="188.5" x2="155.4" y2="188.5" class="whisk"/><text x="152.4" y="177.9" class="vlab" text-anchor="middle">2.59M</text><path d="M160.8,268.0 L160.8,201.4 Q160.8,197.4 164.8,197.4 L169.6,197.4 Q173.6,197.4 173.6,201.4 L173.6,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="2,223,166 ops/sec
+RocksDB (C++)
+runs: 2.20M, 2.24M (min 2.20M – max 2.24M)
+16 B / 100 B — 0.86× of group best"/><line x1="167.2" y1="196.8" x2="167.2" y2="198.0" class="whisk"/><line x1="164.2" y1="196.8" x2="170.2" y2="196.8" class="whisk"/><line x1="164.2" y1="198.0" x2="170.2" y2="198.0" class="whisk"/><path d="M175.6,268.0 L175.6,210.2 Q175.6,206.2 179.6,206.2 L184.4,206.2 Q188.4,206.2 188.4,210.2 L188.4,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="1,945,919 ops/sec
+surrealkv (Rust)
+runs: 1.95M, 1.95M (min 1.95M – max 1.95M)
+16 B / 100 B — 0.75× of group best"/><line x1="182.0" y1="206.2" x2="182.0" y2="206.2" class="whisk"/><line x1="179.0" y1="206.2" x2="185.0" y2="206.2" class="whisk"/><line x1="179.0" y1="206.2" x2="185.0" y2="206.2" class="whisk"/><text x="137.6" y="286" class="xlab" text-anchor="middle">16 B / 100 B</text><text x="137.6" y="302" class="xsub" text-anchor="middle">1M ops</text><path d="M213.9,268.0 L213.9,159.1 Q213.9,155.1 217.9,155.1 L222.7,155.1 Q226.7,155.1 226.7,159.1 L226.7,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="3,555,830 ops/sec
+ondaDB (Rust)
+runs: 3.91M, 3.20M (min 3.20M – max 3.91M)
+64 B / 512 B — 1.00× of group best"/><line x1="220.3" y1="144.0" x2="220.3" y2="166.2" class="whisk"/><line x1="217.3" y1="144.0" x2="223.3" y2="144.0" class="whisk"/><line x1="217.3" y1="166.2" x2="223.3" y2="166.2" class="whisk"/><text x="220.3" y="139.0" class="vlab" text-anchor="middle">3.56M</text><path d="M228.7,268.0 L228.7,254.3 Q228.7,250.3 232.7,250.3 L237.5,250.3 Q241.5,250.3 241.5,254.3 L241.5,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="557,010 ops/sec
+TidesDB (C)
+runs: 555k, 559k (min 555k – max 559k)
+64 B / 512 B — 0.16× of group best"/><line x1="235.1" y1="250.3" x2="235.1" y2="250.4" class="whisk"/><line x1="232.1" y1="250.3" x2="238.1" y2="250.3" class="whisk"/><line x1="232.1" y1="250.4" x2="238.1" y2="250.4" class="whisk"/><path d="M243.5,268.0 L243.5,258.9 Q243.5,254.9 247.5,254.9 L252.3,254.9 Q256.3,254.9 256.3,258.9 L256.3,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="411,994 ops/sec
+fjall (Rust)
+runs: 434k, 390k (min 390k – max 434k)
+64 B / 512 B — 0.12× of group best"/><line x1="249.9" y1="254.2" x2="249.9" y2="255.6" class="whisk"/><line x1="246.9" y1="254.2" x2="252.9" y2="254.2" class="whisk"/><line x1="246.9" y1="255.6" x2="252.9" y2="255.6" class="whisk"/><path d="M258.3,268.0 L258.3,257.1 Q258.3,253.1 262.3,253.1 L267.1,253.1 Q271.1,253.1 271.1,257.1 L271.1,268.0 Z" class="bar s-badger" tabindex="0" data-tip="468,839 ops/sec
+BadgerDB (Go)
+runs: 493k, 444k (min 444k – max 493k)
+64 B / 512 B — 0.13× of group best"/><line x1="264.7" y1="252.3" x2="264.7" y2="253.9" class="whisk"/><line x1="261.7" y1="252.3" x2="267.7" y2="252.3" class="whisk"/><line x1="261.7" y1="253.9" x2="267.7" y2="253.9" class="whisk"/><path d="M273.1,268.0 L273.1,172.5 Q273.1,168.5 277.1,168.5 L281.9,168.5 Q285.9,168.5 285.9,172.5 L285.9,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="3,135,274 ops/sec
+wavesdb (Go)
+runs: 3.21M, 3.06M (min 3.06M – max 3.21M)
+64 B / 512 B — 0.88× of group best"/><line x1="279.5" y1="166.1" x2="279.5" y2="170.8" class="whisk"/><line x1="276.5" y1="166.1" x2="282.5" y2="166.1" class="whisk"/><line x1="276.5" y1="170.8" x2="282.5" y2="170.8" class="whisk"/><path d="M287.9,268.0 L287.9,222.0 Q287.9,218.0 291.9,218.0 L296.8,218.0 Q300.8,218.0 300.8,222.0 L300.8,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,576,102 ops/sec
+RocksDB (C++)
+runs: 1.58M, 1.57M (min 1.57M – max 1.58M)
+64 B / 512 B — 0.44× of group best"/><line x1="294.3" y1="217.7" x2="294.3" y2="218.2" class="whisk"/><line x1="291.3" y1="217.7" x2="297.3" y2="217.7" class="whisk"/><line x1="291.3" y1="218.2" x2="297.3" y2="218.2" class="whisk"/><path d="M302.8,268.0 L302.8,223.5 Q302.8,219.5 306.8,219.5 L311.6,219.5 Q315.6,219.5 315.6,223.5 L315.6,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="1,527,200 ops/sec
+surrealkv (Rust)
+runs: 1.51M, 1.55M (min 1.51M – max 1.55M)
+64 B / 512 B — 0.43× of group best"/><line x1="309.2" y1="218.8" x2="309.2" y2="220.2" class="whisk"/><line x1="306.2" y1="218.8" x2="312.2" y2="218.8" class="whisk"/><line x1="306.2" y1="220.2" x2="312.2" y2="220.2" class="whisk"/><text x="264.7" y="286" class="xlab" text-anchor="middle">64 B / 512 B</text><text x="264.7" y="302" class="xsub" text-anchor="middle">400k ops</text><path d="M341.0,268.0 L341.0,105.5 Q341.0,101.5 345.0,101.5 L349.8,101.5 Q353.8,101.5 353.8,105.5 L353.8,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="5,243,646 ops/sec
+ondaDB (Rust)
+runs: 5.10M, 5.38M (min 5.10M – max 5.38M)
+16 B / 1 KiB — 1.00× of group best"/><line x1="347.4" y1="97.0" x2="347.4" y2="106.0" class="whisk"/><line x1="344.4" y1="97.0" x2="350.4" y2="97.0" class="whisk"/><line x1="344.4" y1="106.0" x2="350.4" y2="106.0" class="whisk"/><text x="347.4" y="92.0" class="vlab" text-anchor="middle">5.24M</text><path d="M355.8,268.0 L355.8,247.0 Q355.8,243.0 359.8,243.0 L364.6,243.0 Q368.6,243.0 368.6,247.0 L368.6,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="786,532 ops/sec
+TidesDB (C)
+runs: 787k, 786k (min 786k – max 787k)
+16 B / 1 KiB — 0.15× of group best"/><line x1="362.2" y1="243.0" x2="362.2" y2="243.1" class="whisk"/><line x1="359.2" y1="243.0" x2="365.2" y2="243.0" class="whisk"/><line x1="359.2" y1="243.1" x2="365.2" y2="243.1" class="whisk"/><path d="M370.6,268.0 L370.6,259.4 Q370.6,255.4 374.6,255.4 L379.4,255.4 Q383.4,255.4 383.4,259.4 L383.4,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="396,065 ops/sec
+fjall (Rust)
+runs: 357k, 435k (min 357k – max 435k)
+16 B / 1 KiB — 0.08× of group best"/><line x1="377.0" y1="254.2" x2="377.0" y2="256.7" class="whisk"/><line x1="374.0" y1="254.2" x2="380.0" y2="254.2" class="whisk"/><line x1="374.0" y1="256.7" x2="380.0" y2="256.7" class="whisk"/><path d="M385.4,268.0 L385.4,249.1 Q385.4,245.1 389.4,245.1 L394.3,245.1 Q398.3,245.1 398.3,249.1 L398.3,268.0 Z" class="bar s-badger" tabindex="0" data-tip="722,543 ops/sec
+BadgerDB (Go)
+runs: 659k, 786k (min 659k – max 786k)
+16 B / 1 KiB — 0.14× of group best"/><line x1="391.9" y1="243.0" x2="391.9" y2="247.1" class="whisk"/><line x1="388.9" y1="243.0" x2="394.9" y2="243.0" class="whisk"/><line x1="388.9" y1="247.1" x2="394.9" y2="247.1" class="whisk"/><path d="M400.3,268.0 L400.3,138.2 Q400.3,134.2 404.3,134.2 L409.1,134.2 Q413.1,134.2 413.1,138.2 L413.1,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="4,213,602 ops/sec
+wavesdb (Go)
+runs: 4.22M, 4.21M (min 4.21M – max 4.22M)
+16 B / 1 KiB — 0.80× of group best"/><line x1="406.7" y1="134.1" x2="406.7" y2="134.3" class="whisk"/><line x1="403.7" y1="134.1" x2="409.7" y2="134.1" class="whisk"/><line x1="403.7" y1="134.3" x2="409.7" y2="134.3" class="whisk"/><path d="M415.1,268.0 L415.1,168.7 Q415.1,164.7 419.1,164.7 L423.9,164.7 Q427.9,164.7 427.9,168.7 L427.9,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="3,253,634 ops/sec
+RocksDB (C++)
+runs: 3.47M, 3.04M (min 3.04M – max 3.47M)
+16 B / 1 KiB — 0.62× of group best"/><line x1="421.5" y1="157.9" x2="421.5" y2="171.5" class="whisk"/><line x1="418.5" y1="157.9" x2="424.5" y2="157.9" class="whisk"/><line x1="418.5" y1="171.5" x2="424.5" y2="171.5" class="whisk"/><path d="M429.9,268.0 L429.9,207.8 Q429.9,203.8 433.9,203.8 L438.7,203.8 Q442.7,203.8 442.7,207.8 L442.7,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="2,023,140 ops/sec
+surrealkv (Rust)
+runs: 2.01M, 2.03M (min 2.01M – max 2.03M)
+16 B / 1 KiB — 0.39× of group best"/><line x1="436.3" y1="203.5" x2="436.3" y2="204.1" class="whisk"/><line x1="433.3" y1="203.5" x2="439.3" y2="203.5" class="whisk"/><line x1="433.3" y1="204.1" x2="439.3" y2="204.1" class="whisk"/><text x="391.9" y="286" class="xlab" text-anchor="middle">16 B / 1 KiB</text><text x="391.9" y="302" class="xsub" text-anchor="middle">250k ops</text><path d="M468.1,268.0 L468.1,67.3 Q468.1,63.3 472.1,63.3 L477.0,63.3 Q481.0,63.3 481.0,67.3 L481.0,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="6,446,966 ops/sec
+ondaDB (Rust)
+runs: 5.86M, 7.04M (min 5.86M – max 7.04M)
+16 B / 4 KiB — 1.00× of group best"/><line x1="474.6" y1="44.5" x2="474.6" y2="82.1" class="whisk"/><line x1="471.6" y1="44.5" x2="477.6" y2="44.5" class="whisk"/><line x1="471.6" y1="82.1" x2="477.6" y2="82.1" class="whisk"/><text x="474.6" y="39.5" class="vlab" text-anchor="middle">6.45M</text><path d="M483.0,268.0 L483.0,234.5 Q483.0,230.5 487.0,230.5 L491.8,230.5 Q495.8,230.5 495.8,234.5 L495.8,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,182,473 ops/sec
+TidesDB (C)
+runs: 1.26M, 1.11M (min 1.11M – max 1.26M)
+16 B / 4 KiB — 0.18× of group best"/><line x1="489.4" y1="228.1" x2="489.4" y2="232.9" class="whisk"/><line x1="486.4" y1="228.1" x2="492.4" y2="228.1" class="whisk"/><line x1="486.4" y1="232.9" x2="492.4" y2="232.9" class="whisk"/><path d="M497.8,268.0 L497.8,235.9 Q497.8,231.9 501.8,231.9 L506.6,231.9 Q510.6,231.9 510.6,235.9 L510.6,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,137,855 ops/sec
+fjall (Rust)
+runs: 1.15M, 1.13M (min 1.13M – max 1.15M)
+16 B / 4 KiB — 0.18× of group best"/><line x1="504.2" y1="231.5" x2="504.2" y2="232.2" class="whisk"/><line x1="501.2" y1="231.5" x2="507.2" y2="231.5" class="whisk"/><line x1="501.2" y1="232.2" x2="507.2" y2="232.2" class="whisk"/><path d="M512.6,268.0 L512.6,240.3 Q512.6,236.3 516.6,236.3 L521.4,236.3 Q525.4,236.3 525.4,240.3 L525.4,268.0 Z" class="bar s-badger" tabindex="0" data-tip="998,698 ops/sec
+BadgerDB (Go)
+runs: 1.14M, 857k (min 857k – max 1.14M)
+16 B / 4 KiB — 0.15× of group best"/><line x1="519.0" y1="231.8" x2="519.0" y2="240.8" class="whisk"/><line x1="516.0" y1="231.8" x2="522.0" y2="231.8" class="whisk"/><line x1="516.0" y1="240.8" x2="522.0" y2="240.8" class="whisk"/><path d="M527.4,268.0 L527.4,109.1 Q527.4,105.1 531.4,105.1 L536.2,105.1 Q540.2,105.1 540.2,109.1 L540.2,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="5,129,278 ops/sec
+wavesdb (Go)
+runs: 5.39M, 4.86M (min 4.86M – max 5.39M)
+16 B / 4 KiB — 0.80× of group best"/><line x1="533.8" y1="96.7" x2="533.8" y2="113.6" class="whisk"/><line x1="530.8" y1="96.7" x2="536.8" y2="96.7" class="whisk"/><line x1="530.8" y1="113.6" x2="536.8" y2="113.6" class="whisk"/><path d="M542.2,268.0 L542.2,124.2 Q542.2,120.2 546.2,120.2 L551.0,120.2 Q555.0,120.2 555.0,124.2 L555.0,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="4,654,820 ops/sec
+RocksDB (C++)
+runs: 4.64M, 4.67M (min 4.64M – max 4.67M)
+16 B / 4 KiB — 0.72× of group best"/><line x1="548.6" y1="119.8" x2="548.6" y2="120.7" class="whisk"/><line x1="545.6" y1="119.8" x2="551.6" y2="119.8" class="whisk"/><line x1="545.6" y1="120.7" x2="551.6" y2="120.7" class="whisk"/><path d="M557.0,268.0 L557.0,206.4 Q557.0,202.4 561.0,202.4 L565.9,202.4 Q569.9,202.4 569.9,206.4 L569.9,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="2,066,142 ops/sec
+surrealkv (Rust)
+runs: 2.20M, 1.93M (min 1.93M – max 2.20M)
+16 B / 4 KiB — 0.32× of group best"/><line x1="563.4" y1="198.0" x2="563.4" y2="206.8" class="whisk"/><line x1="560.4" y1="198.0" x2="566.4" y2="198.0" class="whisk"/><line x1="560.4" y1="206.8" x2="566.4" y2="206.8" class="whisk"/><text x="519.0" y="286" class="xlab" text-anchor="middle">16 B / 4 KiB</text><text x="519.0" y="302" class="xsub" text-anchor="middle">30k ops</text><path d="M595.3,268.0 L595.3,146.2 Q595.3,142.2 599.3,142.2 L604.1,142.2 Q608.1,142.2 608.1,146.2 L608.1,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="3,963,228 ops/sec
+ondaDB (Rust)
+runs: 3.95M, 3.98M (min 3.95M – max 3.98M)
+16 B / 16 KiB — 0.88× of group best"/><line x1="601.7" y1="141.7" x2="601.7" y2="142.7" class="whisk"/><line x1="598.7" y1="141.7" x2="604.7" y2="141.7" class="whisk"/><line x1="598.7" y1="142.7" x2="604.7" y2="142.7" class="whisk"/><path d="M610.1,268.0 L610.1,225.2 Q610.1,221.2 614.1,221.2 L618.9,221.2 Q622.9,221.2 622.9,225.2 L622.9,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,472,961 ops/sec
+TidesDB (C)
+runs: 1.53M, 1.42M (min 1.42M – max 1.53M)
+16 B / 16 KiB — 0.33× of group best"/><line x1="616.5" y1="219.4" x2="616.5" y2="223.1" class="whisk"/><line x1="613.5" y1="219.4" x2="619.5" y2="219.4" class="whisk"/><line x1="613.5" y1="223.1" x2="619.5" y2="223.1" class="whisk"/><path d="M624.9,268.0 L624.9,231.4 Q624.9,227.4 628.9,227.4 L633.7,227.4 Q637.7,227.4 637.7,231.4 L637.7,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,279,585 ops/sec
+fjall (Rust)
+runs: 1.26M, 1.30M (min 1.26M – max 1.30M)
+16 B / 16 KiB — 0.29× of group best"/><line x1="631.3" y1="226.7" x2="631.3" y2="228.1" class="whisk"/><line x1="628.3" y1="226.7" x2="634.3" y2="226.7" class="whisk"/><line x1="628.3" y1="228.1" x2="634.3" y2="228.1" class="whisk"/><path d="M639.7,268.0 L639.7,235.0 Q639.7,231.0 643.7,231.0 L648.6,231.0 Q652.6,231.0 652.6,235.0 L652.6,268.0 Z" class="bar s-badger" tabindex="0" data-tip="1,165,787 ops/sec
+BadgerDB (Go)
+runs: 1.23M, 1.10M (min 1.10M – max 1.23M)
+16 B / 16 KiB — 0.26× of group best"/><line x1="646.1" y1="228.9" x2="646.1" y2="233.0" class="whisk"/><line x1="643.1" y1="228.9" x2="649.1" y2="228.9" class="whisk"/><line x1="643.1" y1="233.0" x2="649.1" y2="233.0" class="whisk"/><path d="M654.6,268.0 L654.6,129.7 Q654.6,125.7 658.6,125.7 L663.4,125.7 Q667.4,125.7 667.4,129.7 L667.4,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="4,480,396 ops/sec
+wavesdb (Go)
+runs: 4.73M, 4.23M (min 4.23M – max 4.73M)
+16 B / 16 KiB — 1.00× of group best"/><line x1="661.0" y1="117.7" x2="661.0" y2="133.7" class="whisk"/><line x1="658.0" y1="117.7" x2="664.0" y2="117.7" class="whisk"/><line x1="658.0" y1="133.7" x2="664.0" y2="133.7" class="whisk"/><text x="661.0" y="112.7" class="vlab" text-anchor="middle">4.48M</text><path d="M669.4,268.0 L669.4,139.2 Q669.4,135.2 673.4,135.2 L678.2,135.2 Q682.2,135.2 682.2,139.2 L682.2,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="4,183,509 ops/sec
+RocksDB (C++)
+runs: 3.93M, 4.44M (min 3.93M – max 4.44M)
+16 B / 16 KiB — 0.93× of group best"/><line x1="675.8" y1="127.2" x2="675.8" y2="143.2" class="whisk"/><line x1="672.8" y1="127.2" x2="678.8" y2="127.2" class="whisk"/><line x1="672.8" y1="143.2" x2="678.8" y2="143.2" class="whisk"/><path d="M684.2,268.0 L684.2,210.8 Q684.2,206.8 688.2,206.8 L693.0,206.8 Q697.0,206.8 697.0,210.8 L697.0,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="1,927,910 ops/sec
+surrealkv (Rust)
+runs: 1.97M, 1.89M (min 1.89M – max 1.97M)
+16 B / 16 KiB — 0.43× of group best"/><line x1="690.6" y1="205.4" x2="690.6" y2="208.1" class="whisk"/><line x1="687.6" y1="205.4" x2="693.6" y2="205.4" class="whisk"/><line x1="687.6" y1="208.1" x2="693.6" y2="208.1" class="whisk"/><text x="646.1" y="286" class="xlab" text-anchor="middle">16 B / 16 KiB</text><text x="646.1" y="302" class="xsub" text-anchor="middle">8k ops</text><path d="M722.4,268.0 L722.4,265.2 Q722.4,261.2 726.4,261.2 L731.2,261.2 Q735.2,261.2 735.2,265.2 L735.2,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="214,774 ops/sec
+ondaDB (Rust)
+runs: 207k, 223k (min 207k – max 223k)
+1 KiB / 256 B — 0.49× of group best"/><line x1="728.8" y1="260.9" x2="728.8" y2="261.4" class="whisk"/><line x1="725.8" y1="260.9" x2="731.8" y2="260.9" class="whisk"/><line x1="725.8" y1="261.4" x2="731.8" y2="261.4" class="whisk"/><path d="M737.2,268.0 L737.2,266.9 Q737.2,262.9 741.2,262.9 L746.1,262.9 Q750.1,262.9 750.1,266.9 L750.1,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="159,862 ops/sec
+TidesDB (C)
+runs: 170k, 149k (min 149k – max 170k)
+1 KiB / 256 B — 0.36× of group best"/><line x1="743.7" y1="262.6" x2="743.7" y2="263.3" class="whisk"/><line x1="740.7" y1="262.6" x2="746.7" y2="262.6" class="whisk"/><line x1="740.7" y1="263.3" x2="746.7" y2="263.3" class="whisk"/><path d="M752.1,268.0 L752.1,266.0 Q752.1,262.0 756.1,262.0 L760.9,262.0 Q764.9,262.0 764.9,266.0 L764.9,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="188,104 ops/sec
+fjall (Rust)
+runs: 190k, 187k (min 187k – max 190k)
+1 KiB / 256 B — 0.43× of group best"/><line x1="758.5" y1="262.0" x2="758.5" y2="262.1" class="whisk"/><line x1="755.5" y1="262.0" x2="761.5" y2="262.0" class="whisk"/><line x1="755.5" y1="262.1" x2="761.5" y2="262.1" class="whisk"/><path d="M766.9,268.0 L766.9,259.6 Q766.9,255.6 770.9,255.6 L775.7,255.6 Q779.7,255.6 779.7,259.6 L779.7,268.0 Z" class="bar s-badger" tabindex="0" data-tip="390,006 ops/sec
+BadgerDB (Go)
+runs: 384k, 396k (min 384k – max 396k)
+1 KiB / 256 B — 0.88× of group best"/><line x1="773.3" y1="255.4" x2="773.3" y2="255.8" class="whisk"/><line x1="770.3" y1="255.4" x2="776.3" y2="255.4" class="whisk"/><line x1="770.3" y1="255.8" x2="776.3" y2="255.8" class="whisk"/><path d="M781.7,268.0 L781.7,258.0 Q781.7,254.0 785.7,254.0 L790.5,254.0 Q794.5,254.0 794.5,258.0 L794.5,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="442,486 ops/sec
+wavesdb (Go)
+runs: 459k, 426k (min 426k – max 459k)
+1 KiB / 256 B — 1.00× of group best"/><line x1="788.1" y1="253.4" x2="788.1" y2="254.5" class="whisk"/><line x1="785.1" y1="253.4" x2="791.1" y2="253.4" class="whisk"/><line x1="785.1" y1="254.5" x2="791.1" y2="254.5" class="whisk"/><text x="788.1" y="248.4" class="vlab" text-anchor="middle">442k</text><path d="M796.5,268.0 L796.5,263.5 Q796.5,259.5 800.5,259.5 L805.3,259.5 Q809.3,259.5 809.3,263.5 L809.3,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="266,638 ops/sec
+RocksDB (C++)
+runs: 246k, 287k (min 246k – max 287k)
+1 KiB / 256 B — 0.60× of group best"/><line x1="802.9" y1="258.9" x2="802.9" y2="260.2" class="whisk"/><line x1="799.9" y1="258.9" x2="805.9" y2="258.9" class="whisk"/><line x1="799.9" y1="260.2" x2="805.9" y2="260.2" class="whisk"/><path d="M811.3,268.0 L811.3,263.8 Q811.3,259.8 815.3,259.8 L820.1,259.8 Q824.1,259.8 824.1,263.8 L824.1,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="259,254 ops/sec
+surrealkv (Rust)
+runs: 282k, 237k (min 237k – max 282k)
+1 KiB / 256 B — 0.59× of group best"/><line x1="817.7" y1="259.0" x2="817.7" y2="260.5" class="whisk"/><line x1="814.7" y1="259.0" x2="820.7" y2="259.0" class="whisk"/><line x1="814.7" y1="260.5" x2="820.7" y2="260.5" class="whisk"/><text x="773.3" y="286" class="xlab" text-anchor="middle">1 KiB / 256 B</text><text x="773.3" y="302" class="xsub" text-anchor="middle">150k ops</text><path d="M849.6,268.0 L849.6,268.0 Q849.6,264.0 853.6,264.0 L858.4,264.0 Q862.4,264.0 862.4,268.0 L862.4,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="125,429 ops/sec
+ondaDB (Rust)
+runs: 158k, 92k (min 92k – max 158k)
+2 KiB / 256 B — 0.47× of group best"/><line x1="856.0" y1="263.0" x2="856.0" y2="265.1" class="whisk"/><line x1="853.0" y1="263.0" x2="859.0" y2="263.0" class="whisk"/><line x1="853.0" y1="265.1" x2="859.0" y2="265.1" class="whisk"/><path d="M864.4,268.0 L864.4,268.0 Q864.4,265.7 866.7,265.7 L874.9,265.7 Q877.2,265.7 877.2,268.0 L877.2,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="72,450 ops/sec
+TidesDB (C)
+runs: 71k, 74k (min 71k – max 74k)
+2 KiB / 256 B — 0.27× of group best"/><line x1="870.8" y1="265.7" x2="870.8" y2="265.7" class="whisk"/><line x1="867.8" y1="265.7" x2="873.8" y2="265.7" class="whisk"/><line x1="867.8" y1="265.7" x2="873.8" y2="265.7" class="whisk"/><path d="M879.2,268.0 L879.2,268.0 Q879.2,265.0 882.2,265.0 L889.0,265.0 Q892.0,265.0 892.0,268.0 L892.0,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="94,298 ops/sec
+fjall (Rust)
+runs: 74k, 114k (min 74k – max 114k)
+2 KiB / 256 B — 0.35× of group best"/><line x1="885.6" y1="264.4" x2="885.6" y2="265.6" class="whisk"/><line x1="882.6" y1="264.4" x2="888.6" y2="264.4" class="whisk"/><line x1="882.6" y1="265.6" x2="888.6" y2="265.6" class="whisk"/><path d="M894.0,268.0 L894.0,263.5 Q894.0,259.5 898.0,259.5 L902.8,259.5 Q906.8,259.5 906.8,263.5 L906.8,268.0 Z" class="bar s-badger" tabindex="0" data-tip="266,667 ops/sec
+BadgerDB (Go)
+runs: 264k, 270k (min 264k – max 270k)
+2 KiB / 256 B — 1.00× of group best"/><line x1="900.4" y1="259.4" x2="900.4" y2="259.6" class="whisk"/><line x1="897.4" y1="259.4" x2="903.4" y2="259.4" class="whisk"/><line x1="897.4" y1="259.6" x2="903.4" y2="259.6" class="whisk"/><text x="900.4" y="254.4" class="vlab" text-anchor="middle">267k</text><path d="M908.8,268.0 L908.8,264.9 Q908.8,260.9 912.8,260.9 L917.7,260.9 Q921.7,260.9 921.7,264.9 L921.7,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="222,903 ops/sec
+wavesdb (Go)
+runs: 224k, 222k (min 222k – max 224k)
+2 KiB / 256 B — 0.84× of group best"/><line x1="915.2" y1="260.9" x2="915.2" y2="261.0" class="whisk"/><line x1="912.2" y1="260.9" x2="918.2" y2="260.9" class="whisk"/><line x1="912.2" y1="261.0" x2="918.2" y2="261.0" class="whisk"/><path d="M923.7,268.0 L923.7,266.8 Q923.7,262.8 927.7,262.8 L932.5,262.8 Q936.5,262.8 936.5,266.8 L936.5,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="163,170 ops/sec
+RocksDB (C++)
+runs: 173k, 154k (min 154k – max 173k)
+2 KiB / 256 B — 0.61× of group best"/><line x1="930.1" y1="262.5" x2="930.1" y2="263.1" class="whisk"/><line x1="927.1" y1="262.5" x2="933.1" y2="262.5" class="whisk"/><line x1="927.1" y1="263.1" x2="933.1" y2="263.1" class="whisk"/><path d="M938.5,268.0 L938.5,268.0 Q938.5,265.0 941.5,265.0 L948.3,265.0 Q951.3,265.0 951.3,268.0 L951.3,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="94,924 ops/sec
+surrealkv (Rust)
+runs: 92k, 98k (min 92k – max 98k)
+2 KiB / 256 B — 0.36× of group best"/><line x1="944.9" y1="264.9" x2="944.9" y2="265.1" class="whisk"/><line x1="941.9" y1="264.9" x2="947.9" y2="264.9" class="whisk"/><line x1="941.9" y1="265.1" x2="947.9" y2="265.1" class="whisk"/><text x="900.4" y="286" class="xlab" text-anchor="middle">2 KiB / 256 B</text><text x="900.4" y="302" class="xsub" text-anchor="middle">100k ops</text></svg><script type="application/json">{"type":"vbar","unit":"ops/sec","vfmt":"ops","groups":[{"label":"16 B / 100 B","sub":"1M ops"},{"label":"64 B / 512 B","sub":"400k ops"},{"label":"16 B / 1 KiB","sub":"250k ops"},{"label":"16 B / 4 KiB","sub":"30k ops"},{"label":"16 B / 16 KiB","sub":"8k ops"},{"label":"1 KiB / 256 B","sub":"150k ops"},{"label":"2 KiB / 256 B","sub":"100k ops"}],"series":[{"eng":"ondadb","label":"ondaDB (Rust)","values":[{"mean":922602.0,"lo":746974.0,"hi":1098230.0,"runs":[746974.0,1098230.0]},{"mean":3555830.5,"lo":3204828.0,"hi":3906833.0,"runs":[3906833.0,3204828.0]},{"mean":5243645.5,"lo":5102527.0,"hi":5384764.0,"runs":[5102527.0,5384764.0]},{"mean":6446965.5,"lo":5855032.0,"hi":7038899.0,"runs":[5855032.0,7038899.0]},{"mean":3963227.5,"lo":3947761.0,"hi":3978694.0,"runs":[3947761.0,3978694.0]},{"mean":214774.0,"lo":206542.0,"hi":223006.0,"runs":[206542.0,223006.0]},{"mean":125429.0,"lo":92370.0,"hi":158488.0,"runs":[158488.0,92370.0]}]},{"eng":"tidesdb","label":"TidesDB (C)","values":[{"mean":221375.54,"lo":207707.1,"hi":235043.98,"runs":[207707.1,235043.98]},{"mean":557010.175,"lo":555433.7,"hi":558586.65,"runs":[555433.7,558586.65]},{"mean":786531.71,"lo":785765.97,"hi":787297.45,"runs":[787297.45,785765.97]},{"mean":1182473.125,"lo":1106767.78,"hi":1258178.47,"runs":[1258178.47,1106767.78]},{"mean":1472961.43,"lo":1415708.98,"hi":1530213.88,"runs":[1530213.88,1415708.98]},{"mean":159862.31,"lo":149310.17,"hi":170414.45,"runs":[170414.45,149310.17]},{"mean":72450.035,"lo":71197.08,"hi":73702.99,"runs":[71197.08,73702.99]}]},{"eng":"fjall","label":"fjall (Rust)","values":[{"mean":309308.0,"lo":296857.0,"hi":321759.0,"runs":[296857.0,321759.0]},{"mean":411994.0,"lo":389511.0,"hi":434477.0,"runs":[434477.0,389511.0]},{"mean":396065.0,"lo":357480.0,"hi":434650.0,"runs":[357480.0,434650.0]},{"mean":1137855.0,"lo":1126860.0,"hi":1148850.0,"runs":[1148850.0,1126860.0]},{"mean":1279585.0,"lo":1257382.0,"hi":1301788.0,"runs":[1257382.0,1301788.0]},{"mean":188103.5,"lo":186673.0,"hi":189534.0,"runs":[189534.0,186673.0]},{"mean":94298.5,"lo":74129.0,"hi":114468.0,"runs":[74129.0,114468.0]}]},{"eng":"badger","label":"BadgerDB (Go)","values":[{"mean":525771.5,"lo":506514.0,"hi":545029.0,"runs":[506514.0,545029.0]},{"mean":468839.0,"lo":444335.0,"hi":493343.0,"runs":[493343.0,444335.0]},{"mean":722543.0,"lo":659136.0,"hi":785950.0,"runs":[659136.0,785950.0]},{"mean":998697.5,"lo":857470.0,"hi":1139925.0,"runs":[1139925.0,857470.0]},{"mean":1165787.0,"lo":1100886.0,"hi":1230688.0,"runs":[1230688.0,1100886.0]},{"mean":390006.0,"lo":383809.0,"hi":396203.0,"runs":[383809.0,396203.0]},{"mean":266667.0,"lo":263831.0,"hi":269503.0,"runs":[263831.0,269503.0]}]},{"eng":"wavesdb","label":"wavesdb (Go)","values":[{"mean":2592025.0,"lo":2503817.0,"hi":2680233.0,"runs":[2680233.0,2503817.0]},{"mean":3135273.5,"lo":3061488.0,"hi":3209059.0,"runs":[3209059.0,3061488.0]},{"mean":4213602.0,"lo":4210858.0,"hi":4216346.0,"runs":[4216346.0,4210858.0]},{"mean":5129278.5,"lo":4863982.0,"hi":5394575.0,"runs":[5394575.0,4863982.0]},{"mean":4480396.0,"lo":4228392.0,"hi":4732400.0,"runs":[4732400.0,4228392.0]},{"mean":442485.5,"lo":425549.0,"hi":459422.0,"runs":[459422.0,425549.0]},{"mean":222903.0,"lo":222010.0,"hi":223796.0,"runs":[223796.0,222010.0]}]},{"eng":"rocksdb","label":"RocksDB (C++)","values":[{"mean":2223166.5,"lo":2203758.0,"hi":2242575.0,"runs":[2203758.0,2242575.0]},{"mean":1576102.5,"lo":1568668.0,"hi":1583537.0,"runs":[1583537.0,1568668.0]},{"mean":3253634.5,"lo":3040836.0,"hi":3466433.0,"runs":[3466433.0,3040836.0]},{"mean":4654819.5,"lo":4640594.0,"hi":4669045.0,"runs":[4640594.0,4669045.0]},{"mean":4183509.0,"lo":3930877.0,"hi":4436141.0,"runs":[3930877.0,4436141.0]},{"mean":266637.5,"lo":245948.0,"hi":287327.0,"runs":[245948.0,287327.0]},{"mean":163170.5,"lo":153778.0,"hi":172563.0,"runs":[172563.0,153778.0]}]},{"eng":"surrealkv","label":"surrealkv (Rust)","values":[{"mean":1945919.0,"lo":1945017.0,"hi":1946821.0,"runs":[1946821.0,1945017.0]},{"mean":1527200.0,"lo":1506163.0,"hi":1548237.0,"runs":[1506163.0,1548237.0]},{"mean":2023139.5,"lo":2013854.0,"hi":2032425.0,"runs":[2013854.0,2032425.0]},{"mean":2066141.5,"lo":1928600.0,"hi":2203683.0,"runs":[2203683.0,1928600.0]},{"mean":1927909.5,"lo":1885565.0,"hi":1970254.0,"runs":[1970254.0,1885565.0]},{"mean":259254.5,"lo":236561.0,"hi":281948.0,"runs":[281948.0,236561.0]},{"mean":94924.0,"lo":92146.0,"hi":97702.0,"runs":[92146.0,97702.0]}]}]}</script></div><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb">922,602</td><td class="c-tidesdb">221,376</td><td class="c-fjall">309,308</td><td class="c-badger">525,772</td><td class="c-wavesdb best">2,592,025</td><td class="c-rocksdb">2,223,166</td><td class="c-surrealkv">1,945,919</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb best">3,555,830</td><td class="c-tidesdb">557,010</td><td class="c-fjall">411,994</td><td class="c-badger">468,839</td><td class="c-wavesdb">3,135,274</td><td class="c-rocksdb">1,576,102</td><td class="c-surrealkv">1,527,200</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb best">5,243,646</td><td class="c-tidesdb">786,532</td><td class="c-fjall">396,065</td><td class="c-badger">722,543</td><td class="c-wavesdb">4,213,602</td><td class="c-rocksdb">3,253,634</td><td class="c-surrealkv">2,023,140</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb best">6,446,966</td><td class="c-tidesdb">1,182,473</td><td class="c-fjall">1,137,855</td><td class="c-badger">998,698</td><td class="c-wavesdb">5,129,278</td><td class="c-rocksdb">4,654,820</td><td class="c-surrealkv">2,066,142</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb">3,963,228</td><td class="c-tidesdb">1,472,961</td><td class="c-fjall">1,279,585</td><td class="c-badger">1,165,787</td><td class="c-wavesdb best">4,480,396</td><td class="c-rocksdb">4,183,509</td><td class="c-surrealkv">1,927,910</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb">214,774</td><td class="c-tidesdb">159,862</td><td class="c-fjall">188,104</td><td class="c-badger">390,006</td><td class="c-wavesdb best">442,486</td><td class="c-rocksdb">266,638</td><td class="c-surrealkv">259,254</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb">125,429</td><td class="c-tidesdb">72,450</td><td class="c-fjall">94,298</td><td class="c-badger best">266,667</td><td class="c-wavesdb">222,903</td><td class="c-rocksdb">163,170</td><td class="c-surrealkv">94,924</td></tr></tbody></table></div></section><section class="card"><h2>Forward scan (concurrent full iterations)</h2><p class="unit">ops/sec — higher is better; whiskers span min–max across runs; the group leader is value-labeled</p><div class="chart" id="ph-Forward"><svg viewBox="0 0 980 320" role="img"><line x1="74" y1="268.0" x2="964" y2="268.0" class="grid"/><text x="66" y="272.0" class="ylab" text-anchor="end">0</text><line x1="74" y1="141.0" x2="964" y2="141.0" class="grid"/><text x="66" y="145.0" class="ylab" text-anchor="end">5M</text><line x1="74" y1="14.0" x2="964" y2="14.0" class="grid"/><text x="66" y="18.0" class="ylab" text-anchor="end">10M</text><line x1="74" y1="268.0" x2="964" y2="268.0" class="axis"/><path d="M86.7,268.0 L86.7,155.7 Q86.7,151.7 90.7,151.7 L95.5,151.7 Q99.5,151.7 99.5,155.7 L99.5,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="4,576,965 ops/sec
+ondaDB (Rust)
+runs: 4.70M, 4.45M (min 4.45M – max 4.70M)
+16 B / 100 B — 1.00× of group best"/><line x1="93.1" y1="148.6" x2="93.1" y2="154.9" class="whisk"/><line x1="90.1" y1="148.6" x2="96.1" y2="148.6" class="whisk"/><line x1="90.1" y1="154.9" x2="96.1" y2="154.9" class="whisk"/><text x="93.1" y="143.6" class="vlab" text-anchor="middle">4.58M</text><path d="M101.5,268.0 L101.5,192.9 Q101.5,188.9 105.5,188.9 L110.3,188.9 Q114.3,188.9 114.3,192.9 L114.3,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="3,115,171 ops/sec
+TidesDB (C)
+runs: 5.43M, 798k (min 798k – max 5.43M)
+16 B / 100 B — 0.68× of group best"/><line x1="107.9" y1="130.0" x2="107.9" y2="247.7" class="whisk"/><line x1="104.9" y1="130.0" x2="110.9" y2="130.0" class="whisk"/><line x1="104.9" y1="247.7" x2="110.9" y2="247.7" class="whisk"/><path d="M116.3,268.0 L116.3,230.4 Q116.3,226.4 120.3,226.4 L125.2,226.4 Q129.2,226.4 129.2,230.4 L129.2,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,637,208 ops/sec
+fjall (Rust)
+runs: 916k, 2.36M (min 916k – max 2.36M)
+16 B / 100 B — 0.36× of group best"/><line x1="122.8" y1="208.1" x2="122.8" y2="244.7" class="whisk"/><line x1="119.8" y1="208.1" x2="125.8" y2="208.1" class="whisk"/><line x1="119.8" y1="244.7" x2="125.8" y2="244.7" class="whisk"/><path d="M131.2,268.0 L131.2,190.6 Q131.2,186.6 135.2,186.6 L140.0,186.6 Q144.0,186.6 144.0,190.6 L144.0,268.0 Z" class="bar s-badger" tabindex="0" data-tip="3,202,840 ops/sec
+BadgerDB (Go)
+runs: 3.10M, 3.31M (min 3.10M – max 3.31M)
+16 B / 100 B — 0.70× of group best"/><line x1="137.6" y1="184.0" x2="137.6" y2="189.3" class="whisk"/><line x1="134.6" y1="184.0" x2="140.6" y2="184.0" class="whisk"/><line x1="134.6" y1="189.3" x2="140.6" y2="189.3" class="whisk"/><path d="M146.0,268.0 L146.0,174.7 Q146.0,170.7 150.0,170.7 L154.8,170.7 Q158.8,170.7 158.8,174.7 L158.8,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="3,831,312 ops/sec
+wavesdb (Go)
+runs: 3.75M, 3.92M (min 3.75M – max 3.92M)
+16 B / 100 B — 0.84× of group best"/><line x1="152.4" y1="168.5" x2="152.4" y2="172.9" class="whisk"/><line x1="149.4" y1="168.5" x2="155.4" y2="168.5" class="whisk"/><line x1="149.4" y1="172.9" x2="155.4" y2="172.9" class="whisk"/><path d="M160.8,268.0 L160.8,199.2 Q160.8,195.2 164.8,195.2 L169.6,195.2 Q173.6,195.2 173.6,199.2 L173.6,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="2,865,086 ops/sec
+RocksDB (C++)
+runs: 2.88M, 2.85M (min 2.85M – max 2.88M)
+16 B / 100 B — 0.63× of group best"/><line x1="167.2" y1="194.8" x2="167.2" y2="195.7" class="whisk"/><line x1="164.2" y1="194.8" x2="170.2" y2="194.8" class="whisk"/><line x1="164.2" y1="195.7" x2="170.2" y2="195.7" class="whisk"/><path d="M175.6,268.0 L175.6,239.9 Q175.6,235.9 179.6,235.9 L184.4,235.9 Q188.4,235.9 188.4,239.9 L188.4,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="1,263,281 ops/sec
+surrealkv (Rust)
+runs: 1.17M, 1.36M (min 1.17M – max 1.36M)
+16 B / 100 B — 0.28× of group best"/><line x1="182.0" y1="233.6" x2="182.0" y2="238.2" class="whisk"/><line x1="179.0" y1="233.6" x2="185.0" y2="233.6" class="whisk"/><line x1="179.0" y1="238.2" x2="185.0" y2="238.2" class="whisk"/><text x="137.6" y="286" class="xlab" text-anchor="middle">16 B / 100 B</text><text x="137.6" y="302" class="xsub" text-anchor="middle">1M ops</text><path d="M213.9,268.0 L213.9,210.3 Q213.9,206.3 217.9,206.3 L222.7,206.3 Q226.7,206.3 226.7,210.3 L226.7,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="2,428,156 ops/sec
+ondaDB (Rust)
+runs: 2.24M, 2.61M (min 2.24M – max 2.61M)
+64 B / 512 B — 0.49× of group best"/><line x1="220.3" y1="201.6" x2="220.3" y2="211.0" class="whisk"/><line x1="217.3" y1="201.6" x2="223.3" y2="201.6" class="whisk"/><line x1="217.3" y1="211.0" x2="223.3" y2="211.0" class="whisk"/><path d="M228.7,268.0 L228.7,145.8 Q228.7,141.8 232.7,141.8 L237.5,141.8 Q241.5,141.8 241.5,145.8 L241.5,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="4,969,968 ops/sec
+TidesDB (C)
+runs: 8.70M, 1.24M (min 1.24M – max 8.70M)
+64 B / 512 B — 1.00× of group best"/><line x1="235.1" y1="47.0" x2="235.1" y2="236.5" class="whisk"/><line x1="232.1" y1="47.0" x2="238.1" y2="47.0" class="whisk"/><line x1="232.1" y1="236.5" x2="238.1" y2="236.5" class="whisk"/><text x="235.1" y="42.0" class="vlab" text-anchor="middle">4.97M</text><path d="M243.5,268.0 L243.5,224.6 Q243.5,220.6 247.5,220.6 L252.3,220.6 Q256.3,220.6 256.3,224.6 L256.3,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,865,680 ops/sec
+fjall (Rust)
+runs: 1.87M, 1.87M (min 1.87M – max 1.87M)
+64 B / 512 B — 0.38× of group best"/><line x1="249.9" y1="220.6" x2="249.9" y2="220.6" class="whisk"/><line x1="246.9" y1="220.6" x2="252.9" y2="220.6" class="whisk"/><line x1="246.9" y1="220.6" x2="252.9" y2="220.6" class="whisk"/><path d="M258.3,268.0 L258.3,235.2 Q258.3,231.2 262.3,231.2 L267.1,231.2 Q271.1,231.2 271.1,235.2 L271.1,268.0 Z" class="bar s-badger" tabindex="0" data-tip="1,449,764 ops/sec
+BadgerDB (Go)
+runs: 1.40M, 1.50M (min 1.40M – max 1.50M)
+64 B / 512 B — 0.29× of group best"/><line x1="264.7" y1="229.9" x2="264.7" y2="232.4" class="whisk"/><line x1="261.7" y1="229.9" x2="267.7" y2="229.9" class="whisk"/><line x1="261.7" y1="232.4" x2="267.7" y2="232.4" class="whisk"/><path d="M273.1,268.0 L273.1,257.0 Q273.1,253.0 277.1,253.0 L281.9,253.0 Q285.9,253.0 285.9,257.0 L285.9,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="588,740 ops/sec
+wavesdb (Go)
+runs: 655k, 522k (min 522k – max 655k)
+64 B / 512 B — 0.12× of group best"/><line x1="279.5" y1="251.4" x2="279.5" y2="254.7" class="whisk"/><line x1="276.5" y1="251.4" x2="282.5" y2="251.4" class="whisk"/><line x1="276.5" y1="254.7" x2="282.5" y2="254.7" class="whisk"/><path d="M287.9,268.0 L287.9,235.2 Q287.9,231.2 291.9,231.2 L296.8,231.2 Q300.8,231.2 300.8,235.2 L300.8,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,447,832 ops/sec
+RocksDB (C++)
+runs: 1.44M, 1.46M (min 1.44M – max 1.46M)
+64 B / 512 B — 0.29× of group best"/><line x1="294.3" y1="230.9" x2="294.3" y2="231.5" class="whisk"/><line x1="291.3" y1="230.9" x2="297.3" y2="230.9" class="whisk"/><line x1="291.3" y1="231.5" x2="297.3" y2="231.5" class="whisk"/><path d="M302.8,268.0 L302.8,264.8 Q302.8,260.8 306.8,260.8 L311.6,260.8 Q315.6,260.8 315.6,264.8 L315.6,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="283,170 ops/sec
+surrealkv (Rust)
+runs: 326k, 240k (min 240k – max 326k)
+64 B / 512 B — 0.06× of group best"/><line x1="309.2" y1="259.7" x2="309.2" y2="261.9" class="whisk"/><line x1="306.2" y1="259.7" x2="312.2" y2="259.7" class="whisk"/><line x1="306.2" y1="261.9" x2="312.2" y2="261.9" class="whisk"/><text x="264.7" y="286" class="xlab" text-anchor="middle">64 B / 512 B</text><text x="264.7" y="302" class="xsub" text-anchor="middle">400k ops</text><path d="M341.0,268.0 L341.0,210.8 Q341.0,206.8 345.0,206.8 L349.8,206.8 Q353.8,206.8 353.8,210.8 L353.8,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="2,408,270 ops/sec
+ondaDB (Rust)
+runs: 2.44M, 2.38M (min 2.38M – max 2.44M)
+16 B / 1 KiB — 1.00× of group best"/><line x1="347.4" y1="206.1" x2="347.4" y2="207.6" class="whisk"/><line x1="344.4" y1="206.1" x2="350.4" y2="206.1" class="whisk"/><line x1="344.4" y1="207.6" x2="350.4" y2="207.6" class="whisk"/><text x="347.4" y="201.1" class="vlab" text-anchor="middle">2.41M</text><path d="M355.8,268.0 L355.8,259.6 Q355.8,255.6 359.8,255.6 L364.6,255.6 Q368.6,255.6 368.6,259.6 L368.6,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="489,658 ops/sec
+TidesDB (C)
+runs: 460k, 520k (min 460k – max 520k)
+16 B / 1 KiB — 0.20× of group best"/><line x1="362.2" y1="254.8" x2="362.2" y2="256.3" class="whisk"/><line x1="359.2" y1="254.8" x2="365.2" y2="254.8" class="whisk"/><line x1="359.2" y1="256.3" x2="365.2" y2="256.3" class="whisk"/><path d="M370.6,268.0 L370.6,250.6 Q370.6,246.6 374.6,246.6 L379.4,246.6 Q383.4,246.6 383.4,250.6 L383.4,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="841,466 ops/sec
+fjall (Rust)
+runs: 966k, 717k (min 717k – max 966k)
+16 B / 1 KiB — 0.35× of group best"/><line x1="377.0" y1="243.5" x2="377.0" y2="249.8" class="whisk"/><line x1="374.0" y1="243.5" x2="380.0" y2="243.5" class="whisk"/><line x1="374.0" y1="249.8" x2="380.0" y2="249.8" class="whisk"/><path d="M385.4,268.0 L385.4,244.5 Q385.4,240.5 389.4,240.5 L394.3,240.5 Q398.3,240.5 398.3,244.5 L398.3,268.0 Z" class="bar s-badger" tabindex="0" data-tip="1,084,515 ops/sec
+BadgerDB (Go)
+runs: 1.10M, 1.06M (min 1.06M – max 1.10M)
+16 B / 1 KiB — 0.45× of group best"/><line x1="391.9" y1="239.9" x2="391.9" y2="241.0" class="whisk"/><line x1="388.9" y1="239.9" x2="394.9" y2="239.9" class="whisk"/><line x1="388.9" y1="241.0" x2="394.9" y2="241.0" class="whisk"/><path d="M400.3,268.0 L400.3,258.7 Q400.3,254.7 404.3,254.7 L409.1,254.7 Q413.1,254.7 413.1,258.7 L413.1,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="524,543 ops/sec
+wavesdb (Go)
+runs: 517k, 532k (min 517k – max 532k)
+16 B / 1 KiB — 0.22× of group best"/><line x1="406.7" y1="254.5" x2="406.7" y2="254.9" class="whisk"/><line x1="403.7" y1="254.5" x2="409.7" y2="254.5" class="whisk"/><line x1="403.7" y1="254.9" x2="409.7" y2="254.9" class="whisk"/><path d="M415.1,268.0 L415.1,245.9 Q415.1,241.9 419.1,241.9 L423.9,241.9 Q427.9,241.9 427.9,245.9 L427.9,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,028,006 ops/sec
+RocksDB (C++)
+runs: 1.02M, 1.03M (min 1.02M – max 1.03M)
+16 B / 1 KiB — 0.43× of group best"/><line x1="421.5" y1="241.7" x2="421.5" y2="242.0" class="whisk"/><line x1="418.5" y1="241.7" x2="424.5" y2="241.7" class="whisk"/><line x1="418.5" y1="242.0" x2="424.5" y2="242.0" class="whisk"/><path d="M429.9,268.0 L429.9,268.0 Q429.9,264.1 433.8,264.1 L438.8,264.1 Q442.7,264.1 442.7,268.0 L442.7,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="154,725 ops/sec
+surrealkv (Rust)
+runs: 137k, 172k (min 137k – max 172k)
+16 B / 1 KiB — 0.06× of group best"/><line x1="436.3" y1="263.6" x2="436.3" y2="264.5" class="whisk"/><line x1="433.3" y1="263.6" x2="439.3" y2="263.6" class="whisk"/><line x1="433.3" y1="264.5" x2="439.3" y2="264.5" class="whisk"/><text x="391.9" y="286" class="xlab" text-anchor="middle">16 B / 1 KiB</text><text x="391.9" y="302" class="xsub" text-anchor="middle">250k ops</text><path d="M468.1,268.0 L468.1,246.8 Q468.1,242.8 472.1,242.8 L477.0,242.8 Q481.0,242.8 481.0,246.8 L481.0,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="993,240 ops/sec
+ondaDB (Rust)
+runs: 1.10M, 882k (min 882k – max 1.10M)
+16 B / 4 KiB — 1.00× of group best"/><line x1="474.6" y1="239.9" x2="474.6" y2="245.6" class="whisk"/><line x1="471.6" y1="239.9" x2="477.6" y2="239.9" class="whisk"/><line x1="471.6" y1="245.6" x2="477.6" y2="245.6" class="whisk"/><text x="474.6" y="234.9" class="vlab" text-anchor="middle">993k</text><path d="M483.0,268.0 L483.0,262.3 Q483.0,258.3 487.0,258.3 L491.8,258.3 Q495.8,258.3 495.8,262.3 L495.8,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="380,747 ops/sec
+TidesDB (C)
+runs: 380k, 382k (min 380k – max 382k)
+16 B / 4 KiB — 0.38× of group best"/><line x1="489.4" y1="258.3" x2="489.4" y2="258.4" class="whisk"/><line x1="486.4" y1="258.3" x2="492.4" y2="258.3" class="whisk"/><line x1="486.4" y1="258.4" x2="492.4" y2="258.4" class="whisk"/><path d="M497.8,268.0 L497.8,263.1 Q497.8,259.1 501.8,259.1 L506.6,259.1 Q510.6,259.1 510.6,263.1 L510.6,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="351,812 ops/sec
+fjall (Rust)
+runs: 412k, 291k (min 291k – max 412k)
+16 B / 4 KiB — 0.35× of group best"/><line x1="504.2" y1="257.5" x2="504.2" y2="260.6" class="whisk"/><line x1="501.2" y1="257.5" x2="507.2" y2="257.5" class="whisk"/><line x1="501.2" y1="260.6" x2="507.2" y2="260.6" class="whisk"/><path d="M512.6,268.0 L512.6,260.0 Q512.6,256.0 516.6,256.0 L521.4,256.0 Q525.4,256.0 525.4,260.0 L525.4,268.0 Z" class="bar s-badger" tabindex="0" data-tip="474,249 ops/sec
+BadgerDB (Go)
+runs: 441k, 507k (min 441k – max 507k)
+16 B / 4 KiB — 0.48× of group best"/><line x1="519.0" y1="255.1" x2="519.0" y2="256.8" class="whisk"/><line x1="516.0" y1="255.1" x2="522.0" y2="255.1" class="whisk"/><line x1="516.0" y1="256.8" x2="522.0" y2="256.8" class="whisk"/><path d="M527.4,268.0 L527.4,268.0 Q527.4,264.3 531.1,264.3 L536.5,264.3 Q540.2,264.3 540.2,268.0 L540.2,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="145,196 ops/sec
+wavesdb (Go)
+runs: 143k, 147k (min 143k – max 147k)
+16 B / 4 KiB — 0.15× of group best"/><line x1="533.8" y1="264.3" x2="533.8" y2="264.4" class="whisk"/><line x1="530.8" y1="264.3" x2="536.8" y2="264.3" class="whisk"/><line x1="530.8" y1="264.4" x2="536.8" y2="264.4" class="whisk"/><path d="M542.2,268.0 L542.2,262.7 Q542.2,258.7 546.2,258.7 L551.0,258.7 Q555.0,258.7 555.0,262.7 L555.0,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="368,063 ops/sec
+RocksDB (C++)
+runs: 367k, 369k (min 367k – max 369k)
+16 B / 4 KiB — 0.37× of group best"/><line x1="548.6" y1="258.6" x2="548.6" y2="258.7" class="whisk"/><line x1="545.6" y1="258.6" x2="551.6" y2="258.6" class="whisk"/><line x1="545.6" y1="258.7" x2="551.6" y2="258.7" class="whisk"/><path d="M557.0,268.0 L557.0,268.0 Q557.0,267.0 558.1,267.0 L568.8,267.0 Q569.9,267.0 569.9,268.0 L569.9,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="40,811 ops/sec
+surrealkv (Rust)
+runs: 43k, 39k (min 39k – max 43k)
+16 B / 4 KiB — 0.04× of group best"/><line x1="563.4" y1="266.9" x2="563.4" y2="267.0" class="whisk"/><line x1="560.4" y1="266.9" x2="566.4" y2="266.9" class="whisk"/><line x1="560.4" y1="267.0" x2="566.4" y2="267.0" class="whisk"/><text x="519.0" y="286" class="xlab" text-anchor="middle">16 B / 4 KiB</text><text x="519.0" y="302" class="xsub" text-anchor="middle">30k ops</text><path d="M595.3,268.0 L595.3,265.9 Q595.3,261.9 599.3,261.9 L604.1,261.9 Q608.1,261.9 608.1,265.9 L608.1,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="239,432 ops/sec
+ondaDB (Rust)
+runs: 275k, 204k (min 204k – max 275k)
+16 B / 16 KiB — 0.97× of group best"/><line x1="601.7" y1="261.0" x2="601.7" y2="262.8" class="whisk"/><line x1="598.7" y1="261.0" x2="604.7" y2="261.0" class="whisk"/><line x1="598.7" y1="262.8" x2="604.7" y2="262.8" class="whisk"/><path d="M610.1,268.0 L610.1,267.1 Q610.1,263.1 614.1,263.1 L618.9,263.1 Q622.9,263.1 622.9,267.1 L622.9,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="191,676 ops/sec
+TidesDB (C)
+runs: 237k, 147k (min 147k – max 237k)
+16 B / 16 KiB — 0.78× of group best"/><line x1="616.5" y1="262.0" x2="616.5" y2="264.3" class="whisk"/><line x1="613.5" y1="262.0" x2="619.5" y2="262.0" class="whisk"/><line x1="613.5" y1="264.3" x2="619.5" y2="264.3" class="whisk"/><path d="M624.9,268.0 L624.9,268.0 Q624.9,265.7 627.3,265.7 L635.4,265.7 Q637.7,265.7 637.7,268.0 L637.7,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="92,128 ops/sec
+fjall (Rust)
+runs: 79k, 105k (min 79k – max 105k)
+16 B / 16 KiB — 0.37× of group best"/><line x1="631.3" y1="265.3" x2="631.3" y2="266.0" class="whisk"/><line x1="628.3" y1="265.3" x2="634.3" y2="265.3" class="whisk"/><line x1="628.3" y1="266.0" x2="634.3" y2="266.0" class="whisk"/><path d="M639.7,268.0 L639.7,265.7 Q639.7,261.7 643.7,261.7 L648.6,261.7 Q652.6,261.7 652.6,265.7 L652.6,268.0 Z" class="bar s-badger" tabindex="0" data-tip="246,556 ops/sec
+BadgerDB (Go)
+runs: 236k, 257k (min 236k – max 257k)
+16 B / 16 KiB — 1.00× of group best"/><line x1="646.1" y1="261.5" x2="646.1" y2="262.0" class="whisk"/><line x1="643.1" y1="261.5" x2="649.1" y2="261.5" class="whisk"/><line x1="643.1" y1="262.0" x2="649.1" y2="262.0" class="whisk"/><text x="646.1" y="256.5" class="vlab" text-anchor="middle">247k</text><path d="M654.6,268.0 L654.6,268.0 Q654.6,266.5 656.0,266.5 L665.9,266.5 Q667.4,266.5 667.4,268.0 L667.4,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="57,795 ops/sec
+wavesdb (Go)
+runs: 58k, 58k (min 58k – max 58k)
+16 B / 16 KiB — 0.23× of group best"/><line x1="661.0" y1="266.5" x2="661.0" y2="266.5" class="whisk"/><line x1="658.0" y1="266.5" x2="664.0" y2="266.5" class="whisk"/><line x1="658.0" y1="266.5" x2="664.0" y2="266.5" class="whisk"/><path d="M669.4,268.0 L669.4,266.1 Q669.4,262.1 673.4,262.1 L678.2,262.1 Q682.2,262.1 682.2,266.1 L682.2,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="231,490 ops/sec
+RocksDB (C++)
+runs: 230k, 233k (min 230k – max 233k)
+16 B / 16 KiB — 0.94× of group best"/><line x1="675.8" y1="262.1" x2="675.8" y2="262.1" class="whisk"/><line x1="672.8" y1="262.1" x2="678.8" y2="262.1" class="whisk"/><line x1="672.8" y1="262.1" x2="678.8" y2="262.1" class="whisk"/><path d="M684.2,268.0 L684.2,268.0 Q684.2,267.8 684.4,267.8 L696.8,267.8 Q697.0,267.8 697.0,268.0 L697.0,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="9,364 ops/sec
+surrealkv (Rust)
+runs: 9k, 10k (min 9k – max 10k)
+16 B / 16 KiB — 0.04× of group best"/><line x1="690.6" y1="267.8" x2="690.6" y2="267.8" class="whisk"/><line x1="687.6" y1="267.8" x2="693.6" y2="267.8" class="whisk"/><line x1="687.6" y1="267.8" x2="693.6" y2="267.8" class="whisk"/><text x="646.1" y="286" class="xlab" text-anchor="middle">16 B / 16 KiB</text><text x="646.1" y="302" class="xsub" text-anchor="middle">8k ops</text><path d="M722.4,268.0 L722.4,238.7 Q722.4,234.7 726.4,234.7 L731.2,234.7 Q735.2,234.7 735.2,238.7 L735.2,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="1,312,100 ops/sec
+ondaDB (Rust)
+runs: 1.31M, 1.32M (min 1.31M – max 1.32M)
+1 KiB / 256 B — 0.24× of group best"/><line x1="728.8" y1="234.6" x2="728.8" y2="234.8" class="whisk"/><line x1="725.8" y1="234.6" x2="731.8" y2="234.6" class="whisk"/><line x1="725.8" y1="234.8" x2="731.8" y2="234.8" class="whisk"/><path d="M737.2,268.0 L737.2,131.7 Q737.2,127.7 741.2,127.7 L746.1,127.7 Q750.1,127.7 750.1,131.7 L750.1,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="5,523,656 ops/sec
+TidesDB (C)
+runs: 5.51M, 5.54M (min 5.51M – max 5.54M)
+1 KiB / 256 B — 1.00× of group best"/><line x1="743.7" y1="127.3" x2="743.7" y2="128.1" class="whisk"/><line x1="740.7" y1="127.3" x2="746.7" y2="127.3" class="whisk"/><line x1="740.7" y1="128.1" x2="746.7" y2="128.1" class="whisk"/><text x="743.7" y="122.3" class="vlab" text-anchor="middle">5.52M</text><path d="M752.1,268.0 L752.1,253.4 Q752.1,249.4 756.1,249.4 L760.9,249.4 Q764.9,249.4 764.9,253.4 L764.9,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="732,738 ops/sec
+fjall (Rust)
+runs: 734k, 731k (min 731k – max 734k)
+1 KiB / 256 B — 0.13× of group best"/><line x1="758.5" y1="249.3" x2="758.5" y2="249.4" class="whisk"/><line x1="755.5" y1="249.3" x2="761.5" y2="249.3" class="whisk"/><line x1="755.5" y1="249.4" x2="761.5" y2="249.4" class="whisk"/><path d="M766.9,268.0 L766.9,248.8 Q766.9,244.8 770.9,244.8 L775.7,244.8 Q779.7,244.8 779.7,248.8 L779.7,268.0 Z" class="bar s-badger" tabindex="0" data-tip="912,888 ops/sec
+BadgerDB (Go)
+runs: 885k, 940k (min 885k – max 940k)
+1 KiB / 256 B — 0.17× of group best"/><line x1="773.3" y1="244.1" x2="773.3" y2="245.5" class="whisk"/><line x1="770.3" y1="244.1" x2="776.3" y2="244.1" class="whisk"/><line x1="770.3" y1="245.5" x2="776.3" y2="245.5" class="whisk"/><path d="M781.7,268.0 L781.7,239.4 Q781.7,235.4 785.7,235.4 L790.5,235.4 Q794.5,235.4 794.5,239.4 L794.5,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="1,285,274 ops/sec
+wavesdb (Go)
+runs: 1.25M, 1.32M (min 1.25M – max 1.32M)
+1 KiB / 256 B — 0.23× of group best"/><line x1="788.1" y1="234.6" x2="788.1" y2="236.1" class="whisk"/><line x1="785.1" y1="234.6" x2="791.1" y2="234.6" class="whisk"/><line x1="785.1" y1="236.1" x2="791.1" y2="236.1" class="whisk"/><path d="M796.5,268.0 L796.5,250.0 Q796.5,246.0 800.5,246.0 L805.3,246.0 Q809.3,246.0 809.3,250.0 L809.3,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="867,814 ops/sec
+RocksDB (C++)
+runs: 871k, 865k (min 865k – max 871k)
+1 KiB / 256 B — 0.16× of group best"/><line x1="802.9" y1="245.9" x2="802.9" y2="246.0" class="whisk"/><line x1="799.9" y1="245.9" x2="805.9" y2="245.9" class="whisk"/><line x1="799.9" y1="246.0" x2="805.9" y2="246.0" class="whisk"/><path d="M811.3,268.0 L811.3,268.0 Q811.3,265.3 814.0,265.3 L821.4,265.3 Q824.1,265.3 824.1,268.0 L824.1,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="106,604 ops/sec
+surrealkv (Rust)
+runs: 109k, 104k (min 104k – max 109k)
+1 KiB / 256 B — 0.02× of group best"/><line x1="817.7" y1="265.2" x2="817.7" y2="265.3" class="whisk"/><line x1="814.7" y1="265.2" x2="820.7" y2="265.2" class="whisk"/><line x1="814.7" y1="265.3" x2="820.7" y2="265.3" class="whisk"/><text x="773.3" y="286" class="xlab" text-anchor="middle">1 KiB / 256 B</text><text x="773.3" y="302" class="xsub" text-anchor="middle">150k ops</text><path d="M849.6,268.0 L849.6,253.7 Q849.6,249.7 853.6,249.7 L858.4,249.7 Q862.4,249.7 862.4,253.7 L862.4,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="721,030 ops/sec
+ondaDB (Rust)
+runs: 723k, 719k (min 719k – max 723k)
+2 KiB / 256 B — 0.25× of group best"/><line x1="856.0" y1="249.6" x2="856.0" y2="249.7" class="whisk"/><line x1="853.0" y1="249.6" x2="859.0" y2="249.6" class="whisk"/><line x1="853.0" y1="249.7" x2="859.0" y2="249.7" class="whisk"/><path d="M864.4,268.0 L864.4,198.1 Q864.4,194.1 868.4,194.1 L873.2,194.1 Q877.2,194.1 877.2,198.1 L877.2,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="2,909,283 ops/sec
+TidesDB (C)
+runs: 2.90M, 2.92M (min 2.90M – max 2.92M)
+2 KiB / 256 B — 1.00× of group best"/><line x1="870.8" y1="193.9" x2="870.8" y2="194.3" class="whisk"/><line x1="867.8" y1="193.9" x2="873.8" y2="193.9" class="whisk"/><line x1="867.8" y1="194.3" x2="873.8" y2="194.3" class="whisk"/><text x="870.8" y="188.9" class="vlab" text-anchor="middle">2.91M</text><path d="M879.2,268.0 L879.2,257.2 Q879.2,253.2 883.2,253.2 L888.0,253.2 Q892.0,253.2 892.0,257.2 L892.0,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="580,874 ops/sec
+fjall (Rust)
+runs: 655k, 507k (min 507k – max 655k)
+2 KiB / 256 B — 0.20× of group best"/><line x1="885.6" y1="251.4" x2="885.6" y2="255.1" class="whisk"/><line x1="882.6" y1="251.4" x2="888.6" y2="251.4" class="whisk"/><line x1="882.6" y1="255.1" x2="888.6" y2="255.1" class="whisk"/><path d="M894.0,268.0 L894.0,260.9 Q894.0,256.9 898.0,256.9 L902.8,256.9 Q906.8,256.9 906.8,260.9 L906.8,268.0 Z" class="bar s-badger" tabindex="0" data-tip="438,438 ops/sec
+BadgerDB (Go)
+runs: 448k, 429k (min 429k – max 448k)
+2 KiB / 256 B — 0.15× of group best"/><line x1="900.4" y1="256.6" x2="900.4" y2="257.1" class="whisk"/><line x1="897.4" y1="256.6" x2="903.4" y2="256.6" class="whisk"/><line x1="897.4" y1="257.1" x2="903.4" y2="257.1" class="whisk"/><path d="M908.8,268.0 L908.8,255.1 Q908.8,251.1 912.8,251.1 L917.7,251.1 Q921.7,251.1 921.7,255.1 L921.7,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="665,548 ops/sec
+wavesdb (Go)
+runs: 718k, 613k (min 613k – max 718k)
+2 KiB / 256 B — 0.23× of group best"/><line x1="915.2" y1="249.8" x2="915.2" y2="252.4" class="whisk"/><line x1="912.2" y1="249.8" x2="918.2" y2="249.8" class="whisk"/><line x1="912.2" y1="252.4" x2="918.2" y2="252.4" class="whisk"/><path d="M923.7,268.0 L923.7,257.4 Q923.7,253.4 927.7,253.4 L932.5,253.4 Q936.5,253.4 936.5,257.4 L936.5,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="576,137 ops/sec
+RocksDB (C++)
+runs: 577k, 575k (min 575k – max 577k)
+2 KiB / 256 B — 0.20× of group best"/><line x1="930.1" y1="253.3" x2="930.1" y2="253.4" class="whisk"/><line x1="927.1" y1="253.3" x2="933.1" y2="253.3" class="whisk"/><line x1="927.1" y1="253.4" x2="933.1" y2="253.4" class="whisk"/><path d="M938.5,268.0 L938.5,268.0 Q938.5,266.4 940.1,266.4 L949.7,266.4 Q951.3,266.4 951.3,268.0 L951.3,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="62,952 ops/sec
+surrealkv (Rust)
+runs: 58k, 68k (min 58k – max 68k)
+2 KiB / 256 B — 0.02× of group best"/><line x1="944.9" y1="266.3" x2="944.9" y2="266.5" class="whisk"/><line x1="941.9" y1="266.3" x2="947.9" y2="266.3" class="whisk"/><line x1="941.9" y1="266.5" x2="947.9" y2="266.5" class="whisk"/><text x="900.4" y="286" class="xlab" text-anchor="middle">2 KiB / 256 B</text><text x="900.4" y="302" class="xsub" text-anchor="middle">100k ops</text></svg><script type="application/json">{"type":"vbar","unit":"ops/sec","vfmt":"ops","groups":[{"label":"16 B / 100 B","sub":"1M ops"},{"label":"64 B / 512 B","sub":"400k ops"},{"label":"16 B / 1 KiB","sub":"250k ops"},{"label":"16 B / 4 KiB","sub":"30k ops"},{"label":"16 B / 16 KiB","sub":"8k ops"},{"label":"1 KiB / 256 B","sub":"150k ops"},{"label":"2 KiB / 256 B","sub":"100k ops"}],"series":[{"eng":"ondadb","label":"ondaDB (Rust)","values":[{"mean":4576965.0,"lo":4453651.0,"hi":4700279.0,"runs":[4700279.0,4453651.0]},{"mean":2428156.5,"lo":2242777.0,"hi":2613536.0,"runs":[2242777.0,2613536.0]},{"mean":2408270.0,"lo":2378160.0,"hi":2438380.0,"runs":[2438380.0,2378160.0]},{"mean":993240.0,"lo":881887.0,"hi":1104593.0,"runs":[1104593.0,881887.0]},{"mean":239432.5,"lo":203713.0,"hi":275152.0,"runs":[275152.0,203713.0]},{"mean":1312099.5,"lo":1308415.0,"hi":1315784.0,"runs":[1308415.0,1315784.0]},{"mean":721030.5,"lo":718941.0,"hi":723120.0,"runs":[723120.0,718941.0]}]},{"eng":"tidesdb","label":"TidesDB (C)","values":[{"mean":3115171.0999999996,"lo":797866.18,"hi":5432476.02,"runs":[5432476.02,797866.18]},{"mean":4969968.315,"lo":1238788.97,"hi":8701147.66,"runs":[8701147.66,1238788.97]},{"mean":489657.91500000004,"lo":459787.87,"hi":519527.96,"runs":[459787.87,519527.96]},{"mean":380746.55,"lo":379770.31,"hi":381722.79,"runs":[379770.31,381722.79]},{"mean":191675.53,"lo":146635.94,"hi":236715.12,"runs":[236715.12,146635.94]},{"mean":5523656.285,"lo":5508584.75,"hi":5538727.82,"runs":[5508584.75,5538727.82]},{"mean":2909282.8449999997,"lo":2900480.11,"hi":2918085.58,"runs":[2900480.11,2918085.58]}]},{"eng":"fjall","label":"fjall (Rust)","values":[{"mean":1637208.0,"lo":915781.0,"hi":2358635.0,"runs":[915781.0,2358635.0]},{"mean":1865680.0,"lo":1865100.0,"hi":1866260.0,"runs":[1865100.0,1866260.0]},{"mean":841466.0,"lo":717291.0,"hi":965641.0,"runs":[965641.0,717291.0]},{"mean":351812.0,"lo":291475.0,"hi":412149.0,"runs":[412149.0,291475.0]},{"mean":92128.0,"lo":78801.0,"hi":105455.0,"runs":[78801.0,105455.0]},{"mean":732737.5,"lo":731062.0,"hi":734413.0,"runs":[734413.0,731062.0]},{"mean":580873.5,"lo":506946.0,"hi":654801.0,"runs":[654801.0,506946.0]}]},{"eng":"badger","label":"BadgerDB (Go)","values":[{"mean":3202839.5,"lo":3098950.0,"hi":3306729.0,"runs":[3098950.0,3306729.0]},{"mean":1449764.5,"lo":1400860.0,"hi":1498669.0,"runs":[1400860.0,1498669.0]},{"mean":1084515.0,"lo":1064351.0,"hi":1104679.0,"runs":[1104679.0,1064351.0]},{"mean":474249.0,"lo":441057.0,"hi":507441.0,"runs":[441057.0,507441.0]},{"mean":246556.0,"lo":235846.0,"hi":257266.0,"runs":[235846.0,257266.0]},{"mean":912888.0,"lo":885499.0,"hi":940277.0,"runs":[885499.0,940277.0]},{"mean":438437.5,"lo":428728.0,"hi":448147.0,"runs":[448147.0,428728.0]}]},{"eng":"wavesdb","label":"wavesdb (Go)","values":[{"mean":3831311.5,"lo":3745572.0,"hi":3917051.0,"runs":[3745572.0,3917051.0]},{"mean":588740.0,"lo":522274.0,"hi":655206.0,"runs":[655206.0,522274.0]},{"mean":524543.0,"lo":516826.0,"hi":532260.0,"runs":[516826.0,532260.0]},{"mean":145196.5,"lo":143142.0,"hi":147251.0,"runs":[143142.0,147251.0]},{"mean":57795.0,"lo":57502.0,"hi":58088.0,"runs":[58088.0,57502.0]},{"mean":1285274.5,"lo":1254387.0,"hi":1316162.0,"runs":[1254387.0,1316162.0]},{"mean":665547.5,"lo":613101.0,"hi":717994.0,"runs":[717994.0,613101.0]}]},{"eng":"rocksdb","label":"RocksDB (C++)","values":[{"mean":2865085.5,"lo":2848321.0,"hi":2881850.0,"runs":[2881850.0,2848321.0]},{"mean":1447832.0,"lo":1436107.0,"hi":1459557.0,"runs":[1436107.0,1459557.0]},{"mean":1028006.5,"lo":1022287.0,"hi":1033726.0,"runs":[1022287.0,1033726.0]},{"mean":368063.0,"lo":367299.0,"hi":368827.0,"runs":[367299.0,368827.0]},{"mean":231490.5,"lo":230352.0,"hi":232629.0,"runs":[230352.0,232629.0]},{"mean":867814.5,"lo":864992.0,"hi":870637.0,"runs":[870637.0,864992.0]},{"mean":576137.0,"lo":574978.0,"hi":577296.0,"runs":[577296.0,574978.0]}]},{"eng":"surrealkv","label":"surrealkv (Rust)","values":[{"mean":1263281.0,"lo":1171520.0,"hi":1355042.0,"runs":[1171520.0,1355042.0]},{"mean":283170.5,"lo":240093.0,"hi":326248.0,"runs":[326248.0,240093.0]},{"mean":154725.0,"lo":137390.0,"hi":172060.0,"runs":[137390.0,172060.0]},{"mean":40811.0,"lo":38906.0,"hi":42716.0,"runs":[42716.0,38906.0]},{"mean":9363.5,"lo":8983.0,"hi":9744.0,"runs":[8983.0,9744.0]},{"mean":106604.0,"lo":104491.0,"hi":108717.0,"runs":[108717.0,104491.0]},{"mean":62952.0,"lo":57647.0,"hi":68257.0,"runs":[57647.0,68257.0]}]}]}</script></div><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb best">4,576,965</td><td class="c-tidesdb">3,115,171</td><td class="c-fjall">1,637,208</td><td class="c-badger">3,202,840</td><td class="c-wavesdb">3,831,312</td><td class="c-rocksdb">2,865,086</td><td class="c-surrealkv">1,263,281</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb">2,428,156</td><td class="c-tidesdb best">4,969,968</td><td class="c-fjall">1,865,680</td><td class="c-badger">1,449,764</td><td class="c-wavesdb">588,740</td><td class="c-rocksdb">1,447,832</td><td class="c-surrealkv">283,170</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb best">2,408,270</td><td class="c-tidesdb">489,658</td><td class="c-fjall">841,466</td><td class="c-badger">1,084,515</td><td class="c-wavesdb">524,543</td><td class="c-rocksdb">1,028,006</td><td class="c-surrealkv">154,725</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb best">993,240</td><td class="c-tidesdb">380,747</td><td class="c-fjall">351,812</td><td class="c-badger">474,249</td><td class="c-wavesdb">145,196</td><td class="c-rocksdb">368,063</td><td class="c-surrealkv">40,811</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb">239,432</td><td class="c-tidesdb">191,676</td><td class="c-fjall">92,128</td><td class="c-badger best">246,556</td><td class="c-wavesdb">57,795</td><td class="c-rocksdb">231,490</td><td class="c-surrealkv">9,364</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb">1,312,100</td><td class="c-tidesdb best">5,523,656</td><td class="c-fjall">732,738</td><td class="c-badger">912,888</td><td class="c-wavesdb">1,285,274</td><td class="c-rocksdb">867,814</td><td class="c-surrealkv">106,604</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb">721,030</td><td class="c-tidesdb best">2,909,283</td><td class="c-fjall">580,874</td><td class="c-badger">438,438</td><td class="c-wavesdb">665,548</td><td class="c-rocksdb">576,137</td><td class="c-surrealkv">62,952</td></tr></tbody></table></div></section><section class="card"><h2>Backward scan (concurrent full iterations)</h2><p class="unit">ops/sec — higher is better; whiskers span min–max across runs; the group leader is value-labeled</p><div class="chart" id="ph-Backward"><svg viewBox="0 0 980 320" role="img"><line x1="74" y1="268.0" x2="964" y2="268.0" class="grid"/><text x="66" y="272.0" class="ylab" text-anchor="end">0</text><line x1="74" y1="183.3" x2="964" y2="183.3" class="grid"/><text x="66" y="187.3" class="ylab" text-anchor="end">2M</text><line x1="74" y1="98.7" x2="964" y2="98.7" class="grid"/><text x="66" y="102.7" class="ylab" text-anchor="end">4M</text><line x1="74" y1="14.0" x2="964" y2="14.0" class="grid"/><text x="66" y="18.0" class="ylab" text-anchor="end">6M</text><line x1="74" y1="268.0" x2="964" y2="268.0" class="axis"/><path d="M86.7,268.0 L86.7,102.7 Q86.7,98.7 90.7,98.7 L95.5,98.7 Q99.5,98.7 99.5,102.7 L99.5,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="3,999,533 ops/sec
+ondaDB (Rust)
+runs: 3.90M, 4.09M (min 3.90M – max 4.09M)
+16 B / 100 B — 0.85× of group best"/><line x1="93.1" y1="94.7" x2="93.1" y2="102.7" class="whisk"/><line x1="90.1" y1="94.7" x2="96.1" y2="94.7" class="whisk"/><line x1="90.1" y1="102.7" x2="96.1" y2="102.7" class="whisk"/><path d="M101.5,268.0 L101.5,71.9 Q101.5,67.9 105.5,67.9 L110.3,67.9 Q114.3,67.9 114.3,71.9 L114.3,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="4,727,226 ops/sec
+TidesDB (C)
+runs: 4.45M, 5M (min 4.45M – max 5M)
+16 B / 100 B — 1.00× of group best"/><line x1="107.9" y1="56.2" x2="107.9" y2="79.6" class="whisk"/><line x1="104.9" y1="56.2" x2="110.9" y2="56.2" class="whisk"/><line x1="104.9" y1="79.6" x2="110.9" y2="79.6" class="whisk"/><text x="107.9" y="51.2" class="vlab" text-anchor="middle">4.73M</text><path d="M116.3,268.0 L116.3,227.8 Q116.3,223.8 120.3,223.8 L125.2,223.8 Q129.2,223.8 129.2,227.8 L129.2,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,043,044 ops/sec
+fjall (Rust)
+runs: 567k, 1.52M (min 567k – max 1.52M)
+16 B / 100 B — 0.22× of group best"/><line x1="122.8" y1="203.7" x2="122.8" y2="244.0" class="whisk"/><line x1="119.8" y1="203.7" x2="125.8" y2="203.7" class="whisk"/><line x1="119.8" y1="244.0" x2="125.8" y2="244.0" class="whisk"/><path d="M131.2,268.0 L131.2,131.6 Q131.2,127.6 135.2,127.6 L140.0,127.6 Q144.0,127.6 144.0,131.6 L144.0,268.0 Z" class="bar s-badger" tabindex="0" data-tip="3,316,844 ops/sec
+BadgerDB (Go)
+runs: 3.23M, 3.40M (min 3.23M – max 3.40M)
+16 B / 100 B — 0.70× of group best"/><line x1="137.6" y1="123.9" x2="137.6" y2="131.2" class="whisk"/><line x1="134.6" y1="123.9" x2="140.6" y2="123.9" class="whisk"/><line x1="134.6" y1="131.2" x2="140.6" y2="131.2" class="whisk"/><path d="M146.0,268.0 L146.0,115.1 Q146.0,111.1 150.0,111.1 L154.8,111.1 Q158.8,111.1 158.8,115.1 L158.8,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="3,706,906 ops/sec
+wavesdb (Go)
+runs: 3.62M, 3.79M (min 3.62M – max 3.79M)
+16 B / 100 B — 0.78× of group best"/><line x1="152.4" y1="107.5" x2="152.4" y2="114.7" class="whisk"/><line x1="149.4" y1="107.5" x2="155.4" y2="107.5" class="whisk"/><line x1="149.4" y1="114.7" x2="155.4" y2="114.7" class="whisk"/><path d="M160.8,268.0 L160.8,173.1 Q160.8,169.1 164.8,169.1 L169.6,169.1 Q173.6,169.1 173.6,173.1 L173.6,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="2,336,012 ops/sec
+RocksDB (C++)
+runs: 2.34M, 2.33M (min 2.33M – max 2.34M)
+16 B / 100 B — 0.49× of group best"/><line x1="167.2" y1="168.8" x2="167.2" y2="169.4" class="whisk"/><line x1="164.2" y1="168.8" x2="170.2" y2="168.8" class="whisk"/><line x1="164.2" y1="169.4" x2="170.2" y2="169.4" class="whisk"/><path d="M175.6,268.0 L175.6,237.3 Q175.6,233.3 179.6,233.3 L184.4,233.3 Q188.4,233.3 188.4,237.3 L188.4,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="820,710 ops/sec
+surrealkv (Rust)
+runs: 767k, 875k (min 767k – max 875k)
+16 B / 100 B — 0.17× of group best"/><line x1="182.0" y1="231.0" x2="182.0" y2="235.5" class="whisk"/><line x1="179.0" y1="231.0" x2="185.0" y2="231.0" class="whisk"/><line x1="179.0" y1="235.5" x2="185.0" y2="235.5" class="whisk"/><text x="137.6" y="286" class="xlab" text-anchor="middle">16 B / 100 B</text><text x="137.6" y="302" class="xsub" text-anchor="middle">1M ops</text><path d="M213.9,268.0 L213.9,172.0 Q213.9,168.0 217.9,168.0 L222.7,168.0 Q226.7,168.0 226.7,172.0 L226.7,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="2,363,386 ops/sec
+ondaDB (Rust)
+runs: 2.47M, 2.26M (min 2.26M – max 2.47M)
+64 B / 512 B — 0.76× of group best"/><line x1="220.3" y1="163.5" x2="220.3" y2="172.4" class="whisk"/><line x1="217.3" y1="163.5" x2="223.3" y2="163.5" class="whisk"/><line x1="217.3" y1="172.4" x2="223.3" y2="172.4" class="whisk"/><path d="M228.7,268.0 L228.7,140.1 Q228.7,136.1 232.7,136.1 L237.5,136.1 Q241.5,136.1 241.5,140.1 L241.5,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="3,114,687 ops/sec
+TidesDB (C)
+runs: 4.18M, 2.04M (min 2.04M – max 4.18M)
+64 B / 512 B — 1.00× of group best"/><line x1="235.1" y1="90.8" x2="235.1" y2="181.4" class="whisk"/><line x1="232.1" y1="90.8" x2="238.1" y2="90.8" class="whisk"/><line x1="232.1" y1="181.4" x2="238.1" y2="181.4" class="whisk"/><text x="235.1" y="85.8" class="vlab" text-anchor="middle">3.11M</text><path d="M243.5,268.0 L243.5,202.9 Q243.5,198.9 247.5,198.9 L252.3,198.9 Q256.3,198.9 256.3,202.9 L256.3,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="1,632,236 ops/sec
+fjall (Rust)
+runs: 1.64M, 1.62M (min 1.62M – max 1.64M)
+64 B / 512 B — 0.52× of group best"/><line x1="249.9" y1="198.4" x2="249.9" y2="199.4" class="whisk"/><line x1="246.9" y1="198.4" x2="252.9" y2="198.4" class="whisk"/><line x1="246.9" y1="199.4" x2="252.9" y2="199.4" class="whisk"/><path d="M258.3,268.0 L258.3,207.1 Q258.3,203.1 262.3,203.1 L267.1,203.1 Q271.1,203.1 271.1,207.1 L271.1,268.0 Z" class="bar s-badger" tabindex="0" data-tip="1,533,702 ops/sec
+BadgerDB (Go)
+runs: 1.49M, 1.57M (min 1.49M – max 1.57M)
+64 B / 512 B — 0.49× of group best"/><line x1="264.7" y1="201.4" x2="264.7" y2="204.8" class="whisk"/><line x1="261.7" y1="201.4" x2="267.7" y2="201.4" class="whisk"/><line x1="261.7" y1="204.8" x2="267.7" y2="204.8" class="whisk"/><path d="M273.1,268.0 L273.1,244.2 Q273.1,240.2 277.1,240.2 L281.9,240.2 Q285.9,240.2 285.9,244.2 L285.9,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="657,330 ops/sec
+wavesdb (Go)
+runs: 665k, 650k (min 650k – max 665k)
+64 B / 512 B — 0.21× of group best"/><line x1="279.5" y1="239.9" x2="279.5" y2="240.5" class="whisk"/><line x1="276.5" y1="239.9" x2="282.5" y2="239.9" class="whisk"/><line x1="276.5" y1="240.5" x2="282.5" y2="240.5" class="whisk"/><path d="M287.9,268.0 L287.9,220.9 Q287.9,216.9 291.9,216.9 L296.8,216.9 Q300.8,216.9 300.8,220.9 L300.8,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="1,207,368 ops/sec
+RocksDB (C++)
+runs: 1.22M, 1.20M (min 1.20M – max 1.22M)
+64 B / 512 B — 0.39× of group best"/><line x1="294.3" y1="216.6" x2="294.3" y2="217.2" class="whisk"/><line x1="291.3" y1="216.6" x2="297.3" y2="216.6" class="whisk"/><line x1="291.3" y1="217.2" x2="297.3" y2="217.2" class="whisk"/><path d="M302.8,268.0 L302.8,261.6 Q302.8,257.6 306.8,257.6 L311.6,257.6 Q315.6,257.6 315.6,261.6 L315.6,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="245,634 ops/sec
+surrealkv (Rust)
+runs: 271k, 220k (min 220k – max 271k)
+64 B / 512 B — 0.08× of group best"/><line x1="309.2" y1="256.5" x2="309.2" y2="258.7" class="whisk"/><line x1="306.2" y1="256.5" x2="312.2" y2="256.5" class="whisk"/><line x1="306.2" y1="258.7" x2="312.2" y2="258.7" class="whisk"/><text x="264.7" y="286" class="xlab" text-anchor="middle">64 B / 512 B</text><text x="264.7" y="302" class="xsub" text-anchor="middle">400k ops</text><path d="M341.0,268.0 L341.0,200.2 Q341.0,196.2 345.0,196.2 L349.8,196.2 Q353.8,196.2 353.8,200.2 L353.8,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="1,695,480 ops/sec
+ondaDB (Rust)
+runs: 1.30M, 2.09M (min 1.30M – max 2.09M)
+16 B / 1 KiB — 1.00× of group best"/><line x1="347.4" y1="179.4" x2="347.4" y2="213.1" class="whisk"/><line x1="344.4" y1="179.4" x2="350.4" y2="179.4" class="whisk"/><line x1="344.4" y1="213.1" x2="350.4" y2="213.1" class="whisk"/><text x="347.4" y="174.4" class="vlab" text-anchor="middle">1.70M</text><path d="M355.8,268.0 L355.8,253.0 Q355.8,249.0 359.8,249.0 L364.6,249.0 Q368.6,249.0 368.6,253.0 L368.6,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="448,519 ops/sec
+TidesDB (C)
+runs: 427k, 470k (min 427k – max 470k)
+16 B / 1 KiB — 0.26× of group best"/><line x1="362.2" y1="248.1" x2="362.2" y2="249.9" class="whisk"/><line x1="359.2" y1="248.1" x2="365.2" y2="248.1" class="whisk"/><line x1="359.2" y1="249.9" x2="365.2" y2="249.9" class="whisk"/><path d="M370.6,268.0 L370.6,237.9 Q370.6,233.9 374.6,233.9 L379.4,233.9 Q383.4,233.9 383.4,237.9 L383.4,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="804,899 ops/sec
+fjall (Rust)
+runs: 889k, 720k (min 720k – max 889k)
+16 B / 1 KiB — 0.47× of group best"/><line x1="377.0" y1="230.3" x2="377.0" y2="237.5" class="whisk"/><line x1="374.0" y1="230.3" x2="380.0" y2="230.3" class="whisk"/><line x1="374.0" y1="237.5" x2="380.0" y2="237.5" class="whisk"/><path d="M385.4,268.0 L385.4,222.6 Q385.4,218.6 389.4,218.6 L394.3,218.6 Q398.3,218.6 398.3,222.6 L398.3,268.0 Z" class="bar s-badger" tabindex="0" data-tip="1,168,052 ops/sec
+BadgerDB (Go)
+runs: 1.13M, 1.20M (min 1.13M – max 1.20M)
+16 B / 1 KiB — 0.69× of group best"/><line x1="391.9" y1="217.1" x2="391.9" y2="220.0" class="whisk"/><line x1="388.9" y1="217.1" x2="394.9" y2="217.1" class="whisk"/><line x1="388.9" y1="220.0" x2="394.9" y2="220.0" class="whisk"/><path d="M400.3,268.0 L400.3,250.5 Q400.3,246.5 404.3,246.5 L409.1,246.5 Q413.1,246.5 413.1,250.5 L413.1,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="507,802 ops/sec
+wavesdb (Go)
+runs: 499k, 517k (min 499k – max 517k)
+16 B / 1 KiB — 0.30× of group best"/><line x1="406.7" y1="246.1" x2="406.7" y2="246.9" class="whisk"/><line x1="403.7" y1="246.1" x2="409.7" y2="246.1" class="whisk"/><line x1="403.7" y1="246.9" x2="409.7" y2="246.9" class="whisk"/><path d="M415.1,268.0 L415.1,231.3 Q415.1,227.3 419.1,227.3 L423.9,227.3 Q427.9,227.3 427.9,231.3 L427.9,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="960,497 ops/sec
+RocksDB (C++)
+runs: 976k, 945k (min 945k – max 976k)
+16 B / 1 KiB — 0.57× of group best"/><line x1="421.5" y1="226.7" x2="421.5" y2="228.0" class="whisk"/><line x1="418.5" y1="226.7" x2="424.5" y2="226.7" class="whisk"/><line x1="418.5" y1="228.0" x2="424.5" y2="228.0" class="whisk"/><path d="M429.9,268.0 L429.9,265.7 Q429.9,261.7 433.9,261.7 L438.7,261.7 Q442.7,261.7 442.7,265.7 L442.7,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="149,754 ops/sec
+surrealkv (Rust)
+runs: 139k, 161k (min 139k – max 161k)
+16 B / 1 KiB — 0.09× of group best"/><line x1="436.3" y1="261.2" x2="436.3" y2="262.1" class="whisk"/><line x1="433.3" y1="261.2" x2="439.3" y2="261.2" class="whisk"/><line x1="433.3" y1="262.1" x2="439.3" y2="262.1" class="whisk"/><text x="391.9" y="286" class="xlab" text-anchor="middle">16 B / 1 KiB</text><text x="391.9" y="302" class="xsub" text-anchor="middle">250k ops</text><path d="M468.1,268.0 L468.1,220.9 Q468.1,216.9 472.1,216.9 L477.0,216.9 Q481.0,216.9 481.0,220.9 L481.0,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="1,206,374 ops/sec
+ondaDB (Rust)
+runs: 1.31M, 1.10M (min 1.10M – max 1.31M)
+16 B / 4 KiB — 1.00× of group best"/><line x1="474.6" y1="212.5" x2="474.6" y2="221.3" class="whisk"/><line x1="471.6" y1="212.5" x2="477.6" y2="212.5" class="whisk"/><line x1="471.6" y1="221.3" x2="477.6" y2="221.3" class="whisk"/><text x="474.6" y="207.5" class="vlab" text-anchor="middle">1.21M</text><path d="M483.0,268.0 L483.0,256.5 Q483.0,252.5 487.0,252.5 L491.8,252.5 Q495.8,252.5 495.8,256.5 L495.8,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="366,368 ops/sec
+TidesDB (C)
+runs: 367k, 365k (min 365k – max 367k)
+16 B / 4 KiB — 0.30× of group best"/><line x1="489.4" y1="252.4" x2="489.4" y2="252.5" class="whisk"/><line x1="486.4" y1="252.4" x2="492.4" y2="252.4" class="whisk"/><line x1="486.4" y1="252.5" x2="492.4" y2="252.5" class="whisk"/><path d="M497.8,268.0 L497.8,251.6 Q497.8,247.6 501.8,247.6 L506.6,247.6 Q510.6,247.6 510.6,251.6 L510.6,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="481,332 ops/sec
+fjall (Rust)
+runs: 524k, 439k (min 439k – max 524k)
+16 B / 4 KiB — 0.40× of group best"/><line x1="504.2" y1="245.8" x2="504.2" y2="249.4" class="whisk"/><line x1="501.2" y1="245.8" x2="507.2" y2="245.8" class="whisk"/><line x1="501.2" y1="249.4" x2="507.2" y2="249.4" class="whisk"/><path d="M512.6,268.0 L512.6,251.8 Q512.6,247.8 516.6,247.8 L521.4,247.8 Q525.4,247.8 525.4,251.8 L525.4,268.0 Z" class="bar s-badger" tabindex="0" data-tip="476,640 ops/sec
+BadgerDB (Go)
+runs: 535k, 418k (min 418k – max 535k)
+16 B / 4 KiB — 0.40× of group best"/><line x1="519.0" y1="245.3" x2="519.0" y2="250.3" class="whisk"/><line x1="516.0" y1="245.3" x2="522.0" y2="245.3" class="whisk"/><line x1="516.0" y1="250.3" x2="522.0" y2="250.3" class="whisk"/><path d="M527.4,268.0 L527.4,265.4 Q527.4,261.4 531.4,261.4 L536.2,261.4 Q540.2,261.4 540.2,265.4 L540.2,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="156,334 ops/sec
+wavesdb (Go)
+runs: 153k, 160k (min 153k – max 160k)
+16 B / 4 KiB — 0.13× of group best"/><line x1="533.8" y1="261.2" x2="533.8" y2="261.5" class="whisk"/><line x1="530.8" y1="261.2" x2="536.8" y2="261.2" class="whisk"/><line x1="530.8" y1="261.5" x2="536.8" y2="261.5" class="whisk"/><path d="M542.2,268.0 L542.2,252.9 Q542.2,248.9 546.2,248.9 L551.0,248.9 Q555.0,248.9 555.0,252.9 L555.0,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="451,226 ops/sec
+RocksDB (C++)
+runs: 460k, 442k (min 442k – max 460k)
+16 B / 4 KiB — 0.37× of group best"/><line x1="548.6" y1="248.5" x2="548.6" y2="249.3" class="whisk"/><line x1="545.6" y1="248.5" x2="551.6" y2="248.5" class="whisk"/><line x1="545.6" y1="249.3" x2="551.6" y2="249.3" class="whisk"/><path d="M557.0,268.0 L557.0,268.0 Q557.0,266.4 558.7,266.4 L568.2,266.4 Q569.9,266.4 569.9,268.0 L569.9,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="38,156 ops/sec
+surrealkv (Rust)
+runs: 33k, 43k (min 33k – max 43k)
+16 B / 4 KiB — 0.03× of group best"/><line x1="563.4" y1="266.2" x2="563.4" y2="266.6" class="whisk"/><line x1="560.4" y1="266.2" x2="566.4" y2="266.2" class="whisk"/><line x1="560.4" y1="266.6" x2="566.4" y2="266.6" class="whisk"/><text x="519.0" y="286" class="xlab" text-anchor="middle">16 B / 4 KiB</text><text x="519.0" y="302" class="xsub" text-anchor="middle">30k ops</text><path d="M595.3,268.0 L595.3,252.9 Q595.3,248.9 599.3,248.9 L604.1,248.9 Q608.1,248.9 608.1,252.9 L608.1,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="450,042 ops/sec
+ondaDB (Rust)
+runs: 418k, 482k (min 418k – max 482k)
+16 B / 16 KiB — 1.00× of group best"/><line x1="601.7" y1="247.6" x2="601.7" y2="250.3" class="whisk"/><line x1="598.7" y1="247.6" x2="604.7" y2="247.6" class="whisk"/><line x1="598.7" y1="250.3" x2="604.7" y2="250.3" class="whisk"/><text x="601.7" y="242.6" class="vlab" text-anchor="middle">450k</text><path d="M610.1,268.0 L610.1,263.7 Q610.1,259.7 614.1,259.7 L618.9,259.7 Q622.9,259.7 622.9,263.7 L622.9,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="195,072 ops/sec
+TidesDB (C)
+runs: 227k, 164k (min 164k – max 227k)
+16 B / 16 KiB — 0.43× of group best"/><line x1="616.5" y1="258.4" x2="616.5" y2="261.1" class="whisk"/><line x1="613.5" y1="258.4" x2="619.5" y2="258.4" class="whisk"/><line x1="613.5" y1="261.1" x2="619.5" y2="261.1" class="whisk"/><path d="M624.9,268.0 L624.9,257.0 Q624.9,253.0 628.9,253.0 L633.7,253.0 Q637.7,253.0 637.7,257.0 L637.7,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="353,532 ops/sec
+fjall (Rust)
+runs: 350k, 357k (min 350k – max 357k)
+16 B / 16 KiB — 0.79× of group best"/><line x1="631.3" y1="252.9" x2="631.3" y2="253.2" class="whisk"/><line x1="628.3" y1="252.9" x2="634.3" y2="252.9" class="whisk"/><line x1="628.3" y1="253.2" x2="634.3" y2="253.2" class="whisk"/><path d="M639.7,268.0 L639.7,260.5 Q639.7,256.5 643.7,256.5 L648.6,256.5 Q652.6,256.5 652.6,260.5 L652.6,268.0 Z" class="bar s-badger" tabindex="0" data-tip="270,820 ops/sec
+BadgerDB (Go)
+runs: 248k, 294k (min 248k – max 294k)
+16 B / 16 KiB — 0.60× of group best"/><line x1="646.1" y1="255.6" x2="646.1" y2="257.5" class="whisk"/><line x1="643.1" y1="255.6" x2="649.1" y2="255.6" class="whisk"/><line x1="643.1" y1="257.5" x2="649.1" y2="257.5" class="whisk"/><path d="M654.6,268.0 L654.6,268.0 Q654.6,265.9 656.7,265.9 L665.2,265.9 Q667.4,265.9 667.4,268.0 L667.4,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="50,617 ops/sec
+wavesdb (Go)
+runs: 50k, 52k (min 50k – max 52k)
+16 B / 16 KiB — 0.11× of group best"/><line x1="661.0" y1="265.8" x2="661.0" y2="265.9" class="whisk"/><line x1="658.0" y1="265.8" x2="664.0" y2="265.8" class="whisk"/><line x1="658.0" y1="265.9" x2="664.0" y2="265.9" class="whisk"/><path d="M669.4,268.0 L669.4,259.8 Q669.4,255.8 673.4,255.8 L678.2,255.8 Q682.2,255.8 682.2,259.8 L682.2,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="288,653 ops/sec
+RocksDB (C++)
+runs: 274k, 303k (min 274k – max 303k)
+16 B / 16 KiB — 0.64× of group best"/><line x1="675.8" y1="255.2" x2="675.8" y2="256.4" class="whisk"/><line x1="672.8" y1="255.2" x2="678.8" y2="255.2" class="whisk"/><line x1="672.8" y1="256.4" x2="678.8" y2="256.4" class="whisk"/><path d="M684.2,268.0 L684.2,268.0 Q684.2,267.6 684.6,267.6 L696.6,267.6 Q697.0,267.6 697.0,268.0 L697.0,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="9,526 ops/sec
+surrealkv (Rust)
+runs: 10k, 9k (min 9k – max 10k)
+16 B / 16 KiB — 0.02× of group best"/><line x1="690.6" y1="267.6" x2="690.6" y2="267.6" class="whisk"/><line x1="687.6" y1="267.6" x2="693.6" y2="267.6" class="whisk"/><line x1="687.6" y1="267.6" x2="693.6" y2="267.6" class="whisk"/><text x="646.1" y="286" class="xlab" text-anchor="middle">16 B / 16 KiB</text><text x="646.1" y="302" class="xsub" text-anchor="middle">8k ops</text><path d="M722.4,268.0 L722.4,225.7 Q722.4,221.7 726.4,221.7 L731.2,221.7 Q735.2,221.7 735.2,225.7 L735.2,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="1,093,234 ops/sec
+ondaDB (Rust)
+runs: 1.21M, 976k (min 976k – max 1.21M)
+1 KiB / 256 B — 0.51× of group best"/><line x1="728.8" y1="216.7" x2="728.8" y2="226.7" class="whisk"/><line x1="725.8" y1="216.7" x2="731.8" y2="216.7" class="whisk"/><line x1="725.8" y1="226.7" x2="731.8" y2="226.7" class="whisk"/><path d="M737.2,268.0 L737.2,181.9 Q737.2,177.9 741.2,177.9 L746.1,177.9 Q750.1,177.9 750.1,181.9 L750.1,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="2,127,990 ops/sec
+TidesDB (C)
+runs: 2.12M, 2.13M (min 2.12M – max 2.13M)
+1 KiB / 256 B — 1.00× of group best"/><line x1="743.7" y1="177.7" x2="743.7" y2="178.1" class="whisk"/><line x1="740.7" y1="177.7" x2="746.7" y2="177.7" class="whisk"/><line x1="740.7" y1="178.1" x2="746.7" y2="178.1" class="whisk"/><text x="743.7" y="172.7" class="vlab" text-anchor="middle">2.13M</text><path d="M752.1,268.0 L752.1,247.5 Q752.1,243.5 756.1,243.5 L760.9,243.5 Q764.9,243.5 764.9,247.5 L764.9,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="578,142 ops/sec
+fjall (Rust)
+runs: 558k, 599k (min 558k – max 599k)
+1 KiB / 256 B — 0.27× of group best"/><line x1="758.5" y1="242.7" x2="758.5" y2="244.4" class="whisk"/><line x1="755.5" y1="242.7" x2="761.5" y2="242.7" class="whisk"/><line x1="755.5" y1="244.4" x2="761.5" y2="244.4" class="whisk"/><path d="M766.9,268.0 L766.9,227.2 Q766.9,223.2 770.9,223.2 L775.7,223.2 Q779.7,223.2 779.7,227.2 L779.7,268.0 Z" class="bar s-badger" tabindex="0" data-tip="1,058,930 ops/sec
+BadgerDB (Go)
+runs: 1.10M, 1.02M (min 1.02M – max 1.10M)
+1 KiB / 256 B — 0.50× of group best"/><line x1="773.3" y1="221.6" x2="773.3" y2="224.7" class="whisk"/><line x1="770.3" y1="221.6" x2="776.3" y2="221.6" class="whisk"/><line x1="770.3" y1="224.7" x2="776.3" y2="224.7" class="whisk"/><path d="M781.7,268.0 L781.7,216.2 Q781.7,212.2 785.7,212.2 L790.5,212.2 Q794.5,212.2 794.5,216.2 L794.5,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="1,318,009 ops/sec
+wavesdb (Go)
+runs: 1.22M, 1.42M (min 1.22M – max 1.42M)
+1 KiB / 256 B — 0.62× of group best"/><line x1="788.1" y1="207.8" x2="788.1" y2="216.6" class="whisk"/><line x1="785.1" y1="207.8" x2="791.1" y2="207.8" class="whisk"/><line x1="785.1" y1="216.6" x2="791.1" y2="216.6" class="whisk"/><path d="M796.5,268.0 L796.5,254.0 Q796.5,250.0 800.5,250.0 L805.3,250.0 Q809.3,250.0 809.3,254.0 L809.3,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="424,861 ops/sec
+RocksDB (C++)
+runs: 423k, 427k (min 423k – max 427k)
+1 KiB / 256 B — 0.20× of group best"/><line x1="802.9" y1="249.9" x2="802.9" y2="250.1" class="whisk"/><line x1="799.9" y1="249.9" x2="805.9" y2="249.9" class="whisk"/><line x1="799.9" y1="250.1" x2="805.9" y2="250.1" class="whisk"/><path d="M811.3,268.0 L811.3,267.4 Q811.3,263.4 815.3,263.4 L820.1,263.4 Q824.1,263.4 824.1,267.4 L824.1,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="109,160 ops/sec
+surrealkv (Rust)
+runs: 103k, 115k (min 103k – max 115k)
+1 KiB / 256 B — 0.05× of group best"/><line x1="817.7" y1="263.1" x2="817.7" y2="263.6" class="whisk"/><line x1="814.7" y1="263.1" x2="820.7" y2="263.1" class="whisk"/><line x1="814.7" y1="263.6" x2="820.7" y2="263.6" class="whisk"/><text x="773.3" y="286" class="xlab" text-anchor="middle">1 KiB / 256 B</text><text x="773.3" y="302" class="xsub" text-anchor="middle">150k ops</text><path d="M849.6,268.0 L849.6,245.4 Q849.6,241.4 853.6,241.4 L858.4,241.4 Q862.4,241.4 862.4,245.4 L862.4,268.0 Z" class="bar s-ondadb" tabindex="0" data-tip="628,458 ops/sec
+ondaDB (Rust)
+runs: 685k, 572k (min 572k – max 685k)
+2 KiB / 256 B — 0.49× of group best"/><line x1="856.0" y1="239.0" x2="856.0" y2="243.8" class="whisk"/><line x1="853.0" y1="239.0" x2="859.0" y2="239.0" class="whisk"/><line x1="853.0" y1="243.8" x2="859.0" y2="243.8" class="whisk"/><path d="M864.4,268.0 L864.4,218.0 Q864.4,214.0 868.4,214.0 L873.2,214.0 Q877.2,214.0 877.2,218.0 L877.2,268.0 Z" class="bar s-tidesdb" tabindex="0" data-tip="1,274,561 ops/sec
+TidesDB (C)
+runs: 1.28M, 1.27M (min 1.27M – max 1.28M)
+2 KiB / 256 B — 1.00× of group best"/><line x1="870.8" y1="213.9" x2="870.8" y2="214.2" class="whisk"/><line x1="867.8" y1="213.9" x2="873.8" y2="213.9" class="whisk"/><line x1="867.8" y1="214.2" x2="873.8" y2="214.2" class="whisk"/><text x="870.8" y="208.9" class="vlab" text-anchor="middle">1.27M</text><path d="M879.2,268.0 L879.2,248.8 Q879.2,244.8 883.2,244.8 L888.0,244.8 Q892.0,244.8 892.0,248.8 L892.0,268.0 Z" class="bar s-fjall" tabindex="0" data-tip="546,982 ops/sec
+fjall (Rust)
+runs: 602k, 492k (min 492k – max 602k)
+2 KiB / 256 B — 0.43× of group best"/><line x1="885.6" y1="242.5" x2="885.6" y2="247.2" class="whisk"/><line x1="882.6" y1="242.5" x2="888.6" y2="242.5" class="whisk"/><line x1="882.6" y1="247.2" x2="888.6" y2="247.2" class="whisk"/><path d="M894.0,268.0 L894.0,251.2 Q894.0,247.2 898.0,247.2 L902.8,247.2 Q906.8,247.2 906.8,251.2 L906.8,268.0 Z" class="bar s-badger" tabindex="0" data-tip="490,987 ops/sec
+BadgerDB (Go)
+runs: 481k, 501k (min 481k – max 501k)
+2 KiB / 256 B — 0.39× of group best"/><line x1="900.4" y1="246.8" x2="900.4" y2="247.6" class="whisk"/><line x1="897.4" y1="246.8" x2="903.4" y2="246.8" class="whisk"/><line x1="897.4" y1="247.6" x2="903.4" y2="247.6" class="whisk"/><path d="M908.8,268.0 L908.8,250.7 Q908.8,246.7 912.8,246.7 L917.7,246.7 Q921.7,246.7 921.7,250.7 L921.7,268.0 Z" class="bar s-wavesdb" tabindex="0" data-tip="503,972 ops/sec
+wavesdb (Go)
+runs: 397k, 611k (min 397k – max 611k)
+2 KiB / 256 B — 0.40× of group best"/><line x1="915.2" y1="242.2" x2="915.2" y2="251.2" class="whisk"/><line x1="912.2" y1="242.2" x2="918.2" y2="242.2" class="whisk"/><line x1="912.2" y1="251.2" x2="918.2" y2="251.2" class="whisk"/><path d="M923.7,268.0 L923.7,262.3 Q923.7,258.3 927.7,258.3 L932.5,258.3 Q936.5,258.3 936.5,262.3 L936.5,268.0 Z" class="bar s-rocksdb" tabindex="0" data-tip="229,438 ops/sec
+RocksDB (C++)
+runs: 247k, 212k (min 212k – max 247k)
+2 KiB / 256 B — 0.18× of group best"/><line x1="930.1" y1="257.5" x2="930.1" y2="259.0" class="whisk"/><line x1="927.1" y1="257.5" x2="933.1" y2="257.5" class="whisk"/><line x1="927.1" y1="259.0" x2="933.1" y2="259.0" class="whisk"/><path d="M938.5,268.0 L938.5,268.0 Q938.5,265.6 940.9,265.6 L948.9,265.6 Q951.3,265.6 951.3,268.0 L951.3,268.0 Z" class="bar s-surrealkv" tabindex="0" data-tip="57,099 ops/sec
+surrealkv (Rust)
+runs: 57k, 57k (min 57k – max 57k)
+2 KiB / 256 B — 0.04× of group best"/><line x1="944.9" y1="265.6" x2="944.9" y2="265.6" class="whisk"/><line x1="941.9" y1="265.6" x2="947.9" y2="265.6" class="whisk"/><line x1="941.9" y1="265.6" x2="947.9" y2="265.6" class="whisk"/><text x="900.4" y="286" class="xlab" text-anchor="middle">2 KiB / 256 B</text><text x="900.4" y="302" class="xsub" text-anchor="middle">100k ops</text></svg><script type="application/json">{"type":"vbar","unit":"ops/sec","vfmt":"ops","groups":[{"label":"16 B / 100 B","sub":"1M ops"},{"label":"64 B / 512 B","sub":"400k ops"},{"label":"16 B / 1 KiB","sub":"250k ops"},{"label":"16 B / 4 KiB","sub":"30k ops"},{"label":"16 B / 16 KiB","sub":"8k ops"},{"label":"1 KiB / 256 B","sub":"150k ops"},{"label":"2 KiB / 256 B","sub":"100k ops"}],"series":[{"eng":"ondadb","label":"ondaDB (Rust)","values":[{"mean":3999533.0,"lo":3904233.0,"hi":4094833.0,"runs":[3904233.0,4094833.0]},{"mean":2363385.5,"lo":2257437.0,"hi":2469334.0,"runs":[2469334.0,2257437.0]},{"mean":1695480.0,"lo":1297138.0,"hi":2093822.0,"runs":[1297138.0,2093822.0]},{"mean":1206374.5,"lo":1102397.0,"hi":1310352.0,"runs":[1310352.0,1102397.0]},{"mean":450041.5,"lo":418498.0,"hi":481585.0,"runs":[418498.0,481585.0]},{"mean":1093233.5,"lo":975522.0,"hi":1210945.0,"runs":[1210945.0,975522.0]},{"mean":628458.0,"lo":572153.0,"hi":684763.0,"runs":[684763.0,572153.0]}]},{"eng":"tidesdb","label":"TidesDB (C)","values":[{"mean":4727226.305,"lo":4451472.32,"hi":5002980.29,"runs":[4451472.32,5002980.29]},{"mean":3114686.825,"lo":2044529.41,"hi":4184844.24,"runs":[4184844.24,2044529.41]},{"mean":448519.12,"lo":427284.81,"hi":469753.43,"runs":[427284.81,469753.43]},{"mean":366367.87,"lo":365385.87,"hi":367349.87,"runs":[367349.87,365385.87]},{"mean":195071.58000000002,"lo":163572.56,"hi":226570.6,"runs":[226570.6,163572.56]},{"mean":2127990.09,"lo":2122602.4,"hi":2133377.78,"runs":[2122602.4,2133377.78]},{"mean":1274560.96,"lo":1271051.01,"hi":1278070.91,"runs":[1278070.91,1271051.01]}]},{"eng":"fjall","label":"fjall (Rust)","values":[{"mean":1043043.5,"lo":567473.0,"hi":1518614.0,"runs":[567473.0,1518614.0]},{"mean":1632236.0,"lo":1620282.0,"hi":1644190.0,"runs":[1644190.0,1620282.0]},{"mean":804899.0,"lo":720348.0,"hi":889450.0,"runs":[889450.0,720348.0]},{"mean":481332.5,"lo":438647.0,"hi":524018.0,"runs":[524018.0,438647.0]},{"mean":353531.5,"lo":349598.0,"hi":357465.0,"runs":[349598.0,357465.0]},{"mean":578141.5,"lo":557539.0,"hi":598744.0,"runs":[557539.0,598744.0]},{"mean":546981.5,"lo":491851.0,"hi":602112.0,"runs":[602112.0,491851.0]}]},{"eng":"badger","label":"BadgerDB (Go)","values":[{"mean":3316844.0,"lo":3230906.0,"hi":3402782.0,"runs":[3230906.0,3402782.0]},{"mean":1533701.5,"lo":1493080.0,"hi":1574323.0,"runs":[1493080.0,1574323.0]},{"mean":1168051.5,"lo":1133039.0,"hi":1203064.0,"runs":[1133039.0,1203064.0]},{"mean":476640.5,"lo":417916.0,"hi":535365.0,"runs":[535365.0,417916.0]},{"mean":270820.0,"lo":247752.0,"hi":293888.0,"runs":[247752.0,293888.0]},{"mean":1058929.5,"lo":1022624.0,"hi":1095235.0,"runs":[1095235.0,1022624.0]},{"mean":490987.0,"lo":480859.0,"hi":501115.0,"runs":[480859.0,501115.0]}]},{"eng":"wavesdb","label":"wavesdb (Go)","values":[{"mean":3706905.5,"lo":3621934.0,"hi":3791877.0,"runs":[3621934.0,3791877.0]},{"mean":657330.0,"lo":649708.0,"hi":664952.0,"runs":[664952.0,649708.0]},{"mean":507802.5,"lo":498996.0,"hi":516609.0,"runs":[498996.0,516609.0]},{"mean":156334.0,"lo":153016.0,"hi":159652.0,"runs":[153016.0,159652.0]},{"mean":50617.0,"lo":49518.0,"hi":51716.0,"runs":[49518.0,51716.0]},{"mean":1318009.0,"lo":1215015.0,"hi":1421003.0,"runs":[1215015.0,1421003.0]},{"mean":503972.5,"lo":397346.0,"hi":610599.0,"runs":[397346.0,610599.0]}]},{"eng":"rocksdb","label":"RocksDB (C++)","values":[{"mean":2336012.0,"lo":2329683.0,"hi":2342341.0,"runs":[2342341.0,2329683.0]},{"mean":1207367.5,"lo":1199457.0,"hi":1215278.0,"runs":[1215278.0,1199457.0]},{"mean":960497.0,"lo":945213.0,"hi":975781.0,"runs":[975781.0,945213.0]},{"mean":451225.5,"lo":442223.0,"hi":460228.0,"runs":[460228.0,442223.0]},{"mean":288653.0,"lo":273927.0,"hi":303379.0,"runs":[273927.0,303379.0]},{"mean":424861.0,"lo":422719.0,"hi":427003.0,"runs":[422719.0,427003.0]},{"mean":229438.5,"lo":211802.0,"hi":247075.0,"runs":[247075.0,211802.0]}]},{"eng":"surrealkv","label":"surrealkv (Rust)","values":[{"mean":820710.5,"lo":766828.0,"hi":874593.0,"runs":[766828.0,874593.0]},{"mean":245633.5,"lo":220279.0,"hi":270988.0,"runs":[270988.0,220279.0]},{"mean":149754.5,"lo":138866.0,"hi":160643.0,"runs":[138866.0,160643.0]},{"mean":38155.5,"lo":32993.0,"hi":43318.0,"runs":[32993.0,43318.0]},{"mean":9525.5,"lo":9403.0,"hi":9648.0,"runs":[9648.0,9403.0]},{"mean":109160.5,"lo":103357.0,"hi":114964.0,"runs":[103357.0,114964.0]},{"mean":57099.0,"lo":56880.0,"hi":57318.0,"runs":[56880.0,57318.0]}]}]}</script></div><div class="tblwrap"><table><thead><tr><th></th><th class="c-ondadb"><span class="chip s-ondadb"></span>ondaDB (Rust)</th><th class="c-tidesdb"><span class="chip s-tidesdb"></span>TidesDB (C)</th><th class="c-fjall"><span class="chip s-fjall"></span>fjall (Rust)</th><th class="c-badger"><span class="chip s-badger"></span>BadgerDB (Go)</th><th class="c-wavesdb"><span class="chip s-wavesdb"></span>wavesdb (Go)</th><th class="c-rocksdb"><span class="chip s-rocksdb"></span>RocksDB (C++)</th><th class="c-surrealkv"><span class="chip s-surrealkv"></span>surrealkv (Rust)</th></tr></thead><tbody><tr><th>16 B / 100 B</th><td class="c-ondadb">3,999,533</td><td class="c-tidesdb best">4,727,226</td><td class="c-fjall">1,043,044</td><td class="c-badger">3,316,844</td><td class="c-wavesdb">3,706,906</td><td class="c-rocksdb">2,336,012</td><td class="c-surrealkv">820,710</td></tr><tr><th>64 B / 512 B</th><td class="c-ondadb">2,363,386</td><td class="c-tidesdb best">3,114,687</td><td class="c-fjall">1,632,236</td><td class="c-badger">1,533,702</td><td class="c-wavesdb">657,330</td><td class="c-rocksdb">1,207,368</td><td class="c-surrealkv">245,634</td></tr><tr><th>16 B / 1 KiB</th><td class="c-ondadb best">1,695,480</td><td class="c-tidesdb">448,519</td><td class="c-fjall">804,899</td><td class="c-badger">1,168,052</td><td class="c-wavesdb">507,802</td><td class="c-rocksdb">960,497</td><td class="c-surrealkv">149,754</td></tr><tr><th>16 B / 4 KiB</th><td class="c-ondadb best">1,206,374</td><td class="c-tidesdb">366,368</td><td class="c-fjall">481,332</td><td class="c-badger">476,640</td><td class="c-wavesdb">156,334</td><td class="c-rocksdb">451,226</td><td class="c-surrealkv">38,156</td></tr><tr><th>16 B / 16 KiB</th><td class="c-ondadb best">450,042</td><td class="c-tidesdb">195,072</td><td class="c-fjall">353,532</td><td class="c-badger">270,820</td><td class="c-wavesdb">50,617</td><td class="c-rocksdb">288,653</td><td class="c-surrealkv">9,526</td></tr><tr><th>1 KiB / 256 B</th><td class="c-ondadb">1,093,234</td><td class="c-tidesdb best">2,127,990</td><td class="c-fjall">578,142</td><td class="c-badger">1,058,930</td><td class="c-wavesdb">1,318,009</td><td class="c-rocksdb">424,861</td><td class="c-surrealkv">109,160</td></tr><tr><th>2 KiB / 256 B</th><td class="c-ondadb">628,458</td><td class="c-tidesdb best">1,274,561</td><td class="c-fjall">546,982</td><td class="c-badger">490,987</td><td class="c-wavesdb">503,972</td><td class="c-rocksdb">229,438</td><td class="c-surrealkv">57,099</td></tr></tbody></table></div></section>
+<footer>Wildcat is excluded from the Linux dataset (its write path is orders of magnitude slower and dominated total runtime). Key/value sizes per group; op counts scaled to keep data volume comparable. Best per row is bold-marked (●). Engines use independent on-disk formats; this measures performance, not file compatibility.</footer>
+<div id="tip"></div>
+<script>
+(function () {
+  'use strict';
+  // ---- theme: auto -> light -> dark, persisted --------------------------------
+  var themes = ['auto', 'light', 'dark'];
+  var btn = document.getElementById('theme');
+  function applyTheme(t) {
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', t);
+    btn.textContent = 'theme: ' + t;
+  }
+  var theme = localStorage.getItem('bench-theme') || 'auto';
+  applyTheme(theme);
+  btn.addEventListener('click', function () {
+    theme = themes[(themes.indexOf(theme) + 1) % themes.length];
+    localStorage.setItem('bench-theme', theme);
+    applyTheme(theme);
+  });
+
+  // ---- shared state ------------------------------------------------------------
+  var off = {};   // engine slug -> true when filtered out
+  var log = false;
+
+  function fmt(v) {
+    if (v >= 1e6) { var s = (v / 1e6).toFixed(2) + 'M'; return s.replace('.00M', 'M'); }
+    if (v >= 1e3) return Math.round(v / 1e3) + 'k';
+    return Math.round(v).toString();
+  }
+  function fmtFull(v) { return Math.round(v).toLocaleString('en-US'); }
+  function fval(v, vf) { return vf === 'score' ? v.toFixed(2) + '×' : fmt(v); }
+  function niceTicks(vmax, n) {
+    n = n || 4;
+    if (vmax <= 0) return [0, 1];
+    var raw = vmax / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    var step = [1, 2, 5, 10].map(function (s) { return s * mag; })
+      .filter(function (s) { return raw <= s; })[0];
+    var t = [], i;
+    for (i = 0; i <= Math.ceil(vmax / step); i++) t.push(i * step);
+    return t;
+  }
+  function logDomain(vals) {
+    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    var bot = Math.pow(10, Math.floor(Math.log10(Math.max(lo, 1e-9))));
+    var top = Math.pow(10, Math.ceil(Math.log10(Math.max(hi, bot * 10))));
+    return [bot, top];
+  }
+  function el(parts) { return parts.join(''); }
+  function esc(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  }
+  function hbarPath(x, y, w, h) {
+    if (w <= 0) return '';
+    var r = Math.min(4, w, h / 2);
+    return 'M' + x + ',' + y + ' L' + (x + w - r) + ',' + y +
+      ' Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) +
+      ' L' + (x + w) + ',' + (y + h - r) +
+      ' Q' + (x + w) + ',' + (y + h) + ' ' + (x + w - r) + ',' + (y + h) +
+      ' L' + x + ',' + (y + h) + ' Z';
+  }
+  function vbarPath(x, y, w, h) {
+    if (h <= 0) return '';
+    var r = Math.min(4, w / 2, h);
+    return 'M' + x + ',' + (y + h) + ' L' + x + ',' + (y + r) +
+      ' Q' + x + ',' + y + ' ' + (x + r) + ',' + y +
+      ' L' + (x + w - r) + ',' + y +
+      ' Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) +
+      ' L' + (x + w) + ',' + (y + h) + ' Z';
+  }
+  function tipText(mean, unit, vf, label, runs, lo, hi, extra) {
+    var lines = [vf === 'score' ? mean.toFixed(2) + '× (geomean vs fastest)'
+                                : fmtFull(mean) + ' ' + unit, label];
+    if (runs && runs.length > 1)
+      lines.push('runs: ' + runs.map(fmt).join(', ') +
+                 ' (min ' + fmt(lo) + ' – max ' + fmt(hi) + ')');
+    if (extra) lines.push(extra);
+    return lines.join('\n');
+  }
+
+  function renderHbar(d) {
+    var rows = d.rows.filter(function (r) { return !off[r.eng]; });
+    if (!rows.length) return '<p class="unit">all engines filtered out</p>';
+    var W = 980, ML = 180, MR = 168, BAR = 22, GAP = 12, TOP = 8;
+    var H = TOP + rows.length * (BAR + GAP) + 26;
+    var vmax = Math.max.apply(null, rows.map(function (r) { return r.hi; }));
+    var best = Math.max.apply(null, rows.map(function (r) { return r.mean; }));
+    var p = ['<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">'];
+    var ticks, sx;
+    var pos = rows.filter(function (r) { return r.mean > 0; })
+                  .map(function (r) { return r.mean; });
+    if (log && pos.length) {
+      var dom = logDomain(pos), bot = dom[0], top = dom[1];
+      var span = Math.log10(top) - Math.log10(bot);
+      sx = function (v) {
+        return v <= bot ? ML
+          : ML + (W - ML - MR) * (Math.log10(v) - Math.log10(bot)) / span;
+      };
+      ticks = []; for (var t = bot; t <= top * 1.001; t *= 10) ticks.push(t);
+    } else {
+      ticks = niceTicks(vmax);
+      var vtop = ticks[ticks.length - 1] || 1;
+      sx = function (v) { return ML + (W - ML - MR) * v / vtop; };
+    }
+    ticks.forEach(function (t) {
+      var x = sx(t).toFixed(1);
+      p.push('<line x1="' + x + '" y1="' + TOP + '" x2="' + x + '" y2="' + (H - 24) + '" class="grid"/>');
+      p.push('<text x="' + x + '" y="' + (H - 8) + '" class="ylab" text-anchor="middle">' + fval(t, d.vfmt) + '</text>');
+    });
+    p.push('<line x1="' + ML + '" y1="' + TOP + '" x2="' + ML + '" y2="' + (H - 24) + '" class="axis"/>');
+    var y = TOP;
+    rows.forEach(function (r) {
+      var w = Math.max(sx(r.mean) - ML, 0), cy = y + BAR / 2;
+      var ratio = best ? r.mean / best : 0;
+      var tip = tipText(r.mean, d.unit, d.vfmt, r.label, r.runs, r.lo, r.hi,
+                        ratio.toFixed(2) + '× of fastest');
+      p.push('<text x="' + (ML - 10) + '" y="' + (cy + 4) + '" class="xlab" text-anchor="end">' + esc(r.label) + '</text>');
+      p.push('<path d="' + hbarPath(ML, y, w, BAR) + '" class="bar s-' + r.eng + '" tabindex="0" data-tip="' + esc(tip) + '"/>');
+      if (r.runs.length > 1) {
+        var x1 = sx(r.lo), x2 = sx(r.hi);
+        p.push('<line x1="' + x1 + '" y1="' + cy + '" x2="' + x2 + '" y2="' + cy + '" class="whisk"/>');
+        [x1, x2].forEach(function (xx) {
+          p.push('<line x1="' + xx + '" y1="' + (cy - 3) + '" x2="' + xx + '" y2="' + (cy + 3) + '" class="whisk"/>');
+        });
+      }
+      var lbl = fval(r.mean, d.vfmt);
+      if (d.vfmt !== 'score') lbl += ' <tspan class="dim">' + ratio.toFixed(2) + '×</tspan>';
+      p.push('<text x="' + (Math.max(sx(r.hi), sx(r.mean)) + 8) + '" y="' + (cy + 4) + '" class="vlab">' + lbl + '</text>');
+      y += BAR + GAP;
+    });
+    p.push('</svg>');
+    return el(p);
+  }
+
+  function renderVbar(d) {
+    var series = d.series.filter(function (s) { return !off[s.eng]; });
+    if (!series.length) return '<p class="unit">all engines filtered out</p>';
+    var W = 980, H = 320, ML = 74, MR = 16, MT = 14, MB = 52, BGAP = 2;
+    var pw = W - ML - MR, ph = H - MT - MB;
+    var means = [], his = [];
+    series.forEach(function (s) {
+      s.values.forEach(function (v) {
+        if (v) { his.push(v.hi); if (v.mean > 0) means.push(v.mean); }
+      });
+    });
+    if (!means.length) return '<p class="unit">no data</p>';
+    var p = ['<svg viewBox="0 0 ' + W + ' ' + H + '" role="img">'];
+    var ticks, sy;
+    if (log) {
+      var dom = logDomain(means), bot = dom[0], top = dom[1];
+      var span = Math.log10(top) - Math.log10(bot);
+      sy = function (v) {
+        return v <= bot ? MT + ph
+          : MT + ph * (1 - (Math.log10(v) - Math.log10(bot)) / span);
+      };
+      ticks = []; for (var t = bot; t <= top * 1.001; t *= 10) ticks.push(t);
+    } else {
+      ticks = niceTicks(Math.max.apply(null, his));
+      var vtop = ticks[ticks.length - 1] || 1;
+      sy = function (v) { return MT + ph * (1 - v / vtop); };
+    }
+    ticks.forEach(function (t) {
+      var yy = sy(t).toFixed(1);
+      p.push('<line x1="' + ML + '" y1="' + yy + '" x2="' + (W - MR) + '" y2="' + yy + '" class="grid"/>');
+      p.push('<text x="' + (ML - 8) + '" y="' + (+yy + 4) + '" class="ylab" text-anchor="end">' + fmt(t) + '</text>');
+    });
+    p.push('<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (W - MR) + '" y2="' + (MT + ph) + '" class="axis"/>');
+    var gw = pw / d.groups.length, n = series.length;
+    var bw = Math.min(38, (gw * 0.8 - BGAP * (n - 1)) / n);
+    var cw = bw * n + BGAP * (n - 1);
+    d.groups.forEach(function (g, gi) {
+      var gx = ML + gi * gw + (gw - cw) / 2;
+      var gbest = 0;
+      series.forEach(function (s) {
+        var v = s.values[gi]; if (v && v.mean > gbest) gbest = v.mean;
+      });
+      series.forEach(function (s, si) {
+        var v = s.values[gi];
+        if (!v) return;
+        var x = gx + si * (bw + BGAP), yy = sy(v.mean), h = MT + ph - yy;
+        var extra = gbest ? g.label + ' — ' + (v.mean / gbest).toFixed(2) + '× of group best' : g.label;
+        var tip = tipText(v.mean, d.unit, d.vfmt, s.label, v.runs, v.lo, v.hi, extra);
+        p.push('<path d="' + vbarPath(x, yy, bw, h) + '" class="bar s-' + s.eng + '" tabindex="0" data-tip="' + esc(tip) + '"/>');
+        if (v.runs.length > 1) {
+          var cx = x + bw / 2, y1 = sy(v.hi), y2 = sy(v.lo);
+          p.push('<line x1="' + cx + '" y1="' + y1 + '" x2="' + cx + '" y2="' + y2 + '" class="whisk"/>');
+          [y1, y2].forEach(function (wy) {
+            p.push('<line x1="' + (cx - 3) + '" y1="' + wy + '" x2="' + (cx + 3) + '" y2="' + wy + '" class="whisk"/>');
+          });
+        }
+        if (v.mean === gbest && gbest > 0)
+          p.push('<text x="' + (x + bw / 2) + '" y="' + (Math.min(yy, sy(v.hi)) - 5) + '" class="vlab" text-anchor="middle">' + fmt(v.mean) + '</text>');
+      });
+      var lx = ML + gi * gw + gw / 2;
+      p.push('<text x="' + lx + '" y="' + (H - MB + 18) + '" class="xlab" text-anchor="middle">' + esc(g.label) + '</text>');
+      if (g.sub) p.push('<text x="' + lx + '" y="' + (H - MB + 34) + '" class="xsub" text-anchor="middle">' + esc(g.sub) + '</text>');
+    });
+    p.push('</svg>');
+    return el(p);
+  }
+
+  var charts = [];
+  document.querySelectorAll('.chart').forEach(function (c) {
+    var blob = c.querySelector('script[type="application/json"]');
+    if (blob) charts.push({ el: c, data: JSON.parse(blob.textContent), blob: blob });
+  });
+  function rerender() {
+    charts.forEach(function (c) {
+      var svg = c.data.type === 'hbar' ? renderHbar(c.data) : renderVbar(c.data);
+      c.el.innerHTML = svg;
+      c.el.appendChild(c.blob);
+    });
+    bindTips();
+  }
+
+  // ---- engine filter chips -------------------------------------------------------
+  document.querySelectorAll('.lg input').forEach(function (cb) {
+    cb.addEventListener('change', function () {
+      var slug = cb.getAttribute('data-eng');
+      off[slug] = !cb.checked;
+      cb.closest('.lg').classList.toggle('off', !cb.checked);
+      document.querySelectorAll('.c-' + slug).forEach(function (cell) {
+        cell.classList.toggle('coloff', !cb.checked);
+      });
+      rerender();
+    });
+  });
+
+  // ---- linear/log toggle -----------------------------------------------------------
+  document.querySelectorAll('.scale button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      log = b.getAttribute('data-scale') === 'log';
+      document.querySelectorAll('.scale button').forEach(function (x) {
+        x.classList.toggle('on', x === b);
+      });
+      rerender();
+    });
+  });
+
+  // ---- tooltips -----------------------------------------------------------------
+  var tip = document.getElementById('tip');
+  function showTip(text, x, y) {
+    tip.textContent = text;
+    tip.style.display = 'block';
+    tip.style.left = Math.min(x + 14, window.innerWidth - 370) + 'px';
+    tip.style.top = (y + 14) + 'px';
+  }
+  function bindTips() {
+    document.querySelectorAll('.bar').forEach(function (b) {
+      b.addEventListener('mousemove', function (e) {
+        showTip(b.getAttribute('data-tip'), e.clientX, e.clientY);
+      });
+      b.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+      b.addEventListener('focus', function () {
+        var r = b.getBoundingClientRect();
+        showTip(b.getAttribute('data-tip'), r.right, r.top);
+      });
+      b.addEventListener('blur', function () { tip.style.display = 'none'; });
+    });
+  }
+  bindTips();
+})();
+</script>
+</body></html>
