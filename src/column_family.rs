@@ -634,6 +634,7 @@ impl ColumnFamily {
             block_size: DATA_BLOCK_SIZE,
             expected_entries: expected,
             use_btree: self.opts.use_btree,
+            restart_interval: crate::sst::RESTART_INTERVAL,
         }
     }
 

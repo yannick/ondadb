@@ -6,7 +6,8 @@ use std::path::Path;
 
 use super::{
     data_block_alg, encode_entry, vlog_path_for, BlockHandle, FileMeta, IndexEntry,
-    DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_SIZE, VLOG_CRC_LEN,
+    DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS,
+    FOOTER_SIZE, VLOG_CRC_LEN,
 };
 use crate::block::write_block;
 use crate::bloom::Bloom;
@@ -27,6 +28,9 @@ pub struct WriterOptions {
     pub expected_entries: usize,
     /// Write a B+tree (hybrid klog) index instead of a flat single-level index.
     pub use_btree: bool,
+    /// Entries per in-block restart point (`0` disables the restart trailer,
+    /// producing legacy blocks). See [`super::RESTART_INTERVAL`].
+    pub restart_interval: usize,
 }
 
 /// Fan-out (entries per node) for the B+tree index.
@@ -51,6 +55,11 @@ pub struct Writer {
     opts: WriterOptions,
 
     cur_block: Vec<u8>,
+    /// Restart offsets (entry starts) of the block being built, one per
+    /// `restart_interval` entries; empty when the trailer is disabled.
+    cur_restarts: Vec<u32>,
+    /// Entries appended to the block being built.
+    cur_entries: usize,
     index: Vec<IndexEntry>,
     /// A flushed block whose index separator is deferred until the next key is
     /// known: `(block_last_key, block_last_seq, handle)`. With the following
@@ -107,6 +116,8 @@ impl Writer {
             vlog: None,
             opts,
             cur_block: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
+            cur_restarts: Vec::new(),
+            cur_entries: 0,
             index: Vec::new(),
             pending_index: None,
             klog_off: 0,
@@ -167,6 +178,10 @@ impl Writer {
             has_vlog = true;
         }
 
+        if self.opts.restart_interval > 0 && self.cur_entries % self.opts.restart_interval == 0 {
+            self.cur_restarts.push(self.cur_block.len() as u32);
+        }
+        self.cur_entries += 1;
         encode_entry(
             &mut self.cur_block,
             user_key,
@@ -222,6 +237,20 @@ impl Writer {
         if self.cur_block.is_empty() {
             return Ok(());
         }
+        if self.opts.restart_interval > 0 {
+            // Trailer: restart offsets then their count, all u32 LE. Readers
+            // find it from the count in the block's last 4 bytes.
+            for i in 0..self.cur_restarts.len() {
+                let mut b = [0u8; 4];
+                put_u32(&mut b, self.cur_restarts[i]);
+                self.cur_block.extend_from_slice(&b);
+            }
+            let mut b = [0u8; 4];
+            put_u32(&mut b, self.cur_restarts.len() as u32);
+            self.cur_block.extend_from_slice(&b);
+        }
+        self.cur_restarts.clear();
+        self.cur_entries = 0;
         let mut framed = Vec::new();
         let n = write_block(
             &mut framed,
@@ -350,6 +379,9 @@ impl Writer {
         }
 
         let mut footer_flags = 0u8;
+        if self.opts.restart_interval > 0 {
+            footer_flags |= FOOTER_RESTARTS;
+        }
         let mut bloom_handle = BlockHandle::default();
         if let Some(b) = self.bloom.take() {
             let enc = b.encode();
@@ -521,6 +553,7 @@ mod tests {
                 block_size: 4 << 10,
                 expected_entries: n,
                 use_btree: false,
+                restart_interval: 8,
             },
         )
         .unwrap();

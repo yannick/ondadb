@@ -17,6 +17,7 @@ fn opts(alg: Compression, n: usize, klog_threshold: usize, block_size: usize) ->
         block_size,
         expected_entries: n,
         use_btree: false,
+        restart_interval: 8,
     }
 }
 

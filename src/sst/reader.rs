@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::{
     cmp_internal, decode_entry, vlog_path_for, Block, BlockHandle, IndexEntry, SstIterator,
-    FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_SIZE, VLOG_CRC_LEN,
+    FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, VLOG_CRC_LEN,
 };
 use crate::block::read_block;
 use crate::bloom::Bloom;
@@ -33,6 +33,8 @@ pub struct Reader {
     num_entries: u64,
     max_seq: u64,
     bloom: Option<Bloom>,
+    /// Data blocks carry the restart-offset trailer ([`FOOTER_RESTARTS`]).
+    has_restarts: bool,
 
     #[cfg(feature = "unsafe-fastpath")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
@@ -82,6 +84,7 @@ impl Reader {
             num_entries: 0,
             max_seq: 0,
             bloom: None,
+            has_restarts: false,
             #[cfg(feature = "unsafe-fastpath")]
             klog_mmap: None,
             #[cfg(feature = "unsafe-fastpath")]
@@ -106,6 +109,7 @@ impl Reader {
         r.num_entries = read_u64(&footer[32..40]);
         r.max_seq = read_u64(&footer[40..48]);
         let flags = footer[48];
+        r.has_restarts = flags & FOOTER_RESTARTS != 0;
 
         if flags & FOOTER_HAS_BLOOM != 0 && bloom_len > 0 {
             let raw = read_block_at(&f, bloom_off, bloom_len)?;
@@ -335,6 +339,25 @@ impl Reader {
         Ok(Block::Owned(arc))
     }
 
+    /// Split a data block's decompressed bytes into its entries region and its
+    /// restart-offset array (empty for legacy blocks without the trailer).
+    pub(crate) fn split_block<'a>(&self, raw: &'a [u8]) -> Result<(&'a [u8], &'a [u8])> {
+        if !self.has_restarts {
+            return Ok((raw, &[]));
+        }
+        if raw.len() < 4 {
+            return Err(corrupt());
+        }
+        let count = read_u32(&raw[raw.len() - 4..]) as usize;
+        let trailer = count
+            .checked_mul(4)
+            .and_then(|t| t.checked_add(4))
+            .filter(|&t| t <= raw.len())
+            .ok_or_else(corrupt)?;
+        let entries_end = raw.len() - trailer;
+        Ok((&raw[..entries_end], &raw[entries_end..raw.len() - 4]))
+    }
+
     /// Index of the first data block whose last key is `>= (user_key, seq)`.
     pub(crate) fn find_block(&self, user_key: &[u8], seq: u64) -> usize {
         let (mut lo, mut hi) = (0, self.index.len());
@@ -401,8 +424,27 @@ impl Reader {
             return Ok((None, 0, false, false));
         }
         let block = self.read_data_block(bi)?;
-        let raw = block.bytes();
+        let (raw, restarts) = self.split_block(block.bytes())?;
         let mut off = 0;
+        if restarts.len() >= 8 {
+            // Binary-search the restart points for the first restart entry
+            // >= target, then scan at most one interval from its predecessor.
+            let n = restarts.len() / 4;
+            let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
+            let (mut lo, mut hi) = (0usize, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (e, _) = decode_entry(raw, restart_off(mid))?;
+                if cmp_internal(&self.cmp, e.user_key(raw), e.seq, user_key, read_seq).is_lt() {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo > 0 {
+                off = restart_off(lo - 1);
+            }
+        }
         while off < raw.len() {
             let (e, next) = decode_entry(raw, off)?;
             let ek = e.user_key(raw);
@@ -545,6 +587,7 @@ mod tests {
                 block_size: 512,
                 expected_entries: n,
                 use_btree: false,
+                restart_interval: 8,
             },
         )
         .unwrap();
@@ -562,6 +605,73 @@ mod tests {
             default_comparator(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn restart_trailer_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = small_reader(dir.path(), 500);
+        assert!(r.has_restarts, "footer flag must be set");
+        for i in 0..500 {
+            let k = format!("key{i:06}");
+            let (v, _, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            assert!(found && !deleted, "missing {k}");
+            assert_eq!(v.unwrap(), b"value");
+        }
+        for probe in ["key00000", "key0005000", "aaa", "zzz"] {
+            let (_, _, found, _) = r.get(probe.as_bytes(), u64::MAX, 0).unwrap();
+            assert!(!found, "phantom hit for {probe}");
+        }
+    }
+
+    #[test]
+    fn legacy_block_without_trailer_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("legacy.klog");
+        let klog = klog.to_str().unwrap();
+        let mut w = Writer::new(
+            klog,
+            WriterOptions {
+                compression: Compression::None,
+                cmp: default_comparator(),
+                enable_bloom: true,
+                bloom_fpr: 0.01,
+                klog_value_threshold: 512,
+                block_size: 512,
+                expected_entries: 300,
+                use_btree: false,
+                restart_interval: 0, // legacy: no trailer, no footer flag
+            },
+        )
+        .unwrap();
+        for i in 0..300 {
+            let k = format!("key{i:06}");
+            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+                .unwrap();
+        }
+        w.finish().unwrap();
+        let r = Reader::open(
+            klog,
+            Arc::new(FileCache::new(4)),
+            Arc::new(BlockCache::new(1 << 20)),
+            2,
+            default_comparator(),
+        )
+        .unwrap();
+        assert!(!r.has_restarts);
+        for i in 0..300 {
+            let k = format!("key{i:06}");
+            let (_, _, found, _) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            assert!(found, "missing {k}");
+        }
+        let mut it = r.iter();
+        it.seek_to_first();
+        let mut n = 0;
+        while it.valid() {
+            n += 1;
+            it.next();
+        }
+        assert_eq!(n, 300);
     }
 
     #[test]

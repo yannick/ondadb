@@ -39,6 +39,12 @@ pub(crate) const FOOTER_HAS_BLOOM: u8 = 0x01;
 /// Footer flag: the index block is a B+tree root (hybrid klog) rather than a
 /// flat single-level index.
 pub(crate) const FOOTER_BTREE: u8 = 0x02;
+/// Footer flag: data blocks carry a restart-offset trailer
+/// (`entries... | restart_off u32 LE x R | R u32 LE`) enabling in-block binary
+/// search. Absent on legacy files, whose blocks are entries only.
+pub(crate) const FOOTER_RESTARTS: u8 = 0x04;
+/// Entries per restart interval written by default.
+pub(crate) const RESTART_INTERVAL: usize = 8;
 /// Default target data-block size.
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4 << 10;
 /// Length of the per-value CRC32-C prefix in the vlog frame.

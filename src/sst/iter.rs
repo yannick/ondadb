@@ -18,6 +18,10 @@ pub struct SstIterator {
     r: Arc<Reader>,
     block_idx: i64,
     raw: Option<Block>,
+    /// Length of the current block's entries region (excludes the restart
+    /// trailer on files that have one). Every walk is bounded by this, never
+    /// by the raw block length.
+    entries_len: usize,
     offsets: Vec<u32>,
     pos: i64,
     cur: Option<DecEntry>,
@@ -45,6 +49,7 @@ impl SstIterator {
             r,
             block_idx: -1,
             raw: None,
+            entries_len: 0,
             offsets: Vec::new(),
             pos: -1,
             cur: None,
@@ -76,12 +81,21 @@ impl SstIterator {
                 return false;
             }
         };
+        self.entries_len = match self.r.split_block(raw.bytes()) {
+            Ok((entries, _)) => entries.len(),
+            Err(e) => {
+                self.err = Some(e);
+                self.raw = None;
+                self.valid = false;
+                return false;
+            }
+        };
         self.block_idx = i;
         self.offsets.clear();
         if full {
             let bytes = raw.bytes();
             let mut off = 0usize;
-            while off < bytes.len() {
+            while off < self.entries_len {
                 match decode_entry(bytes, off) {
                     Ok((_, next)) => {
                         self.offsets.push(off as u32);
@@ -217,8 +231,7 @@ impl SstIterator {
             self.decode_at(off);
             return;
         }
-        let raw_len = self.raw.as_ref().map(|r| r.len()).unwrap_or(0);
-        if self.cur_next >= raw_len {
+        if self.cur_next >= self.entries_len {
             if self.load_block(self.block_idx + 1, false) {
                 self.offsets.clear();
                 self.offsets.push(0);
