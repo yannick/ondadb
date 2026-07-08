@@ -17,19 +17,20 @@
 //! write directly under the file lock.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::config::SyncMode;
 use crate::encoding::{
-    append_uvarint, append_varint, checksum, put_u32, read_u32, uvarint, varint,
+    append_uvarint, append_varint, checksum, put_u32, read_u32, uvarint, uvarint_len, varint,
 };
 use crate::error::{OndaError, Result};
 use crate::format::flags;
@@ -168,9 +169,18 @@ pub fn remove_wal_files(base: impl AsRef<Path>) {
     }
 }
 
+/// One WAL stripe: the file plus the next append offset. Appends reserve a
+/// range with a lock-free `fetch_add` and write positionally (`pwrite`), so
+/// concurrent committers copy into the page cache in parallel; the `RwLock` is
+/// only write-held to sync or close.
+struct Stripe {
+    file: RwLock<Option<File>>,
+    off: AtomicU64,
+}
+
 struct Shared {
-    /// One file per stripe (a single entry under [`SyncMode::Full`]).
-    files: Vec<Mutex<Option<File>>>,
+    /// One stripe per file (a single entry under [`SyncMode::Full`]).
+    files: Vec<Stripe>,
     sync: SyncMode,
     size: AtomicI64,
     dirty: AtomicBool,
@@ -218,12 +228,18 @@ impl Wal {
         let mut files = Vec::with_capacity(nstripes);
         let mut size = 0i64;
         for k in 0..nstripes {
+            // No O_APPEND: appends reserve an offset and pwrite it (O_APPEND
+            // would make pwrite ignore the offset on Linux).
             let f = OpenOptions::new()
                 .create(true)
-                .append(true)
+                .write(true)
                 .open(stripe_path(path.as_ref(), k))?;
-            size += f.metadata()?.len() as i64;
-            files.push(Mutex::new(Some(f)));
+            let len = f.metadata()?.len();
+            size += len as i64;
+            files.push(Stripe {
+                file: RwLock::new(Some(f)),
+                off: AtomicU64::new(len),
+            });
         }
         let shared = Arc::new(Shared {
             files,
@@ -274,7 +290,20 @@ impl Wal {
     /// thread): a single header + CRC per commit, and the whole batch replays
     /// atomically — a torn tail can never resurrect half a transaction.
     pub fn append_batch(&self, recs: &[RecordRef<'_>]) -> Result<()> {
-        let mut buf = Vec::with_capacity(HEADER_SIZE + recs.len() * 64);
+        // Exact frame size: growth reallocations re-copy the whole payload,
+        // which dominated large-value commits.
+        let body: usize = recs
+            .iter()
+            .map(|r| {
+                1 + uvarint_len(r.key.len() as u64)
+                    + uvarint_len(r.value.len() as u64)
+                    + uvarint_len(r.seq)
+                    + if r.ttl != 0 { 10 } else { 0 }
+                    + r.key.len()
+                    + r.value.len()
+            })
+            .sum();
+        let mut buf = Vec::with_capacity(HEADER_SIZE + body);
         buf.extend_from_slice(&[0u8; HEADER_SIZE]);
         for r in recs {
             encode_record_body(&mut buf, *r);
@@ -289,13 +318,19 @@ impl Wal {
         // to this thread's stripe file, so concurrent committers don't convoy
         // on a single file mutex.
         if self.shared.sync != SyncMode::Full {
-            let stripe = my_stripe(self.shared.files.len());
-            let mut guard = self.shared.files[stripe].lock();
-            let f = match guard.as_mut() {
+            let stripe = &self.shared.files[my_stripe(self.shared.files.len())];
+            let guard = stripe.file.read();
+            let f = match guard.as_ref() {
                 Some(f) => f,
                 None => return Err(OndaError::InvalidDb("wal closed".into())),
             };
-            f.write_all(&buf)?;
+            // Reserve the range lock-free, then pwrite it: concurrent
+            // committers copy into the page cache in parallel instead of
+            // convoying on a file mutex for the duration of the copy. A crash
+            // between reserve and write leaves a zeroed hole; frame CRCs keep
+            // replay from ever surfacing bytes from one.
+            let pos = stripe.off.fetch_add(buf.len() as u64, Ordering::Relaxed);
+            f.write_all_at(&buf, pos)?;
             if self.shared.sync == SyncMode::Interval {
                 self.shared.dirty.store(true, Ordering::Relaxed);
             }
@@ -348,15 +383,18 @@ impl Wal {
     fn flush_group(&self, batch: &[WalReq]) -> i32 {
         let total: usize = batch.iter().map(|r| r.buf.len()).sum();
         // Group commit only runs under SyncMode::Full, which uses one stripe.
-        let mut guard = self.shared.files[0].lock();
-        let f = match guard.as_mut() {
+        let stripe = &self.shared.files[0];
+        let guard = stripe.file.read();
+        let f = match guard.as_ref() {
             Some(f) => f,
             None => return -10, // closed
         };
+        let mut pos = stripe.off.fetch_add(total as u64, Ordering::Relaxed);
         for req in batch {
-            if let Err(e) = f.write_all(&req.buf) {
+            if let Err(e) = f.write_all_at(&req.buf, pos) {
                 return OndaError::from(e).code();
             }
+            pos += req.buf.len() as u64;
         }
         match self.shared.sync {
             SyncMode::Full => {
@@ -379,8 +417,8 @@ impl Wal {
     /// fsync every stripe file.
     pub fn sync(&self) -> Result<()> {
         self.shared.dirty.store(false, Ordering::Relaxed);
-        for file in &self.shared.files {
-            let guard = file.lock();
+        for stripe in &self.shared.files {
+            let guard = stripe.file.read();
             match guard.as_ref() {
                 Some(f) => {
                     if let Err(e) = f.sync_data() {
@@ -407,8 +445,8 @@ impl Wal {
         if let Some(h) = self.bg.lock().take() {
             let _ = h.join();
         }
-        for file in &self.shared.files {
-            if let Some(f) = file.lock().take() {
+        for stripe in &self.shared.files {
+            if let Some(f) = stripe.file.write().take() {
                 f.sync_data()?;
             }
         }
@@ -529,8 +567,8 @@ fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
             Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if shared.dirty.swap(false, Ordering::Relaxed) {
-                    for file in &shared.files {
-                        if let Some(f) = file.lock().as_ref() {
+                    for stripe in &shared.files {
+                        if let Some(f) = stripe.file.read().as_ref() {
                             if let Err(e) = f.sync_data() {
                                 // Commits acknowledged since the last successful
                                 // sync may be lost — fail-stop the DB rather
@@ -548,6 +586,59 @@ fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_append_replay_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = std::sync::Arc::new(
+            Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap(),
+        );
+        let threads = 8;
+        let batches = 500;
+        let per_batch = 10;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let w = wal.clone();
+            handles.push(std::thread::spawn(move || {
+                for b in 0..batches {
+                    let base = ((t * batches + b) * per_batch) as u64;
+                    let keys: Vec<Vec<u8>> = (0..per_batch)
+                        .map(|i| format!("k{:010}", base + i as u64).into_bytes())
+                        .collect();
+                    let recs: Vec<RecordRef<'_>> = keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| RecordRef {
+                            key: k,
+                            value: b"v",
+                            seq: base + i as u64 + 1,
+                            ttl: 0,
+                            tombstone: false,
+                            single_delete: false,
+                        })
+                        .collect();
+                    w.append_batch(&recs).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        wal.close().unwrap();
+        let total = threads * batches * per_batch;
+        let mut seen = vec![false; total + 1];
+        let mut count = 0usize;
+        let last = Wal::replay(&path, |r| {
+            assert!(!seen[r.seq as usize], "duplicate seq {}", r.seq);
+            seen[r.seq as usize] = true;
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, total, "lost records");
+        assert_eq!(last, total as u64);
+    }
 
     fn rec(key: &str, val: &str, seq: u64) -> Record {
         Record {

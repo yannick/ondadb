@@ -33,6 +33,17 @@ pub fn append_uvarint(dst: &mut Vec<u8>, mut x: u64) {
     dst.push(x as u8);
 }
 
+/// Encoded length of `x` as a uvarint (1..=10 bytes).
+#[inline]
+pub fn uvarint_len(mut x: u64) -> usize {
+    let mut n = 1;
+    while x >= 0x80 {
+        x >>= 7;
+        n += 1;
+    }
+    n
+}
+
 /// Decode a uvarint from the front of `b`.
 ///
 /// Returns `Some((value, bytes_consumed))`, or `None` if the buffer is too short
