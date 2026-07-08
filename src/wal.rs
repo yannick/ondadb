@@ -17,16 +17,15 @@
 //! write directly under the file lock.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read};
-use std::os::unix::fs::FileExt;
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use crate::config::SyncMode;
 use crate::encoding::{
@@ -169,18 +168,9 @@ pub fn remove_wal_files(base: impl AsRef<Path>) {
     }
 }
 
-/// One WAL stripe: the file plus the next append offset. Appends reserve a
-/// range with a lock-free `fetch_add` and write positionally (`pwrite`), so
-/// concurrent committers copy into the page cache in parallel; the `RwLock` is
-/// only write-held to sync or close.
-struct Stripe {
-    file: RwLock<Option<File>>,
-    off: AtomicU64,
-}
-
 struct Shared {
-    /// One stripe per file (a single entry under [`SyncMode::Full`]).
-    files: Vec<Stripe>,
+    /// One file per stripe (a single entry under [`SyncMode::Full`]).
+    files: Vec<Mutex<Option<File>>>,
     sync: SyncMode,
     size: AtomicI64,
     dirty: AtomicBool,
@@ -228,19 +218,12 @@ impl Wal {
         let mut files = Vec::with_capacity(nstripes);
         let mut size = 0i64;
         for k in 0..nstripes {
-            // No O_APPEND: appends reserve an offset and pwrite it (O_APPEND
-            // would make pwrite ignore the offset on Linux).
             let f = OpenOptions::new()
                 .create(true)
-                .write(true)
-                .truncate(false) // reopening an existing WAL must keep it for replay
+                .append(true)
                 .open(stripe_path(path.as_ref(), k))?;
-            let len = f.metadata()?.len();
-            size += len as i64;
-            files.push(Stripe {
-                file: RwLock::new(Some(f)),
-                off: AtomicU64::new(len),
-            });
+            size += f.metadata()?.len() as i64;
+            files.push(Mutex::new(Some(f)));
         }
         let shared = Arc::new(Shared {
             files,
@@ -292,7 +275,9 @@ impl Wal {
     /// atomically — a torn tail can never resurrect half a transaction.
     pub fn append_batch(&self, recs: &[RecordRef<'_>]) -> Result<()> {
         // Exact frame size: growth reallocations re-copy the whole payload,
-        // which dominated large-value commits.
+        // which dominated large-value commits. (A lock-free pwrite append was
+        // tried here and reverted: on macOS/APFS positional writes to one file
+        // serialize in the kernel anyway and lose the O_APPEND fast path.)
         let body: usize = recs
             .iter()
             .map(|r| {
@@ -319,19 +304,13 @@ impl Wal {
         // to this thread's stripe file, so concurrent committers don't convoy
         // on a single file mutex.
         if self.shared.sync != SyncMode::Full {
-            let stripe = &self.shared.files[my_stripe(self.shared.files.len())];
-            let guard = stripe.file.read();
-            let f = match guard.as_ref() {
+            let stripe = my_stripe(self.shared.files.len());
+            let mut guard = self.shared.files[stripe].lock();
+            let f = match guard.as_mut() {
                 Some(f) => f,
                 None => return Err(OndaError::InvalidDb("wal closed".into())),
             };
-            // Reserve the range lock-free, then pwrite it: concurrent
-            // committers copy into the page cache in parallel instead of
-            // convoying on a file mutex for the duration of the copy. A crash
-            // between reserve and write leaves a zeroed hole; frame CRCs keep
-            // replay from ever surfacing bytes from one.
-            let pos = stripe.off.fetch_add(buf.len() as u64, Ordering::Relaxed);
-            f.write_all_at(&buf, pos)?;
+            f.write_all(&buf)?;
             if self.shared.sync == SyncMode::Interval {
                 self.shared.dirty.store(true, Ordering::Relaxed);
             }
@@ -384,18 +363,15 @@ impl Wal {
     fn flush_group(&self, batch: &[WalReq]) -> i32 {
         let total: usize = batch.iter().map(|r| r.buf.len()).sum();
         // Group commit only runs under SyncMode::Full, which uses one stripe.
-        let stripe = &self.shared.files[0];
-        let guard = stripe.file.read();
-        let f = match guard.as_ref() {
+        let mut guard = self.shared.files[0].lock();
+        let f = match guard.as_mut() {
             Some(f) => f,
             None => return -10, // closed
         };
-        let mut pos = stripe.off.fetch_add(total as u64, Ordering::Relaxed);
         for req in batch {
-            if let Err(e) = f.write_all_at(&req.buf, pos) {
+            if let Err(e) = f.write_all(&req.buf) {
                 return OndaError::from(e).code();
             }
-            pos += req.buf.len() as u64;
         }
         match self.shared.sync {
             SyncMode::Full => {
@@ -418,8 +394,8 @@ impl Wal {
     /// fsync every stripe file.
     pub fn sync(&self) -> Result<()> {
         self.shared.dirty.store(false, Ordering::Relaxed);
-        for stripe in &self.shared.files {
-            let guard = stripe.file.read();
+        for file in &self.shared.files {
+            let guard = file.lock();
             match guard.as_ref() {
                 Some(f) => {
                     if let Err(e) = f.sync_data() {
@@ -446,8 +422,8 @@ impl Wal {
         if let Some(h) = self.bg.lock().take() {
             let _ = h.join();
         }
-        for stripe in &self.shared.files {
-            if let Some(f) = stripe.file.write().take() {
+        for file in &self.shared.files {
+            if let Some(f) = file.lock().take() {
                 f.sync_data()?;
             }
         }
@@ -568,8 +544,8 @@ fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
             Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if shared.dirty.swap(false, Ordering::Relaxed) {
-                    for stripe in &shared.files {
-                        if let Some(f) = stripe.file.read().as_ref() {
+                    for file in &shared.files {
+                        if let Some(f) = file.lock().as_ref() {
                             if let Err(e) = f.sync_data() {
                                 // Commits acknowledged since the last successful
                                 // sync may be lost — fail-stop the DB rather
