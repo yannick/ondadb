@@ -192,3 +192,24 @@ Lesson recorded: the feed decay was diagnosed twice — the first "fix" (bounded
 materialization, `0db814d`) attacked the right code path with the wrong asymptotics
 (O(range) per read still decays as hot timelines grow); only O(log n)-per-step backward
 iteration (`9b47504`) flattened the curve. Profile-late-in-run was the decisive tool.
+
+---
+
+## Phase 3a — DONE, MEASURED (M2, 2026-07-09, ondadb bf0d2bf)
+
+Vlog compression + per-key-prefix compression rules. Webtable (8 KB pages, lz4):
+
+| | disk | write-amp | writes/s |
+|---|---|---|---|
+| onda orig | 6,145 MB | 4.70 | 252k |
+| **onda +3a** | **2,966 MB** | **2.35** | **286k** |
+| fjall3 (same run) | 3,062 MB | 2.99 | 270k |
+
+The last ≥2× gap is closed — ondaDB now **beats fjall on disk, write-amp, and
+write throughput** for the large-value workload. All Phase 1/2 gains held
+exactly (queue PAR, timeseries/ycsb-c/rw-seq wins, feed 1.3×); zero regressions
+across the 30-run sweep.
+
+**Final residual gaps (all < 2×):** ycsb-b read 1.6×, rw-random read 1.7×,
+ycsb-a 1.3×, feed 1.3×, event-log 1.2× → Phase 2 (lock-free block cache,
+per-get allocations) is the remaining lever.
