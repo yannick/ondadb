@@ -307,7 +307,11 @@ impl Txn {
             self.db.read_floor_seq()
         };
         let id = cf_id(cf);
-        let overlay: Option<Arc<Memtable>> = {
+        // Read-only transactions (the overwhelmingly common case for scans)
+        // must not construct a throwaway overlay memtable per iterator.
+        let overlay: Option<Arc<Memtable>> = if self.writes.is_empty() {
+            None
+        } else {
             let mem = Memtable::new(cf.comparator().clone());
             let mut any = false;
             for w in &self.writes {

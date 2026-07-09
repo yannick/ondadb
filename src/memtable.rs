@@ -152,7 +152,11 @@ pub struct Memtable {
     /// paying a full O(log n) probe each). One 64-bit word per key — a
     /// single cache line touched — with [`FILTER_BITS_PER_KEY`] bits set,
     /// derived from the same xxh3 hash that routes the shard.
-    filter: MemFilter,
+    ///
+    /// Allocated lazily on the first insert: transient memtables (e.g. the
+    /// per-iterator transaction overlay) must not pay the 512 KiB
+    /// alloc+zero — that showed up as a large per-scan cost.
+    filter: std::sync::OnceLock<MemFilter>,
 }
 
 /// Bits set per key within its filter word.
@@ -265,7 +269,7 @@ impl Memtable {
             approx_size: AtomicI64::new(0),
             num_entries: AtomicI64::new(0),
             max_seq: AtomicU64::new(0),
-            filter: MemFilter::new(),
+            filter: std::sync::OnceLock::new(),
         })
     }
 
@@ -287,7 +291,7 @@ impl Memtable {
     ) {
         let fl = flag_bits(tombstone, single_delete, ttl);
         let h = key_hash(user_key);
-        self.filter.insert(h);
+        self.filter.get_or_init(MemFilter::new).insert(h);
         let shard = &self.shards[shard_of(h)];
         let added = user_key.len() + value.len() + 64;
         #[cfg(not(feature = "arena-memtable"))]
@@ -317,7 +321,7 @@ impl Memtable {
     ) {
         let fl = flag_bits(tombstone, single_delete, ttl);
         let h = key_hash(user_key);
-        self.filter.insert(h);
+        self.filter.get_or_init(MemFilter::new).insert(h);
         let shard = &self.shards[shard_of(h)];
         let added = user_key.len() + value.len() + 64;
         #[cfg(not(feature = "arena-memtable"))]
@@ -369,9 +373,10 @@ impl Memtable {
         // pre-filter as we hash each key).
         let mut shard_idx: Vec<u16> = Vec::with_capacity(n);
         let mut counts = [0u32; NUM_SHARDS];
+        let filter = self.filter.get_or_init(MemFilter::new);
         for r in recs {
             let h = key_hash(r.key);
-            self.filter.insert(h);
+            filter.insert(h);
             let s = shard_of(h);
             shard_idx.push(s as u16);
             counts[s] += 1;
@@ -447,8 +452,11 @@ impl Memtable {
         }
         let h = key_hash(user_key);
         // Definite miss: skip the shard descend entirely (one cache line).
-        if !self.filter.may_contain(h) {
-            return Lookup::default();
+        // An uninitialized filter means nothing was ever inserted.
+        match self.filter.get() {
+            None => return Lookup::default(),
+            Some(f) if !f.may_contain(h) => return Lookup::default(),
+            _ => {}
         }
         let shard = &self.shards[shard_of(h)];
         #[cfg(feature = "arena-memtable")]

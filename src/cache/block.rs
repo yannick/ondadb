@@ -31,6 +31,9 @@ struct CacheEntry {
     referenced: AtomicBool,
 }
 
+/// Max entries a single eviction sweep may spare (see [`Shard::evict_to_cap`]).
+const CLOCK_SWEEP_BUDGET: usize = 32;
+
 struct Shard {
     map: HashMap<BlockKey, CacheEntry>,
     /// Clock ring in insertion order. Every map entry is in the ring exactly
@@ -43,19 +46,25 @@ struct Shard {
 impl Shard {
     /// Evict with the clock hand until under capacity: pop the ring front;
     /// a referenced entry is cleared and pushed to the back (second chance),
-    /// an unreferenced one is evicted. Bounded to two full revolutions so a
-    /// pathological state cannot spin forever.
+    /// an unreferenced one is evicted.
+    ///
+    /// The sweep runs under the shard's WRITE lock, so second chances are
+    /// strictly budgeted: when a workload keeps every entry referenced (hot
+    /// scans re-touching the whole shard), an unbounded hand would walk
+    /// thousands of slots clearing bits while readers stall. After
+    /// [`CLOCK_SWEEP_BUDGET`] spared entries the hand evicts regardless —
+    /// put latency stays bounded and capacity always converges.
     fn evict_to_cap(&mut self) {
-        let mut budget = self.ring.len().saturating_mul(2);
-        while self.used > self.cap && self.map.len() > 1 && budget > 0 {
-            budget -= 1;
+        let mut spared = 0usize;
+        while self.used > self.cap && self.map.len() > 1 {
             let Some(k) = self.ring.pop_front() else {
                 break;
             };
             let Some(e) = self.map.get(&k) else {
                 continue; // stale ring slot (shouldn't happen; be tolerant)
             };
-            if e.referenced.swap(false, Ordering::Relaxed) {
+            if spared < CLOCK_SWEEP_BUDGET && e.referenced.swap(false, Ordering::Relaxed) {
+                spared += 1;
                 self.ring.push_back(k); // second chance
             } else if let Some(e) = self.map.remove(&k) {
                 self.used -= e.data.len() as i64;
