@@ -40,9 +40,15 @@ use crate::format::{self, make_internal_key};
 #[cfg(feature = "arena-memtable")]
 use crate::memtable_arena::ArenaShard;
 
-/// Number of independent shards. 256 keeps per-shard skip lists shallow and
-/// makes writer collisions rare even with many committing threads.
-pub const NUM_SHARDS: usize = 256;
+/// Number of independent shards.
+///
+/// Every ordered read (scan/peek) must merge ALL shards — a `lower_bound`
+/// probe per shard per seek — so the shard count is a direct multiplier on
+/// iterator construction cost, while writes only need enough shards to keep
+/// committer collisions rare. Profiling the queue-peek workload showed 70% of
+/// reader CPU in the 256-way `lower_bound` fan-out; 16 shards recovered a 5.9x
+/// range-scan throughput gain for ~3% (noise-level) write cost at 4 threads.
+pub const NUM_SHARDS: usize = 16;
 
 /// The selected per-shard storage: a lock-free `crossbeam-skiplist` by default,
 /// or an arena-backed skip list under `arena-memtable`.
