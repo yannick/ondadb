@@ -283,9 +283,9 @@ impl ArenaShard {
         }
     }
 
-    pub(crate) fn get(&self, user_key: &[u8], read_seq: u64, now: i64) -> Lookup {
-        // Find the first node >= (user_key, read_seq).
-        let ukpfx = key_prefix(user_key);
+    /// Skip-list descent: the first node whose `(user_key, seq)` is `>=` the
+    /// probe in internal order (user key ascending, seq descending), or null.
+    fn find_ge(&self, user_key: &[u8], ukpfx: u64, seq: u64) -> *const Node {
         let head: *const Node = &*self.head;
         let mut x = head;
         let cur_height = self.height.load(AtOrd::Relaxed) as usize;
@@ -295,17 +295,20 @@ impl ArenaShard {
                 if next.is_null() {
                     break;
                 }
-                if self
-                    .cmp_node(unsafe { &*next }, user_key, ukpfx, read_seq)
-                    .is_lt()
-                {
+                if self.cmp_node(unsafe { &*next }, user_key, ukpfx, seq).is_lt() {
                     x = next as *const Node;
                 } else {
                     break;
                 }
             }
         }
-        let cand = unsafe { (*x).next[0].load(AtOrd::Acquire) };
+        unsafe { (*x).next[0].load(AtOrd::Acquire) }
+    }
+
+    pub(crate) fn get(&self, user_key: &[u8], read_seq: u64, now: i64) -> Lookup {
+        // Find the first node >= (user_key, read_seq).
+        let ukpfx = key_prefix(user_key);
+        let cand = self.find_ge(user_key, ukpfx, read_seq);
         if cand.is_null() {
             return Lookup::default();
         }
@@ -360,6 +363,15 @@ impl ArenaShard {
     pub(crate) fn cursor(&self) -> ShardCursor<'_> {
         ShardCursor {
             node: self.head.next[0].load(AtOrd::Acquire),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// A borrowing cursor positioned at the first entry whose `(user_key, seq)`
+    /// is `>=` the probe in internal order — the lazy read-iterator seek.
+    pub(crate) fn cursor_ge(&self, user_key: &[u8], seq: u64) -> ShardCursor<'_> {
+        ShardCursor {
+            node: self.find_ge(user_key, key_prefix(user_key), seq),
             _shard: std::marker::PhantomData,
         }
     }
