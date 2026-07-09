@@ -1,4 +1,4 @@
-//! Arena-backed skip-list shard (the `unsafe-fastpath` memtable).
+//! Arena-backed skip-list shard (the `arena-memtable` memtable).
 //!
 //! Each shard is a skip list whose nodes live in a **chunked arena** — fixed-
 //! capacity `Vec<Node>` chunks that are never reallocated, so a `*mut Node` stays
@@ -12,7 +12,7 @@
 //! following a loaded pointer is always sound.
 //!
 //! This is the one place ondaDB uses raw pointers; it is compiled only under the
-//! `unsafe-fastpath` feature.
+//! `arena-memtable` feature.
 
 use std::cmp::Ordering;
 use std::ptr;

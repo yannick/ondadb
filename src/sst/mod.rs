@@ -99,11 +99,11 @@ pub(crate) struct BlockHandle {
 }
 
 /// A decompressed data block, either owned (read+decompressed, possibly cached)
-/// or, under `unsafe-fastpath`, a zero-copy view into an mmap'd file.
+/// or, under `mmap-reads`, a zero-copy view into an mmap'd file.
 #[derive(Clone, Debug)]
 pub(crate) enum Block {
     Owned(std::sync::Arc<[u8]>),
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "mmap-reads")]
     Mapped {
         mmap: std::sync::Arc<memmap2::Mmap>,
         start: usize,
@@ -116,7 +116,7 @@ impl Block {
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             Block::Owned(a) => a,
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             Block::Mapped { mmap, start, len } => &mmap[*start..*start + *len],
         }
     }
@@ -128,7 +128,7 @@ impl Block {
     pub(crate) fn same_backing(&self, other: &Block) -> bool {
         match (self, other) {
             (Block::Owned(a), Block::Owned(b)) => std::sync::Arc::ptr_eq(a, b),
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             (
                 Block::Mapped {
                     mmap: a, start: sa, ..
@@ -137,7 +137,7 @@ impl Block {
                     mmap: b, start: sb, ..
                 },
             ) => std::sync::Arc::ptr_eq(a, b) && sa == sb,
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             _ => false,
         }
     }

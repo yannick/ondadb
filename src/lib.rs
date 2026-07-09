@@ -10,10 +10,14 @@
 //! The crate is built bottom-up; modules are added phase by phase. See the
 //! implementation plan for the full roadmap.
 
-// The default build is 100% safe Rust.  The optional `unsafe-fastpath` feature
-// lifts this to allow the localized `unsafe` in the mmap zero-copy reader and the
-// arena-backed memtable; everything else stays safe.
-#![cfg_attr(not(feature = "unsafe-fastpath"), forbid(unsafe_code))]
+// The default build is 100% safe Rust.  The optional `mmap-reads` and
+// `arena-memtable` features each lift this to allow the localized `unsafe` in,
+// respectively, the mmap zero-copy reader and the arena-backed memtable;
+// everything else stays safe.  `unsafe-fastpath` enables both.
+#![cfg_attr(
+    not(any(feature = "mmap-reads", feature = "arena-memtable")),
+    forbid(unsafe_code)
+)]
 #![warn(missing_debug_implementations)]
 
 pub mod block;
@@ -33,7 +37,7 @@ pub mod iterator;
 pub mod maintenance;
 pub mod manifest;
 pub mod memtable;
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;
 pub mod sst;
 pub mod txn;

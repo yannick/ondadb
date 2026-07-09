@@ -16,29 +16,29 @@
 //! `O(shards)` — independent of the number of live entries.  This matters because
 //! a scan reading a single record used to pay for cloning and sorting the whole
 //! memtable up front.  The [`snapshot`](Memtable::snapshot) materialization path
-//! is retained for flush.  Under `unsafe-fastpath` the read iterator stays on the
+//! is retained for flush.  Under `arena-memtable` the read iterator stays on the
 //! snapshot path (the arena shard cursor is forward-only); see [`Memtable::iter`].
 
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtOrd};
 use std::sync::Arc;
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 use crossbeam_skiplist::map::Entry as SkipEntry;
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 use crossbeam_skiplist::SkipMap;
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 use std::ops::Bound;
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 use self_cell::self_cell;
 
 use crate::comparator::ComparatorRef;
 use crate::format::flags;
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 use crate::format::{self, make_internal_key};
 
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 use crate::memtable_arena::ArenaShard;
 
 /// Number of independent shards. 256 keeps per-shard skip lists shallow and
@@ -46,24 +46,24 @@ use crate::memtable_arena::ArenaShard;
 pub const NUM_SHARDS: usize = 256;
 
 /// The selected per-shard storage: a lock-free `crossbeam-skiplist` by default,
-/// or an arena-backed skip list under `unsafe-fastpath`.
-#[cfg(not(feature = "unsafe-fastpath"))]
+/// or an arena-backed skip list under `arena-memtable`.
+#[cfg(not(feature = "arena-memtable"))]
 type ShardImpl = SkipMap<IKey, Val>;
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 type ShardImpl = ArenaShard;
 
 /// Internal key: `user_key || !seq` (big-endian), ordered via the comparator.
 /// `cmp` is `None` for plain byte-wise ordering (the default), so the hot
 /// skip-list comparisons use an inlined slice compare with no per-key `Arc`
 /// clone and no virtual call.
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 #[derive(Clone)]
 struct IKey {
     ik: Box<[u8]>,
     cmp: Option<ComparatorRef>,
 }
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 mod skipmap_key {
     use super::*;
 
@@ -105,7 +105,7 @@ mod skipmap_key {
 }
 
 /// Stored value payload.
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 #[derive(Clone)]
 struct Val {
     value: Vec<u8>,
@@ -177,9 +177,9 @@ pub(crate) fn flag_bits(tombstone: bool, single_delete: bool, ttl: i64) -> u8 {
 impl Memtable {
     /// Create an empty memtable ordering user keys with `cmp`.
     pub fn new(cmp: ComparatorRef) -> Arc<Memtable> {
-        #[cfg(not(feature = "unsafe-fastpath"))]
+        #[cfg(not(feature = "arena-memtable"))]
         let shards = (0..NUM_SHARDS).map(|_| SkipMap::new()).collect();
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "arena-memtable")]
         let shards = (0..NUM_SHARDS)
             .map(|_| ArenaShard::new(cmp.clone()))
             .collect();
@@ -211,7 +211,7 @@ impl Memtable {
         let fl = flag_bits(tombstone, single_delete, ttl);
         let shard = &self.shards[shard_index(user_key)];
         let added = user_key.len() + value.len() + 64;
-        #[cfg(not(feature = "unsafe-fastpath"))]
+        #[cfg(not(feature = "arena-memtable"))]
         shard.insert(
             IKey::new(user_key, seq, &self.cmp),
             Val {
@@ -220,7 +220,7 @@ impl Memtable {
                 flags: fl,
             },
         );
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "arena-memtable")]
         shard.put(user_key, &value, seq, ttl, fl);
         self.after_insert(added, seq);
     }
@@ -239,7 +239,7 @@ impl Memtable {
         let fl = flag_bits(tombstone, single_delete, ttl);
         let shard = &self.shards[shard_index(user_key)];
         let added = user_key.len() + value.len() + 64;
-        #[cfg(not(feature = "unsafe-fastpath"))]
+        #[cfg(not(feature = "arena-memtable"))]
         shard.insert(
             IKey::new(user_key, seq, &self.cmp),
             Val {
@@ -248,7 +248,7 @@ impl Memtable {
                 flags: fl,
             },
         );
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "arena-memtable")]
         shard.put(user_key, value, seq, ttl, fl);
         self.after_insert(added, seq);
     }
@@ -321,9 +321,9 @@ impl Memtable {
                 continue;
             }
             let group = &order[lo..hi];
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "arena-memtable")]
             self.shards[s].put_group(recs, group);
-            #[cfg(not(feature = "unsafe-fastpath"))]
+            #[cfg(not(feature = "arena-memtable"))]
             for &i in group {
                 let r = &recs[i as usize];
                 let fl = flag_bits(r.tombstone, r.single_delete, r.ttl);
@@ -354,7 +354,7 @@ impl Memtable {
 
     /// Resolve `user_key` as of `read_seq`.  `now_nanos` is the current time for
     /// TTL expiry evaluation.
-    #[cfg_attr(feature = "unsafe-fastpath", allow(clippy::needless_return))]
+    #[cfg_attr(feature = "arena-memtable", allow(clippy::needless_return))]
     pub fn get(&self, user_key: &[u8], read_seq: u64, now_nanos: i64) -> Lookup {
         // Cold-read fast path: a fresh (or drained) memtable holds nothing, so
         // skip the shard hash entirely — it hashes the whole key.
@@ -362,11 +362,11 @@ impl Memtable {
             return Lookup::default();
         }
         let shard = &self.shards[shard_index(user_key)];
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "arena-memtable")]
         {
             return shard.get(user_key, read_seq, now_nanos);
         }
-        #[cfg(not(feature = "unsafe-fastpath"))]
+        #[cfg(not(feature = "arena-memtable"))]
         {
             let probe = IKey::new(user_key, read_seq, &self.cmp);
             let entry = match shard.lower_bound(std::ops::Bound::Included(&probe)) {
@@ -427,7 +427,7 @@ impl Memtable {
     /// (user key ascending, sequence descending).
     pub fn snapshot(&self) -> Vec<Entry> {
         let mut out = Vec::with_capacity(self.num_entries.load(AtOrd::Relaxed).max(0) as usize);
-        #[cfg(not(feature = "unsafe-fastpath"))]
+        #[cfg(not(feature = "arena-memtable"))]
         for shard in &self.shards {
             for e in shard.iter() {
                 let (uk, seq) = format::split_internal_key(&e.key().ik);
@@ -442,7 +442,7 @@ impl Memtable {
                 });
             }
         }
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "arena-memtable")]
         for shard in &self.shards {
             shard.collect(&mut out);
         }
@@ -468,16 +468,16 @@ impl Memtable {
     /// inserts the cursors may physically observe are invisible under the
     /// caller's `read_seq` filter; see [`LazyMemIter`] for the argument.
     ///
-    /// `unsafe-fastpath` build: the arena shard cursor is forward-only, so the
+    /// `arena-memtable` build: the arena shard cursor is forward-only, so the
     /// read iterator keeps the materialized-snapshot path (acceptable — the
     /// default build is what ships).
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     pub fn iter(self: &Arc<Self>) -> MemIter {
         LazyMemIter::new(self.clone())
     }
 
     /// See [`iter`](Self::iter) — fast-path variant over a materialized snapshot.
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "arena-memtable")]
     pub fn iter(self: &Arc<Self>) -> MemIter {
         MemIterator::new(self.snapshot(), self.cmp.clone())
     }
@@ -485,7 +485,7 @@ impl Memtable {
     /// A zero-materialization merge over all shards in internal order, for the
     /// flush path: keys and values are borrowed straight from the arena nodes
     /// instead of copied into a sorted `Vec<Entry>`.
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "arena-memtable")]
     pub(crate) fn flush_merge(&self) -> FlushMerge<'_> {
         let cursors: Vec<crate::memtable_arena::ShardCursor<'_>> = self
             .shards
@@ -500,9 +500,9 @@ impl Memtable {
 /// The read-iterator type exposed to [`iterator::ChildIter`](crate::iterator):
 /// the lazy shard-merge by default, the materialized-snapshot iterator under the
 /// fast path. Both expose the same inherent methods.
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 pub type MemIter = LazyMemIter;
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 pub type MemIter = MemIterator;
 
 // ===========================================================================
@@ -514,14 +514,14 @@ pub type MemIter = MemIterator;
 /// links in `O(1)` and leave the entry pinned by refcount, and (re-)seeks go
 /// through the shard's `lower_bound`/`upper_bound`. Keys/values are borrowed
 /// straight from the pinned node — no copy at the shard level.
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 struct ShardCur<'a> {
     map: &'a SkipMap<IKey, Val>,
     /// `None` once stepped past an end (or seeked to an empty result).
     cur: Option<SkipEntry<'a, IKey, Val>>,
 }
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 impl<'a> ShardCur<'a> {
     #[inline]
     fn valid(&self) -> bool {
@@ -629,7 +629,7 @@ impl<'a> ShardCur<'a> {
 ///
 /// Immutable memtables are sealed (no writer ever, per the rotation protocol),
 /// so iteration over them is trivially stable; only the active memtable can grow.
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 struct MemMerge<'a> {
     shards: Vec<ShardCur<'a>>,
     /// Indices into `shards` of the currently valid cursors, kept as a binary
@@ -641,7 +641,7 @@ struct MemMerge<'a> {
     bytewise: bool,
 }
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 impl<'a> MemMerge<'a> {
     fn new(mem: &'a Arc<Memtable>) -> MemMerge<'a> {
         let cmp = mem.cmp.clone();
@@ -839,7 +839,7 @@ impl<'a> MemMerge<'a> {
     }
 }
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 self_cell!(
     struct MemMergeCell {
         owner: Arc<Memtable>,
@@ -854,12 +854,12 @@ self_cell!(
 ///
 /// Exposes the same inherent surface as [`MemIterator`] so both are drop-in for
 /// [`iterator::ChildIter`](crate::iterator).
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 pub struct LazyMemIter {
     cell: MemMergeCell,
 }
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 impl LazyMemIter {
     fn new(mem: Arc<Memtable>) -> LazyMemIter {
         LazyMemIter {
@@ -923,7 +923,7 @@ impl LazyMemIter {
     }
 }
 
-#[cfg(not(feature = "unsafe-fastpath"))]
+#[cfg(not(feature = "arena-memtable"))]
 impl std::fmt::Debug for LazyMemIter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyMemIter")
@@ -934,7 +934,7 @@ impl std::fmt::Debug for LazyMemIter {
 
 /// K-way merge over sorted shard cursors (user key ascending, seq descending),
 /// comparing cached 8-byte key prefixes first for byte-wise orderings.
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 pub(crate) struct FlushMerge<'a> {
     cursors: Vec<crate::memtable_arena::ShardCursor<'a>>,
     heap: Vec<u32>, // indices into `cursors`
@@ -942,7 +942,7 @@ pub(crate) struct FlushMerge<'a> {
     bytewise: bool,
 }
 
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 impl<'a> FlushMerge<'a> {
     fn new(cursors: Vec<crate::memtable_arena::ShardCursor<'a>>, cmp: ComparatorRef) -> Self {
         let bytewise = cmp.is_bytewise();
@@ -1022,9 +1022,9 @@ impl<'a> FlushMerge<'a> {
 }
 
 /// Bidirectional iterator over a materialized memtable snapshot. Used by the
-/// `unsafe-fastpath` read path (the arena shard cursor is forward-only, so it
+/// `arena-memtable` read path (the arena shard cursor is forward-only, so it
 /// keeps the snapshot path); the default build reads lazily via [`LazyMemIter`].
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 #[derive(Debug)]
 pub struct MemIterator {
     entries: Vec<Entry>,
@@ -1033,7 +1033,7 @@ pub struct MemIterator {
     valid: bool,
 }
 
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "arena-memtable")]
 impl MemIterator {
     fn new(entries: Vec<Entry>, cmp: ComparatorRef) -> MemIterator {
         MemIterator {
@@ -1283,10 +1283,10 @@ mod tests {
     // ---- Lazy read iterator (default build) ------------------------------
     // These pin the lazy shard-merge against the materialized `snapshot()`
     // reference, exercise seek/reverse/interleave, and prove construction is
-    // sub-linear. Under `unsafe-fastpath` the read iterator IS the snapshot
+    // sub-linear. Under `arena-memtable` the read iterator IS the snapshot
     // path, so the equality checks are vacuous and the tests are gated off.
 
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn snapshot_triples(m: &Arc<Memtable>) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
         m.snapshot()
             .into_iter()
@@ -1294,7 +1294,7 @@ mod tests {
             .collect()
     }
 
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_forward(m: &Arc<Memtable>) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
         let mut it = m.iter();
         let mut out = Vec::new();
@@ -1306,7 +1306,7 @@ mod tests {
         out
     }
 
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_backward(m: &Arc<Memtable>) -> Vec<(Vec<u8>, u64, Vec<u8>)> {
         let mut it = m.iter();
         let mut out = Vec::new();
@@ -1319,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_iter_matches_snapshot_forward_and_reverse() {
         let m = mt();
         // Many keys spread across shards, inserted in scrambled order, with
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_iter_seek_and_interleave() {
         let m = mt();
         for k in ["a", "c", "e", "g", "i"] {
@@ -1401,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_iter_mvcc_versions_in_seq_order() {
         // One user key with several versions across the merge: newest seq first.
         let m = mt();
@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_iter_construction_is_sublinear() {
         use std::time::{Duration, Instant};
         let m = mt();
@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "unsafe-fastpath"))]
+    #[cfg(not(feature = "arena-memtable"))]
     fn lazy_iter_stays_ordered_under_concurrent_inserts() {
         use std::sync::atomic::{AtomicBool, Ordering as O};
         use std::thread;

@@ -11,14 +11,14 @@ use crate::block::read_block;
 use crate::bloom::Bloom;
 use crate::cache::{BlockCache, FileCache};
 use crate::comparator::ComparatorRef;
-#[cfg(feature = "unsafe-fastpath")]
+#[cfg(feature = "mmap-reads")]
 use crate::config::Compression;
 use crate::encoding::{checksum, read_u32, read_u64, uvarint};
 use crate::error::{OndaError, Result};
 
 /// Reads a finished SSTable.  The footer, index and bloom filter are loaded on
 /// open; data blocks are read on demand through the block cache (or, under
-/// `unsafe-fastpath`, served zero-copy from an mmap of the klog file).
+/// `mmap-reads`, served zero-copy from an mmap of the klog file).
 pub struct Reader {
     klog_path: String,
     vlog_path: String,
@@ -36,14 +36,14 @@ pub struct Reader {
     /// Data blocks carry the restart-offset trailer ([`FOOTER_RESTARTS`]).
     has_restarts: bool,
 
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "mmap-reads")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "mmap-reads")]
     vlog_mmap: parking_lot::Mutex<Option<Arc<memmap2::Mmap>>>,
     /// One bit per data block: set once the block's CRC has been verified.
     /// SSTable bytes are immutable, so each block only needs checking on its
     /// first read — not on every read by every scanning thread.
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "mmap-reads")]
     verified: Vec<std::sync::atomic::AtomicU64>,
 }
 
@@ -62,11 +62,11 @@ fn corrupt() -> OndaError {
 }
 
 /// A data block borrowed for the duration of one point read: either an owned
-/// (cached/decompressed) block or, under `unsafe-fastpath`, a plain slice into
+/// (cached/decompressed) block or, under `mmap-reads`, a plain slice into
 /// the reader's mmap — no refcount traffic per get.
 pub(crate) enum BlockRef<'a> {
     Owned(Arc<[u8]>),
-    #[allow(dead_code)] // only constructed under unsafe-fastpath
+    #[allow(dead_code)] // only constructed under mmap-reads
     Mapped(&'a [u8]),
 }
 
@@ -104,11 +104,11 @@ impl Reader {
             max_seq: 0,
             bloom: None,
             has_restarts: false,
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             klog_mmap: None,
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             vlog_mmap: parking_lot::Mutex::new(None),
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             verified: Vec::new(),
         };
         let f = r.fc.acquire(klog_path)?;
@@ -149,11 +149,11 @@ impl Reader {
             r.decode_index(&idx_raw)?;
         }
 
-        // SAFETY (`unsafe-fastpath`): the klog is an immutable, finished SSTable;
+        // SAFETY (`mmap-reads`): the klog is an immutable, finished SSTable;
         // ondaDB never writes to it after `finish`, and compaction only *unlinks*
         // it (the pages stay valid while this mapping holds the inode). The mmap
         // is owned by the Reader, so views into it live exactly as long as it.
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "mmap-reads")]
         {
             let mmap = unsafe { memmap2::Mmap::map(&*f)? };
             // Hint the kernel to start paging the file in now: SSTables are
@@ -305,13 +305,13 @@ impl Reader {
 
     /// Read (and decompress if needed) data block `i`.
     ///
-    /// Under `unsafe-fastpath`, an *uncompressed* block is returned as a
+    /// Under `mmap-reads`, an *uncompressed* block is returned as a
     /// zero-copy view into the mmap; compressed blocks are decompressed once and
     /// cached.  Otherwise the block is read through the block cache.
     pub(crate) fn read_data_block(&self, i: usize) -> Result<Block> {
         let h = self.index[i].handle;
 
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "mmap-reads")]
         if let Some(mmap) = &self.klog_mmap {
             use std::sync::atomic::Ordering as AtOrd;
             let start = h.offset as usize;
@@ -363,7 +363,7 @@ impl Reader {
     /// returns a borrowed slice instead of bumping the mmap's `Arc` refcount
     /// on every point read.
     pub(crate) fn read_data_block_local(&self, i: usize) -> Result<BlockRef<'_>> {
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "mmap-reads")]
         if let Some(mmap) = &self.klog_mmap {
             use std::sync::atomic::Ordering as AtOrd;
             let h = self.index[i].handle;
@@ -388,7 +388,7 @@ impl Reader {
         }
         self.read_data_block(i).map(|b| match b {
             Block::Owned(a) => BlockRef::Owned(a),
-            #[cfg(feature = "unsafe-fastpath")]
+            #[cfg(feature = "mmap-reads")]
             Block::Mapped { .. } => unreachable!("uncompressed mmap handled above"),
         })
     }
@@ -529,7 +529,7 @@ impl Reader {
     /// the frame start (crc), `length` the logical value length.
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
         let len = length as usize;
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "mmap-reads")]
         {
             let mmap = self.vlog_mmap_handle()?;
             let s = off as usize;
@@ -559,7 +559,7 @@ impl Reader {
     }
 
     /// Lazily mmap the vlog file (created only when large values exist).
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "mmap-reads")]
     fn vlog_mmap_handle(&self) -> Result<Arc<memmap2::Mmap>> {
         let mut guard = self.vlog_mmap.lock();
         if let Some(m) = guard.as_ref() {

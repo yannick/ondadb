@@ -19,10 +19,16 @@ path = "src/bin/onda_bench.rs"
 default = []
 # Object-store (S3) support pulls in network deps; gated so the core build stays lean.
 s3 = ["dep:rust-s3", "dep:tokio"]
-# Opt-in performance fast path that uses localized `unsafe`: mmap'd zero-copy
-# SSTable reads and an arena-backed skip-list memtable. The default build forbids
-# unsafe entirely; enabling this lifts that for the fast-path modules only.
-unsafe-fastpath = ["dep:memmap2"]
+# Opt-in performance fast paths that use localized `unsafe`. The default build
+# forbids unsafe entirely; each feature lifts that for its module only.
+# mmap'd zero-copy SSTable/vlog reads (helps point reads and SST-resident scans).
+mmap-reads = ["dep:memmap2"]
+# Arena-backed skip-list memtable (helps write/flush throughput). NOTE: its read
+# iterator currently materializes a full sorted snapshot per iterator, so
+# scan-heavy workloads should benchmark before enabling.
+arena-memtable = []
+# Back-compat alias: both fast paths.
+unsafe-fastpath = ["mmap-reads", "arena-memtable"]
 
 [dependencies]
 crossbeam-skiplist = "0.1"

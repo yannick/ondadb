@@ -499,9 +499,9 @@ impl ColumnFamily {
     fn flush_imm_inner(&self, imm: &Arc<ImmMemtable>, file_id: u64) -> Result<Vec<String>> {
         // Fast path: stream entries straight out of the sealed memtable's arena
         // nodes through a k-way merge — no per-entry allocation, no sort.
-        #[cfg(feature = "unsafe-fastpath")]
+        #[cfg(feature = "arena-memtable")]
         self.write_l0_streaming(&imm.mem, file_id)?;
-        #[cfg(not(feature = "unsafe-fastpath"))]
+        #[cfg(not(feature = "arena-memtable"))]
         {
             let entries = imm.mem.snapshot();
             self.write_l0(&entries, file_id)?;
@@ -557,7 +557,7 @@ impl ColumnFamily {
 
     /// Stream a sealed memtable to a new L0 SSTable without materializing
     /// entries (keys/values borrowed from the arena through the merge).
-    #[cfg(feature = "unsafe-fastpath")]
+    #[cfg(feature = "arena-memtable")]
     fn write_l0_streaming(&self, mem: &Memtable, file_id: u64) -> Result<()> {
         let mut m = mem.flush_merge();
         if !m.valid() {
