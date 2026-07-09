@@ -186,3 +186,70 @@ parts on local tiers, with S3 as a drop-in `Storage` later.
 - **WAL/L0 never tiered** — tier movement applies to sealed bottom-level parts only.
 - **Compression rules & tier rules compose:** e.g. `img/` → zstd + hdd after 30 days;
   both resolve by longest prefix, independently.
+
+## 9. Directory layout — before / after
+
+Today (everything in `Options::path`):
+
+```
+/data/mydb/
+├── LOCK                    # advisory single-process lock
+├── MANIFEST                # catalog: CF configs + one record per SSTable
+│                           #   (id, level, min/max key, sizes, max_seq)
+└── cf-default/             # one dir per column family
+    ├── wal-0.log           # WAL generations (rotated at memtable seal)
+    ├── wal-7.log
+    ├── 12.klog             # SSTable #12: keys + inline values + bloom/index/footer
+    ├── 12.vlog             # #12's large values (WiscKey; compressed since 3a)
+    ├── 15.klog             # no .vlog twin -> no values >= threshold
+    └── 23.klog / 23.vlog
+```
+
+The dir is flat: a table's LEVEL is manifest metadata, not path. `<id>.klog/.vlog`
+are a pair, created together and (today) rewritten together at compaction.
+
+After parts + tiers (filenames unchanged; location + manifest annotations new):
+
+```
+/data/mydb/                          # tier "ssd" (implicit default)
+├── LOCK
+├── MANIFEST                         # records gain: partition, tier, vlog_refs
+└── cf-default/
+    ├── wal-9.log                    # WAL + L0..L(n-1): ALWAYS on default tier
+    ├── 41.klog / 41.vlog            # young table: partitions mixed (upper level)
+    ├── 57.klog / 57.vlog            # bottom level, partition "img" (only img/ keys;
+    ├── 58.klog / 58.vlog            #   compaction cuts at partition boundaries)
+    ├── 60.klog                      # bottom level, partition "logs"
+    └── detached/
+        └── 33.klog / 33.vlog        # DETACHed part: out of manifest, invisible
+
+/mnt/hdd/onda-tier/mydb/             # tier "hdd" root (TierDef)
+└── cf-default/
+    ├── 49.klog / 49.vlog            # partition "img" part moved by TierRule
+    └── 50.klog / 50.vlog
+```
+
+A part = one partition's bottom-level table set (e.g. img -> {57,58} on ssd,
+{49,50} on hdd) — a closed set: every vlog a part's klogs reference is in the set.
+
+## 10. Part-move walkthrough (mover protocol)
+
+Rule `TierRule { prefix: "img/", tier: "hdd", min_age: 30d }`, part = {49, 50}:
+
+1. **Select** — records say partition="img", tier="ssd", max_entry_time > 30d old.
+2. **Copy** — files -> hdd root as `*.tmp`, fsync, rename into place, fsync dir.
+   Part still fully live on ssd; readers unaffected.
+3. **Flip** — ONE manifest record: "49,50: tier=hdd" + fsync (the atomic commit
+   point). Under the CF write-lock, SstHandles swap to the hdd Storage; new reads
+   open hdd files, in-flight reads finish on the old handles/mmap.
+4. **Clean up** — delete ssd copies.
+
+Crash safety (manifest = single source of truth):
+- die 2→3: manifest still says ssd; startup GC deletes unreferenced hdd copies.
+- die 3→4: manifest says hdd; startup GC deletes orphaned ssd copies.
+- A reader is never routed to a file that is not durably in place.
+
+MOVE keeps the part ACTIVE (reads just go to the slower mount, block cache absorbs
+the hit); DETACH removes it from the catalog. An S3 tier changes only the copy
+target and read path (Storage impl, no mmap, range-GET blocks) — the flip/cleanup
+protocol is identical.
