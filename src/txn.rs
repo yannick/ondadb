@@ -283,6 +283,24 @@ impl Txn {
     /// Create a snapshot iterator over `cf` that includes this transaction's
     /// buffered writes.
     pub fn new_iterator(&self, cf: &Arc<ColumnFamily>) -> Iterator {
+        self.new_iterator_bounded(cf, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+    }
+
+    /// Like [`new_iterator`](Self::new_iterator), with declared key bounds.
+    ///
+    /// SSTables whose key range lies entirely outside `[lower, upper]` are
+    /// skipped at construction — for a scan touching a narrow key range this
+    /// avoids opening (and seeking, i.e. reading a block of) every table in
+    /// every level. The iterator also terminates at the bounds: forward
+    /// iteration goes invalid at the first key past `upper`, backward at the
+    /// first key below `lower`. Seeking outside the declared bounds yields
+    /// unspecified (but memory-safe) results.
+    pub fn new_iterator_bounded(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Iterator {
         let rs = if self.fixed {
             self.read_seq
         } else {
@@ -311,7 +329,7 @@ impl Txn {
                 None
             }
         };
-        cf.new_iterator(rs, overlay)
+        cf.new_iterator(rs, overlay, (lower, upper))
     }
 
     /// Name a savepoint at the current buffer position.

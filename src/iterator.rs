@@ -3,6 +3,8 @@
 //! SSTable levels, collapses MVCC versions, hides tombstones and expired entries,
 //! and presents one value per visible user key.
 
+use std::ops::Bound;
+
 use crate::comparator::ComparatorRef;
 use crate::error::Result;
 use crate::memtable::MemIter;
@@ -355,6 +357,14 @@ pub struct Iterator {
     pinned_key: Vec<Option<Block>>,
     valid: bool,
     err: Option<crate::error::OndaError>,
+    /// Declared key bounds (see [`Txn::new_iterator_bounded`]
+    /// (crate::txn::Txn::new_iterator_bounded)): forward iteration terminates
+    /// at the first group past `upper`, backward at the first group below
+    /// `lower`. SSTables entirely outside the bounds were pruned at
+    /// construction, so seeking outside them yields unspecified (but
+    /// memory-safe) completeness.
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Iterator {
@@ -376,6 +386,7 @@ impl Iterator {
         children: Vec<ChildIter>,
         read_seq: u64,
         now: i64,
+        bounds: (Bound<Vec<u8>>, Bound<Vec<u8>>),
     ) -> Iterator {
         let n = children.len();
         Iterator {
@@ -391,6 +402,30 @@ impl Iterator {
             pinned_key: (0..n).map(|_| None).collect(),
             valid: false,
             err: None,
+            lower: bounds.0,
+            upper: bounds.1,
+        }
+    }
+
+    /// Is the current group key past the declared upper bound (forward
+    /// direction)?
+    #[inline]
+    fn past_upper(&self) -> bool {
+        match &self.upper {
+            Bound::Unbounded => false,
+            Bound::Included(u) => self.m.key_cmp(self.key(), u).is_gt(),
+            Bound::Excluded(u) => self.m.key_cmp(self.key(), u).is_ge(),
+        }
+    }
+
+    /// Is the current group key below the declared lower bound (backward
+    /// direction)?
+    #[inline]
+    fn below_lower(&self) -> bool {
+        match &self.lower {
+            Bound::Unbounded => false,
+            Bound::Included(l) => self.m.key_cmp(self.key(), l).is_lt(),
+            Bound::Excluded(l) => self.m.key_cmp(self.key(), l).is_le(),
         }
     }
 
@@ -551,6 +586,10 @@ impl Iterator {
             }
             if visible && !deleted && !expired(ttl, self.now) {
                 self.valid = true;
+                // Terminate at the first group past the declared upper bound.
+                if self.past_upper() {
+                    self.valid = false;
+                }
                 return;
             }
         }
@@ -587,6 +626,10 @@ impl Iterator {
             }
             if have && !best_tomb && !expired(best_ttl, self.now) {
                 self.valid = true;
+                // Terminate at the first group below the declared lower bound.
+                if self.below_lower() {
+                    self.valid = false;
+                }
                 return;
             }
         }

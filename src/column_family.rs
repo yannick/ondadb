@@ -6,6 +6,7 @@
 //! with `Arc` (replacing the manual incref/decref), and backpressure uses a
 //! `parking_lot` `Mutex`/`Condvar`.
 
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -789,13 +790,40 @@ impl ColumnFamily {
         Ok(best)
     }
 
+    /// Does `[meta.min_key, meta.max_key]` overlap the declared key bounds?
+    fn sst_in_bounds(
+        th: &SstHandle,
+        cmp: &ComparatorRef,
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> bool {
+        let above_lower = match bounds.0 {
+            Bound::Unbounded => true,
+            Bound::Included(l) => cmp.compare(&th.meta.max_key, l).is_ge(),
+            Bound::Excluded(l) => cmp.compare(&th.meta.max_key, l).is_gt(),
+        };
+        let below_upper = match bounds.1 {
+            Bound::Unbounded => true,
+            Bound::Included(u) => cmp.compare(&th.meta.min_key, u).is_le(),
+            Bound::Excluded(u) => cmp.compare(&th.meta.min_key, u).is_lt(),
+        };
+        above_lower && below_upper
+    }
+
     /// Build a snapshot iterator. `extra` is an optional transaction overlay
-    /// memtable consulted as the newest source.
-    pub(crate) fn new_iterator(&self, read_seq: u64, extra: Option<Arc<Memtable>>) -> Iterator {
+    /// memtable consulted as the newest source. `bounds` are the caller's
+    /// declared key bounds: SSTables whose `[min_key, max_key]` lies entirely
+    /// outside them are skipped (memtables are hash-sharded and cannot be
+    /// pruned), and the returned iterator terminates at the bounds.
+    pub(crate) fn new_iterator(
+        &self,
+        read_seq: u64,
+        extra: Option<Arc<Memtable>>,
+        bounds: (Bound<&[u8]>, Bound<&[u8]>),
+    ) -> Iterator {
         let mut children: Vec<ChildIter> = Vec::new();
         let s = self.state.read();
         if let Some(extra) = extra {
-            children.push(ChildIter::Mem(extra.iter()));
+            children.push(ChildIter::Mem(extra.iter_bounded(bounds)));
         }
         // Unified mode: overlay this CF's slice of the shared memtable.
         if let Some(u) = &self.ctx.unified {
@@ -812,23 +840,31 @@ impl ColumnFamily {
                         e.single_delete,
                     );
                 }
-                children.push(ChildIter::Mem(overlay.iter()));
+                children.push(ChildIter::Mem(overlay.iter_bounded(bounds)));
             }
         }
-        children.push(ChildIter::Mem(s.mem.iter()));
+        children.push(ChildIter::Mem(s.mem.iter_bounded(bounds)));
         for imm in s.imm.iter().rev() {
-            children.push(ChildIter::Mem(imm.mem.iter()));
+            children.push(ChildIter::Mem(imm.mem.iter_bounded(bounds)));
         }
         for th in &s.levels[0] {
-            children.push(ChildIter::Sst(th.reader.iter()));
-        }
-        for lvl in s.levels.iter().skip(1) {
-            for th in lvl {
+            if Self::sst_in_bounds(th, &self.cmp, &bounds) {
                 children.push(ChildIter::Sst(th.reader.iter()));
             }
         }
+        for lvl in s.levels.iter().skip(1) {
+            for th in lvl {
+                if Self::sst_in_bounds(th, &self.cmp, &bounds) {
+                    children.push(ChildIter::Sst(th.reader.iter()));
+                }
+            }
+        }
         drop(s);
-        Iterator::new(self.cmp.clone(), children, read_seq, now_nanos())
+        let owned = (
+            bound_to_owned(bounds.0),
+            bound_to_owned(bounds.1),
+        );
+        Iterator::new(self.cmp.clone(), children, read_seq, now_nanos(), owned)
     }
 
     /// Snapshot the SSTable metadata for the manifest.
@@ -1035,4 +1071,13 @@ fn existing_wal_gens(dir: &str) -> Result<Vec<u64>> {
     }
     gens.sort_unstable();
     Ok(gens)
+}
+
+/// Convert a borrowed key bound to an owned one (for storage in the iterator).
+fn bound_to_owned(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
+    match b {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(k) => Bound::Included(k.to_vec()),
+        Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
+    }
 }

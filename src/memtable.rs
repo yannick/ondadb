@@ -476,7 +476,8 @@ impl Memtable {
     /// `arena-memtable` build: forward operations run a lazy k-way merge over
     /// the arena shards ([`LazyArenaIter`]); the first *reverse* operation
     /// falls back to a materialized snapshot (the arena cursor is
-    /// forward-only).
+    /// forward-only), bounded to the declared key range when one was given
+    /// (see [`iter_bounded`](Self::iter_bounded)).
     #[cfg(not(feature = "arena-memtable"))]
     pub fn iter(self: &Arc<Self>) -> MemIter {
         LazyMemIter::new(self.clone())
@@ -485,7 +486,66 @@ impl Memtable {
     /// See [`iter`](Self::iter) — lazy-forward variant over the arena shards.
     #[cfg(feature = "arena-memtable")]
     pub fn iter(self: &Arc<Self>) -> MemIter {
-        LazyArenaIter::new(self.clone())
+        LazyArenaIter::new(
+            self.clone(),
+            (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        )
+    }
+
+    /// [`iter`](Self::iter) with declared key bounds.
+    ///
+    /// Default build: the lazy shard merge is bidirectional and needs no
+    /// bounds — they are ignored.
+    #[cfg(not(feature = "arena-memtable"))]
+    pub fn iter_bounded(
+        self: &Arc<Self>,
+        _bounds: (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>),
+    ) -> MemIter {
+        LazyMemIter::new(self.clone())
+    }
+
+    /// [`iter`](Self::iter) with declared key bounds.
+    ///
+    /// `arena-memtable` build: the bounds limit the materialized-snapshot
+    /// fallback taken on the first reverse operation to `O(log n + matches)`
+    /// per shard instead of `O(entries)` — a reverse scan of a narrow range
+    /// (e.g. one user's feed) no longer collects and sorts the whole memtable.
+    #[cfg(feature = "arena-memtable")]
+    pub fn iter_bounded(
+        self: &Arc<Self>,
+        bounds: (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>),
+    ) -> MemIter {
+        let owned = |b: std::ops::Bound<&[u8]>| match b {
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+            std::ops::Bound::Included(k) => std::ops::Bound::Included(k.to_vec()),
+            std::ops::Bound::Excluded(k) => std::ops::Bound::Excluded(k.to_vec()),
+        };
+        LazyArenaIter::new(self.clone(), (owned(bounds.0), owned(bounds.1)))
+    }
+
+    /// Materialize the live entries within the key bounds, in internal order —
+    /// the bounded variant of [`snapshot`](Self::snapshot), used by the arena
+    /// read iterator's reverse fallback.
+    #[cfg(feature = "arena-memtable")]
+    pub(crate) fn snapshot_range(
+        &self,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Vec<Entry> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            shard.collect_range(lower, upper, &mut out);
+        }
+        if self.cmp.is_bytewise() {
+            out.sort_by(|a, b| a.user_key.cmp(&b.user_key).then_with(|| b.seq.cmp(&a.seq)));
+        } else {
+            out.sort_by(|a, b| {
+                self.cmp
+                    .compare(&a.user_key, &b.user_key)
+                    .then_with(|| b.seq.cmp(&a.seq))
+            });
+        }
+        out
     }
 
     /// A zero-materialization merge over all shards in internal order, for the
@@ -1314,13 +1374,22 @@ enum ArenaIterState {
 #[cfg(feature = "arena-memtable")]
 pub struct LazyArenaIter {
     state: ArenaIterState,
+    /// Declared key bounds: the reverse-fallback snapshot materializes only
+    /// entries within them (`O(log n + matches)` per shard).
+    lower: std::ops::Bound<Vec<u8>>,
+    upper: std::ops::Bound<Vec<u8>>,
 }
 
 #[cfg(feature = "arena-memtable")]
 impl LazyArenaIter {
-    fn new(mem: Arc<Memtable>) -> LazyArenaIter {
+    fn new(
+        mem: Arc<Memtable>,
+        bounds: (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>),
+    ) -> LazyArenaIter {
         LazyArenaIter {
             state: ArenaIterState::Lazy(ArenaMergeCell::new(mem, |owner| ArenaMerge::new(owner))),
+            lower: bounds.0,
+            upper: bounds.1,
         }
     }
 
@@ -1329,7 +1398,15 @@ impl LazyArenaIter {
     fn materialize(&mut self, at: Option<(Vec<u8>, u64)>) -> &mut MemIterator {
         if let ArenaIterState::Lazy(cell) = &self.state {
             let mem = cell.borrow_owner().clone();
-            let mut it = MemIterator::new(mem.snapshot(), mem.cmp.clone());
+            fn as_ref(b: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
+                match b {
+                    std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                    std::ops::Bound::Included(k) => std::ops::Bound::Included(k.as_slice()),
+                    std::ops::Bound::Excluded(k) => std::ops::Bound::Excluded(k.as_slice()),
+                }
+            }
+            let entries = mem.snapshot_range(as_ref(&self.lower), as_ref(&self.upper));
+            let mut it = MemIterator::new(entries, mem.cmp.clone());
             if let Some((uk, seq)) = &at {
                 it.seek_ge(uk, *seq);
             }

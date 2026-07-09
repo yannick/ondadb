@@ -375,6 +375,46 @@ impl ArenaShard {
             _shard: std::marker::PhantomData,
         }
     }
+
+    /// Append every entry within the key bounds to `out` (shard order is
+    /// already sorted): a skip-list descent to the lower bound, then a walk
+    /// until the upper bound — `O(log n + matches)` instead of `O(n)`.
+    pub(crate) fn collect_range(
+        &self,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+        out: &mut Vec<Entry>,
+    ) {
+        use std::ops::Bound;
+        let mut x = match lower {
+            Bound::Unbounded => self.head.next[0].load(AtOrd::Acquire) as *const Node,
+            // (l, MAX) sorts before every live version of l (seq descending).
+            Bound::Included(l) => self.find_ge(l, key_prefix(l), u64::MAX),
+            // (l, 0) sorts after every live version of l — sequences start at 1.
+            Bound::Excluded(l) => self.find_ge(l, key_prefix(l), 0),
+        };
+        while !x.is_null() {
+            let node = unsafe { &*x };
+            let uk = node.user_key();
+            let past = match upper {
+                Bound::Unbounded => false,
+                Bound::Included(u) => self.cmp.compare(uk, u).is_gt(),
+                Bound::Excluded(u) => self.cmp.compare(uk, u).is_ge(),
+            };
+            if past {
+                break;
+            }
+            out.push(Entry {
+                user_key: uk.to_vec(),
+                value: node.value().to_vec(),
+                seq: node.seq(),
+                ttl: node.ttl,
+                tombstone: node.flags & flags::TOMBSTONE != 0,
+                single_delete: node.flags & flags::SINGLE_DELETE != 0,
+            });
+            x = node.next[0].load(AtOrd::Acquire);
+        }
+    }
 }
 
 /// Walks one shard's level-0 list, borrowing keys/values straight from the
