@@ -146,6 +146,66 @@ pub struct Memtable {
     approx_size: AtomicI64,
     num_entries: AtomicI64,
     max_seq: AtomicU64,
+    /// Word-granular atomic bloom over user keys: point reads skip the
+    /// shard skip-list descend entirely on a definite miss (in read-mostly
+    /// workloads the vast majority of gets don't hit the memtable but were
+    /// paying a full O(log n) probe each). One 64-bit word per key — a
+    /// single cache line touched — with [`FILTER_BITS_PER_KEY`] bits set,
+    /// derived from the same xxh3 hash that routes the shard.
+    filter: MemFilter,
+}
+
+/// Bits set per key within its filter word.
+const FILTER_BITS_PER_KEY: u32 = 4;
+/// Filter size in 64-bit words (2^16 words = 512 KiB of bits). At the default
+/// 64 MiB write buffer (~250-500k entries) this keeps the word-collision
+/// false-positive rate in the low percent — a false positive just means one
+/// wasted shard probe, exactly the pre-filter-less behavior.
+const FILTER_WORDS: usize = 1 << 16;
+
+struct MemFilter {
+    words: Vec<AtomicU64>,
+}
+
+impl MemFilter {
+    fn new() -> MemFilter {
+        MemFilter {
+            words: (0..FILTER_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Word index + bit mask for `h` (the key's xxh3). The word is chosen by
+    /// the high hash bits (shard routing uses the low ones), the in-word bits
+    /// by successive 6-bit slices.
+    #[inline]
+    fn word_and_mask(h: u64) -> (usize, u64) {
+        let w = ((h >> 24) as usize) & (FILTER_WORDS - 1);
+        let mut mask = 0u64;
+        let mut x = h;
+        for _ in 0..FILTER_BITS_PER_KEY {
+            mask |= 1u64 << (x & 63);
+            x >>= 6;
+        }
+        (w, mask)
+    }
+
+    #[inline]
+    fn insert(&self, h: u64) {
+        let (w, mask) = Self::word_and_mask(h);
+        // Check-before-write: once the bits are set (hot keys re-written many
+        // times), the insert is a pure load — no cache-line invalidation
+        // traffic between writer cores and the readers polling the filter.
+        let cur = self.words[w].load(AtOrd::Relaxed);
+        if cur & mask != mask {
+            self.words[w].fetch_or(mask, AtOrd::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn may_contain(&self, h: u64) -> bool {
+        let (w, mask) = Self::word_and_mask(h);
+        self.words[w].load(AtOrd::Relaxed) & mask == mask
+    }
 }
 
 impl std::fmt::Debug for Memtable {
@@ -158,12 +218,22 @@ impl std::fmt::Debug for Memtable {
 }
 
 #[inline]
-fn shard_index(user_key: &[u8]) -> usize {
+fn key_hash(user_key: &[u8]) -> u64 {
     // xxh3 processes the whole key in wide lanes — measurably cheaper than a
     // byte-at-a-time FNV on every put/get. Routing only needs in-process
-    // consistency, so the hash choice is not a format concern.
-    let h = xxhash_rust::xxh3::xxh3_64(user_key);
+    // consistency, so the hash choice is not a format concern. The same hash
+    // feeds the shard index and the memtable pre-filter.
+    xxhash_rust::xxh3::xxh3_64(user_key)
+}
+
+#[inline]
+fn shard_of(h: u64) -> usize {
     ((h ^ (h >> 32)) & (NUM_SHARDS as u64 - 1)) as usize
+}
+
+#[inline]
+fn shard_index(user_key: &[u8]) -> usize {
+    shard_of(key_hash(user_key))
 }
 
 pub(crate) fn flag_bits(tombstone: bool, single_delete: bool, ttl: i64) -> u8 {
@@ -195,6 +265,7 @@ impl Memtable {
             approx_size: AtomicI64::new(0),
             num_entries: AtomicI64::new(0),
             max_seq: AtomicU64::new(0),
+            filter: MemFilter::new(),
         })
     }
 
@@ -215,7 +286,9 @@ impl Memtable {
         single_delete: bool,
     ) {
         let fl = flag_bits(tombstone, single_delete, ttl);
-        let shard = &self.shards[shard_index(user_key)];
+        let h = key_hash(user_key);
+        self.filter.insert(h);
+        let shard = &self.shards[shard_of(h)];
         let added = user_key.len() + value.len() + 64;
         #[cfg(not(feature = "arena-memtable"))]
         shard.insert(
@@ -243,7 +316,9 @@ impl Memtable {
         single_delete: bool,
     ) {
         let fl = flag_bits(tombstone, single_delete, ttl);
-        let shard = &self.shards[shard_index(user_key)];
+        let h = key_hash(user_key);
+        self.filter.insert(h);
+        let shard = &self.shards[shard_of(h)];
         let added = user_key.len() + value.len() + 64;
         #[cfg(not(feature = "arena-memtable"))]
         shard.insert(
@@ -290,12 +365,15 @@ impl Memtable {
             return;
         }
 
-        // Counting-sort record indices into per-shard runs.
-        let mut shard_of: Vec<u16> = Vec::with_capacity(n);
+        // Counting-sort record indices into per-shard runs (setting the
+        // pre-filter as we hash each key).
+        let mut shard_idx: Vec<u16> = Vec::with_capacity(n);
         let mut counts = [0u32; NUM_SHARDS];
         for r in recs {
-            let s = shard_index(r.key);
-            shard_of.push(s as u16);
+            let h = key_hash(r.key);
+            self.filter.insert(h);
+            let s = shard_of(h);
+            shard_idx.push(s as u16);
             counts[s] += 1;
         }
         let mut cursor = [0u32; NUM_SHARDS];
@@ -306,7 +384,7 @@ impl Memtable {
         }
         let starts = cursor;
         let mut order: Vec<u32> = vec![0; n];
-        for (i, &s) in shard_of.iter().enumerate() {
+        for (i, &s) in shard_idx.iter().enumerate() {
             let s = s as usize;
             order[cursor[s] as usize] = i as u32;
             cursor[s] += 1;
@@ -367,7 +445,12 @@ impl Memtable {
         if self.num_entries.load(AtOrd::Relaxed) == 0 {
             return Lookup::default();
         }
-        let shard = &self.shards[shard_index(user_key)];
+        let h = key_hash(user_key);
+        // Definite miss: skip the shard descend entirely (one cache line).
+        if !self.filter.may_contain(h) {
+            return Lookup::default();
+        }
+        let shard = &self.shards[shard_of(h)];
         #[cfg(feature = "arena-memtable")]
         {
             return shard.get(user_key, read_seq, now_nanos);

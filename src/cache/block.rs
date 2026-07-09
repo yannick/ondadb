@@ -1,12 +1,22 @@
-//! Sharded, byte-bounded LRU cache of decompressed SSTable blocks keyed by
-//! `(file_id, offset)`.  Cached values are immutable (`Arc<[u8]>`); callers must
-//! not mutate them.
+//! Sharded, byte-bounded CLOCK (second-chance) cache of decompressed SSTable
+//! blocks keyed by `(file_id, offset)`.  Cached values are immutable
+//! (`Arc<[u8]>`); callers must not mutate them.
+//!
+//! Reads are deliberately **non-serializing**: a hit takes the shard's
+//! `RwLock` in *read* mode and sets an atomic reference bit — unlike an LRU,
+//! it never reorders a recency list, so concurrent readers on the same shard
+//! proceed in parallel (the previous `Mutex<LruCache>` made every cache *hit*
+//! take an exclusive lock, which showed up as reader serialization on
+//! point-read-heavy multi-threaded workloads).  Only `put` (insert +
+//! clock-sweep eviction) takes the write lock.  CLOCK approximates LRU: the
+//! sweep hand gives referenced entries a second chance, evicting only entries
+//! not touched since the hand last passed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct BlockKey {
@@ -14,10 +24,44 @@ struct BlockKey {
     off: u64,
 }
 
+struct CacheEntry {
+    data: Arc<[u8]>,
+    /// CLOCK reference bit: set (Relaxed) on every hit, cleared by the sweep
+    /// hand. Relaxed is enough — it only biases eviction order.
+    referenced: AtomicBool,
+}
+
 struct Shard {
-    lru: LruCache<BlockKey, Arc<[u8]>>,
+    map: HashMap<BlockKey, CacheEntry>,
+    /// Clock ring in insertion order. Every map entry is in the ring exactly
+    /// once; entries leave both together during a sweep.
+    ring: VecDeque<BlockKey>,
     used: i64,
     cap: i64,
+}
+
+impl Shard {
+    /// Evict with the clock hand until under capacity: pop the ring front;
+    /// a referenced entry is cleared and pushed to the back (second chance),
+    /// an unreferenced one is evicted. Bounded to two full revolutions so a
+    /// pathological state cannot spin forever.
+    fn evict_to_cap(&mut self) {
+        let mut budget = self.ring.len().saturating_mul(2);
+        while self.used > self.cap && self.map.len() > 1 && budget > 0 {
+            budget -= 1;
+            let Some(k) = self.ring.pop_front() else {
+                break;
+            };
+            let Some(e) = self.map.get(&k) else {
+                continue; // stale ring slot (shouldn't happen; be tolerant)
+            };
+            if e.referenced.swap(false, Ordering::Relaxed) {
+                self.ring.push_back(k); // second chance
+            } else if let Some(e) = self.map.remove(&k) {
+                self.used -= e.data.len() as i64;
+            }
+        }
+    }
 }
 
 /// Hit/miss/size counters.
@@ -29,9 +73,9 @@ pub struct CacheStats {
     pub bytes: i64,
 }
 
-/// A sharded LRU block cache.
+/// A sharded CLOCK block cache (see module docs).
 pub struct BlockCache {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<RwLock<Shard>>,
     mask: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -62,8 +106,9 @@ impl BlockCache {
         let per = (capacity_bytes / NUM_SHARDS as i64).max(1);
         let shards = (0..NUM_SHARDS)
             .map(|_| {
-                Mutex::new(Shard {
-                    lru: LruCache::unbounded(),
+                RwLock::new(Shard {
+                    map: HashMap::new(),
+                    ring: VecDeque::new(),
                     used: 0,
                     cap: per,
                 })
@@ -82,52 +127,60 @@ impl BlockCache {
         !self.shards.is_empty()
     }
 
-    fn shard_for(&self, k: &BlockKey) -> &Mutex<Shard> {
+    fn shard_for(&self, k: &BlockKey) -> &RwLock<Shard> {
         let mut h = k.file_id.wrapping_mul(1099511628211) ^ k.off;
         h ^= h >> 33;
         &self.shards[(h & self.mask) as usize]
     }
 
-    /// Look up the block cached at `(file_id, off)`.
+    /// Look up the block cached at `(file_id, off)`. Hits take the shard lock
+    /// in read mode only — concurrent readers do not serialize.
     pub fn get(&self, file_id: u64, off: u64) -> Option<Arc<[u8]>> {
         if !self.enabled() {
             return None;
         }
         let k = BlockKey { file_id, off };
-        let mut s = self.shard_for(&k).lock();
-        if let Some(v) = s.lru.get(&k) {
-            let v = v.clone();
-            drop(s);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(v)
-        } else {
-            drop(s);
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+        let out = {
+            let s = self.shard_for(&k).read();
+            s.map.get(&k).map(|e| {
+                e.referenced.store(true, Ordering::Relaxed);
+                e.data.clone()
+            })
+        };
+        match &out {
+            Some(_) => self.hits.fetch_add(1, Ordering::Relaxed),
+            None => self.misses.fetch_add(1, Ordering::Relaxed),
+        };
+        out
     }
 
-    /// Insert a block, evicting least-recently-used blocks if over capacity.
+    /// Insert a block, evicting not-recently-referenced blocks if over
+    /// capacity.
     pub fn put(&self, file_id: u64, off: u64, val: Arc<[u8]>) {
         if !self.enabled() {
             return;
         }
         let k = BlockKey { file_id, off };
-        let mut s = self.shard_for(&k).lock();
-        if s.lru.get(&k).is_some() {
-            return; // already present (and now MRU)
+        let mut s = self.shard_for(&k).write();
+        if let Some(e) = s.map.get(&k) {
+            // Already present: blocks are immutable, so keep the existing
+            // value and just mark it referenced.
+            e.referenced.store(true, Ordering::Relaxed);
+            return;
         }
-        let added = val.len() as i64;
-        if let Some(old) = s.lru.put(k, val) {
-            s.used -= old.len() as i64;
-        }
-        s.used += added;
-        while s.used > s.cap && s.lru.len() > 1 {
-            if let Some((_, v)) = s.lru.pop_lru() {
-                s.used -= v.len() as i64;
-            } else {
-                break;
-            }
+        s.used += val.len() as i64;
+        s.map.insert(
+            k,
+            CacheEntry {
+                data: val,
+                // Insert unreferenced: a never-again-touched block is evicted
+                // on the hand's first pass (scan resistance).
+                referenced: AtomicBool::new(false),
+            },
+        );
+        s.ring.push_back(k);
+        if s.used > s.cap {
+            s.evict_to_cap();
         }
     }
 
@@ -136,8 +189,8 @@ impl BlockCache {
         let mut entries = 0;
         let mut bytes = 0;
         for shard in &self.shards {
-            let s = shard.lock();
-            entries += s.lru.len();
+            let s = shard.read();
+            entries += s.map.len();
             bytes += s.used;
         }
         CacheStats {
@@ -189,5 +242,45 @@ mod tests {
         // Each shard holds <= ~ cap/200 entries; far fewer than 1000.
         assert!(st.entries < 1000, "entries={}", st.entries);
         assert!(st.bytes <= NUM_SHARDS as i64 * 256 + 200);
+    }
+
+    #[test]
+    fn referenced_entries_survive_eviction_pressure() {
+        // Hot key is touched between inserts, cold keys are not; under
+        // pressure the hot key must survive (second chance).
+        let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
+        c.put(1, 0, blk(200, 1)); // hot
+        for i in 1..200u64 {
+            let _ = c.get(1, 0); // keep the reference bit set
+            c.put(1, i * 4096, blk(200, i as u8)); // cold churn
+        }
+        assert!(c.get(1, 0).is_some(), "hot block was evicted");
+    }
+
+    #[test]
+    fn concurrent_readers_and_writers() {
+        use std::sync::Arc as StdArc;
+        let c = StdArc::new(BlockCache::new(1 << 20));
+        for i in 0..64u64 {
+            c.put(1, i * 4096, blk(256, i as u8));
+        }
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let c = c.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20_000u64 {
+                    let k = (i * 31 + t) % 64;
+                    if let Some(v) = c.get(1, k * 4096) {
+                        assert_eq!(v[0], k as u8);
+                    }
+                    if i % 512 == 0 {
+                        c.put(2, (t * 100_000 + i) * 4096, blk(256, t as u8));
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

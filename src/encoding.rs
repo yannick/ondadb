@@ -51,12 +51,17 @@ pub fn uvarint_len(mut x: u64) -> usize {
 /// `n <= 0`).
 #[inline]
 pub fn uvarint(b: &[u8]) -> Option<(u64, usize)> {
-    // Single-byte fast path: the overwhelmingly common case for lengths and
-    // small sequence deltas in hot decode loops.
+    // One- and two-byte fast paths: lengths are almost always 1 byte, and
+    // sequence numbers 2-3 bytes, in the hot block-decode loops.
     match b.first() {
         Some(&byte) if byte < 0x80 => return Some((u64::from(byte), 1)),
         None => return None,
         _ => {}
+    }
+    if let Some(&b1) = b.get(1) {
+        if b1 < 0x80 {
+            return Some((u64::from(b[0] & 0x7f) | (u64::from(b1) << 7), 2));
+        }
     }
     uvarint_slow(b)
 }
