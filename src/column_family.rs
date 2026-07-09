@@ -823,7 +823,7 @@ impl ColumnFamily {
         let mut children: Vec<ChildIter> = Vec::new();
         let s = self.state.read();
         if let Some(extra) = extra {
-            children.push(ChildIter::Mem(extra.iter_bounded(bounds)));
+            children.push(ChildIter::Mem(extra.iter()));
         }
         // Unified mode: overlay this CF's slice of the shared memtable.
         if let Some(u) = &self.ctx.unified {
@@ -840,12 +840,12 @@ impl ColumnFamily {
                         e.single_delete,
                     );
                 }
-                children.push(ChildIter::Mem(overlay.iter_bounded(bounds)));
+                children.push(ChildIter::Mem(overlay.iter()));
             }
         }
-        children.push(ChildIter::Mem(s.mem.iter_bounded(bounds)));
+        children.push(ChildIter::Mem(s.mem.iter()));
         for imm in s.imm.iter().rev() {
-            children.push(ChildIter::Mem(imm.mem.iter_bounded(bounds)));
+            children.push(ChildIter::Mem(imm.mem.iter()));
         }
         for th in &s.levels[0] {
             if Self::sst_in_bounds(th, &self.cmp, &bounds) {

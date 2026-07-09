@@ -283,9 +283,11 @@ impl ArenaShard {
         }
     }
 
-    /// Skip-list descent: the first node whose `(user_key, seq)` is `>=` the
-    /// probe in internal order (user key ascending, seq descending), or null.
-    fn find_ge(&self, user_key: &[u8], ukpfx: u64, seq: u64) -> *const Node {
+    /// Skip-list descent to the last node `<` the probe (`inclusive: false`)
+    /// or `<=` the probe (`inclusive: true`) in internal order (user key
+    /// ascending, seq descending). Returns the head sentinel when no node
+    /// qualifies.
+    fn descend(&self, user_key: &[u8], ukpfx: u64, seq: u64, inclusive: bool) -> *const Node {
         let head: *const Node = &*self.head;
         let mut x = head;
         let cur_height = self.height.load(AtOrd::Relaxed) as usize;
@@ -295,14 +297,69 @@ impl ArenaShard {
                 if next.is_null() {
                     break;
                 }
-                if self.cmp_node(unsafe { &*next }, user_key, ukpfx, seq).is_lt() {
+                let ord = self.cmp_node(unsafe { &*next }, user_key, ukpfx, seq);
+                if if inclusive { ord.is_le() } else { ord.is_lt() } {
                     x = next as *const Node;
                 } else {
                     break;
                 }
             }
         }
+        x
+    }
+
+    /// The first node whose `(user_key, seq)` is `>=` the probe, or null.
+    fn find_ge(&self, user_key: &[u8], ukpfx: u64, seq: u64) -> *const Node {
+        let x = self.descend(user_key, ukpfx, seq, false);
         unsafe { (*x).next[0].load(AtOrd::Acquire) }
+    }
+
+    /// The first node strictly `>` the probe, or null.
+    fn find_gt(&self, user_key: &[u8], ukpfx: u64, seq: u64) -> *const Node {
+        let x = self.descend(user_key, ukpfx, seq, true);
+        unsafe { (*x).next[0].load(AtOrd::Acquire) }
+    }
+
+    /// The last node whose `(user_key, seq)` is `<=` the probe, or null.
+    fn find_le(&self, user_key: &[u8], ukpfx: u64, seq: u64) -> *const Node {
+        let x = self.descend(user_key, ukpfx, seq, true);
+        if std::ptr::eq(x, &*self.head) {
+            std::ptr::null()
+        } else {
+            x
+        }
+    }
+
+    /// The last node strictly `<` the probe, or null.
+    fn find_lt(&self, user_key: &[u8], ukpfx: u64, seq: u64) -> *const Node {
+        let x = self.descend(user_key, ukpfx, seq, false);
+        if std::ptr::eq(x, &*self.head) {
+            std::ptr::null()
+        } else {
+            x
+        }
+    }
+
+    /// The last node in the shard, or null. `O(log n)` — descends the head
+    /// tower following the highest non-null links.
+    fn find_last(&self) -> *const Node {
+        let head: *const Node = &*self.head;
+        let mut x = head;
+        let cur_height = self.height.load(AtOrd::Relaxed) as usize;
+        for level in (0..cur_height).rev() {
+            loop {
+                let next = unsafe { (*x).next[level].load(AtOrd::Acquire) };
+                if next.is_null() {
+                    break;
+                }
+                x = next;
+            }
+        }
+        if std::ptr::eq(x, head) {
+            std::ptr::null()
+        } else {
+            x
+        }
     }
 
     pub(crate) fn get(&self, user_key: &[u8], read_seq: u64, now: i64) -> Lookup {
@@ -376,43 +433,35 @@ impl ArenaShard {
         }
     }
 
-    /// Append every entry within the key bounds to `out` (shard order is
-    /// already sorted): a skip-list descent to the lower bound, then a walk
-    /// until the upper bound — `O(log n + matches)` instead of `O(n)`.
-    pub(crate) fn collect_range(
-        &self,
-        lower: std::ops::Bound<&[u8]>,
-        upper: std::ops::Bound<&[u8]>,
-        out: &mut Vec<Entry>,
-    ) {
-        use std::ops::Bound;
-        let mut x = match lower {
-            Bound::Unbounded => self.head.next[0].load(AtOrd::Acquire) as *const Node,
-            // (l, MAX) sorts before every live version of l (seq descending).
-            Bound::Included(l) => self.find_ge(l, key_prefix(l), u64::MAX),
-            // (l, 0) sorts after every live version of l — sequences start at 1.
-            Bound::Excluded(l) => self.find_ge(l, key_prefix(l), 0),
-        };
-        while !x.is_null() {
-            let node = unsafe { &*x };
-            let uk = node.user_key();
-            let past = match upper {
-                Bound::Unbounded => false,
-                Bound::Included(u) => self.cmp.compare(uk, u).is_gt(),
-                Bound::Excluded(u) => self.cmp.compare(uk, u).is_ge(),
-            };
-            if past {
-                break;
-            }
-            out.push(Entry {
-                user_key: uk.to_vec(),
-                value: node.value().to_vec(),
-                seq: node.seq(),
-                ttl: node.ttl,
-                tombstone: node.flags & flags::TOMBSTONE != 0,
-                single_delete: node.flags & flags::SINGLE_DELETE != 0,
-            });
-            x = node.next[0].load(AtOrd::Acquire);
+    /// A cursor at the first entry strictly `>` the probe (direction flips).
+    pub(crate) fn cursor_gt(&self, user_key: &[u8], seq: u64) -> ShardCursor<'_> {
+        ShardCursor {
+            node: self.find_gt(user_key, key_prefix(user_key), seq),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// A cursor at the last entry whose `(user_key, seq)` is `<=` the probe.
+    pub(crate) fn cursor_le(&self, user_key: &[u8], seq: u64) -> ShardCursor<'_> {
+        ShardCursor {
+            node: self.find_le(user_key, key_prefix(user_key), seq),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// A cursor at the last entry strictly `<` the probe (backward step).
+    pub(crate) fn cursor_lt(&self, user_key: &[u8], seq: u64) -> ShardCursor<'_> {
+        ShardCursor {
+            node: self.find_lt(user_key, key_prefix(user_key), seq),
+            _shard: std::marker::PhantomData,
+        }
+    }
+
+    /// A cursor at the shard's last entry.
+    pub(crate) fn cursor_last(&self) -> ShardCursor<'_> {
+        ShardCursor {
+            node: self.find_last(),
+            _shard: std::marker::PhantomData,
         }
     }
 }

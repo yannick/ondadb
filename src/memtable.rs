@@ -16,8 +16,9 @@
 //! `O(shards)` — independent of the number of live entries.  This matters because
 //! a scan reading a single record used to pay for cloning and sorting the whole
 //! memtable up front.  The [`snapshot`](Memtable::snapshot) materialization path
-//! is retained for flush.  Under `arena-memtable` the read iterator stays on the
-//! snapshot path (the arena shard cursor is forward-only); see [`Memtable::iter`].
+//! is retained for flush.  Under `arena-memtable` the read iterator is the
+//! equally lazy [`LazyArenaIter`]; backward steps re-seek with a skip-list
+//! descent since arena nodes have no back links.
 
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtOrd};
@@ -473,79 +474,18 @@ impl Memtable {
     /// inserts the cursors may physically observe are invisible under the
     /// caller's `read_seq` filter; see [`LazyMemIter`] for the argument.
     ///
-    /// `arena-memtable` build: forward operations run a lazy k-way merge over
-    /// the arena shards ([`LazyArenaIter`]); the first *reverse* operation
-    /// falls back to a materialized snapshot (the arena cursor is
-    /// forward-only), bounded to the declared key range when one was given
-    /// (see [`iter_bounded`](Self::iter_bounded)).
+    /// `arena-memtable` build: the same lazy k-way merge over the arena
+    /// shards ([`LazyArenaIter`]) — backward steps re-seek via a skip-list
+    /// descent (`O(log n)`) since arena nodes have no back links.
     #[cfg(not(feature = "arena-memtable"))]
     pub fn iter(self: &Arc<Self>) -> MemIter {
         LazyMemIter::new(self.clone())
     }
 
-    /// See [`iter`](Self::iter) — lazy-forward variant over the arena shards.
+    /// See [`iter`](Self::iter) — lazy merge over the arena shards.
     #[cfg(feature = "arena-memtable")]
     pub fn iter(self: &Arc<Self>) -> MemIter {
-        LazyArenaIter::new(
-            self.clone(),
-            (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-        )
-    }
-
-    /// [`iter`](Self::iter) with declared key bounds.
-    ///
-    /// Default build: the lazy shard merge is bidirectional and needs no
-    /// bounds — they are ignored.
-    #[cfg(not(feature = "arena-memtable"))]
-    pub fn iter_bounded(
-        self: &Arc<Self>,
-        _bounds: (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>),
-    ) -> MemIter {
-        LazyMemIter::new(self.clone())
-    }
-
-    /// [`iter`](Self::iter) with declared key bounds.
-    ///
-    /// `arena-memtable` build: the bounds limit the materialized-snapshot
-    /// fallback taken on the first reverse operation to `O(log n + matches)`
-    /// per shard instead of `O(entries)` — a reverse scan of a narrow range
-    /// (e.g. one user's feed) no longer collects and sorts the whole memtable.
-    #[cfg(feature = "arena-memtable")]
-    pub fn iter_bounded(
-        self: &Arc<Self>,
-        bounds: (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>),
-    ) -> MemIter {
-        let owned = |b: std::ops::Bound<&[u8]>| match b {
-            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-            std::ops::Bound::Included(k) => std::ops::Bound::Included(k.to_vec()),
-            std::ops::Bound::Excluded(k) => std::ops::Bound::Excluded(k.to_vec()),
-        };
-        LazyArenaIter::new(self.clone(), (owned(bounds.0), owned(bounds.1)))
-    }
-
-    /// Materialize the live entries within the key bounds, in internal order —
-    /// the bounded variant of [`snapshot`](Self::snapshot), used by the arena
-    /// read iterator's reverse fallback.
-    #[cfg(feature = "arena-memtable")]
-    pub(crate) fn snapshot_range(
-        &self,
-        lower: std::ops::Bound<&[u8]>,
-        upper: std::ops::Bound<&[u8]>,
-    ) -> Vec<Entry> {
-        let mut out = Vec::new();
-        for shard in &self.shards {
-            shard.collect_range(lower, upper, &mut out);
-        }
-        if self.cmp.is_bytewise() {
-            out.sort_by(|a, b| a.user_key.cmp(&b.user_key).then_with(|| b.seq.cmp(&a.seq)));
-        } else {
-            out.sort_by(|a, b| {
-                self.cmp
-                    .compare(&a.user_key, &b.user_key)
-                    .then_with(|| b.seq.cmp(&a.seq))
-            });
-        }
-        out
+        LazyArenaIter::new(self.clone())
     }
 
     /// A zero-materialization merge over all shards in internal order, for the
@@ -1087,152 +1027,34 @@ impl<'a> FlushMerge<'a> {
     }
 }
 
-/// Bidirectional iterator over a materialized memtable snapshot. Used by the
-/// `arena-memtable` read path (the arena shard cursor is forward-only, so it
-/// keeps the snapshot path); the default build reads lazily via [`LazyMemIter`].
-#[cfg(feature = "arena-memtable")]
-#[derive(Debug)]
-pub struct MemIterator {
-    entries: Vec<Entry>,
-    cmp: ComparatorRef,
-    pos: usize,
-    valid: bool,
-}
-
-#[cfg(feature = "arena-memtable")]
-impl MemIterator {
-    fn new(entries: Vec<Entry>, cmp: ComparatorRef) -> MemIterator {
-        MemIterator {
-            entries,
-            cmp,
-            pos: 0,
-            valid: false,
-        }
-    }
-
-    pub fn valid(&self) -> bool {
-        self.valid && self.pos < self.entries.len()
-    }
-
-    pub fn seek_to_first(&mut self) {
-        self.pos = 0;
-        self.valid = !self.entries.is_empty();
-    }
-
-    pub fn seek_to_last(&mut self) {
-        if self.entries.is_empty() {
-            self.valid = false;
-        } else {
-            self.pos = self.entries.len() - 1;
-            self.valid = true;
-        }
-    }
-
-    /// Position at the newest version of the first user key `>= user_key`.
-    pub fn seek(&mut self, user_key: &[u8]) {
-        self.seek_ge(user_key, u64::MAX);
-    }
-
-    /// Position at the first entry whose `(user_key, seq)` is `>=` the target.
-    pub fn seek_ge(&mut self, user_key: &[u8], seq: u64) {
-        let idx = self.entries.partition_point(|e| {
-            match self.cmp.compare(&e.user_key, user_key) {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => e.seq > seq, // seq descending: higher seq comes first
-            }
-        });
-        self.pos = idx;
-        self.valid = idx < self.entries.len();
-    }
-
-    /// Position at the last entry whose `(user_key, seq)` is `<=` the target.
-    pub fn seek_le(&mut self, user_key: &[u8], seq: u64) {
-        self.seek_ge(user_key, seq);
-        if !self.valid() {
-            self.seek_to_last();
-        } else {
-            // If we landed exactly on the target it is <=; otherwise step back.
-            let e = &self.entries[self.pos];
-            let cmp = self
-                .cmp
-                .compare(&e.user_key, user_key)
-                .then_with(|| seq.cmp(&e.seq));
-            if cmp != Ordering::Equal {
-                self.prev();
-            }
-        }
-    }
-
-    pub fn next(&mut self) {
-        if self.valid() {
-            self.pos += 1;
-            self.valid = self.pos < self.entries.len();
-        }
-    }
-
-    pub fn prev(&mut self) {
-        if self.pos == 0 {
-            self.valid = false;
-        } else {
-            self.pos -= 1;
-            self.valid = true;
-        }
-    }
-
-    pub fn entry(&self) -> &Entry {
-        &self.entries[self.pos]
-    }
-    pub fn user_key(&self) -> &[u8] {
-        &self.entries[self.pos].user_key
-    }
-    /// Zero-padded 8-byte prefix of the current user key (see
-    /// `sst::iter::key_prefix8`).
-    #[inline]
-    pub(crate) fn key_prefix(&self) -> u64 {
-        crate::sst::key_prefix8(&self.entries[self.pos].user_key)
-    }
-    pub fn seq(&self) -> u64 {
-        self.entries[self.pos].seq
-    }
-    pub fn ttl(&self) -> i64 {
-        self.entries[self.pos].ttl
-    }
-    pub fn is_tombstone(&self) -> bool {
-        self.entries[self.pos].tombstone
-    }
-    pub fn value(&self) -> Vec<u8> {
-        self.entries[self.pos].value.clone()
-    }
-    /// Borrow the current value without copying.
-    pub fn value_ref(&self) -> &[u8] {
-        &self.entries[self.pos].value
-    }
-}
-
 // ===========================================================================
 // Lazy read iterator (`arena-memtable` build)
 // ===========================================================================
 
-/// Forward-only lazy k-way merge over the arena shards in internal order
-/// (user key ascending, seq descending). Positioning (`seek_to_first`,
-/// `seek_ge`) is `O(shards)` — one cursor per shard plus a heapify — never
-/// `O(entries)`; `next` advances the heap top in `O(log shards)`.
+/// Lazy, bidirectional k-way merge over the arena shards in internal order
+/// (user key ascending, seq descending). Positioning is `O(shards · log n)`
+/// — one skip-list descent per shard — never `O(entries)`. Forward steps
+/// follow level-0 links in `O(1)`; backward steps re-seek the stepped shard
+/// with a descent (`O(log n)`, the arena has no back links).
 ///
-/// Snapshot consistency under concurrent writers follows the same argument as
-/// [`MemMerge`]: arena nodes are Acquire-published and never freed while the
-/// memtable is alive, and any entry inserted after iterator construction has
-/// `seq > read_seq`, so the public [`Iterator`](crate::iterator::Iterator)
-/// filters it during version collapse.
+/// Direction handling mirrors [`MemMerge`]: `dir` selects a min-heap
+/// (forward) or max-heap (backward), and reversing repositions every non-top
+/// cursor relative to the current key. Snapshot consistency under concurrent
+/// writers follows the same argument as [`MemMerge`]: arena nodes are
+/// Acquire-published and never freed while the memtable is alive, and any
+/// entry inserted after iterator construction has `seq > read_seq`, so the
+/// public [`Iterator`](crate::iterator::Iterator) filters it.
 #[cfg(feature = "arena-memtable")]
 struct ArenaMerge<'a> {
     mem: &'a Memtable,
-    /// One cursor per shard (invalid cursors stay in place; only `heap`
-    /// membership tracks validity).
+    /// One cursor per shard, parallel to `mem.shards` (invalid cursors stay
+    /// in place; only `heap` membership tracks validity).
     cursors: Vec<crate::memtable_arena::ShardCursor<'a>>,
     /// Indices into `cursors` of the currently valid cursors, kept as a
-    /// min-heap under internal order (`heap[0]` is the merge top).
+    /// binary heap under the active direction (`heap[0]` is the merge top).
     heap: Vec<u32>,
+    /// `+1` forward (min-heap), `-1` backward (max-heap).
+    dir: i8,
     cmp: ComparatorRef,
     bytewise: bool,
 }
@@ -1246,13 +1068,14 @@ impl<'a> ArenaMerge<'a> {
             mem,
             cursors: Vec::new(),
             heap: Vec::new(),
+            dir: 1,
             cmp,
             bytewise,
         }
     }
 
-    /// Does cursor `a` sort before cursor `b` in internal order? Uses the
-    /// cached 8-byte key prefix to decide most byte-wise comparisons inline.
+    /// Does cursor `a` sort before cursor `b` under the active direction?
+    /// Uses the cached 8-byte key prefix to decide most byte-wise comparisons.
     #[inline]
     fn before(&self, a: u32, b: u32) -> bool {
         let (ca, cb) = (&self.cursors[a as usize], &self.cursors[b as usize]);
@@ -1264,7 +1087,13 @@ impl<'a> ArenaMerge<'a> {
         } else {
             self.cmp.compare(ca.user_key(), cb.user_key())
         };
-        key_ord.then_with(|| cb.seq().cmp(&ca.seq())).is_lt()
+        // Higher seq sorts first in internal (forward) order.
+        let ord = key_ord.then_with(|| cb.seq().cmp(&ca.seq()));
+        if self.dir >= 0 {
+            ord.is_lt()
+        } else {
+            ord.is_gt()
+        }
     }
 
     fn heap_down(&mut self, mut i: usize) {
@@ -1300,28 +1129,71 @@ impl<'a> ArenaMerge<'a> {
         }
     }
 
-    fn seek_to_first(&mut self) {
+    /// Re-seek every shard cursor with `f`, set direction, re-heap.
+    #[inline]
+    fn position_all<F>(&mut self, dir: i8, f: F)
+    where
+        F: Fn(&'a crate::memtable_arena::ArenaShard) -> crate::memtable_arena::ShardCursor<'a>,
+    {
         let mem = self.mem;
         self.cursors.clear();
-        self.cursors.extend(mem.shards.iter().map(|s| s.cursor()));
+        self.cursors.extend(mem.shards.iter().map(f));
+        self.dir = dir;
         self.rebuild();
     }
 
+    fn seek_to_first(&mut self) {
+        self.position_all(1, |s| s.cursor());
+    }
+
+    fn seek_to_last(&mut self) {
+        self.position_all(-1, |s| s.cursor_last());
+    }
+
     fn seek_ge(&mut self, user_key: &[u8], seq: u64) {
-        let mem = self.mem;
-        self.cursors.clear();
-        self.cursors
-            .extend(mem.shards.iter().map(|s| s.cursor_ge(user_key, seq)));
-        self.rebuild();
+        self.position_all(1, |s| s.cursor_ge(user_key, seq));
+    }
+
+    fn seek_le(&mut self, user_key: &[u8], seq: u64) {
+        self.position_all(-1, |s| s.cursor_le(user_key, seq));
     }
 
     fn next(&mut self) {
         if self.heap.is_empty() {
             return;
         }
+        if self.dir < 0 {
+            self.flip_to_forward();
+            return;
+        }
         let idx = self.heap[0] as usize;
         self.cursors[idx].advance();
-        if !self.cursors[idx].valid() {
+        self.settle_top();
+    }
+
+    fn prev(&mut self) {
+        if self.heap.is_empty() {
+            return;
+        }
+        if self.dir > 0 {
+            self.flip_to_backward();
+            return;
+        }
+        let idx = self.heap[0] as usize;
+        // Backward step: re-seek this shard to the last entry strictly before
+        // the current one (`O(log n)` descent — no back links in the arena).
+        let (uk, seq) = {
+            let c = &self.cursors[idx];
+            (c.user_key(), c.seq())
+        };
+        self.cursors[idx] = self.mem.shards[idx].cursor_lt(uk, seq);
+        self.settle_top();
+    }
+
+    /// After stepping the top cursor, restore the heap invariant (dropping
+    /// the top if it went invalid).
+    fn settle_top(&mut self) {
+        if !self.cursors[self.heap[0] as usize].valid() {
             let last = self.heap.len() - 1;
             self.heap[0] = self.heap[last];
             self.heap.pop();
@@ -1329,6 +1201,42 @@ impl<'a> ArenaMerge<'a> {
         if !self.heap.is_empty() {
             self.heap_down(0);
         }
+    }
+
+    /// Reverse from backward to forward: put every non-top cursor at the
+    /// first entry strictly after the current key, step the top forward.
+    fn flip_to_forward(&mut self) {
+        let top = self.heap[0] as usize;
+        let (uk, seq) = {
+            let c = &self.cursors[top];
+            (c.user_key(), c.seq())
+        };
+        for (i, shard) in self.mem.shards.iter().enumerate() {
+            if i != top {
+                self.cursors[i] = shard.cursor_gt(uk, seq);
+            }
+        }
+        self.cursors[top].advance();
+        self.dir = 1;
+        self.rebuild();
+    }
+
+    /// Reverse from forward to backward: symmetric to
+    /// [`flip_to_forward`](Self::flip_to_forward).
+    fn flip_to_backward(&mut self) {
+        let top = self.heap[0] as usize;
+        let (uk, seq) = {
+            let c = &self.cursors[top];
+            (c.user_key(), c.seq())
+        };
+        for (i, shard) in self.mem.shards.iter().enumerate() {
+            if i != top {
+                self.cursors[i] = shard.cursor_lt(uk, seq);
+            }
+        }
+        self.cursors[top] = self.mem.shards[top].cursor_lt(uk, seq);
+        self.dir = -1;
+        self.rebuild();
     }
 
     #[inline]
@@ -1351,188 +1259,78 @@ self_cell!(
     }
 );
 
-#[cfg(feature = "arena-memtable")]
-enum ArenaIterState {
-    /// Lazy forward merge directly over the arena shards.
-    Lazy(ArenaMergeCell),
-    /// Materialized-snapshot fallback, entered on the first reverse operation.
-    Snap(MemIterator),
-}
-
-/// Bidirectional, seekable read iterator for the `arena-memtable` build.
-///
-/// Forward operations (`seek_to_first`, `seek`/`seek_ge`, `next`) run a lazy
-/// k-way merge over the arena shard skip lists — `O(shards)` to position, no
-/// per-entry materialization — so `range_first`-style peeks and forward scans
-/// no longer pay `O(entries)` per iterator. The arena cursor is forward-only,
-/// so the first *reverse* operation (`seek_to_last`, `seek_le`, `prev`) falls
-/// back to a materialized sorted snapshot (the pre-existing behavior) and the
-/// iterator continues there, repositioned exactly where it stood.
+/// Bidirectional, seekable read iterator for the `arena-memtable` build:
+/// a lazy k-way merge directly over the arena shard skip lists — `O(shards)`
+/// cursors to position, no per-entry materialization in either direction.
 ///
 /// Exposes the same inherent surface as [`LazyMemIter`] so both are drop-in
 /// for [`iterator::ChildIter`](crate::iterator).
 #[cfg(feature = "arena-memtable")]
 pub struct LazyArenaIter {
-    state: ArenaIterState,
-    /// Declared key bounds: the reverse-fallback snapshot materializes only
-    /// entries within them (`O(log n + matches)` per shard).
-    lower: std::ops::Bound<Vec<u8>>,
-    upper: std::ops::Bound<Vec<u8>>,
+    cell: ArenaMergeCell,
 }
 
 #[cfg(feature = "arena-memtable")]
 impl LazyArenaIter {
-    fn new(
-        mem: Arc<Memtable>,
-        bounds: (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>),
-    ) -> LazyArenaIter {
+    fn new(mem: Arc<Memtable>) -> LazyArenaIter {
         LazyArenaIter {
-            state: ArenaIterState::Lazy(ArenaMergeCell::new(mem, |owner| ArenaMerge::new(owner))),
-            lower: bounds.0,
-            upper: bounds.1,
-        }
-    }
-
-    /// Switch to the materialized-snapshot fallback (idempotent), optionally
-    /// repositioning at an exact `(user_key, seq)` the lazy merge stood on.
-    fn materialize(&mut self, at: Option<(Vec<u8>, u64)>) -> &mut MemIterator {
-        if let ArenaIterState::Lazy(cell) = &self.state {
-            let mem = cell.borrow_owner().clone();
-            fn as_ref(b: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
-                match b {
-                    std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-                    std::ops::Bound::Included(k) => std::ops::Bound::Included(k.as_slice()),
-                    std::ops::Bound::Excluded(k) => std::ops::Bound::Excluded(k.as_slice()),
-                }
-            }
-            let entries = mem.snapshot_range(as_ref(&self.lower), as_ref(&self.upper));
-            let mut it = MemIterator::new(entries, mem.cmp.clone());
-            if let Some((uk, seq)) = &at {
-                it.seek_ge(uk, *seq);
-            }
-            self.state = ArenaIterState::Snap(it);
-        }
-        match &mut self.state {
-            ArenaIterState::Snap(it) => it,
-            ArenaIterState::Lazy(_) => unreachable!(),
+            cell: ArenaMergeCell::new(mem, |owner| ArenaMerge::new(owner)),
         }
     }
 
     pub fn valid(&self) -> bool {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().valid(),
-            ArenaIterState::Snap(it) => it.valid(),
-        }
+        self.cell.borrow_dependent().valid()
     }
     pub fn seek_to_first(&mut self) {
-        match &mut self.state {
-            ArenaIterState::Lazy(c) => c.with_dependent_mut(|_, m| m.seek_to_first()),
-            ArenaIterState::Snap(it) => it.seek_to_first(),
-        }
+        self.cell.with_dependent_mut(|_, m| m.seek_to_first());
     }
     pub fn seek_to_last(&mut self) {
-        if let ArenaIterState::Snap(it) = &mut self.state {
-            it.seek_to_last();
-            return;
-        }
-        self.materialize(None).seek_to_last();
+        self.cell.with_dependent_mut(|_, m| m.seek_to_last());
     }
     /// Position at the newest version of the first user key `>= user_key`.
     pub fn seek(&mut self, user_key: &[u8]) {
-        self.seek_ge(user_key, u64::MAX);
+        self.cell
+            .with_dependent_mut(|_, m| m.seek_ge(user_key, u64::MAX));
     }
     pub fn seek_ge(&mut self, user_key: &[u8], seq: u64) {
-        match &mut self.state {
-            ArenaIterState::Lazy(c) => c.with_dependent_mut(|_, m| m.seek_ge(user_key, seq)),
-            ArenaIterState::Snap(it) => it.seek_ge(user_key, seq),
-        }
+        self.cell
+            .with_dependent_mut(|_, m| m.seek_ge(user_key, seq));
     }
     pub fn seek_le(&mut self, user_key: &[u8], seq: u64) {
-        if let ArenaIterState::Snap(it) = &mut self.state {
-            it.seek_le(user_key, seq);
-            return;
-        }
-        self.materialize(None).seek_le(user_key, seq);
+        self.cell
+            .with_dependent_mut(|_, m| m.seek_le(user_key, seq));
     }
     pub fn next(&mut self) {
-        match &mut self.state {
-            ArenaIterState::Lazy(c) => c.with_dependent_mut(|_, m| m.next()),
-            ArenaIterState::Snap(it) => it.next(),
-        }
+        self.cell.with_dependent_mut(|_, m| m.next());
     }
     pub fn prev(&mut self) {
-        if let ArenaIterState::Snap(it) = &mut self.state {
-            it.prev();
-            return;
-        }
-        // Forward-only lazy merge: fall back to the snapshot, repositioned at
-        // the current entry so `prev` steps back from the right place. The
-        // entry cannot disappear (arena nodes are never removed), so the
-        // reposition lands exactly.
-        let at = {
-            let ArenaIterState::Lazy(c) = &self.state else {
-                unreachable!()
-            };
-            let m = c.borrow_dependent();
-            if m.valid() {
-                Some((m.top().user_key().to_vec(), m.top().seq()))
-            } else {
-                None
-            }
-        };
-        match at {
-            Some(at) => self.materialize(Some(at)).prev(),
-            // prev() on an unpositioned iterator is a no-op (the merging
-            // parent only calls prev on valid children).
-            None => {}
-        }
+        self.cell.with_dependent_mut(|_, m| m.prev());
     }
 
     pub fn user_key(&self) -> &[u8] {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().user_key(),
-            ArenaIterState::Snap(it) => it.user_key(),
-        }
+        self.cell.borrow_dependent().top().user_key()
     }
     /// Zero-padded 8-byte prefix of the current user key (see
     /// `sst::iter::key_prefix8`).
     #[inline]
     pub(crate) fn key_prefix(&self) -> u64 {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().key_prefix(),
-            ArenaIterState::Snap(it) => it.key_prefix(),
-        }
+        self.cell.borrow_dependent().top().key_prefix()
     }
     pub fn seq(&self) -> u64 {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().seq(),
-            ArenaIterState::Snap(it) => it.seq(),
-        }
+        self.cell.borrow_dependent().top().seq()
     }
     pub fn ttl(&self) -> i64 {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().ttl(),
-            ArenaIterState::Snap(it) => it.ttl(),
-        }
+        self.cell.borrow_dependent().top().ttl()
     }
     pub fn is_tombstone(&self) -> bool {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().tombstone(),
-            ArenaIterState::Snap(it) => it.is_tombstone(),
-        }
+        self.cell.borrow_dependent().top().tombstone()
     }
     pub fn value(&self) -> Vec<u8> {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().value().to_vec(),
-            ArenaIterState::Snap(it) => it.value(),
-        }
+        self.cell.borrow_dependent().top().value().to_vec()
     }
     /// Borrow the current value without copying.
     pub fn value_ref(&self) -> &[u8] {
-        match &self.state {
-            ArenaIterState::Lazy(c) => c.borrow_dependent().top().value(),
-            ArenaIterState::Snap(it) => it.value_ref(),
-        }
+        self.cell.borrow_dependent().top().value()
     }
 }
 
@@ -1541,10 +1339,6 @@ impl std::fmt::Debug for LazyArenaIter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyArenaIter")
             .field("valid", &self.valid())
-            .field(
-                "materialized",
-                &matches!(self.state, ArenaIterState::Snap(_)),
-            )
             .finish()
     }
 }

@@ -20,6 +20,9 @@ mod iter;
 mod reader;
 mod writer;
 
+// The arena memtable caches key prefixes on its own nodes, so this re-export
+// is only consumed by the default build's memtable merge.
+#[cfg_attr(feature = "arena-memtable", allow(unused_imports))]
 pub(crate) use iter::key_prefix8;
 pub use iter::SstIterator;
 pub use reader::Reader;
