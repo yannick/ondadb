@@ -213,3 +213,26 @@ across the 30-run sweep.
 **Final residual gaps (all < 2×):** ycsb-b read 1.6×, rw-random read 1.7×,
 ycsb-a 1.3×, feed 1.3×, event-log 1.2× → Phase 2 (lock-free block cache,
 per-get allocations) is the remaining lever.
+
+---
+
+## Phase 2 — DONE, MEASURED (M2, 2026-07-09, ondadb d9af280)
+
+CLOCK block cache (non-serializing hits), memtable pre-filter (lazy 512 KiB
+word-bloom), 2-byte uvarint fast path, and — found while fixing a first-cut
+scan regression — read-only transactions no longer build a throwaway overlay
+memtable per iterator.
+
+| workload | before P2 | after P2 | fjall | verdict |
+|---|---|---|---|---|
+| queue peek | 88k (PAR) | **97k** | 88k | **WIN 1.1×** |
+| feed rev | 142k | **152k** | 185k | 1.2× |
+| ycsb-b read | 453k | 499k | 684k | 1.4× (was 1.6×) |
+| rw-random read | 334k | 370k | ~574k | ~1.6× (was 1.7×) |
+| ycsb-c read | 2.84M | 2.87M | 2.14M | WIN 1.3× |
+| queue writes | 90k | **99k** | 88k | **WIN 1.1×** |
+
+Lesson: the first cut regressed scans 2× (eager 512 KiB filter alloc on the
+per-iterator overlay memtable + unbounded CLOCK sweep under the write lock).
+Bisection on the queue workload isolated all three effects in three runs;
+the uvarint fast path alone turned out to be +9% for scans.
