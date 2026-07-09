@@ -10,6 +10,7 @@ use ondadb::sst::{Reader, Writer, WriterOptions};
 fn opts(alg: Compression, n: usize, klog_threshold: usize, block_size: usize) -> WriterOptions {
     WriterOptions {
         compression: alg,
+        compression_rules: Vec::new(),
         cmp: default_comparator(),
         enable_bloom: true,
         bloom_fpr: 0.01,
@@ -240,4 +241,160 @@ fn value_round_trip_via_iterator() {
         i += 1;
     }
     assert_eq!(i, keys.len());
+}
+
+
+// ---- vlog compression (v2 frames) + per-prefix rules -----------------------
+
+/// Large compressible values must shrink the vlog and round-trip intact.
+#[test]
+fn vlog_compression_roundtrip_and_shrinks() {
+    let n = 200;
+    let val: Vec<u8> = (0..4096u32).map(|i| (i % 13) as u8).collect(); // highly compressible
+    let mut sizes = std::collections::HashMap::new();
+    for alg in [Compression::None, Compression::Lz4, Compression::Zstd] {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("1.klog");
+        let klog = klog.to_str().unwrap();
+        let mut w = Writer::new(klog, opts(alg, n, 512, 4096)).unwrap();
+        for i in 0..n {
+            let k = format!("key{i:06}");
+            w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+                .unwrap();
+        }
+        w.finish().unwrap();
+        let vlog_size = std::fs::metadata(dir.path().join("1.vlog")).unwrap().len();
+        sizes.insert(alg, vlog_size);
+        let fc = Arc::new(FileCache::new(16));
+        let bc = Arc::new(BlockCache::new(1 << 20));
+        let r = Reader::open(klog, fc, bc, 1, default_comparator()).unwrap();
+        for i in 0..n {
+            let k = format!("key{i:06}");
+            let (v, _seq, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            assert!(found && !deleted, "alg {alg:?} get {k}");
+            assert_eq!(v.unwrap(), val, "alg {alg:?} value mismatch for {k}");
+        }
+        // Scan path reads vlog values too.
+        let r = Arc::new(r);
+        let mut it = r.iter();
+        it.seek_to_first();
+        let mut cnt = 0;
+        while it.valid() {
+            let mut out = Vec::new();
+            it.value_into(&mut out).unwrap();
+            assert_eq!(out, val);
+            cnt += 1;
+            it.next();
+        }
+        assert_eq!(cnt, n);
+    }
+    let raw = sizes[&Compression::None];
+    assert!(
+        sizes[&Compression::Lz4] < raw / 2,
+        "lz4 vlog {} not < half of raw {}",
+        sizes[&Compression::Lz4],
+        raw
+    );
+    assert!(sizes[&Compression::Zstd] < raw / 2);
+}
+
+/// Incompressible values fall back to raw storage (alg=None per frame) and
+/// still round-trip.
+#[test]
+fn vlog_incompressible_stored_raw() {
+    let n = 50;
+    // Pseudo-random bytes: xorshift, effectively incompressible.
+    let mut x = 0x12345678u32;
+    let val: Vec<u8> = (0..2048)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x & 0xff) as u8
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("1.klog");
+    let klog = klog.to_str().unwrap();
+    let mut w = Writer::new(klog, opts(Compression::Lz4, n, 512, 4096)).unwrap();
+    for i in 0..n {
+        let k = format!("key{i:06}");
+        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+            .unwrap();
+    }
+    w.finish().unwrap();
+    let fc = Arc::new(FileCache::new(16));
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    let r = Reader::open(klog, fc, bc, 1, default_comparator()).unwrap();
+    for i in 0..n {
+        let k = format!("key{i:06}");
+        let (v, _s, found, _d) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        assert!(found);
+        assert_eq!(v.unwrap(), val);
+    }
+}
+
+/// Per-prefix rules: klog blocks are cut at rule boundaries, every key stays
+/// readable, and the rule algorithm is applied to vlog values.
+#[test]
+fn per_prefix_compression_rules() {
+    use ondadb::config::CompressionRule;
+    let compressible: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("1.klog");
+    let klog = klog.to_str().unwrap();
+    let mut o = opts(Compression::None, 300, 512, 4096);
+    o.compression_rules = vec![
+        CompressionRule {
+            prefix: b"az".to_vec(), // longer prefix beats "a"
+            compression: Compression::Zstd,
+        },
+        CompressionRule {
+            prefix: b"a".to_vec(),
+            compression: Compression::Lz4,
+        },
+    ];
+    let mut w = Writer::new(klog, o).unwrap();
+    // Interleave rule regions in sorted order: a..., az..., b... (no rule).
+    let mut keys = Vec::new();
+    for i in 0..100 {
+        keys.push(format!("a{i:04}"));
+    }
+    for i in 0..100 {
+        keys.push(format!("az{i:04}"));
+    }
+    for i in 0..100 {
+        keys.push(format!("b{i:04}"));
+    }
+    keys.sort();
+    for (i, k) in keys.iter().enumerate() {
+        w.add(k.as_bytes(), &compressible, (i + 1) as u64, 0, false, false)
+            .unwrap();
+    }
+    w.finish().unwrap();
+    // Vlog must be far smaller than raw (200 of 300 values compressed).
+    let vlog_size = std::fs::metadata(dir.path().join("1.vlog")).unwrap().len();
+    assert!(
+        (vlog_size as usize) < 300 * compressible.len() / 2,
+        "vlog {} not compressed",
+        vlog_size
+    );
+    let fc = Arc::new(FileCache::new(16));
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    let r = Reader::open(klog, fc, bc, 1, default_comparator()).unwrap();
+    for k in &keys {
+        let (v, _s, found, _d) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        assert!(found, "missing {k}");
+        assert_eq!(v.unwrap(), compressible, "value mismatch for {k}");
+    }
+    // Full scan sees every key in order.
+    let r = Arc::new(r);
+    let mut it = r.iter();
+    it.seek_to_first();
+    let mut seen = Vec::new();
+    while it.valid() {
+        seen.push(String::from_utf8(it.user_key().to_vec()).unwrap());
+        it.next();
+    }
+    assert_eq!(seen, keys);
 }

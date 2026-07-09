@@ -629,6 +629,7 @@ impl ColumnFamily {
         WriterOptions {
             // Flush and ingestion always write L0.
             compression: self.opts.compression_for_level(0),
+            compression_rules: self.opts.compression_rules.clone(),
             cmp: self.cmp.clone(),
             enable_bloom: self.opts.enable_bloom_filter,
             bloom_fpr: self.opts.bloom_fpr,

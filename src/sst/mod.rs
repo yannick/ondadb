@@ -46,12 +46,19 @@ pub(crate) const FOOTER_BTREE: u8 = 0x02;
 /// (`entries... | restart_off u32 LE x R | R u32 LE`) enabling in-block binary
 /// search. Absent on legacy files, whose blocks are entries only.
 pub(crate) const FOOTER_RESTARTS: u8 = 0x04;
+/// Footer flag: vlog frames use the v2 layout
+/// `[crc32c u32 LE][alg u8][comp_len u32 LE][payload]` (payload may be
+/// compressed; `alg = None` stores it raw). Absent on legacy files, whose
+/// frames are `[crc32c u32 LE][raw value]`.
+pub(crate) const FOOTER_VLOG_V2: u8 = 0x08;
 /// Entries per restart interval written by default.
 pub(crate) const RESTART_INTERVAL: usize = 8;
 /// Default target data-block size.
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4 << 10;
 /// Length of the per-value CRC32-C prefix in the vlog frame.
 pub(crate) const VLOG_CRC_LEN: usize = 4;
+/// Length of the v2 vlog frame header: crc32c(4) + alg(1) + comp_len(4).
+pub(crate) const VLOG_V2_HDR_LEN: usize = 9;
 
 /// Metadata describing a finished SSTable. `id` and paths are assigned by the
 /// caller (the column family).

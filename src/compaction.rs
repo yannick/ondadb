@@ -311,6 +311,7 @@ fn cf_writer_opts(
 ) -> crate::sst::WriterOptions {
     crate::sst::WriterOptions {
         compression: cf.opts.compression_for_level(target_level),
+        compression_rules: cf.opts.compression_rules.clone(),
         cmp: cmp.clone(),
         enable_bloom: cf.opts.enable_bloom_filter,
         bloom_fpr: cf.opts.bloom_fpr,

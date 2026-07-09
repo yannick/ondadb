@@ -7,12 +7,13 @@ use std::path::Path;
 use super::{
     data_block_alg, encode_entry, vlog_path_for, BlockHandle, FileMeta, IndexEntry,
     DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS,
-    FOOTER_SIZE, VLOG_CRC_LEN,
+    FOOTER_SIZE, FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
 };
 use crate::block::write_block;
 use crate::bloom::Bloom;
 use crate::comparator::ComparatorRef;
-use crate::config::Compression;
+use crate::compress::compress as do_compress;
+use crate::config::{compression_for_key, Compression, CompressionRule};
 use crate::encoding::{append_uvarint, checksum, put_u32, put_u64};
 use crate::error::Result;
 
@@ -20,6 +21,10 @@ use crate::error::Result;
 #[derive(Clone)]
 pub struct WriterOptions {
     pub compression: Compression,
+    /// Per-key-prefix compression overrides (longest prefix wins); keys
+    /// matching no rule use `compression`. Applied per vlog value and per
+    /// klog data block (blocks are cut at rule boundaries).
+    pub compression_rules: Vec<CompressionRule>,
     pub cmp: ComparatorRef,
     pub enable_bloom: bool,
     pub bloom_fpr: f64,
@@ -55,6 +60,9 @@ pub struct Writer {
     opts: WriterOptions,
 
     cur_block: Vec<u8>,
+    /// Compression algorithm of the block being built (set from its first
+    /// key's rule; `opts.compression` when no rule matches).
+    cur_block_alg: Compression,
     /// Restart offsets (entry starts) of the block being built, one per
     /// `restart_interval` entries; empty when the trailer is disabled.
     cur_restarts: Vec<u32>,
@@ -109,6 +117,7 @@ impl Writer {
         } else {
             None
         };
+        let default_alg = opts.compression;
         Ok(Writer {
             klog_path: klog_path.to_string(),
             vlog_path: vlog_path_for(klog_path),
@@ -116,6 +125,7 @@ impl Writer {
             vlog: None,
             opts,
             cur_block: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
+            cur_block_alg: default_alg,
             cur_restarts: Vec::new(),
             cur_entries: 0,
             index: Vec::new(),
@@ -134,22 +144,15 @@ impl Writer {
         })
     }
 
-    /// Append one entry. `value` is ignored for tombstones.
-    pub fn add(
-        &mut self,
-        user_key: &[u8],
-        value: &[u8],
-        seq: u64,
-        ttl: i64,
-        tombstone: bool,
-        single_delete: bool,
-    ) -> Result<()> {
+    /// Emit the deferred index entry for the last flushed block, shortening
+    /// its separator against `next_key` (the first key of the next block).
+    /// The separator only has to satisfy `last_key <= sep < next_key`; a
+    /// shortened separator keeps the resident index small and its
+    /// binary-search comparisons cheap.
+    fn settle_pending_index(&mut self, next_key: &[u8]) {
         if let Some((last_key, last_seq, handle)) = self.pending_index.take() {
-            // The previous block's separator only has to satisfy
-            // `last_key <= sep < user_key`; a shortened separator keeps the
-            // resident index small and its binary-search comparisons cheap.
             let sep = if self.opts.cmp.is_bytewise() {
-                shortest_separator(&last_key, user_key)
+                shortest_separator(&last_key, next_key)
             } else {
                 last_key.clone()
             };
@@ -164,6 +167,33 @@ impl Writer {
                 handle,
             });
         }
+    }
+
+    /// Append one entry. `value` is ignored for tombstones.
+    pub fn add(
+        &mut self,
+        user_key: &[u8],
+        value: &[u8],
+        seq: u64,
+        ttl: i64,
+        tombstone: bool,
+        single_delete: bool,
+    ) -> Result<()> {
+        self.settle_pending_index(user_key);
+        // Per-key compression rule; also decides whether this key may share
+        // the block being built.
+        let alg = compression_for_key(&self.opts.compression_rules, user_key)
+            .unwrap_or(self.opts.compression);
+        if !self.cur_block.is_empty() && alg != self.cur_block_alg {
+            // Rule boundary: cut the block so it stays single-algorithm, and
+            // settle its separator against THIS key (a later key could sort
+            // past it and misroute index lookups).
+            self.flush_block()?;
+            self.settle_pending_index(user_key);
+        }
+        if self.cur_block.is_empty() {
+            self.cur_block_alg = alg;
+        }
         if self.min_key.is_none() {
             self.min_key = Some(user_key.to_vec());
         }
@@ -174,7 +204,7 @@ impl Writer {
         let mut has_vlog = false;
         let mut vlog_off = 0u64;
         if !tombstone && value.len() >= self.opts.klog_value_threshold {
-            vlog_off = self.write_vlog(value)?;
+            vlog_off = self.write_vlog(value, alg)?;
             has_vlog = true;
         }
 
@@ -211,10 +241,13 @@ impl Writer {
         Ok(())
     }
 
-    /// Append a value to the vlog as a `[crc32c u32 LE][value]` frame and return
-    /// the frame's start offset. The crc lets reads detect silent corruption of
-    /// large values, matching the checksum coverage klog blocks already have.
-    fn write_vlog(&mut self, value: &[u8]) -> Result<u64> {
+    /// Append a value to the vlog as a v2 frame
+    /// `[crc32c u32 LE][alg u8][comp_len u32 LE][payload]` and return the
+    /// frame's start offset. The payload is `value` compressed with `alg`,
+    /// stored raw (`alg = None`) when compression would not shrink it. The
+    /// crc covers the stored payload, matching the checksum coverage klog
+    /// blocks already have.
+    fn write_vlog(&mut self, value: &[u8], alg: Compression) -> Result<u64> {
         if self.vlog.is_none() {
             let f = OpenOptions::new()
                 .create(true)
@@ -223,13 +256,26 @@ impl Writer {
                 .open(&self.vlog_path)?;
             self.vlog = Some(BufWriter::with_capacity(256 << 10, f));
         }
+        let (used_alg, payload) = if alg == Compression::None {
+            (Compression::None, None)
+        } else {
+            let c = do_compress(alg, value)?;
+            if c.len() < value.len() {
+                (alg, Some(c))
+            } else {
+                (Compression::None, None)
+            }
+        };
+        let stored: &[u8] = payload.as_deref().unwrap_or(value);
         let off = self.vlog_off;
-        let mut hdr = [0u8; 4];
-        put_u32(&mut hdr, checksum(value));
+        let mut hdr = [0u8; VLOG_V2_HDR_LEN];
+        put_u32(&mut hdr[0..4], checksum(stored));
+        hdr[4] = used_alg as u8;
+        put_u32(&mut hdr[5..9], stored.len() as u32);
         let w = self.vlog.as_mut().unwrap();
         w.write_all(&hdr)?;
-        w.write_all(value)?;
-        self.vlog_off += VLOG_CRC_LEN as u64 + value.len() as u64;
+        w.write_all(stored)?;
+        self.vlog_off += VLOG_V2_HDR_LEN as u64 + stored.len() as u64;
         Ok(off)
     }
 
@@ -254,7 +300,7 @@ impl Writer {
         let mut framed = Vec::new();
         let n = write_block(
             &mut framed,
-            data_block_alg(self.opts.compression),
+            data_block_alg(self.cur_block_alg),
             &self.cur_block,
         )?;
         self.klog.as_mut().unwrap().write_all(&framed)?;
@@ -378,7 +424,7 @@ impl Writer {
             });
         }
 
-        let mut footer_flags = 0u8;
+        let mut footer_flags = FOOTER_VLOG_V2;
         if self.opts.restart_interval > 0 {
             footer_flags |= FOOTER_RESTARTS;
         }
@@ -546,6 +592,7 @@ mod tests {
             klog,
             WriterOptions {
                 compression: Compression::None,
+                compression_rules: Vec::new(),
                 cmp: default_comparator(),
                 enable_bloom: false,
                 bloom_fpr: 0.01,

@@ -204,6 +204,14 @@ pub struct ColumnFamilyConfig {
     /// len-1)]` — the last entry repeats for all deeper levels (so
     /// `[None, None, Zstd]` = hot L0/L1 uncompressed, everything below Zstd).
     pub compression_per_level: Vec<Compression>,
+    /// Per-key-prefix override of the level compression. The **longest**
+    /// matching prefix wins; keys matching no rule use
+    /// [`compression_for_level`](Self::compression_for_level). Applied per
+    /// vlog value and per klog data block (the writer cuts a block early when
+    /// the next key's rule differs, so blocks never mix algorithms). Purely a
+    /// write-side policy — SSTable blocks and vlog frames are self-describing,
+    /// so rules can change at any time without rewriting existing data.
+    pub compression_rules: Vec<CompressionRule>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
     pub enable_block_indexes: bool,
@@ -241,6 +249,7 @@ impl Default for ColumnFamilyConfig {
             klog_value_threshold: 512, // WiscKey separation threshold
             compression: Compression::None,
             compression_per_level: Vec::new(),
+            compression_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
             enable_block_indexes: true,
@@ -266,6 +275,28 @@ impl Default for ColumnFamilyConfig {
     }
 }
 
+/// One per-key-prefix compression rule (see
+/// [`ColumnFamilyConfig::compression_rules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressionRule {
+    /// Keys starting with this byte prefix use `compression`.
+    pub prefix: Vec<u8>,
+    pub compression: Compression,
+}
+
+/// Resolve `user_key` against prefix rules: longest matching prefix wins.
+/// `None` when no rule matches.
+pub(crate) fn compression_for_key(
+    rules: &[CompressionRule],
+    user_key: &[u8],
+) -> Option<Compression> {
+    rules
+        .iter()
+        .filter(|r| user_key.starts_with(&r.prefix))
+        .max_by_key(|r| r.prefix.len())
+        .map(|r| r.compression)
+}
+
 impl ColumnFamilyConfig {
     /// Compression algorithm for SSTables written at `level` (see
     /// `compression_per_level`).
@@ -274,6 +305,14 @@ impl ColumnFamilyConfig {
             [] => self.compression,
             v => v[(level as usize).min(v.len() - 1)],
         }
+    }
+
+    /// Compression algorithm for `user_key` written at `level`: the longest
+    /// matching entry in `compression_rules`, falling back to
+    /// [`compression_for_level`](Self::compression_for_level).
+    pub fn compression_for_key(&self, user_key: &[u8], level: u32) -> Compression {
+        compression_for_key(&self.compression_rules, user_key)
+            .unwrap_or_else(|| self.compression_for_level(level))
     }
 
     /// Serialize the durable subset of the config for the manifest blob.
@@ -304,6 +343,12 @@ impl ColumnFamilyConfig {
         b.push(self.compaction_style as u8);
         append_u64(&mut b, self.fifo_max_bytes);
         append_u64(&mut b, self.fifo_ttl.as_micros() as u64);
+        b.push(self.compression_rules.len().min(255) as u8);
+        for r in self.compression_rules.iter().take(255) {
+            append_uvarint(&mut b, r.prefix.len() as u64);
+            b.extend_from_slice(&r.prefix);
+            b.push(r.compression as u8);
+        }
         b
     }
 
@@ -377,6 +422,23 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     }
     cfg.fifo_max_bytes = u64v(&mut p)?;
     cfg.fifo_ttl = std::time::Duration::from_micros(u64v(&mut p)?);
+    let n_rules = byte(&mut p)?;
+    let mut rules = Vec::with_capacity(n_rules as usize);
+    for _ in 0..n_rules {
+        let (plen, n) = uvarint(p)?;
+        p = &p[n..];
+        let plen = plen as usize;
+        if p.len() < plen {
+            return None;
+        }
+        let prefix = p[..plen].to_vec();
+        p = &p[plen..];
+        rules.push(CompressionRule {
+            prefix,
+            compression: Compression::from_u8(byte(&mut p)?)?,
+        });
+    }
+    cfg.compression_rules = rules;
     Some(())
 }
 
@@ -391,6 +453,16 @@ mod tests {
             compression: Compression::Zstd,
             write_buffer_size: 123456,
             enable_bloom_filter: false,
+            compression_rules: vec![
+                CompressionRule {
+                    prefix: b"img/".to_vec(),
+                    compression: Compression::Zstd,
+                },
+                CompressionRule {
+                    prefix: b"hot/".to_vec(),
+                    compression: Compression::None,
+                },
+            ],
             ..ColumnFamilyConfig::default()
         };
         let d = ColumnFamilyConfig::decode(&c.encode());
@@ -399,6 +471,35 @@ mod tests {
         assert_eq!(d.compression, Compression::Zstd);
         assert_eq!(d.write_buffer_size, 123456);
         assert!(!d.enable_bloom_filter);
+        assert_eq!(d.compression_rules, c.compression_rules);
+    }
+
+    #[test]
+    fn compression_rule_resolution() {
+        let rules = vec![
+            CompressionRule {
+                prefix: b"a".to_vec(),
+                compression: Compression::Lz4,
+            },
+            CompressionRule {
+                prefix: b"az".to_vec(),
+                compression: Compression::Zstd,
+            },
+        ];
+        // Longest prefix wins regardless of rule order.
+        assert_eq!(
+            compression_for_key(&rules, b"az123"),
+            Some(Compression::Zstd)
+        );
+        assert_eq!(compression_for_key(&rules, b"ab"), Some(Compression::Lz4));
+        assert_eq!(compression_for_key(&rules, b"zz"), None);
+        let cfg = ColumnFamilyConfig {
+            compression: Compression::Snappy,
+            compression_rules: rules,
+            ..Default::default()
+        };
+        assert_eq!(cfg.compression_for_key(b"az1", 0), Compression::Zstd);
+        assert_eq!(cfg.compression_for_key(b"zz", 3), Compression::Snappy);
     }
 
     #[test]
@@ -465,16 +566,17 @@ mod tests {
     #[test]
     fn legacy_blob_without_sync_fields_decodes_to_defaults() {
         // Simulate a manifest written before the appended-tail fields
-        // (sync_mode/sync_interval, compression_per_level, FIFO settings)
-        // were persisted: encode, then truncate the whole tail (9 bytes sync
-        // + 1 byte per-level count + 17 bytes FIFO).
+        // (sync_mode/sync_interval, compression_per_level, FIFO settings,
+        // compression_rules) were persisted: encode, then truncate the whole
+        // tail (9 bytes sync + 1 byte per-level count + 17 bytes FIFO + 1
+        // byte rules count).
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        let legacy = &full[..full.len() - 27];
+        let legacy = &full[..full.len() - 28];
         let d = ColumnFamilyConfig::decode(legacy);
         // Older fields still decode; the missing sync fields fall back to default.
         assert_eq!(d.comparator_name, "uint64");

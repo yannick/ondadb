@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use super::{
     cmp_internal, decode_entry, vlog_path_for, Block, BlockHandle, IndexEntry, SstIterator,
-    FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, VLOG_CRC_LEN,
+    FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
+    VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
 };
 use crate::block::read_block;
 use crate::bloom::Bloom;
 use crate::cache::{BlockCache, FileCache};
 use crate::comparator::ComparatorRef;
-#[cfg(feature = "mmap-reads")]
 use crate::config::Compression;
 use crate::encoding::{checksum, read_u32, read_u64, uvarint};
 use crate::error::{OndaError, Result};
@@ -35,6 +35,9 @@ pub struct Reader {
     bloom: Option<Bloom>,
     /// Data blocks carry the restart-offset trailer ([`FOOTER_RESTARTS`]).
     has_restarts: bool,
+    /// Vlog frames use the v2 (possibly compressed) layout
+    /// ([`FOOTER_VLOG_V2`]).
+    vlog_v2: bool,
 
     #[cfg(feature = "mmap-reads")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
@@ -104,6 +107,7 @@ impl Reader {
             max_seq: 0,
             bloom: None,
             has_restarts: false,
+            vlog_v2: false,
             #[cfg(feature = "mmap-reads")]
             klog_mmap: None,
             #[cfg(feature = "mmap-reads")]
@@ -129,6 +133,7 @@ impl Reader {
         r.max_seq = read_u64(&footer[40..48]);
         let flags = footer[48];
         r.has_restarts = flags & FOOTER_RESTARTS != 0;
+        r.vlog_v2 = flags & FOOTER_VLOG_V2 != 0;
 
         if flags & FOOTER_HAS_BLOOM != 0 && bloom_len > 0 {
             let raw = read_block_at(&f, bloom_off, bloom_len)?;
@@ -525,26 +530,81 @@ impl Reader {
         Ok(buf)
     }
 
-    /// Append a vlog value to `out`, verifying its CRC32-C frame prefix. `off` is
-    /// the frame start (crc), `length` the logical value length.
+    /// Append a vlog value to `out`, verifying its CRC32-C frame prefix and
+    /// decompressing v2 frames. `off` is the frame start, `length` the
+    /// logical (uncompressed) value length.
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
         let len = length as usize;
         #[cfg(feature = "mmap-reads")]
         {
             let mmap = self.vlog_mmap_handle()?;
             let s = off as usize;
-            let e = s + VLOG_CRC_LEN + len;
-            if e <= mmap.len() {
-                let want = read_u32(&mmap[s..s + VLOG_CRC_LEN]);
-                let val = &mmap[s + VLOG_CRC_LEN..e];
-                if checksum(val) != want {
-                    return Err(corrupt());
+            if self.vlog_v2 {
+                if s + VLOG_V2_HDR_LEN <= mmap.len() {
+                    let want = read_u32(&mmap[s..s + 4]);
+                    let alg = Compression::from_u8(mmap[s + 4]).ok_or_else(corrupt)?;
+                    let comp_len = read_u32(&mmap[s + 5..s + 9]) as usize;
+                    let e = s + VLOG_V2_HDR_LEN + comp_len;
+                    if e <= mmap.len() {
+                        let payload = &mmap[s + VLOG_V2_HDR_LEN..e];
+                        if checksum(payload) != want {
+                            return Err(corrupt());
+                        }
+                        if alg == Compression::None {
+                            // Raw payload: zero extra work beyond the copy out.
+                            if payload.len() != len {
+                                return Err(corrupt());
+                            }
+                            out.extend_from_slice(payload);
+                        } else {
+                            let raw = crate::compress::decompress(alg, payload, len)?;
+                            if raw.len() != len {
+                                return Err(corrupt());
+                            }
+                            out.extend_from_slice(&raw);
+                        }
+                        return Ok(());
+                    }
                 }
-                out.extend_from_slice(val);
-                return Ok(());
+            } else {
+                let e = s + VLOG_CRC_LEN + len;
+                if e <= mmap.len() {
+                    let want = read_u32(&mmap[s..s + VLOG_CRC_LEN]);
+                    let val = &mmap[s + VLOG_CRC_LEN..e];
+                    if checksum(val) != want {
+                        return Err(corrupt());
+                    }
+                    out.extend_from_slice(val);
+                    return Ok(());
+                }
             }
         }
         let f = self.fc.acquire(&self.vlog_path)?;
+        if self.vlog_v2 {
+            let mut hdr = [0u8; VLOG_V2_HDR_LEN];
+            f.read_exact_at(&mut hdr, off)?;
+            let want = read_u32(&hdr[0..4]);
+            let alg = Compression::from_u8(hdr[4]).ok_or_else(corrupt)?;
+            let comp_len = read_u32(&hdr[5..9]) as usize;
+            let mut payload = vec![0u8; comp_len];
+            f.read_exact_at(&mut payload, off + VLOG_V2_HDR_LEN as u64)?;
+            if checksum(&payload) != want {
+                return Err(corrupt());
+            }
+            if alg == Compression::None {
+                if payload.len() != len {
+                    return Err(corrupt());
+                }
+                out.extend_from_slice(&payload);
+            } else {
+                let raw = crate::compress::decompress(alg, &payload, len)?;
+                if raw.len() != len {
+                    return Err(corrupt());
+                }
+                out.extend_from_slice(&raw);
+            }
+            return Ok(());
+        }
         let mut crc_buf = [0u8; VLOG_CRC_LEN];
         f.read_exact_at(&mut crc_buf, off)?;
         let want = read_u32(&crc_buf);
@@ -629,6 +689,7 @@ mod tests {
             klog,
             WriterOptions {
                 compression: Compression::None,
+                compression_rules: Vec::new(),
                 cmp: default_comparator(),
                 enable_bloom: true,
                 bloom_fpr: 0.01,
@@ -682,6 +743,7 @@ mod tests {
             klog,
             WriterOptions {
                 compression: Compression::None,
+                compression_rules: Vec::new(),
                 cmp: default_comparator(),
                 enable_bloom: true,
                 bloom_fpr: 0.01,
