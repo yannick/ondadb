@@ -545,6 +545,7 @@ mod tests {
     use crate::comparator::default_comparator;
     use crate::config::Compression;
     use crate::sst::Reader;
+    use crate::storage::LocalStorage;
     use std::sync::Arc;
 
     #[test]
@@ -614,7 +615,7 @@ mod tests {
         w.finish().unwrap();
         let r = Reader::open(
             klog,
-            Arc::new(FileCache::new(4)),
+            LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
             Arc::new(BlockCache::new(1 << 20)),
             7,
             default_comparator(),

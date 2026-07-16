@@ -40,6 +40,7 @@ pub mod memtable;
 #[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;
 pub mod sst;
+pub mod storage;
 pub mod txn;
 pub mod unified;
 pub mod util;
@@ -49,11 +50,12 @@ pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn
 pub use comparator::{Comparator, ComparatorRef};
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
-    Options, PartitionRule, SyncMode,
+    Options, PartitionRule, SyncMode, TierDef,
 };
 pub use db::DB;
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;
 pub use maintenance::{CfStats, DbStats};
+pub use storage::{LocalStorage, Storage};
 pub use txn::Txn;

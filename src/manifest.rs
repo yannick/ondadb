@@ -38,6 +38,12 @@ pub struct SstMeta {
     /// `None` means the implicit default partition (or a file written before
     /// partitioning existed — old manifests decode every table to `None`).
     pub partition: Option<String>,
+    /// Storage tier holding this table's files, by name (see
+    /// [`TierDef`](crate::config::TierDef)). `None` means the implicit default
+    /// tier — the database directory. Only bottom-level parts may carry a tier;
+    /// WAL and upper levels always live on the default tier. Old manifests
+    /// (written before tiering) decode every table to `None`.
+    pub tier: Option<String>,
 }
 
 /// Persisted state of one column family.
@@ -129,36 +135,40 @@ impl Manifest {
                 append_bytes(&mut b, &s.max_key);
             }
         }
-        // Append-tolerant tail: per-SSTable `partition` names. The per-record
-        // encoding above is a flat sequential list with no framing, so an
-        // optional per-record field can't be tucked in there without breaking
-        // older readers; instead it lives here at the end of the body (still
-        // inside the CRC). A manifest written before partitions existed has no
-        // trailing bytes, so `decode` leaves every `partition` as `None`. The
-        // section is emitted only when some table actually carries a partition,
-        // so partition-free databases keep a byte-identical manifest.
+        // Append-tolerant tail: per-SSTable `partition` and `tier` names. The
+        // per-record encoding above is a flat sequential list with no framing,
+        // so optional per-record fields can't be tucked in there without
+        // breaking older readers; instead they live here at the end of the body
+        // (still inside the CRC).
         //
-        // Layout: for each CF in order, a uvarint count of partitioned tables,
-        // then `(table_index uvarint, name bytes)` pairs — mirroring the nested
-        // CF→table shape of the body above.
-        if self
+        // The tail holds up to two sections, each a per-CF `(count,
+        // (table_index uvarint, name bytes)...)` list mirroring the nested
+        // CF→table shape of the body:
+        //   1. the partition section, and
+        //   2. the tier section (added after partitions; P1 manifests have none).
+        //
+        // Emission rules keep every earlier on-disk format byte-identical:
+        //   - no partitions and no tiers  -> no tail at all (legacy layout).
+        //   - any partition, no tier      -> partition section only (P1 layout).
+        //   - any tier                    -> partition section (possibly all
+        //                                    empty) followed by the tier section.
+        // Because the tier section is emitted only when the partition section
+        // precedes it, `decode` can read them positionally: the first tail bytes
+        // are always a full partition section, and any bytes remaining after it
+        // are the tier section.
+        let has_part = self
             .cfs
             .iter()
-            .any(|cf| cf.sstables.iter().any(|s| s.partition.is_some()))
-        {
-            for cf in &self.cfs {
-                let parted: Vec<(usize, &str)> = cf
-                    .sstables
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| s.partition.as_deref().map(|p| (i, p)))
-                    .collect();
-                append_uvarint(&mut b, parted.len() as u64);
-                for (i, name) in parted {
-                    append_uvarint(&mut b, i as u64);
-                    append_bytes(&mut b, name.as_bytes());
-                }
-            }
+            .any(|cf| cf.sstables.iter().any(|s| s.partition.is_some()));
+        let has_tier = self
+            .cfs
+            .iter()
+            .any(|cf| cf.sstables.iter().any(|s| s.tier.is_some()));
+        if has_part || has_tier {
+            encode_name_section(&mut b, &self.cfs, |s| s.partition.as_deref());
+        }
+        if has_tier {
+            encode_name_section(&mut b, &self.cfs, |s| s.tier.as_deref());
         }
         let crc = checksum(&b);
         append_u32(&mut b, crc);
@@ -227,6 +237,7 @@ impl Manifest {
                     max_key,
                     // Filled from the append-tolerant tail after the CF loop.
                     partition: None,
+                    tier: None,
                 });
             }
             cfs.push(CfManifest {
@@ -235,29 +246,69 @@ impl Manifest {
                 sstables,
             });
         }
-        // Append-tolerant partition tail (see `encode`). Absent in manifests
-        // written before partitioning, in which case `p` is already exhausted
-        // and every `partition` stays `None`.
+        // Append-tolerant tail (see `encode`). The first section, if present, is
+        // always the partition section; any bytes remaining after it are the
+        // tier section. Manifests written before partitioning have no tail, so
+        // `p` is already exhausted and both fields stay `None`; P1 manifests have
+        // only the partition section.
         if !p.is_empty() {
-            for cf in cfs.iter_mut() {
-                let (count, n) = uvarint(p).ok_or_else(bad)?;
-                p = &p[n..];
-                for _ in 0..count {
-                    let (idx, n) = uvarint(p).ok_or_else(bad)?;
-                    p = &p[n..];
-                    let (name, rest) = take_bytes(p).ok_or_else(bad)?;
-                    p = rest;
-                    let sst = cf.sstables.get_mut(idx as usize).ok_or_else(bad)?;
-                    sst.partition = Some(String::from_utf8(name).map_err(|_| bad())?);
-                }
-            }
+            p = decode_name_section(p, &mut cfs, |sst, name| sst.partition = Some(name))?;
         }
+        if !p.is_empty() {
+            p = decode_name_section(p, &mut cfs, |sst, name| sst.tier = Some(name))?;
+        }
+        let _ = p;
         Ok(Manifest {
             next_file_id,
             global_seq,
             cfs,
         })
     }
+}
+
+/// Encode one tail section: for each CF in order, a uvarint count of tables
+/// carrying a name (as selected by `pick`), then `(table_index, name)` pairs.
+fn encode_name_section(
+    b: &mut Vec<u8>,
+    cfs: &[CfManifest],
+    pick: impl Fn(&SstMeta) -> Option<&str>,
+) {
+    for cf in cfs {
+        let named: Vec<(usize, &str)> = cf
+            .sstables
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| pick(s).map(|n| (i, n)))
+            .collect();
+        append_uvarint(b, named.len() as u64);
+        for (i, name) in named {
+            append_uvarint(b, i as u64);
+            append_bytes(b, name.as_bytes());
+        }
+    }
+}
+
+/// Decode one tail section written by [`encode_name_section`], invoking `set`
+/// for each `(table, name)` pair. Returns the unconsumed remainder.
+fn decode_name_section<'a>(
+    mut p: &'a [u8],
+    cfs: &mut [CfManifest],
+    set: impl Fn(&mut SstMeta, String),
+) -> Result<&'a [u8]> {
+    let bad = || OndaError::Corruption("manifest: corrupt or invalid".into());
+    for cf in cfs.iter_mut() {
+        let (count, n) = uvarint(p).ok_or_else(bad)?;
+        p = &p[n..];
+        for _ in 0..count {
+            let (idx, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let (name, rest) = take_bytes(p).ok_or_else(bad)?;
+            p = rest;
+            let sst = cf.sstables.get_mut(idx as usize).ok_or_else(bad)?;
+            set(sst, String::from_utf8(name).map_err(|_| bad())?);
+        }
+    }
+    Ok(p)
 }
 
 fn append_bytes(dst: &mut Vec<u8>, b: &[u8]) {
@@ -298,6 +349,7 @@ mod tests {
                         min_key: b"aaa".to_vec(),
                         max_key: b"zzz".to_vec(),
                         partition: None,
+                        tier: None,
                     },
                     SstMeta {
                         id: 2,
@@ -310,6 +362,7 @@ mod tests {
                         min_key: b"aaa".to_vec(),
                         max_key: b"mmm".to_vec(),
                         partition: Some("img".into()),
+                        tier: None,
                     },
                 ],
             }],
@@ -382,6 +435,46 @@ mod tests {
         let enc = m.encode();
         let d = Manifest::decode(&enc).unwrap();
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+    }
+
+    #[test]
+    fn tier_survives_round_trip_alongside_partition() {
+        // Tag table #2 with a tier; it already carries partition "img". Both the
+        // partition and the tier must survive independently.
+        let mut m = sample();
+        m.cfs[0].sstables[1].tier = Some("hdd".into());
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(d.cfs[0].sstables[0].partition, None);
+        assert_eq!(d.cfs[0].sstables[0].tier, None);
+        assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
+        assert_eq!(d.cfs[0].sstables[1].tier.as_deref(), Some("hdd"));
+    }
+
+    #[test]
+    fn tier_without_any_partition_round_trips() {
+        // A table may carry a tier with no partition tag at all: the encoder then
+        // emits an (all-empty) partition section followed by the tier section, and
+        // the decoder must still read the tier back and leave partitions None.
+        let mut m = sample();
+        for s in &mut m.cfs[0].sstables {
+            s.partition = None;
+        }
+        m.cfs[0].sstables[0].tier = Some("hdd".into());
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+        assert_eq!(d.cfs[0].sstables[0].tier.as_deref(), Some("hdd"));
+        assert_eq!(d.cfs[0].sstables[1].tier, None);
+    }
+
+    #[test]
+    fn p1_manifest_with_partition_only_decodes_tier_to_none() {
+        // A P1-era manifest carries the partition section but no tier section.
+        // Decoding it under the tier-aware format must leave every `tier` None
+        // (the partition section consumes the whole tail, so no tier bytes remain).
+        let m = sample(); // table #2 tagged "img", no tiers anywhere
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
+        assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use crate::cache::{BlockCache, FileCache};
+use crate::cache::BlockCache;
 use crate::comparator::ComparatorRef;
 use crate::config::ColumnFamilyConfig;
 use crate::error::{OndaError, Result};
@@ -21,6 +21,7 @@ use crate::iterator::{ChildIter, Iterator};
 use crate::manifest::SstMeta;
 use crate::memtable::Memtable;
 use crate::sst::{Reader, Writer, WriterOptions};
+use crate::storage::TierRegistry;
 use smallvec::SmallVec;
 use crate::util::now_nanos;
 use crate::wal::{self, Wal};
@@ -76,7 +77,10 @@ pub struct ImmMemtable {
 
 /// Shared database context handed to each column family.
 pub(crate) struct CfCtx {
-    pub fc: Arc<FileCache>,
+    /// Storage-tier registry: resolves a table's tier to its root directory and
+    /// [`Storage`](crate::storage::Storage) backend. The default tier is the DB
+    /// directory, so untiered tables resolve exactly as before tiering existed.
+    pub tiers: Arc<TierRegistry>,
     pub bc: Arc<BlockCache>,
     pub flush_tx: Sender<FlushJob>,
     pub compact_tx: Sender<Arc<ColumnFamily>>,
@@ -176,6 +180,35 @@ impl ColumnFamily {
         format!("{}/{}.klog", self.dir, id)
     }
 
+    /// Absolute klog path for `meta`, honoring its storage tier. An untiered
+    /// table (`meta.tier == None`) resolves to the default-tier path — the same
+    /// `<db_dir>/cf-<name>/<id>.klog` as [`klog_path`](Self::klog_path); a tiered
+    /// bottom part resolves under that tier's root.
+    pub(crate) fn klog_path_for(&self, meta: &SstMeta) -> String {
+        match meta.tier.as_deref() {
+            None => self.klog_path(meta.id),
+            Some(t) => format!(
+                "{}/{}.klog",
+                self.ctx.tiers.cf_dir(Some(t), &self.name),
+                meta.id
+            ),
+        }
+    }
+
+    /// Open a reader for an already-on-disk table described by `meta`, using the
+    /// [`Storage`](crate::storage::Storage) backend for its tier (so a no-mmap
+    /// tier reads through the buffered path).
+    pub(crate) fn open_reader_for(&self, meta: &SstMeta) -> Result<Arc<Reader>> {
+        let storage = self.ctx.tiers.storage_for(meta.tier.as_deref());
+        Reader::open(
+            &self.klog_path_for(meta),
+            storage,
+            self.ctx.bc.clone(),
+            meta.id,
+            self.cmp.clone(),
+        )
+    }
+
     /// Create a fresh column family (directory + generation-0 WAL).
     pub(crate) fn create(
         ctx: Arc<CfCtx>,
@@ -246,8 +279,15 @@ impl ColumnFamily {
         }
         let mut levels: Vec<Vec<Arc<SstHandle>>> = vec![Vec::new(); max_level];
         for s in ssts {
-            let klog = format!("{dir}/{}.klog", s.id);
-            let reader = Reader::open(&klog, ctx.fc.clone(), ctx.bc.clone(), s.id, cmp.clone())?;
+            // Resolve the tier before opening so a bottom part on another mount
+            // (and any no-mmap backend it carries) is read through the right
+            // storage. `None` tier == the default path used before tiering.
+            let storage = ctx.tiers.storage_for(s.tier.as_deref());
+            let klog = match s.tier.as_deref() {
+                None => format!("{dir}/{}.klog", s.id),
+                Some(t) => format!("{}/{}.klog", ctx.tiers.cf_dir(Some(t), &name), s.id),
+            };
+            let reader = Reader::open(&klog, storage, ctx.bc.clone(), s.id, cmp.clone())?;
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),
                 reader,
@@ -533,15 +573,10 @@ impl ColumnFamily {
         w: Writer,
         file_id: u64,
     ) -> Result<Arc<SstHandle>> {
-        let klog = self.klog_path(file_id);
+        // Flush/ingest output always lands on the default tier (L0), so
+        // `meta.tier` is None and `open_reader_for` resolves the default path.
         let meta = w.finish()?.to_sst_meta(file_id, 0);
-        let reader = Reader::open(
-            &klog,
-            self.ctx.fc.clone(),
-            self.ctx.bc.clone(),
-            file_id,
-            self.cmp.clone(),
-        )?;
+        let reader = self.open_reader_for(&meta)?;
         Ok(Arc::new(SstHandle { meta, reader }))
     }
 
@@ -1049,19 +1084,93 @@ impl ColumnFamily {
 
     /// Build a handle for an already-on-disk SSTable id (used by clone).
     pub(crate) fn open_sst(&self, meta: SstMeta) -> Result<Arc<SstHandle>> {
-        let klog = self.klog_path(meta.id);
-        let reader = Reader::open(
-            &klog,
-            self.ctx.fc.clone(),
-            self.ctx.bc.clone(),
-            meta.id,
-            self.cmp.clone(),
-        )?;
+        let reader = self.open_reader_for(&meta)?;
         Ok(Arc::new(SstHandle { meta, reader }))
     }
 
     pub(crate) fn config(&self) -> &ColumnFamilyConfig {
         &self.opts
+    }
+
+    // ---- part lifecycle support (used by parts.rs) ----
+
+    /// Snapshot the bottom-level handles belonging to `partition` (the unit of
+    /// DETACH / ATTACH / FREEZE). Only the last level is considered — upper
+    /// levels are "young data" and never partition-clean.
+    pub(crate) fn bottom_partition_handles(&self, partition: &str) -> Vec<Arc<SstHandle>> {
+        let s = self.state.read();
+        match s.levels.last() {
+            Some(bottom) => bottom
+                .iter()
+                .filter(|h| h.meta.partition.as_deref() == Some(partition))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove the tables with these ids from the bottom level, under the state
+    /// write-lock (the in-memory half of an atomic detach/move). Returns the
+    /// number actually removed.
+    pub(crate) fn remove_bottom_tables(&self, ids: &[u64]) -> usize {
+        let mut s = self.state.write();
+        let Some(bottom) = s.levels.last_mut() else {
+            return 0;
+        };
+        let before = bottom.len();
+        bottom.retain(|h| !ids.contains(&h.meta.id));
+        before - bottom.len()
+    }
+
+    /// Whether `[min_key, max_key]` overlaps any live bottom-level table. An
+    /// attached part with no overlap can slot straight into the bottom level;
+    /// otherwise it must go to L0 (which permits overlapping tables).
+    pub(crate) fn bottom_overlaps(&self, min_key: &[u8], max_key: &[u8]) -> bool {
+        let s = self.state.read();
+        let Some(bottom) = s.levels.last() else {
+            return false;
+        };
+        bottom.iter().any(|h| {
+            self.cmp.compare(min_key, &h.meta.max_key).is_le()
+                && self.cmp.compare(&h.meta.min_key, max_key).is_le()
+        })
+    }
+
+    /// Index of the bottom (last) level.
+    pub(crate) fn bottom_level_index(&self) -> usize {
+        self.state.read().levels.len().saturating_sub(1)
+    }
+
+    /// Insert `handle` into the bottom level, keeping it sorted by `min_key`
+    /// (the invariant leveled reads rely on for binary search).
+    pub(crate) fn insert_bottom_sorted(&self, handle: Arc<SstHandle>) {
+        let mut s = self.state.write();
+        let cmp = self.cmp.clone();
+        let bottom = s.levels.last_mut().expect("at least one level always exists");
+        bottom.push(handle);
+        bottom.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+    }
+
+    /// Replace the bottom-level tables with these ids by `replacements` (same
+    /// ids, new handles/metas) under the state write-lock. Used by the tier
+    /// mover to swap in relocated handles; in-flight reads finish on the old
+    /// handles they already hold.
+    pub(crate) fn swap_bottom_tables(&self, replacements: Vec<Arc<SstHandle>>) {
+        let mut s = self.state.write();
+        let cmp = self.cmp.clone();
+        let Some(bottom) = s.levels.last_mut() else {
+            return;
+        };
+        let ids: std::collections::HashSet<u64> =
+            replacements.iter().map(|h| h.meta.id).collect();
+        bottom.retain(|h| !ids.contains(&h.meta.id));
+        bottom.extend(replacements);
+        bottom.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+    }
+
+    /// This CF's storage-tier registry (path/backend resolution).
+    pub(crate) fn tiers(&self) -> &Arc<TierRegistry> {
+        &self.ctx.tiers
     }
 }
 

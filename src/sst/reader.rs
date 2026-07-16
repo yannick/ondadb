@@ -10,8 +10,9 @@ use super::{
 };
 use crate::block::read_block;
 use crate::bloom::Bloom;
-use crate::cache::{BlockCache, FileCache};
+use crate::cache::BlockCache;
 use crate::comparator::ComparatorRef;
+use crate::storage::Storage;
 use crate::config::Compression;
 use crate::encoding::{checksum, read_u32, read_u64, uvarint};
 use crate::error::{OndaError, Result};
@@ -22,7 +23,7 @@ use crate::error::{OndaError, Result};
 pub struct Reader {
     klog_path: String,
     vlog_path: String,
-    fc: Arc<FileCache>,
+    storage: Arc<dyn Storage>,
     bc: Arc<BlockCache>,
     file_id: u64,
     cmp: ComparatorRef,
@@ -84,11 +85,13 @@ impl BlockRef<'_> {
 }
 
 impl Reader {
-    /// Open the SSTable at `klog_path`. `file_id` must be unique per file for
-    /// block-cache keying.
+    /// Open the SSTable at `klog_path` on `storage`. `file_id` must be unique
+    /// per file for block-cache keying. When `storage.supports_mmap()` is false
+    /// (a slow/remote tier), the reader never mmaps and every read goes through
+    /// the buffered `pread` path plus the block cache.
     pub fn open(
         klog_path: &str,
-        fc: Arc<FileCache>,
+        storage: Arc<dyn Storage>,
         bc: Arc<BlockCache>,
         file_id: u64,
         cmp: ComparatorRef,
@@ -96,7 +99,7 @@ impl Reader {
         let mut r = Reader {
             klog_path: klog_path.to_string(),
             vlog_path: vlog_path_for(klog_path),
-            fc,
+            storage,
             bc,
             file_id,
             cmp,
@@ -115,7 +118,7 @@ impl Reader {
             #[cfg(feature = "mmap-reads")]
             verified: Vec::new(),
         };
-        let f = r.fc.acquire(klog_path)?;
+        let f = r.storage.open_read(klog_path)?;
         let size = f.metadata()?.len();
         if size < FOOTER_SIZE as u64 {
             return Err(corrupt());
@@ -158,8 +161,11 @@ impl Reader {
         // ondaDB never writes to it after `finish`, and compaction only *unlinks*
         // it (the pages stay valid while this mapping holds the inode). The mmap
         // is owned by the Reader, so views into it live exactly as long as it.
+        // A tier that reports `supports_mmap() == false` opts out entirely:
+        // `klog_mmap` stays `None` and every read falls through to the buffered
+        // `pread` path below.
         #[cfg(feature = "mmap-reads")]
-        {
+        if r.storage.supports_mmap() {
             let mmap = unsafe { memmap2::Mmap::map(&*f)? };
             // Hint the kernel to start paging the file in now: SSTables are
             // read-hot right after open (recovery, point gets, scans), and
@@ -356,7 +362,7 @@ impl Reader {
         if let Some(raw) = self.bc.get(self.file_id, h.offset) {
             return Ok(Block::Owned(raw));
         }
-        let f = self.fc.acquire(&self.klog_path)?;
+        let f = self.storage.open_read(&self.klog_path)?;
         let raw = read_block_at(&f, h.offset, h.length)?;
         let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
         self.bc.put(self.file_id, h.offset, arc.clone());
@@ -536,7 +542,7 @@ impl Reader {
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
         let len = length as usize;
         #[cfg(feature = "mmap-reads")]
-        {
+        if self.storage.supports_mmap() {
             let mmap = self.vlog_mmap_handle()?;
             let s = off as usize;
             if self.vlog_v2 {
@@ -579,7 +585,7 @@ impl Reader {
                 }
             }
         }
-        let f = self.fc.acquire(&self.vlog_path)?;
+        let f = self.storage.open_read(&self.vlog_path)?;
         if self.vlog_v2 {
             let mut hdr = [0u8; VLOG_V2_HDR_LEN];
             f.read_exact_at(&mut hdr, off)?;
@@ -625,7 +631,7 @@ impl Reader {
         if let Some(m) = guard.as_ref() {
             return Ok(m.clone());
         }
-        let f = self.fc.acquire(&self.vlog_path)?;
+        let f = self.storage.open_read(&self.vlog_path)?;
         // SAFETY: the vlog of a finished SSTable is immutable (see `open`).
         let mmap = Arc::new(unsafe { memmap2::Mmap::map(&*f)? });
         let _ = mmap.advise(memmap2::Advice::WillNeed);
@@ -662,8 +668,8 @@ impl Reader {
 
     /// Evict this file's handles from the file cache.
     pub fn close(&self) {
-        self.fc.evict(&self.klog_path);
-        self.fc.evict(&self.vlog_path);
+        self.storage.release(&self.klog_path);
+        self.storage.release(&self.vlog_path);
     }
 }
 
@@ -681,6 +687,11 @@ mod tests {
     use crate::comparator::default_comparator;
     use crate::config::Compression;
     use crate::sst::{Writer, WriterOptions};
+    use crate::storage::LocalStorage;
+
+    fn local() -> Arc<dyn Storage> {
+        LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads"))
+    }
 
     fn small_reader(dir: &std::path::Path, n: usize) -> Arc<Reader> {
         let klog = dir.join("t.klog");
@@ -709,7 +720,7 @@ mod tests {
         w.finish().unwrap();
         Reader::open(
             klog,
-            Arc::new(FileCache::new(4)),
+            local(),
             Arc::new(BlockCache::new(1 << 20)),
             1,
             default_comparator(),
@@ -763,7 +774,7 @@ mod tests {
         w.finish().unwrap();
         let r = Reader::open(
             klog,
-            Arc::new(FileCache::new(4)),
+            local(),
             Arc::new(BlockCache::new(1 << 20)),
             2,
             default_comparator(),

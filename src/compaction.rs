@@ -17,7 +17,7 @@ use crate::comparator::ComparatorRef;
 use crate::db::DbInner;
 use crate::error::Result;
 use crate::manifest::SstMeta;
-use crate::sst::{Reader, SstIterator, Writer};
+use crate::sst::{SstIterator, Writer};
 use crate::util::now_nanos;
 
 /// Manual compaction (`DB::compact`): run the triggered rounds, then sweep
@@ -319,17 +319,11 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
     }
     finish_output(&mut writer, &mut outputs)?;
 
-    // Open readers for the new tables.
+    // Open readers for the new tables (compaction output always lands on the
+    // default tier, so `open_reader_for` resolves the default path).
     let mut new_handles = Vec::new();
     for meta in &outputs {
-        let klog = cf.klog_path(meta.id);
-        let reader = Reader::open(
-            &klog,
-            cf.ctx.fc.clone(),
-            cf.ctx.bc.clone(),
-            meta.id,
-            cmp.clone(),
-        )?;
+        let reader = cf.open_reader_for(meta)?;
         new_handles.push(Arc::new(SstHandle {
             meta: meta.clone(),
             reader,

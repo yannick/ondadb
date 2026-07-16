@@ -156,6 +156,48 @@ pub struct Options {
     pub unified_memtable_skip_list_probability: f64,
     pub unified_memtable_sync_mode: SyncMode,
     pub unified_memtable_sync_interval: Duration,
+    /// Named storage tiers, in addition to the implicit `"ssd"` tier (the
+    /// database directory). A bottom-level part may be moved to a tier; its
+    /// files then live under `<tier.root>/cf-<name>/`. WAL and upper levels
+    /// always stay on the default tier. Empty by default. See
+    /// [`TierDef`]. (The keyspace→tier policy and the background mover are a
+    /// later milestone; this release ships the storage substrate.)
+    pub tiers: Vec<TierDef>,
+}
+
+/// A named storage location — for now, a directory on some mount (ssd, hdd,
+/// nfs). A later milestone adds an S3-backed tier behind the same
+/// [`Storage`](crate::storage::Storage) trait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierDef {
+    /// Tier name, referenced by [`SstMeta::tier`](crate::manifest::SstMeta::tier).
+    /// The name `"ssd"` is reserved for the implicit default tier (the DB dir).
+    pub name: String,
+    /// Filesystem root for this tier. Per-CF files live under `<root>/cf-<name>/`.
+    pub root: String,
+    /// Whether readers may mmap files on this tier. Local disks set this `true`;
+    /// slow/remote-style mounts set it `false` so reads always use the buffered
+    /// `pread` path plus the block cache (which matters more there). Defaults to
+    /// `true` via [`TierDef::new`].
+    pub supports_mmap: bool,
+}
+
+impl TierDef {
+    /// A local tier at `root` with mmap reads enabled.
+    pub fn new(name: impl Into<String>, root: impl Into<String>) -> Self {
+        TierDef {
+            name: name.into(),
+            root: root.into(),
+            supports_mmap: true,
+        }
+    }
+
+    /// Disable mmap reads for this tier (route reads through the buffered
+    /// `pread` path + block cache, as a remote tier would).
+    pub fn without_mmap(mut self) -> Self {
+        self.supports_mmap = false;
+        self
+    }
 }
 
 impl Options {
@@ -186,6 +228,7 @@ impl Default for Options {
             unified_memtable_skip_list_probability: 0.25,
             unified_memtable_sync_mode: SyncMode::None,
             unified_memtable_sync_interval: Duration::from_micros(128_000),
+            tiers: Vec::new(),
         }
     }
 }

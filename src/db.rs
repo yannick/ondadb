@@ -316,6 +316,26 @@ impl DB {
         let fc = Arc::new(FileCache::new(opts.max_open_sstables.max(1)));
         let bc = Arc::new(BlockCache::new(opts.block_cache_size as i64));
 
+        // Storage-tier registry: the default tier is the DB directory; every
+        // configured tier gets its own LocalStorage over the shared file cache.
+        // The default tier permits mmap (when the feature is built); a named tier
+        // honors its `supports_mmap` flag so a slow/remote-style mount can force
+        // the buffered pread path. The name "ssd" is reserved for the default.
+        let default_storage = crate::storage::LocalStorage::new(fc.clone(), true);
+        let mut extra_tiers: Vec<(String, String, Arc<dyn crate::storage::Storage>)> = Vec::new();
+        for t in &opts.tiers {
+            if t.name == "ssd" {
+                continue;
+            }
+            let storage = crate::storage::LocalStorage::new(fc.clone(), t.supports_mmap);
+            extra_tiers.push((t.name.clone(), t.root.clone(), storage));
+        }
+        let tiers = Arc::new(crate::storage::TierRegistry::new(
+            dir.clone(),
+            default_storage,
+            extra_tiers,
+        )?);
+
         let (flush_tx, flush_rx) = unbounded::<FlushJob>();
         let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
         let poison = Arc::new(crate::util::Poison::new());
@@ -341,7 +361,7 @@ impl DB {
         };
 
         let ctx = Arc::new(CfCtx {
-            fc,
+            tiers,
             bc,
             flush_tx,
             compact_tx,
