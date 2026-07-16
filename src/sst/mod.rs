@@ -88,6 +88,9 @@ impl FileMeta {
             vlog_size: self.vlog_size,
             min_key: self.min_key.clone(),
             max_key: self.max_key.clone(),
+            // Partition is a bottom-level compaction concern; the writer/flush
+            // paths leave it None and compaction stamps boundary-cut files.
+            partition: None,
         }
     }
 }

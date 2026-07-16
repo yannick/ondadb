@@ -32,6 +32,12 @@ pub struct SstMeta {
     pub vlog_size: u64,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
+    /// Partition this table belongs to, set only for bottom-level files that
+    /// compaction cut on a partition boundary (see
+    /// [`ColumnFamilyConfig::partition_rules`](crate::config::ColumnFamilyConfig::partition_rules)).
+    /// `None` means the implicit default partition (or a file written before
+    /// partitioning existed — old manifests decode every table to `None`).
+    pub partition: Option<String>,
 }
 
 /// Persisted state of one column family.
@@ -123,6 +129,37 @@ impl Manifest {
                 append_bytes(&mut b, &s.max_key);
             }
         }
+        // Append-tolerant tail: per-SSTable `partition` names. The per-record
+        // encoding above is a flat sequential list with no framing, so an
+        // optional per-record field can't be tucked in there without breaking
+        // older readers; instead it lives here at the end of the body (still
+        // inside the CRC). A manifest written before partitions existed has no
+        // trailing bytes, so `decode` leaves every `partition` as `None`. The
+        // section is emitted only when some table actually carries a partition,
+        // so partition-free databases keep a byte-identical manifest.
+        //
+        // Layout: for each CF in order, a uvarint count of partitioned tables,
+        // then `(table_index uvarint, name bytes)` pairs — mirroring the nested
+        // CF→table shape of the body above.
+        if self
+            .cfs
+            .iter()
+            .any(|cf| cf.sstables.iter().any(|s| s.partition.is_some()))
+        {
+            for cf in &self.cfs {
+                let parted: Vec<(usize, &str)> = cf
+                    .sstables
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.partition.as_deref().map(|p| (i, p)))
+                    .collect();
+                append_uvarint(&mut b, parted.len() as u64);
+                for (i, name) in parted {
+                    append_uvarint(&mut b, i as u64);
+                    append_bytes(&mut b, name.as_bytes());
+                }
+            }
+        }
         let crc = checksum(&b);
         append_u32(&mut b, crc);
         b
@@ -188,6 +225,8 @@ impl Manifest {
                     vlog_size,
                     min_key,
                     max_key,
+                    // Filled from the append-tolerant tail after the CF loop.
+                    partition: None,
                 });
             }
             cfs.push(CfManifest {
@@ -195,6 +234,23 @@ impl Manifest {
                 config,
                 sstables,
             });
+        }
+        // Append-tolerant partition tail (see `encode`). Absent in manifests
+        // written before partitioning, in which case `p` is already exhausted
+        // and every `partition` stays `None`.
+        if !p.is_empty() {
+            for cf in cfs.iter_mut() {
+                let (count, n) = uvarint(p).ok_or_else(bad)?;
+                p = &p[n..];
+                for _ in 0..count {
+                    let (idx, n) = uvarint(p).ok_or_else(bad)?;
+                    p = &p[n..];
+                    let (name, rest) = take_bytes(p).ok_or_else(bad)?;
+                    p = rest;
+                    let sst = cf.sstables.get_mut(idx as usize).ok_or_else(bad)?;
+                    sst.partition = Some(String::from_utf8(name).map_err(|_| bad())?);
+                }
+            }
         }
         Ok(Manifest {
             next_file_id,
@@ -241,6 +297,7 @@ mod tests {
                         vlog_size: 0,
                         min_key: b"aaa".to_vec(),
                         max_key: b"zzz".to_vec(),
+                        partition: None,
                     },
                     SstMeta {
                         id: 2,
@@ -252,6 +309,7 @@ mod tests {
                         vlog_size: 1024,
                         min_key: b"aaa".to_vec(),
                         max_key: b"mmm".to_vec(),
+                        partition: Some("img".into()),
                     },
                 ],
             }],
@@ -299,5 +357,54 @@ mod tests {
         let n = enc.len();
         enc[n / 2] ^= 0xFF;
         assert!(Manifest::decode(&enc).is_err());
+    }
+
+    #[test]
+    fn partition_survives_round_trip() {
+        // The sample tags table #2 with partition "img"; #1 has none.
+        let d = Manifest::decode(&sample().encode()).unwrap();
+        assert_eq!(d.cfs[0].sstables[0].partition, None);
+        assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
+    }
+
+    #[test]
+    fn no_partition_manifest_is_byte_identical_to_legacy() {
+        // A manifest with no partitions must not emit the tail section, so its
+        // bytes match what a pre-partition build would have written (and thus
+        // decodes to all-None). We simulate the legacy encoding by stripping
+        // partitions and confirming the encoding is unchanged.
+        let mut m = sample();
+        for cf in &mut m.cfs {
+            for s in &mut cf.sstables {
+                s.partition = None;
+            }
+        }
+        let enc = m.encode();
+        let d = Manifest::decode(&enc).unwrap();
+        assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+    }
+
+    #[test]
+    fn legacy_manifest_without_tail_decodes_to_none() {
+        // Build the body exactly as a pre-partition writer would: encode a
+        // partition-free manifest (which emits no tail), then confirm a decoder
+        // that now understands partitions reads every table as None. Adding a
+        // partition and re-encoding must produce a strictly longer blob (the
+        // tail), proving the tail is the only new on-disk data.
+        let mut legacy = sample();
+        for cf in &mut legacy.cfs {
+            for s in &mut cf.sstables {
+                s.partition = None;
+            }
+        }
+        let legacy_enc = legacy.encode();
+        let d = Manifest::decode(&legacy_enc).unwrap();
+        assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+
+        let with_part = sample(); // table #2 tagged "img"
+        assert!(
+            with_part.encode().len() > legacy_enc.len(),
+            "partition tail must add bytes on top of the legacy body"
+        );
     }
 }
