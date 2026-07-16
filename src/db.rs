@@ -421,6 +421,7 @@ impl DB {
         let cmp = comparator_by_name(&config.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
         })?;
+        config.validate().map_err(OndaError::InvalidArgs)?;
         let mut cfs = self.inner.cfs.write();
         if cfs.contains_key(name) {
             return Err(OndaError::Exists(name.into()));

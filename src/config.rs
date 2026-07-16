@@ -212,6 +212,21 @@ pub struct ColumnFamilyConfig {
     /// write-side policy — SSTable blocks and vlog frames are self-describing,
     /// so rules can change at any time without rewriting existing data.
     pub compression_rules: Vec<CompressionRule>,
+    /// Prefix rules that carve the keyspace into named **partitions**. The
+    /// **longest** matching prefix wins (so rules may nest: `img/` and
+    /// `img/thumb/` are both legal and a key under `img/thumb/` resolves to the
+    /// latter); keys matching no rule live in the implicit default partition
+    /// (`partition_of` returns `None`). Exact-duplicate prefixes are rejected by
+    /// [`validate`](Self::validate).
+    ///
+    /// Partitions are the unit of the parts/tiers machinery: bottom-level
+    /// compaction cuts its output files at partition boundaries so that no
+    /// bottom SSTable ever spans two partitions (see
+    /// [`SstMeta::partition`](crate::manifest::SstMeta::partition)). Upper
+    /// levels are left mixed. Purely a write-side policy — changing the rules
+    /// only affects files written afterward; existing files keep whatever
+    /// partition they were cut into.
+    pub partition_rules: Vec<PartitionRule>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
     pub enable_block_indexes: bool,
@@ -250,6 +265,7 @@ impl Default for ColumnFamilyConfig {
             compression: Compression::None,
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
+            partition_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
             enable_block_indexes: true,
@@ -297,6 +313,26 @@ pub(crate) fn compression_for_key(
         .map(|r| r.compression)
 }
 
+/// One prefix → partition-name rule (see
+/// [`ColumnFamilyConfig::partition_rules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionRule {
+    /// Keys starting with this byte prefix belong to partition `name`.
+    pub prefix: Vec<u8>,
+    /// Partition name, recorded on bottom-level SSTables cut on this boundary.
+    pub name: String,
+}
+
+/// Resolve `user_key` to a partition name: longest matching prefix wins.
+/// `None` (the implicit default partition) when no rule matches.
+pub(crate) fn partition_of<'a>(rules: &'a [PartitionRule], user_key: &[u8]) -> Option<&'a str> {
+    rules
+        .iter()
+        .filter(|r| user_key.starts_with(&r.prefix))
+        .max_by_key(|r| r.prefix.len())
+        .map(|r| r.name.as_str())
+}
+
 impl ColumnFamilyConfig {
     /// Compression algorithm for SSTables written at `level` (see
     /// `compression_per_level`).
@@ -313,6 +349,34 @@ impl ColumnFamilyConfig {
     pub fn compression_for_key(&self, user_key: &[u8], level: u32) -> Compression {
         compression_for_key(&self.compression_rules, user_key)
             .unwrap_or_else(|| self.compression_for_level(level))
+    }
+
+    /// Partition name for `user_key`: the longest matching entry in
+    /// [`partition_rules`](Self::partition_rules), or `None` for the implicit
+    /// default partition.
+    pub fn partition_of(&self, user_key: &[u8]) -> Option<&str> {
+        partition_of(&self.partition_rules, user_key)
+    }
+
+    /// Reject structurally invalid configuration. Currently: exact-duplicate
+    /// partition prefixes (two rules with the same `prefix`). Nested prefixes
+    /// are legal — longest-prefix-wins resolves them deterministically — so
+    /// only an exact collision (which would make resolution order-dependent) is
+    /// an error.
+    pub fn validate(&self) -> Result<(), String> {
+        for (i, a) in self.partition_rules.iter().enumerate() {
+            for b in &self.partition_rules[i + 1..] {
+                if a.prefix == b.prefix {
+                    return Err(format!(
+                        "duplicate partition prefix {:?} (rules {:?} and {:?})",
+                        String::from_utf8_lossy(&a.prefix),
+                        a.name,
+                        b.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Serialize the durable subset of the config for the manifest blob.
@@ -348,6 +412,16 @@ impl ColumnFamilyConfig {
             append_uvarint(&mut b, r.prefix.len() as u64);
             b.extend_from_slice(&r.prefix);
             b.push(r.compression as u8);
+        }
+        // Appended tail (same backward/forward-compatible scheme as above): an
+        // older manifest ends before this count, so `decode_into` returns via
+        // `?` and leaves `partition_rules` empty.
+        b.push(self.partition_rules.len().min(255) as u8);
+        for r in self.partition_rules.iter().take(255) {
+            append_uvarint(&mut b, r.prefix.len() as u64);
+            b.extend_from_slice(&r.prefix);
+            append_uvarint(&mut b, r.name.len() as u64);
+            b.extend_from_slice(r.name.as_bytes());
         }
         b
     }
@@ -439,6 +513,30 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         });
     }
     cfg.compression_rules = rules;
+    // Appended-tail partition rules; an older manifest ends above and keeps the
+    // default (empty) list.
+    let n_parts = byte(&mut p)?;
+    let mut parts = Vec::with_capacity(n_parts as usize);
+    for _ in 0..n_parts {
+        let (plen, n) = uvarint(p)?;
+        p = &p[n..];
+        let plen = plen as usize;
+        if p.len() < plen {
+            return None;
+        }
+        let prefix = p[..plen].to_vec();
+        p = &p[plen..];
+        let (nlen, n) = uvarint(p)?;
+        p = &p[n..];
+        let nlen = nlen as usize;
+        if p.len() < nlen {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&p[..nlen]).into_owned();
+        p = &p[nlen..];
+        parts.push(PartitionRule { prefix, name });
+    }
+    cfg.partition_rules = parts;
     Some(())
 }
 
@@ -500,6 +598,108 @@ mod tests {
         };
         assert_eq!(cfg.compression_for_key(b"az1", 0), Compression::Zstd);
         assert_eq!(cfg.compression_for_key(b"zz", 3), Compression::Snappy);
+    }
+
+    #[test]
+    fn partition_rule_resolution() {
+        let rules = vec![
+            PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            },
+            PartitionRule {
+                prefix: b"img/thumb/".to_vec(),
+                name: "thumb".into(),
+            },
+        ];
+        // Longest prefix wins; nesting is legal.
+        assert_eq!(partition_of(&rules, b"img/thumb/1.jpg"), Some("thumb"));
+        assert_eq!(partition_of(&rules, b"img/full/1.jpg"), Some("img"));
+        // Un-ruled keys fall into the implicit default partition.
+        assert_eq!(partition_of(&rules, b"logs/2026"), None);
+        let cfg = ColumnFamilyConfig {
+            partition_rules: rules,
+            ..Default::default()
+        };
+        assert_eq!(cfg.partition_of(b"img/thumb/x"), Some("thumb"));
+        assert_eq!(cfg.partition_of(b"other"), None);
+    }
+
+    #[test]
+    fn partition_rules_survive_manifest_round_trip() {
+        let c = ColumnFamilyConfig {
+            partition_rules: vec![
+                PartitionRule {
+                    prefix: b"a/".to_vec(),
+                    name: "alpha".into(),
+                },
+                PartitionRule {
+                    prefix: b"b/".to_vec(),
+                    name: "beta".into(),
+                },
+            ],
+            // Coexists with compression_rules (both are appended tails).
+            compression_rules: vec![CompressionRule {
+                prefix: b"a/".to_vec(),
+                compression: Compression::Zstd,
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.partition_rules, c.partition_rules);
+        assert_eq!(d.compression_rules, c.compression_rules);
+    }
+
+    #[test]
+    fn legacy_config_without_partition_tail_decodes_to_empty() {
+        // A config encoded before partition_rules existed ends right after the
+        // compression_rules section: truncate the 1-byte partition-count tail
+        // and confirm the decoder falls back to an empty list.
+        let c = ColumnFamilyConfig {
+            comparator_name: "uint64".into(),
+            ..ColumnFamilyConfig::default()
+        };
+        let full = c.encode();
+        // The final byte is the partition-rule count (0 here); dropping it
+        // simulates an older, shorter blob.
+        let legacy = &full[..full.len() - 1];
+        let d = ColumnFamilyConfig::decode(legacy);
+        assert_eq!(d.comparator_name, "uint64");
+        assert!(d.partition_rules.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_partition_prefix() {
+        let dup = ColumnFamilyConfig {
+            partition_rules: vec![
+                PartitionRule {
+                    prefix: b"x/".to_vec(),
+                    name: "one".into(),
+                },
+                PartitionRule {
+                    prefix: b"x/".to_vec(),
+                    name: "two".into(),
+                },
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(dup.validate().is_err());
+
+        // Nested (non-equal) prefixes are legal — longest-prefix-wins.
+        let nested = ColumnFamilyConfig {
+            partition_rules: vec![
+                PartitionRule {
+                    prefix: b"x/".to_vec(),
+                    name: "one".into(),
+                },
+                PartitionRule {
+                    prefix: b"x/y/".to_vec(),
+                    name: "two".into(),
+                },
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(nested.validate().is_ok());
     }
 
     #[test]
@@ -567,16 +767,17 @@ mod tests {
     fn legacy_blob_without_sync_fields_decodes_to_defaults() {
         // Simulate a manifest written before the appended-tail fields
         // (sync_mode/sync_interval, compression_per_level, FIFO settings,
-        // compression_rules) were persisted: encode, then truncate the whole
-        // tail (9 bytes sync + 1 byte per-level count + 17 bytes FIFO + 1
-        // byte rules count).
+        // compression_rules, partition_rules) were persisted: encode, then
+        // truncate the whole tail (9 bytes sync + 1 byte per-level count + 17
+        // bytes FIFO + 1 byte compression-rules count + 1 byte partition-rules
+        // count).
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        let legacy = &full[..full.len() - 28];
+        let legacy = &full[..full.len() - 29];
         let d = ColumnFamilyConfig::decode(legacy);
         // Older fields still decode; the missing sync fields fall back to default.
         assert_eq!(d.comparator_name, "uint64");
