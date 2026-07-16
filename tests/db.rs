@@ -684,3 +684,88 @@ fn per_level_compression_end_to_end() {
     assert_eq!(db.get(&cf, b"new").unwrap(), b"v");
     db.close().unwrap();
 }
+
+#[test]
+fn bottom_level_compaction_cuts_at_partition_boundaries() {
+    use ondadb::manifest::{manifest_path, Manifest};
+    use ondadb::PartitionRule;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Small write buffer so modest data forms several levels and forces a real
+    // bottom-level compaction.
+    let cfg = ColumnFamilyConfig {
+        write_buffer_size: 8 << 10,
+        partition_rules: vec![
+            PartitionRule {
+                prefix: b"a/".to_vec(),
+                name: "alpha".into(),
+            },
+            PartitionRule {
+                prefix: b"b/".to_vec(),
+                name: "beta".into(),
+            },
+        ],
+        ..ColumnFamilyConfig::default()
+    };
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", cfg.clone()).unwrap();
+
+    // Write across three partitions: a/ (alpha), b/ (beta), and c/ (un-ruled ->
+    // implicit default partition, resolves to None). Interleave and flush often
+    // so upper levels genuinely mix partitions before compaction separates them.
+    let value = vec![b'v'; 256];
+    for i in 0..300u32 {
+        for p in ["a", "b", "c"] {
+            db.put(
+                &cf,
+                format!("{p}/{i:05}").as_bytes(),
+                &value,
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
+        if i % 40 == 39 {
+            db.flush_memtable(&cf).unwrap();
+        }
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    db.close().unwrap();
+    drop(cf);
+    drop(db);
+
+    // Inspect the persisted catalog: every table at the bottom level must sit
+    // entirely within one partition, and its stamped `partition` must match.
+    let m = Manifest::load(manifest_path(dir.path())).unwrap();
+    let cfm = m.cfs.iter().find(|c| c.name == "default").unwrap();
+    let bottom = cfm.sstables.iter().map(|s| s.level).max().unwrap();
+    assert!(bottom >= 1, "expected data pushed below L0, bottom = {bottom}");
+
+    let mut seen_alpha = false;
+    let mut seen_beta = false;
+    let mut seen_default = false;
+    for s in cfm.sstables.iter().filter(|s| s.level == bottom) {
+        let pmin = cfg.partition_of(&s.min_key).map(str::to_string);
+        let pmax = cfg.partition_of(&s.max_key).map(str::to_string);
+        assert_eq!(
+            pmin, pmax,
+            "bottom table {} spans a partition boundary: {:?}..{:?}",
+            s.id, s.min_key, s.max_key
+        );
+        assert_eq!(
+            s.partition, pmin,
+            "bottom table {} has wrong stamped partition",
+            s.id
+        );
+        match s.partition.as_deref() {
+            Some("alpha") => seen_alpha = true,
+            Some("beta") => seen_beta = true,
+            None => seen_default = true,
+            other => panic!("unexpected partition {other:?}"),
+        }
+    }
+    assert!(
+        seen_alpha && seen_beta && seen_default,
+        "expected all three partitions represented at the bottom (alpha={seen_alpha}, beta={seen_beta}, default={seen_default})"
+    );
+}
