@@ -37,6 +37,7 @@ pub mod iterator;
 pub mod maintenance;
 pub mod manifest;
 pub mod memtable;
+pub mod parts;
 #[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;
 pub mod sst;
@@ -57,5 +58,6 @@ pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;
 pub use maintenance::{CfStats, DbStats};
+pub use parts::DetachedPart;
 pub use storage::{LocalStorage, Storage};
 pub use txn::Txn;
