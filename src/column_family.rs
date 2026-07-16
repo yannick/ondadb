@@ -137,6 +137,13 @@ pub struct ColumnFamily {
 
     pub(crate) flushing: AtomicBool,
     pub(crate) compacting: AtomicBool,
+    /// Serializes compaction runs on this CF. Two concurrent runs each
+    /// snapshot the level set, merge, and `replace_levels` — the loser's
+    /// installed tables would be dropped while its inputs are already
+    /// unlinked. Background workers and `DB::compact` can otherwise overlap
+    /// (the compact queue may hold the same CF twice across two worker
+    /// threads).
+    pub(crate) compact_mu: Mutex<()>,
     commit_hook: Mutex<Option<CommitHookFn>>,
     compaction_filter: Mutex<Option<CompactionFilterFn>>,
     /// Mirrors `commit_hook.is_some()`; lets the commit path skip building hook
@@ -209,6 +216,7 @@ impl ColumnFamily {
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
+            compact_mu: Mutex::new(()),
             commit_hook: Mutex::new(None),
             compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
@@ -299,6 +307,7 @@ impl ColumnFamily {
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
+            compact_mu: Mutex::new(()),
             commit_hook: Mutex::new(None),
             compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),

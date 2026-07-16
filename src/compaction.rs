@@ -20,11 +20,50 @@ use crate::manifest::SstMeta;
 use crate::sst::{Reader, SstIterator, Writer};
 use crate::util::now_nanos;
 
+/// Manual compaction (`DB::compact`): run the triggered rounds, then sweep
+/// every populated level down to the bottom once. The sweep is what lets an
+/// explicit compact() reclaim tombstone debris from a quiescent CF — a fully
+/// deleted CF sits below every size trigger, so `run` alone would keep its
+/// tombstones forever (a comparable engine kept 23 MB of tombstones in an
+/// "empty" partition this way). Background workers keep using `run`; only
+/// the user-invoked path pays for the full sweep.
+pub(crate) fn run_manual(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
+    run(db, cf)?;
+    if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
+        return Ok(()); // FIFO never merges; eviction already ran above
+    }
+    let _mu = cf.compact_mu.lock();
+    cf.compacting
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let res = (|| {
+        let n = cf.with_levels(|levels| levels.len());
+        for level in 0..n.saturating_sub(1) {
+            compact_level(db, cf, level)?;
+            cf.compaction_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Rewrite the last level in place. Push-down merges only rewrite
+        // bottom tables that overlap incoming data, so a bottom table that
+        // never overlaps anything again would otherwise keep its tombstones
+        // and never see the compaction filter, no matter how often compact()
+        // is called.
+        let last = cf.with_levels(|levels| levels.len()).saturating_sub(1);
+        compact_into(db, cf, last, last)?;
+        cf.compaction_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    })();
+    cf.compacting
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    res
+}
+
 /// Run compaction on `cf` until no level is over its trigger.
 pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
         return run_fifo(db, cf);
     }
+    let _mu = cf.compact_mu.lock();
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
@@ -44,6 +83,7 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
 /// CF's size/age limits. Manifest is persisted before any file is unlinked
 /// (the same ordering the merge path uses).
 fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
+    let _mu = cf.compact_mu.lock();
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
@@ -91,16 +131,25 @@ fn pick_level(cf: &Arc<ColumnFamily>) -> Option<usize> {
 /// Compact every table in `level` plus overlapping tables in `level+1` into
 /// `level+1`.
 fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Result<()> {
-    let cmp = cf.cmp();
-    let target = level + 1;
+    compact_into(db, cf, level, level + 1)
+}
 
-    // Snapshot the input handles.
+/// Compact `level` into `target` (either `level + 1`, or `level` itself for
+/// the in-place bottom rewrite manual compaction does — the only way tables
+/// in the last level that overlap no incoming data ever see the compaction
+/// filter or drop their tombstones again).
+fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target: usize) -> Result<()> {
+    let cmp = cf.cmp();
+    debug_assert!(target == level || target == level + 1);
+
+    // Snapshot the input handles. An in-place rewrite takes the whole level;
+    // a push-down merges the level with overlapping tables below it.
     let (inputs, retained_next, num_levels): (Vec<Arc<SstHandle>>, Vec<Arc<SstHandle>>, usize) = cf
         .with_levels(|levels| {
             let mut inputs: Vec<Arc<SstHandle>> = levels[level].clone();
             let (min_key, max_key) = key_span(&inputs, &cmp);
             let mut retained_next = Vec::new();
-            if target < levels.len() {
+            if target != level && target < levels.len() {
                 for th in &levels[target] {
                     if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, &min_key, &max_key)
                     {
@@ -265,8 +314,9 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
         let needed = (target + 1).max(levels.len());
         for i in 0..needed {
             if i == level {
-                // Drop all inputs that came from this level.
-                let kept: Vec<Arc<SstHandle>> = levels
+                // Drop all inputs that came from this level. (Tables added
+                // concurrently — e.g. a flush landing in L0 — are kept.)
+                let mut kept: Vec<Arc<SstHandle>> = levels
                     .get(i)
                     .map(|l| {
                         l.iter()
@@ -275,6 +325,11 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
                             .collect()
                     })
                     .unwrap_or_default();
+                if level == target {
+                    // In-place rewrite: the outputs replace the inputs here.
+                    kept.extend(new_handles.iter().cloned());
+                    kept.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+                }
                 out.push(kept);
             } else if i == target {
                 let mut lvl = retained_next.clone();

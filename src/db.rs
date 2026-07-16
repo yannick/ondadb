@@ -516,9 +516,12 @@ impl DB {
         Ok(())
     }
 
-    /// Trigger compaction on a column family and wait for it to settle.
+    /// Compact a column family and wait for it to settle: runs every
+    /// triggered round, then sweeps all populated levels to the bottom so
+    /// tombstones and shadowed versions are reclaimed even when no size
+    /// trigger fires (e.g. a fully deleted CF).
     pub fn compact(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
-        compaction::run(&self.inner, cf)
+        compaction::run_manual(&self.inner, cf)
     }
 
     /// Force an fsync of every write-ahead log (all column families plus the
@@ -775,5 +778,34 @@ mod tests {
         // Reads keep working on a poisoned DB; only new commits are refused.
         assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
         db.close().unwrap();
+    }
+
+    /// A comparable engine's batch commit discarded the journal write error
+    /// and published the batch to the memtable anyway, so a later successful
+    /// sync falsely implied durability. The contract to pin: a commit that
+    /// returns an error must not have published any of its writes.
+    #[test]
+    fn poisoned_txn_commit_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"pre", b"v", Duration::ZERO).unwrap();
+
+        let mut t = db.begin();
+        t.put(&cf, b"staged", b"v", Duration::ZERO).unwrap();
+        // The durability failure lands between buffering and commit.
+        db.inner.poison.set("simulated wal failure".into());
+        match t.commit() {
+            Err(OndaError::Poisoned(_)) => {}
+            other => panic!("commit on a poisoned db must fail, got {other:?}"),
+        }
+        match db.get(&cf, b"staged") {
+            Err(OndaError::NotFound) => {}
+            other => panic!("failed commit must not publish its writes, got {other:?}"),
+        }
+        assert_eq!(db.get(&cf, b"pre").unwrap(), b"v");
+        let _ = db.close(); // close may surface the poison; must not panic
     }
 }

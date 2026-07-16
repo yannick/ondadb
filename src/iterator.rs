@@ -525,11 +525,27 @@ impl Iterator {
     }
 
     pub fn seek_to_first(&mut self) {
-        self.m.seek_to_first();
+        // Start at the lower bound, not the raw heap minimum: SSTables fully
+        // outside the bounds were pruned at construction, but memtables and
+        // straddling tables still hold keys below `lower` that must never
+        // surface from a bounded iterator.
+        match &self.lower {
+            Bound::Unbounded => self.m.seek_to_first(),
+            // (l, MAX) sorts before every version of l → first group >= l.
+            Bound::Included(l) => self.m.seek_ge(l, u64::MAX),
+            // (l, 0) sorts after every live version of l → first group > l.
+            Bound::Excluded(l) => self.m.seek_ge(l, 0),
+        }
         self.advance_forward();
     }
     pub fn seek_to_last(&mut self) {
-        self.m.seek_to_last();
+        // Mirror of `seek_to_first`: start at the upper bound.
+        match &self.upper {
+            Bound::Unbounded => self.m.seek_to_last(),
+            // (u, 0) sorts after every live version of u → last group <= u.
+            Bound::Included(u) => self.m.seek_le(u, 0),
+            Bound::Excluded(u) => self.m.seek_lt(u),
+        }
         self.advance_backward();
     }
     pub fn seek(&mut self, user_key: &[u8]) {

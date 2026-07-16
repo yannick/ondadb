@@ -464,6 +464,7 @@ impl Txn {
         // (zero copies here); the WAL and memtable copy what they need. Hook
         // payloads are only materialized for CFs that actually have a hook.
         let mut applied: Vec<(Arc<ColumnFamily>, Vec<CommitOp>)> = Vec::new();
+        let mut apply_err: Option<OndaError> = None;
         {
             let buf = &self.buf;
             let mut groups: HashMap<usize, CfGroup<'_>> = HashMap::with_capacity(1);
@@ -507,17 +508,33 @@ impl Txn {
                         applied.push((cf, ops));
                     }
                 }
-                u.apply(&items)?;
+                apply_err = u.apply(&items).err();
             } else {
                 for (_, (cf, recs, ops, has_hook)) in groups {
-                    cf.apply_commit(&recs)?;
+                    if let Some(e) = cf.apply_commit(&recs).err() {
+                        apply_err = Some(e);
+                        break;
+                    }
                     if has_hook {
                         applied.push((cf, ops));
                     }
                 }
             }
         }
+        // The reserved range must be published even when the apply failed:
+        // the gap-free cursor (invariant 5) never advances past an
+        // unpublished range, so skipping this would freeze `visible_seq`
+        // forever — hiding every later commit from other threads, persisting
+        // a stale `global_seq`, and losing/reusing sequences after reopen.
+        // Publishing a failed range is safe: its records never reached the
+        // WAL or memtable, so nothing unapplied becomes visible (the same
+        // publish-before-data pattern `start_ingestion` uses).
         self.db.publish_range(start, start + n);
+        if let Some(e) = apply_err {
+            drop(_guard);
+            self.release();
+            return Err(e);
+        }
         self.db.note_thread_commit(start + n - 1);
         drop(_guard);
 
