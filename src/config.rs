@@ -1,7 +1,10 @@
 //! Configuration types for ondaDB.
 //!
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::storage::Storage;
 
 /// Compression algorithm applied per SSTable block (never to the WAL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -195,15 +198,41 @@ pub struct TierDef {
 }
 
 /// Which storage backend implements a [`TierDef`]. A local tier is a directory on
-/// some mount; an S3 tier lives in an S3-compatible object store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// some mount; an S3 tier lives in an S3-compatible object store; a `Custom` tier
+/// hands the engine a caller-built [`Storage`] so an embedder can interpose its
+/// own decorator (e.g. a read-through cache in front of an S3 tier — ayu's foyer
+/// layer, P8).
+#[derive(Debug, Clone)]
 pub enum TierBackend {
     /// A directory on a local (or NFS/SMB-mounted) filesystem.
     Local,
     /// An S3-compatible object store (feature-gated behind `s3`).
     #[cfg(feature = "s3")]
     S3(S3Config),
+    /// A caller-provided [`Storage`] used verbatim for this tier. The engine
+    /// treats it opaquely (no mmap: [`TierDef::custom`] forces the buffered path),
+    /// so an embedder can wrap another backend — the intended seam for a
+    /// read-through cache in front of a remote tier.
+    Custom(Arc<dyn Storage>),
 }
+
+// `Arc<dyn Storage>` has no structural equality, so `TierBackend` cannot derive
+// `PartialEq`/`Eq`. Two `Custom` backends are equal iff they are the *same* Arc
+// (identity — a decorator has no meaningful value equality); `Local`/`S3` keep
+// their value semantics.
+impl PartialEq for TierBackend {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TierBackend::Local, TierBackend::Local) => true,
+            #[cfg(feature = "s3")]
+            (TierBackend::S3(a), TierBackend::S3(b)) => a == b,
+            (TierBackend::Custom(a), TierBackend::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TierBackend {}
 
 /// Connection parameters for an [`S3-backed tier`](TierBackend::S3). Credentials,
 /// endpoint, bucket and region come straight from `Options`. Use `path_style` for
@@ -252,6 +281,24 @@ impl TierDef {
             root: root.into(),
             supports_mmap: false,
             backend: TierBackend::S3(config),
+        }
+    }
+
+    /// A tier backed by a caller-provided [`Storage`] (P8). Reads never mmap (the
+    /// buffered `pread` path + block cache is used, as for any remote-style tier),
+    /// so an embedder can wrap a slow/remote backend with its own read-through
+    /// cache and hand the wrapper here. `root` is still the in-backend key/dir
+    /// prefix the [`TierRegistry`](crate::storage::TierRegistry) prepends.
+    pub fn custom(
+        name: impl Into<String>,
+        root: impl Into<String>,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        TierDef {
+            name: name.into(),
+            root: root.into(),
+            supports_mmap: false,
+            backend: TierBackend::Custom(storage),
         }
     }
 }

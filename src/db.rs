@@ -333,6 +333,9 @@ impl DB {
                 }
                 #[cfg(feature = "s3")]
                 crate::config::TierBackend::S3(cfg) => crate::storage_s3::S3Storage::new(cfg)?,
+                // A caller-provided backend is used verbatim (P8): the embedder
+                // already built (and wrapped) it.
+                crate::config::TierBackend::Custom(s) => s.clone(),
             };
             extra_tiers.push((t.name.clone(), t.root.clone(), storage));
         }
