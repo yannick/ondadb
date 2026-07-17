@@ -173,6 +173,15 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
     let oldest_snapshot = db.oldest_snapshot();
     let now = now_nanos();
     let filter = cf.compaction_filter();
+    // Snapshot the partition rules once for the whole run. A rule added
+    // concurrently (via `DB::add_partition_rule`) must not change this run's cut
+    // boundaries — it takes effect on the next bottom compaction. Only bottom
+    // output is cut on partitions, so upper-level runs need no snapshot.
+    let partition_rules = if bottom {
+        cf.partition_rules_snapshot()
+    } else {
+        Vec::new()
+    };
 
     // Merge-iterate all inputs and write new output SSTables.
     let mut its: Vec<SstIterator> = inputs.iter().map(|t| t.reader.iter()).collect();
@@ -284,7 +293,7 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
                 // (stamped with its partition) before opening the next. Upper
                 // levels leave `part = None`, so this never cuts there.
                 let part = if bottom {
-                    cf.opts.partition_of(&uk).map(str::to_string)
+                    crate::config::partition_of(&partition_rules, &uk).map(str::to_string)
                 } else {
                     None
                 };

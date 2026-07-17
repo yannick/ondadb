@@ -198,7 +198,8 @@ impl DB {
                 // A bottom part is partition-clean: recover its partition tag
                 // from the rules. L0 is never partition-clean, so leave None.
                 meta.partition = if at_bottom {
-                    cf.config().partition_of(&meta.min_key).map(str::to_string)
+                    crate::config::partition_of(&cf.partition_rules_snapshot(), &meta.min_key)
+                        .map(str::to_string)
                 } else {
                     None
                 };
@@ -276,7 +277,7 @@ impl DB {
             global_seq: self.inner.visible_seq(),
             cfs: vec![CfManifest {
                 name: cf.name().to_string(),
-                config: cf.config().encode(),
+                config: cf.effective_config().encode(),
                 sstables: metas,
             }],
         };
@@ -354,6 +355,65 @@ impl DB {
                 self.inner.remove_sst_file(&src_vlog);
             }
         }
+        Ok(())
+    }
+
+    /// Add a partition rule to a **live** column family, carving out a new named
+    /// partition of the keyspace (see
+    /// [`ColumnFamilyConfig::partition_rules`](crate::ColumnFamilyConfig::partition_rules)).
+    ///
+    /// **Write-side-only semantics.** The rule affects only *future* bottom-level
+    /// compactions: the next compaction that reaches the bottom level cuts its
+    /// output files on the new boundary. No existing data is rewritten — bottom
+    /// SSTables already on disk keep whatever partition stamp they were cut with
+    /// until a later compaction happens to touch them. So a freshly added rule
+    /// does not immediately make its partition detachable/tierable; flush +
+    /// compact first to materialize a clean part on the boundary.
+    ///
+    /// The rule is validated with the same check applied at CF creation
+    /// ([`ColumnFamilyConfig::validate`](crate::ColumnFamilyConfig::validate)): an
+    /// exact-duplicate prefix is rejected with [`OndaError::InvalidArgs`]. Nested
+    /// prefixes are legal (longest-prefix-wins). The new rule set is persisted via
+    /// the standard manifest rewrite ([`DbInner::persist_manifest`]), so it
+    /// survives reopen; a compaction already in flight finishes on the rules it
+    /// snapshotted at its start.
+    ///
+    /// Concurrent adds are safe: validation and the in-memory append happen under
+    /// one lock, so a duplicate racing add is rejected rather than both landing.
+    pub fn add_partition_rule(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        rule: crate::config::PartitionRule,
+    ) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.inner.poison.check()?;
+        // Validate + append to the live rules under the CF's rule lock, then
+        // persist the manifest (its own `manifest_mu` serializes the rewrite).
+        // The lock is released before persist because `persist_manifest` re-reads
+        // the live rules through `effective_config`.
+        cf.append_partition_rule(rule)?;
+        self.inner.persist_manifest()?;
+        Ok(())
+    }
+
+    /// Remove the partition rule whose prefix exactly equals `prefix` from a live
+    /// column family, then persist. Errors with [`OndaError::NotFound`] if no
+    /// rule has that exact prefix.
+    ///
+    /// Symmetric with [`add_partition_rule`](Self::add_partition_rule) and equally
+    /// write-side-only: future bottom compactions stop cutting on the boundary,
+    /// but bottom parts already stamped with the removed partition keep those
+    /// stamps (and stay detachable by name) until a later compaction merges them
+    /// back into their neighbors.
+    pub fn remove_partition_rule(&self, cf: &Arc<ColumnFamily>, prefix: &[u8]) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.inner.poison.check()?;
+        cf.remove_partition_rule(prefix)?;
+        self.inner.persist_manifest()?;
         Ok(())
     }
 }

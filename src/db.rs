@@ -243,7 +243,7 @@ impl DbInner {
         for cf in cfs.values() {
             m.cfs.push(CfManifest {
                 name: cf.name().to_string(),
-                config: cf.opts.encode(),
+                config: cf.effective_config().encode(),
                 sstables: cf.snapshot_ssts(),
             });
         }
@@ -506,7 +506,7 @@ impl DB {
         }
         let mut cfs = self.inner.cfs.write();
         let old = cfs.remove(name).ok_or(OndaError::NotFound)?;
-        let cfg = old.opts.clone();
+        let cfg = old.effective_config();
         let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
         })?;

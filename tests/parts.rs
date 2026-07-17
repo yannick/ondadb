@@ -265,6 +265,273 @@ fn move_part_to_tier_reads_correctly_with_mmap_off() {
     db.close().unwrap();
 }
 
+// ---- A5: live partition-rule addition -------------------------------------
+
+/// A rule added to a live CF takes effect only on the *next* bottom compaction
+/// (write-side-only): existing bottom files keep their stamps until a later
+/// compaction re-cuts them, and the new boundary then materializes a fresh part.
+#[test]
+fn add_partition_rule_live_cuts_only_future_bottom_compactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    // Start with only the img/ partition; log/ and etc/ share the default part.
+    let cfg = ColumnFamilyConfig {
+        partition_rules: vec![PartitionRule {
+            prefix: b"img/".to_vec(),
+            name: "img".into(),
+        }],
+        l1_file_count_trigger: 1,
+        ..ColumnFamilyConfig::default()
+    };
+    let cf = db.create_column_family("default", cfg).unwrap();
+    materialize_parts(&db, &cf);
+
+    // freeze_part is a non-destructive probe: it errors (NotFound) unless a
+    // bottom part is stamped with the partition. img/ is a part; log/ is not.
+    db.freeze_part(&cf, "img", tempfile::tempdir().unwrap().path())
+        .expect("img part exists after initial materialize");
+    assert!(
+        db.freeze_part(&cf, "log", tempfile::tempdir().unwrap().path())
+            .is_err(),
+        "log/ is not a partition yet (lives in the default part)"
+    );
+
+    // Add the log/ rule on the LIVE cf.
+    db.add_partition_rule(
+        &cf,
+        PartitionRule {
+            prefix: b"log/".to_vec(),
+            name: "log".into(),
+        },
+    )
+    .unwrap();
+
+    // Write-side-only: no data is rewritten, so the pre-existing bottom files
+    // still hold log/ in the default part — no "log" part materialized yet.
+    assert!(
+        db.freeze_part(&cf, "log", tempfile::tempdir().unwrap().path())
+            .is_err(),
+        "existing bottom files must keep their stamps until recompacted"
+    );
+
+    // The next compaction re-cuts the bottom on the new boundary.
+    db.compact(&cf).unwrap();
+    db.freeze_part(&cf, "log", tempfile::tempdir().unwrap().path())
+        .expect("log part is materialized by the post-add compaction");
+    db.freeze_part(&cf, "img", tempfile::tempdir().unwrap().path())
+        .expect("img part is untouched by the re-cut");
+
+    // All data still reads correctly across the re-partitioning.
+    for i in 0..5u32 {
+        assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), b"IMG");
+        assert_eq!(db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(), b"LOG");
+        assert_eq!(db.get(&cf, format!("etc/{i:03}").as_bytes()).unwrap(), b"ETC");
+    }
+    db.close().unwrap();
+}
+
+/// An exact-duplicate prefix is rejected with a clear `invalid_args` error;
+/// distinct (even nested) prefixes are accepted.
+#[test]
+fn add_partition_rule_rejects_exact_duplicate_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cfg = ColumnFamilyConfig {
+        partition_rules: vec![PartitionRule {
+            prefix: b"img/".to_vec(),
+            name: "img".into(),
+        }],
+        ..ColumnFamilyConfig::default()
+    };
+    let cf = db.create_column_family("default", cfg).unwrap();
+
+    // Same prefix as an existing rule (even under a different name) is rejected.
+    let err = db
+        .add_partition_rule(
+            &cf,
+            PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img2".into(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), "invalid_args");
+    assert!(
+        format!("{err}").contains("duplicate"),
+        "duplicate error must name the problem, got: {err}"
+    );
+
+    // A distinct nested prefix is accepted (longest-prefix-wins resolves it)...
+    db.add_partition_rule(
+        &cf,
+        PartitionRule {
+            prefix: b"img/thumb/".to_vec(),
+            name: "thumb".into(),
+        },
+    )
+    .unwrap();
+    // ...and re-adding that now-present prefix is itself a duplicate.
+    assert!(db
+        .add_partition_rule(
+            &cf,
+            PartitionRule {
+                prefix: b"img/thumb/".to_vec(),
+                name: "x".into(),
+            },
+        )
+        .is_err());
+    db.close().unwrap();
+}
+
+/// A live-added rule is persisted through the manifest rewrite and is still
+/// active after reopen (it rejects a duplicate and drives boundary cutting).
+#[test]
+fn added_partition_rule_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cfg = ColumnFamilyConfig {
+            partition_rules: vec![PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            }],
+            l1_file_count_trigger: 1,
+            ..ColumnFamilyConfig::default()
+        };
+        let cf = db.create_column_family("default", cfg).unwrap();
+        db.add_partition_rule(
+            &cf,
+            PartitionRule {
+                prefix: b"log/".to_vec(),
+                name: "log".into(),
+            },
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    // The persisted rule is active: re-adding it is a duplicate error.
+    assert!(
+        db.add_partition_rule(
+            &cf,
+            PartitionRule {
+                prefix: b"log/".to_vec(),
+                name: "log".into(),
+            },
+        )
+        .is_err(),
+        "log/ rule must survive reopen"
+    );
+    // And it drives boundary cutting on freshly written data.
+    materialize_parts(&db, &cf);
+    db.freeze_part(&cf, "log", tempfile::tempdir().unwrap().path())
+        .expect("reopened log/ rule cuts a log part");
+    db.freeze_part(&cf, "img", tempfile::tempdir().unwrap().path())
+        .expect("img part cut as well");
+    db.close().unwrap();
+}
+
+/// Concurrent adds are race-free: validation and the append happen under one
+/// lock, so a duplicate-prefix stampede yields exactly one winner, and distinct
+/// prefixes all land and persist.
+#[test]
+fn concurrent_add_partition_rule_is_race_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .unwrap();
+
+    let db_ref = &db;
+    let cf_ref = &cf;
+
+    // (a) Many threads racing to add the SAME prefix: exactly one may succeed.
+    let ok_count = std::sync::atomic::AtomicUsize::new(0);
+    let ok_ref = &ok_count;
+    std::thread::scope(|s| {
+        for _ in 0..16 {
+            s.spawn(move || {
+                let r = db_ref.add_partition_rule(
+                    cf_ref,
+                    PartitionRule {
+                        prefix: b"race/".to_vec(),
+                        name: "race".into(),
+                    },
+                );
+                if r.is_ok() {
+                    ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    assert_eq!(
+        ok_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "exactly one concurrent add of a duplicate prefix may win"
+    );
+
+    // (b) Many threads each adding a DISTINCT prefix: all succeed, none lost.
+    std::thread::scope(|s| {
+        for i in 0..16u32 {
+            s.spawn(move || {
+                db_ref
+                    .add_partition_rule(
+                        cf_ref,
+                        PartitionRule {
+                            prefix: format!("p{i:02}/").into_bytes(),
+                            name: format!("p{i}"),
+                        },
+                    )
+                    .unwrap();
+            });
+        }
+    });
+    // Every distinct prefix is present now (re-adding each is a duplicate).
+    for i in 0..16u32 {
+        assert!(
+            db.add_partition_rule(
+                &cf,
+                PartitionRule {
+                    prefix: format!("p{i:02}/").into_bytes(),
+                    name: "dup".into(),
+                },
+            )
+            .is_err(),
+            "p{i:02}/ must be present after the concurrent adds"
+        );
+    }
+
+    // The final rule set persists across reopen (manifest reflects every add).
+    db.close().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    for i in 0..16u32 {
+        assert!(
+            db.add_partition_rule(
+                &cf,
+                PartitionRule {
+                    prefix: format!("p{i:02}/").into_bytes(),
+                    name: "dup".into(),
+                },
+            )
+            .is_err(),
+            "p{i:02}/ must persist across reopen"
+        );
+    }
+    assert!(db
+        .add_partition_rule(
+            &cf,
+            PartitionRule {
+                prefix: b"race/".to_vec(),
+                name: "dup".into(),
+            },
+        )
+        .is_err());
+    db.close().unwrap();
+}
+
 #[test]
 fn detach_unknown_partition_errors() {
     let dir = tempfile::tempdir().unwrap();

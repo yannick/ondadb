@@ -15,7 +15,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::cache::BlockCache;
 use crate::comparator::ComparatorRef;
-use crate::config::ColumnFamilyConfig;
+use crate::config::{ColumnFamilyConfig, PartitionRule};
 use crate::error::{OndaError, Result};
 use crate::iterator::{ChildIter, Iterator};
 use crate::manifest::SstMeta;
@@ -133,6 +133,14 @@ pub struct ColumnFamily {
     id: u64,
     dir: String,
     pub(crate) opts: ColumnFamilyConfig,
+    /// Live partition rules — interior-mutable so [`crate::DB::add_partition_rule`]
+    /// can append to a *running* CF. Seeded from `opts.partition_rules` at
+    /// create/load; from then on this is the runtime authority for partitioning
+    /// (compaction and the manifest encode read it, never `opts.partition_rules`).
+    /// A compaction snapshots it once at the start of a run, so a rule added
+    /// mid-run only affects the *next* bottom compaction — write-side-only
+    /// semantics: existing bottom files keep the stamps they were cut with.
+    live_partition_rules: RwLock<Vec<PartitionRule>>,
     cmp: ComparatorRef,
 
     state: RwLock<CfState>,
@@ -227,12 +235,14 @@ impl ColumnFamily {
             w.set_poison(ctx.poison.clone());
             Some(Arc::new(w))
         };
+        let live_partition_rules = RwLock::new(opts.partition_rules.clone());
         let cf = Arc::new(ColumnFamily {
             ctx,
             id: crate::unified::cf_id(&name),
             name,
             dir,
             opts,
+            live_partition_rules,
             cmp,
             state: RwLock::new(CfState {
                 mem,
@@ -325,12 +335,14 @@ impl ColumnFamily {
             (Some(w), pend)
         };
 
+        let live_partition_rules = RwLock::new(opts.partition_rules.clone());
         let cf = Arc::new(ColumnFamily {
             ctx,
             id: crate::unified::cf_id(&name),
             name,
             dir,
             opts,
+            live_partition_rules,
             cmp,
             state: RwLock::new(CfState {
                 mem,
@@ -1088,8 +1100,53 @@ impl ColumnFamily {
         Ok(Arc::new(SstHandle { meta, reader }))
     }
 
-    pub(crate) fn config(&self) -> &ColumnFamilyConfig {
-        &self.opts
+    /// Snapshot the live partition rules. Compaction takes one snapshot per run
+    /// so a rule added mid-run cannot change that run's cut boundaries — it
+    /// takes effect on the next bottom compaction.
+    pub(crate) fn partition_rules_snapshot(&self) -> Vec<PartitionRule> {
+        self.live_partition_rules.read().clone()
+    }
+
+    /// The effective durable config: `opts` with its partition rules replaced by
+    /// the live set. Every path that (re)encodes the config for persistence —
+    /// `DbInner::persist_manifest`, `freeze_part`, CF copy/clear — goes through
+    /// this so a live-added rule round-trips across reopen.
+    pub(crate) fn effective_config(&self) -> ColumnFamilyConfig {
+        let mut cfg = self.opts.clone();
+        cfg.partition_rules = self.live_partition_rules.read().clone();
+        cfg
+    }
+
+    /// Append `rule` to the live partition rules after validating the resulting
+    /// set with the same check [`ColumnFamilyConfig::validate`] runs at create
+    /// time (an exact-duplicate prefix is rejected). Validation and the append
+    /// happen under one write-lock acquisition, so two concurrent adds serialize
+    /// and the second observes the first (rejecting a duplicate). In-memory only;
+    /// the caller persists the manifest.
+    pub(crate) fn append_partition_rule(&self, rule: PartitionRule) -> Result<()> {
+        let mut rules = self.live_partition_rules.write();
+        let mut candidate = self.opts.clone();
+        candidate.partition_rules = rules.clone();
+        candidate.partition_rules.push(rule.clone());
+        candidate.validate().map_err(OndaError::InvalidArgs)?;
+        rules.push(rule);
+        Ok(())
+    }
+
+    /// Remove the partition rule whose prefix exactly equals `prefix` from the
+    /// live set, returning [`OndaError::NotFound`] if none matches. In-memory
+    /// only; the caller persists the manifest. Symmetric with
+    /// [`append_partition_rule`](Self::append_partition_rule): write-side-only,
+    /// so already-materialized bottom parts keep their stamps until a later
+    /// compaction rewrites them.
+    pub(crate) fn remove_partition_rule(&self, prefix: &[u8]) -> Result<()> {
+        let mut rules = self.live_partition_rules.write();
+        let before = rules.len();
+        rules.retain(|r| r.prefix != prefix);
+        if rules.len() == before {
+            return Err(OndaError::NotFound);
+        }
+        Ok(())
     }
 
     // ---- part lifecycle support (used by parts.rs) ----
