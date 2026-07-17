@@ -51,7 +51,7 @@ pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn
 pub use comparator::{Comparator, ComparatorRef};
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
-    Options, PartitionRule, SyncMode, TierDef,
+    Options, PartitionRule, SyncMode, TierDef, TierRule,
 };
 pub use db::DB;
 pub use error::{OndaError, Result};

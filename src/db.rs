@@ -421,6 +421,12 @@ impl DB {
         }
 
         if !opts.read_only {
+            // Sweep tier-move orphans left by a crash mid-move (a copy on the
+            // target before the manifest flip, or a source after it). The
+            // manifest — now recovered — is the single source of truth for where
+            // each table lives; anything else is deleted. Runs before workers so
+            // no background move races the sweep.
+            sweep_move_orphans(&inner, &manifest);
             spawn_workers(&inner, flush_rx, compact_rx);
         }
         Ok(DB { inner })
@@ -612,6 +618,63 @@ impl DB {
     }
 }
 
+/// Delete storage-tier files orphaned by a crash mid-move. The recovered
+/// `manifest` records, per table id, the tier its files durably live on. A crash
+/// between the copy and the manifest flip leaves a copy on the *target* tier that
+/// the manifest still attributes to the source; a crash between the flip and the
+/// source delete leaves a copy on the *source* tier that the manifest now
+/// attributes to the target. In both cases a `<id>.klog`/`<id>.vlog` file sits in
+/// a tier directory that disagrees with the manifest's tier for that id — so we
+/// delete exactly those. Files whose id the manifest does not know (in-flight
+/// flush/compaction output, WALs) are left untouched; correctly-placed files
+/// match and are kept.
+fn sweep_move_orphans(inner: &Arc<DbInner>, manifest: &Manifest) {
+    // Candidate tier locations: the default tier (`None`) plus every configured
+    // named tier (the reserved "ssd" name aliases the default).
+    let mut locations: Vec<Option<String>> = vec![None];
+    for t in &inner.opts.tiers {
+        if t.name != "ssd" {
+            locations.push(Some(t.name.clone()));
+        }
+    }
+    for cfm in &manifest.cfs {
+        let mut tier_of: HashMap<u64, Option<String>> = HashMap::new();
+        for s in &cfm.sstables {
+            tier_of.insert(s.id, s.tier.clone());
+        }
+        for loc in &locations {
+            let dir = inner.ctx.tiers.cf_dir(loc.as_deref(), &cfm.name);
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue, // tier dir may not exist yet — nothing to sweep
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname = fname.to_string_lossy();
+                let Some(id) = parse_sst_file_id(&fname) else {
+                    continue; // not an <id>.klog/.vlog (e.g. a WAL or subdir)
+                };
+                // Delete only when the manifest knows this id but places it on a
+                // different tier than the directory we found it in.
+                if let Some(manifest_tier) = tier_of.get(&id) {
+                    if manifest_tier.as_deref() != loc.as_deref() {
+                        let _ = std::fs::remove_file(format!("{dir}/{fname}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse the table id from an SSTable file name (`<id>.klog` or `<id>.vlog`),
+/// or `None` for anything else.
+fn parse_sst_file_id(name: &str) -> Option<u64> {
+    let stem = name
+        .strip_suffix(".klog")
+        .or_else(|| name.strip_suffix(".vlog"))?;
+    stem.parse::<u64>().ok()
+}
+
 /// Acquire the advisory lock on `<dir>/LOCK` (exclusive unless `read_only`).
 fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
     use std::fs::TryLockError;
@@ -760,6 +823,11 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
 }
 
 fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<AtomicBool>) {
+    // The part mover shares this worker: between compaction jobs, once per
+    // `part_mover_interval`, run a mover pass (a cheap no-op unless some CF has
+    // tier rules and an aged, mis-placed part). ZERO disables the scheduled pass.
+    let mover_interval = db.opts.part_mover_interval;
+    let mut last_mover = std::time::Instant::now();
     loop {
         match rx.recv_timeout(WORKER_TICK) {
             Ok(cf) => {
@@ -771,6 +839,13 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+        if !mover_interval.is_zero()
+            && !db.closing.load(Ordering::Relaxed)
+            && last_mover.elapsed() >= mover_interval
+        {
+            last_mover = std::time::Instant::now();
+            let _ = db.run_part_mover();
         }
     }
 }

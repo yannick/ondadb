@@ -203,6 +203,10 @@ impl DB {
                 } else {
                     None
                 };
+                // The attached data is being brought in now; give it a defined
+                // age so the mover treats it as freshly written (it must age
+                // `min_age` again before qualifying for a tier move).
+                meta.max_entry_time = Some(crate::util::now_nanos());
                 staged.push((Arc::new(SstHandle { meta, reader }), at_bottom));
             }
             Ok(())
@@ -300,10 +304,45 @@ impl DB {
         partition: &str,
         tier: &str,
     ) -> Result<()> {
-        if self.inner.opts.read_only {
+        self.inner.relocate_part(cf, partition, tier)
+    }
+
+    /// Run one full pass of the background part mover across every column family
+    /// and return the number of parts relocated.
+    ///
+    /// For each bottom-level part the mover resolves the target tier from the
+    /// CF's [`tier_rules`](crate::ColumnFamilyConfig::tier_rules) (longest prefix
+    /// wins) and moves the part there when it is not already on that tier and its
+    /// newest entry is older than the rule's
+    /// [`min_age`](crate::config::TierRule::min_age). Each move uses the same
+    /// crash-safe copy → fsync → manifest-flip → delete protocol as
+    /// [`move_part_to_tier`](Self::move_part_to_tier) and is idempotent: a
+    /// re-run once a part is placed is a no-op.
+    ///
+    /// This is the manual trigger (used by tests and callers that want a mover
+    /// pass on demand); the same pass also runs on a background cadence
+    /// ([`Options::part_mover_interval`](crate::Options::part_mover_interval))
+    /// on the compaction worker.
+    pub fn run_part_mover(&self) -> Result<usize> {
+        self.inner.run_part_mover()
+    }
+}
+
+impl crate::db::DbInner {
+    /// The crash-safe cross-tier part move (the mover protocol, §10 of the parts
+    /// & tiers plan). Shared by the manual
+    /// [`DB::move_part_to_tier`](crate::DB::move_part_to_tier) lever and the
+    /// policy-driven [`run_part_mover`](Self::run_part_mover).
+    pub(crate) fn relocate_part(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        partition: &str,
+        tier: &str,
+    ) -> Result<()> {
+        if self.opts.read_only {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
-        self.inner.poison.check()?;
+        self.poison.check()?;
         if !cf.tiers().is_known(Some(tier)) {
             return Err(OndaError::InvalidArgs(format!("unknown tier {tier:?}")));
         }
@@ -341,7 +380,7 @@ impl DB {
         // Flip: swap the handles in memory, then persist the manifest (the
         // durable commit point that records tier=<tier> for these ids).
         cf.swap_bottom_tables(new_handles);
-        self.inner.persist_manifest()?;
+        self.persist_manifest()?;
 
         // Delete the now-obsolete source files (default-tier copies). Crash
         // before this leaves harmless orphans on the source tier; the manifest
@@ -350,14 +389,74 @@ impl DB {
             h.reader.close();
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
-            self.inner.remove_sst_file(&src_klog);
+            self.remove_sst_file(&src_klog);
             if Path::new(&src_vlog).exists() {
-                self.inner.remove_sst_file(&src_vlog);
+                self.remove_sst_file(&src_vlog);
             }
         }
         Ok(())
     }
 
+    /// One full pass of the part mover; see
+    /// [`DB::run_part_mover`](crate::DB::run_part_mover).
+    pub(crate) fn run_part_mover(&self) -> Result<usize> {
+        if self.opts.read_only {
+            return Ok(0);
+        }
+        self.poison.check()?;
+        let cfs: Vec<Arc<ColumnFamily>> = self.cfs.read().values().cloned().collect();
+        let now = crate::util::now_nanos();
+        let mut moved = 0usize;
+        for cf in &cfs {
+            let rules = cf.tier_rules();
+            if rules.is_empty() {
+                continue;
+            }
+            // Snapshot the bottom-level parts once, then act on each: the
+            // relocate below re-snapshots the part's handles under the CF's
+            // compaction lock, so a concurrent compaction between snapshot and
+            // move can only make a part vanish (relocate then finds nothing and
+            // is a no-op), never move stale data.
+            for part in cf.bottom_parts() {
+                let Some(rule) = crate::config::tier_for_key(rules, &part.min_key) else {
+                    continue;
+                };
+                // The reserved name "ssd" denotes the default tier (`None`).
+                let target: Option<&str> = if rule.tier == "ssd" {
+                    None
+                } else {
+                    Some(rule.tier.as_str())
+                };
+                // Already on the target tier → nothing to do (idempotent).
+                if target == part.tier.as_deref() {
+                    continue;
+                }
+                // P4 relocates onto named local tiers only; moving a part back to
+                // the default tier is out of scope (there is no copy target).
+                let Some(target) = target else { continue };
+                // Age gate: only move once the part's newest entry is older than
+                // the rule's min_age. An unknown age (`None`) is never eligible.
+                let Some(newest) = part.max_entry_time else {
+                    continue;
+                };
+                if now.saturating_sub(newest) <= rule.min_age.as_nanos() as i64 {
+                    continue;
+                }
+                match self.relocate_part(cf, &part.partition, target) {
+                    Ok(()) => moved += 1,
+                    // A part that vanished (compacted/detached) between snapshot
+                    // and move is a benign miss; a genuine durability failure has
+                    // already poisoned the DB via persist_manifest.
+                    Err(OndaError::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(moved)
+    }
+}
+
+impl DB {
     /// Add a partition rule to a **live** column family, carving out a new named
     /// partition of the keyspace (see
     /// [`ColumnFamilyConfig::partition_rules`](crate::ColumnFamilyConfig::partition_rules)).

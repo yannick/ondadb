@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ondadb::{ColumnFamily, ColumnFamilyConfig, Options, PartitionRule, TierDef, DB};
+use ondadb::{ColumnFamily, ColumnFamilyConfig, Options, PartitionRule, TierDef, TierRule, DB};
 
 /// A CF configured so that `img/` and `log/` keys form their own bottom-level
 /// parts (compaction cuts bottom files at partition boundaries).
@@ -542,5 +542,270 @@ fn detach_unknown_partition_errors() {
         db.detach_part(&cf, "nope").is_err(),
         "detaching a partition with no bottom tables must error"
     );
+    db.close().unwrap();
+}
+
+// ---- P4: tier rules + background part mover --------------------------------
+
+/// A `parts_cfg` extended with tier rules: `img/` moves to `hdd` as soon as the
+/// part has any measurable age (`min_age = 0`), while `log/` targets `hdd` only
+/// after an hour — so a freshly written `log/` part must stay put.
+fn mover_cfg() -> ColumnFamilyConfig {
+    ColumnFamilyConfig {
+        tier_rules: vec![
+            TierRule {
+                prefix: b"img/".to_vec(),
+                tier: "hdd".into(),
+                min_age: Duration::ZERO,
+            },
+            TierRule {
+                prefix: b"log/".to_vec(),
+                tier: "hdd".into(),
+                min_age: Duration::from_secs(3600),
+            },
+        ],
+        ..parts_cfg()
+    }
+}
+
+/// Count `<id>.klog` files directly under a tier's `cf-default` directory.
+fn klog_count(tier_root: &str) -> usize {
+    let dir = std::path::Path::new(tier_root).join("cf-default");
+    match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "klog"))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Every `<id>.klog`/`<id>.vlog` file directly under a tier's `cf-default` dir.
+fn part_files(tier_root: &str) -> Vec<std::path::PathBuf> {
+    let dir = std::path::Path::new(tier_root).join("cf-default");
+    match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x == "klog" || x == "vlog")
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn part_mover_moves_aged_part_but_not_young_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    // Second local tier, no-mmap, so reads exercise the buffered path.
+    opts.tiers = vec![TierDef::new("hdd", hdd_root.clone()).without_mmap()];
+    // Disable the scheduled cadence: this test drives the mover explicitly.
+    opts.part_mover_interval = Duration::ZERO;
+
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", mover_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+
+        // img/ (min_age 0) is eligible; log/ (min_age 1h) is far too young.
+        let moved = db.run_part_mover().unwrap();
+        assert_eq!(moved, 1, "only the img/ part should move");
+
+        // The img part now lives on hdd; log/ and the default part stay on ssd.
+        assert_eq!(klog_count(&hdd_root), 1, "img klog must be on hdd");
+
+        // Reads are correct after the move: img through the no-mmap hdd tier,
+        // everything else from the default tier.
+        for i in 0..5u32 {
+            assert_eq!(
+                db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+                b"IMG"
+            );
+            assert_eq!(
+                db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(),
+                b"LOG"
+            );
+            assert_eq!(
+                db.get(&cf, format!("etc/{i:03}").as_bytes()).unwrap(),
+                b"ETC"
+            );
+        }
+
+        // Idempotent: a second pass places nothing new (img already on hdd, log
+        // still too young).
+        assert_eq!(db.run_part_mover().unwrap(), 0, "re-run must be a no-op");
+        db.close().unwrap();
+    }
+
+    // The tier assignment is durable: reopen reads img back from hdd.
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(klog_count(&hdd_root), 1, "img part persists on hdd");
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+        assert_eq!(
+            db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(),
+            b"LOG"
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn startup_sweeps_orphan_copy_left_on_target_by_crash_before_flip() {
+    // Simulate a crash between the mover's copy and its manifest flip: files are
+    // copied onto the target tier but the manifest still attributes them to the
+    // source. On reopen the startup sweep must delete every such target orphan,
+    // and the data must still read from the untouched source.
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let ssd_root = dir.path().to_str().unwrap().to_string();
+
+    let mut opts = Options::new(&ssd_root);
+    opts.tiers = vec![TierDef::new("hdd", hdd_root.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        db.close().unwrap();
+    }
+
+    // Mimic the mover's pre-flip copy: replicate the ssd part files onto hdd
+    // without touching the manifest (the crash lands before the flip).
+    let hdd_cf = std::path::Path::new(&hdd_root).join("cf-default");
+    std::fs::create_dir_all(&hdd_cf).unwrap();
+    for src in part_files(&ssd_root) {
+        let dst = hdd_cf.join(src.file_name().unwrap());
+        std::fs::copy(&src, &dst).unwrap();
+    }
+    assert!(klog_count(&hdd_root) > 0, "orphan copies planted on hdd");
+
+    // Reopen: the manifest says every table is on ssd, so all hdd copies are
+    // orphans and get swept.
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(
+        klog_count(&hdd_root),
+        0,
+        "startup GC must delete the target-tier orphans"
+    );
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+        assert_eq!(
+            db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(),
+            b"LOG"
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn startup_sweeps_orphan_source_left_by_crash_after_flip() {
+    // Simulate a crash between the mover's manifest flip and its source delete:
+    // the manifest already says the part is on hdd, but a stale copy lingers on
+    // ssd. On reopen the sweep must delete the ssd orphan (its id is on hdd per
+    // the manifest) while leaving legitimately-ssd files (log/, default) intact.
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let ssd_root = dir.path().to_str().unwrap().to_string();
+
+    let mut opts = Options::new(&ssd_root);
+    opts.tiers = vec![TierDef::new("hdd", hdd_root.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        // A real, complete move: manifest now says img is on hdd, ssd copies gone.
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+
+        // Recreate the ssd orphan the crash would have left: copy img's hdd files
+        // (the img part's ids) back into the ssd cf-dir.
+        let ssd_cf = std::path::Path::new(&ssd_root).join("cf-default");
+        for src in part_files(&hdd_root) {
+            let dst = ssd_cf.join(src.file_name().unwrap());
+            std::fs::copy(&src, &dst).unwrap();
+        }
+        db.close().unwrap();
+    }
+
+    let ssd_before = klog_count(&ssd_root);
+    // Reopen: the img orphan on ssd (id now attributed to hdd) is swept; the
+    // remaining ssd parts (log/, default) survive.
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert!(
+        klog_count(&ssd_root) < ssd_before,
+        "the ssd source orphan must be swept"
+    );
+    assert_eq!(klog_count(&hdd_root), 1, "the real img part stays on hdd");
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+        assert_eq!(
+            db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(),
+            b"LOG"
+        );
+        assert_eq!(
+            db.get(&cf, format!("etc/{i:03}").as_bytes()).unwrap(),
+            b"ETC"
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn tier_rules_survive_reopen_and_drive_mover_after_restart() {
+    // tier_rules are persisted with the CF config, so a mover pass after reopen
+    // still relocates an eligible part with no re-configuration.
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::new("hdd", hdd_root.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", mover_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        db.close().unwrap();
+    }
+
+    // No rules re-supplied here — they must come back from the manifest.
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(
+        db.run_part_mover().unwrap(),
+        1,
+        "reopened CF's persisted tier_rules must still drive the mover"
+    );
+    assert_eq!(klog_count(&hdd_root), 1);
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+    }
     db.close().unwrap();
 }

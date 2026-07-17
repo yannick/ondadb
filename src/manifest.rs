@@ -44,6 +44,15 @@ pub struct SstMeta {
     /// WAL and upper levels always live on the default tier. Old manifests
     /// (written before tiering) decode every table to `None`.
     pub tier: Option<String>,
+    /// Wall-clock time (nanoseconds since the Unix epoch) of the newest entry in
+    /// this table, stamped approximately by the writer: flush/ingest output takes
+    /// the write time, and compaction carries forward the maximum over its
+    /// inputs so re-compacting cold data does not make it look freshly written.
+    /// Drives the age gate of the part mover
+    /// ([`TierRule::min_age`](crate::config::TierRule::min_age)). `None` means
+    /// the age is unknown (a legacy manifest, or a table whose lineage never
+    /// carried a timestamp); the mover treats an unknown age as ineligible.
+    pub max_entry_time: Option<i64>,
 }
 
 /// Persisted state of one column family.
@@ -141,21 +150,20 @@ impl Manifest {
         // breaking older readers; instead they live here at the end of the body
         // (still inside the CRC).
         //
-        // The tail holds up to two sections, each a per-CF `(count,
-        // (table_index uvarint, name bytes)...)` list mirroring the nested
-        // CF→table shape of the body:
-        //   1. the partition section, and
-        //   2. the tier section (added after partitions; P1 manifests have none).
+        // The tail holds up to three positional sections, each a per-CF `(count,
+        // (table_index uvarint, payload)...)` list mirroring the nested CF→table
+        // shape of the body:
+        //   1. the partition section  (name payload),
+        //   2. the tier section       (name payload; added after partitions), and
+        //   3. the max-entry-time section (uvarint payload; added after tiers).
         //
-        // Emission rules keep every earlier on-disk format byte-identical:
-        //   - no partitions and no tiers  -> no tail at all (legacy layout).
-        //   - any partition, no tier      -> partition section only (P1 layout).
-        //   - any tier                    -> partition section (possibly all
-        //                                    empty) followed by the tier section.
-        // Because the tier section is emitted only when the partition section
-        // precedes it, `decode` can read them positionally: the first tail bytes
-        // are always a full partition section, and any bytes remaining after it
-        // are the tier section.
+        // Emission rules keep every earlier on-disk format byte-identical and let
+        // `decode` read the sections positionally (a later section is emitted only
+        // when all earlier ones precede it, even if those are all-empty):
+        //   - nothing set                 -> no tail at all (legacy layout).
+        //   - only partitions             -> partition section only (P1 layout).
+        //   - tiers, no times             -> partition + tier sections (P3 layout).
+        //   - any max_entry_time          -> partition + tier + time sections.
         let has_part = self
             .cfs
             .iter()
@@ -164,11 +172,18 @@ impl Manifest {
             .cfs
             .iter()
             .any(|cf| cf.sstables.iter().any(|s| s.tier.is_some()));
-        if has_part || has_tier {
+        let has_time = self
+            .cfs
+            .iter()
+            .any(|cf| cf.sstables.iter().any(|s| s.max_entry_time.is_some()));
+        if has_part || has_tier || has_time {
             encode_name_section(&mut b, &self.cfs, |s| s.partition.as_deref());
         }
-        if has_tier {
+        if has_tier || has_time {
             encode_name_section(&mut b, &self.cfs, |s| s.tier.as_deref());
+        }
+        if has_time {
+            encode_u64_section(&mut b, &self.cfs, |s| s.max_entry_time.map(|t| t as u64));
         }
         let crc = checksum(&b);
         append_u32(&mut b, crc);
@@ -238,6 +253,7 @@ impl Manifest {
                     // Filled from the append-tolerant tail after the CF loop.
                     partition: None,
                     tier: None,
+                    max_entry_time: None,
                 });
             }
             cfs.push(CfManifest {
@@ -246,16 +262,20 @@ impl Manifest {
                 sstables,
             });
         }
-        // Append-tolerant tail (see `encode`). The first section, if present, is
-        // always the partition section; any bytes remaining after it are the
-        // tier section. Manifests written before partitioning have no tail, so
-        // `p` is already exhausted and both fields stay `None`; P1 manifests have
-        // only the partition section.
+        // Append-tolerant tail (see `encode`), read positionally: the first
+        // section is always the partition section, the second (if present) the
+        // tier section, the third (if present) the max-entry-time section. A
+        // section is only ever present when all earlier ones precede it, so this
+        // fixed order is unambiguous. Older manifests stop short and leave the
+        // corresponding fields `None`.
         if !p.is_empty() {
             p = decode_name_section(p, &mut cfs, |sst, name| sst.partition = Some(name))?;
         }
         if !p.is_empty() {
             p = decode_name_section(p, &mut cfs, |sst, name| sst.tier = Some(name))?;
+        }
+        if !p.is_empty() {
+            p = decode_u64_section(p, &mut cfs, |sst, v| sst.max_entry_time = Some(v as i64))?;
         }
         let _ = p;
         Ok(Manifest {
@@ -311,6 +331,53 @@ fn decode_name_section<'a>(
     Ok(p)
 }
 
+/// Encode one tail section whose per-table payload is a `u64`: for each CF in
+/// order, a uvarint count of tables carrying a value (as selected by `pick`),
+/// then `(table_index, value)` uvarint pairs. Mirrors [`encode_name_section`]
+/// with a numeric payload in place of a byte string.
+fn encode_u64_section(
+    b: &mut Vec<u8>,
+    cfs: &[CfManifest],
+    pick: impl Fn(&SstMeta) -> Option<u64>,
+) {
+    for cf in cfs {
+        let valued: Vec<(usize, u64)> = cf
+            .sstables
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| pick(s).map(|v| (i, v)))
+            .collect();
+        append_uvarint(b, valued.len() as u64);
+        for (i, v) in valued {
+            append_uvarint(b, i as u64);
+            append_uvarint(b, v);
+        }
+    }
+}
+
+/// Decode one tail section written by [`encode_u64_section`], invoking `set`
+/// for each `(table, value)` pair. Returns the unconsumed remainder.
+fn decode_u64_section<'a>(
+    mut p: &'a [u8],
+    cfs: &mut [CfManifest],
+    set: impl Fn(&mut SstMeta, u64),
+) -> Result<&'a [u8]> {
+    let bad = || OndaError::Corruption("manifest: corrupt or invalid".into());
+    for cf in cfs.iter_mut() {
+        let (count, n) = uvarint(p).ok_or_else(bad)?;
+        p = &p[n..];
+        for _ in 0..count {
+            let (idx, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let (val, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let sst = cf.sstables.get_mut(idx as usize).ok_or_else(bad)?;
+            set(sst, val);
+        }
+    }
+    Ok(p)
+}
+
 fn append_bytes(dst: &mut Vec<u8>, b: &[u8]) {
     append_uvarint(dst, b.len() as u64);
     dst.extend_from_slice(b);
@@ -350,6 +417,7 @@ mod tests {
                         max_key: b"zzz".to_vec(),
                         partition: None,
                         tier: None,
+                        max_entry_time: None,
                     },
                     SstMeta {
                         id: 2,
@@ -363,6 +431,7 @@ mod tests {
                         max_key: b"mmm".to_vec(),
                         partition: Some("img".into()),
                         tier: None,
+                        max_entry_time: None,
                     },
                 ],
             }],
@@ -475,6 +544,52 @@ mod tests {
         let d = Manifest::decode(&m.encode()).unwrap();
         assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
         assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
+    }
+
+    #[test]
+    fn max_entry_time_survives_round_trip_alongside_partition_and_tier() {
+        let mut m = sample();
+        m.cfs[0].sstables[0].max_entry_time = Some(1_700_000_000_000_000_000);
+        m.cfs[0].sstables[1].tier = Some("hdd".into());
+        m.cfs[0].sstables[1].max_entry_time = Some(1_650_000_000_000_000_000);
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(
+            d.cfs[0].sstables[0].max_entry_time,
+            Some(1_700_000_000_000_000_000)
+        );
+        assert_eq!(d.cfs[0].sstables[0].tier, None);
+        assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
+        assert_eq!(d.cfs[0].sstables[1].tier.as_deref(), Some("hdd"));
+        assert_eq!(
+            d.cfs[0].sstables[1].max_entry_time,
+            Some(1_650_000_000_000_000_000)
+        );
+    }
+
+    #[test]
+    fn max_entry_time_without_partition_or_tier_round_trips() {
+        // A table may carry only a max_entry_time (freshly flushed, never
+        // partitioned or moved): the encoder emits all-empty partition and tier
+        // sections ahead of the time section, and the decoder reads the time back
+        // while leaving partition/tier None.
+        let mut m = sample();
+        for s in &mut m.cfs[0].sstables {
+            s.partition = None;
+        }
+        m.cfs[0].sstables[0].max_entry_time = Some(42);
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+        assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
+        assert_eq!(d.cfs[0].sstables[0].max_entry_time, Some(42));
+        assert_eq!(d.cfs[0].sstables[1].max_entry_time, None);
+    }
+
+    #[test]
+    fn p3_manifest_without_time_section_decodes_time_to_none() {
+        // The sample tags a partition but no times; decoding under the
+        // time-aware format must leave every max_entry_time None.
+        let d = Manifest::decode(&sample().encode()).unwrap();
+        assert!(d.cfs[0].sstables.iter().all(|s| s.max_entry_time.is_none()));
     }
 
     #[test]

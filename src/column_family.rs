@@ -587,7 +587,11 @@ impl ColumnFamily {
     ) -> Result<Arc<SstHandle>> {
         // Flush/ingest output always lands on the default tier (L0), so
         // `meta.tier` is None and `open_reader_for` resolves the default path.
-        let meta = w.finish()?.to_sst_meta(file_id, 0);
+        let mut meta = w.finish()?.to_sst_meta(file_id, 0);
+        // Stamp the write time as the table's max entry age: flush/ingest output
+        // holds freshly committed data, so the file's finish time approximates
+        // the newest entry's commit time (see `SstMeta::max_entry_time`).
+        meta.max_entry_time = Some(now_nanos());
         let reader = self.open_reader_for(&meta)?;
         Ok(Arc::new(SstHandle { meta, reader }))
     }
@@ -1229,6 +1233,73 @@ impl ColumnFamily {
     pub(crate) fn tiers(&self) -> &Arc<TierRegistry> {
         &self.ctx.tiers
     }
+
+    /// This CF's storage-tier placement rules (see
+    /// [`ColumnFamilyConfig::tier_rules`]). Unlike partition rules these are not
+    /// live-mutable, so the durable `opts` copy is authoritative.
+    pub(crate) fn tier_rules(&self) -> &[crate::config::TierRule] {
+        &self.opts.tier_rules
+    }
+
+    /// Summarize the bottom-level parts (one per distinct partition name) for the
+    /// part mover: each part's smallest key, its current tier, and the age of its
+    /// newest entry. A part whose tables straddle more than one tier (only
+    /// possible after an interrupted move, before startup GC runs) is skipped so
+    /// the mover never acts on an inconsistent set. `max_entry_time` is the max
+    /// over the part's tables, or `None` if any table lacks a stamp (unknown age
+    /// is conservatively ineligible). The implicit default partition (`None`) is
+    /// not a mover part and is omitted.
+    pub(crate) fn bottom_parts(&self) -> Vec<BottomPart> {
+        let s = self.state.read();
+        let Some(bottom) = s.levels.last() else {
+            return Vec::new();
+        };
+        let mut groups: std::collections::HashMap<&str, Vec<&Arc<SstHandle>>> =
+            std::collections::HashMap::new();
+        for h in bottom {
+            if let Some(p) = h.meta.partition.as_deref() {
+                groups.entry(p).or_default().push(h);
+            }
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for (name, hs) in groups {
+            let tier = hs[0].meta.tier.clone();
+            if !hs.iter().all(|h| h.meta.tier == tier) {
+                continue; // straddles tiers — leave for startup GC / next pass
+            }
+            let min_key = hs
+                .iter()
+                .map(|h| &h.meta.min_key)
+                .min_by(|a, b| self.cmp.compare(a, b))
+                .expect("group is non-empty")
+                .clone();
+            let max_entry_time = if hs.iter().all(|h| h.meta.max_entry_time.is_some()) {
+                hs.iter().filter_map(|h| h.meta.max_entry_time).max()
+            } else {
+                None
+            };
+            out.push(BottomPart {
+                partition: name.to_string(),
+                min_key,
+                tier,
+                max_entry_time,
+            });
+        }
+        out
+    }
+}
+
+/// One bottom-level part as seen by the mover (see
+/// [`ColumnFamily::bottom_parts`]).
+pub(crate) struct BottomPart {
+    /// Partition name (the mover moves whole named partitions).
+    pub partition: String,
+    /// Smallest user key in the part (used to resolve its tier rule).
+    pub min_key: Vec<u8>,
+    /// Tier the part currently lives on (`None` = the default tier).
+    pub tier: Option<String>,
+    /// Age of the part's newest entry, or `None` if unknown.
+    pub max_entry_time: Option<i64>,
 }
 
 fn existing_wal_gens(dir: &str) -> Result<Vec<u64>> {

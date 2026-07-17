@@ -163,6 +163,13 @@ pub struct Options {
     /// [`TierDef`]. (The keyspace→tier policy and the background mover are a
     /// later milestone; this release ships the storage substrate.)
     pub tiers: Vec<TierDef>,
+    /// How often the background part mover scans for bottom-level parts to
+    /// relocate per their column family's
+    /// [`tier_rules`](ColumnFamilyConfig::tier_rules). The pass runs on the
+    /// compaction worker. `Duration::ZERO` disables the scheduled pass entirely
+    /// (a manual [`DB::run_part_mover`](crate::DB::run_part_mover) still works).
+    /// Defaults to 30s; the pass is a cheap no-op when no CF has tier rules.
+    pub part_mover_interval: Duration,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -229,6 +236,7 @@ impl Default for Options {
             unified_memtable_sync_mode: SyncMode::None,
             unified_memtable_sync_interval: Duration::from_micros(128_000),
             tiers: Vec::new(),
+            part_mover_interval: Duration::from_secs(30),
         }
     }
 }
@@ -270,6 +278,21 @@ pub struct ColumnFamilyConfig {
     /// only affects files written afterward; existing files keep whatever
     /// partition they were cut into.
     pub partition_rules: Vec<PartitionRule>,
+    /// Prefix rules that pin a partition's bottom-level part to a storage
+    /// **tier** (see [`TierDef`]). The **longest** matching prefix wins, exactly
+    /// like [`partition_rules`](Self::partition_rules) and
+    /// [`compression_rules`](Self::compression_rules); a part matching no rule
+    /// stays on the tier it was written to (the default `"ssd"` tier).
+    ///
+    /// The background **part mover** (`DB::run_part_mover`, and a scheduled
+    /// cadence) reads these: for each bottom-level part it resolves the target
+    /// tier by the part's key prefix and, once the part's newest entry is older
+    /// than [`TierRule::min_age`], relocates the part there (copy → fsync →
+    /// one-record manifest flip → delete source). Purely a placement policy —
+    /// changing the rules only affects where the mover *next* places a part;
+    /// data already on a tier is not rewritten until it qualifies for a move.
+    /// Exact-duplicate prefixes are rejected by [`validate`](Self::validate).
+    pub tier_rules: Vec<TierRule>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
     pub enable_block_indexes: bool,
@@ -309,6 +332,7 @@ impl Default for ColumnFamilyConfig {
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
             partition_rules: Vec::new(),
+            tier_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
             enable_block_indexes: true,
@@ -376,6 +400,30 @@ pub(crate) fn partition_of<'a>(rules: &'a [PartitionRule], user_key: &[u8]) -> O
         .map(|r| r.name.as_str())
 }
 
+/// One prefix → storage-tier rule (see
+/// [`ColumnFamilyConfig::tier_rules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierRule {
+    /// A part is targeted by this rule when its keys start with this prefix.
+    pub prefix: Vec<u8>,
+    /// Target tier name (a [`TierDef::name`], or the reserved `"ssd"` for the
+    /// default tier).
+    pub tier: String,
+    /// Move a part only once its newest entry
+    /// ([`SstMeta::max_entry_time`](crate::manifest::SstMeta::max_entry_time)) is
+    /// older than this — a part whose freshest data is younger stays put.
+    pub min_age: Duration,
+}
+
+/// Resolve `user_key` to a tier rule: longest matching prefix wins. `None` when
+/// no rule matches (the part keeps its current tier).
+pub(crate) fn tier_for_key<'a>(rules: &'a [TierRule], user_key: &[u8]) -> Option<&'a TierRule> {
+    rules
+        .iter()
+        .filter(|r| user_key.starts_with(&r.prefix))
+        .max_by_key(|r| r.prefix.len())
+}
+
 impl ColumnFamilyConfig {
     /// Compression algorithm for SSTables written at `level` (see
     /// `compression_per_level`).
@@ -401,6 +449,12 @@ impl ColumnFamilyConfig {
         partition_of(&self.partition_rules, user_key)
     }
 
+    /// The [`TierRule`] governing `user_key`: the longest matching entry in
+    /// [`tier_rules`](Self::tier_rules), or `None` if no rule applies.
+    pub fn tier_for_key(&self, user_key: &[u8]) -> Option<&TierRule> {
+        tier_for_key(&self.tier_rules, user_key)
+    }
+
     /// Reject structurally invalid configuration. Currently: exact-duplicate
     /// partition prefixes (two rules with the same `prefix`). Nested prefixes
     /// are legal — longest-prefix-wins resolves them deterministically — so
@@ -415,6 +469,20 @@ impl ColumnFamilyConfig {
                         String::from_utf8_lossy(&a.prefix),
                         a.name,
                         b.name
+                    ));
+                }
+            }
+        }
+        // Two tier rules with the same prefix would make longest-prefix
+        // resolution order-dependent (like duplicate partition prefixes above).
+        for (i, a) in self.tier_rules.iter().enumerate() {
+            for b in &self.tier_rules[i + 1..] {
+                if a.prefix == b.prefix {
+                    return Err(format!(
+                        "duplicate tier prefix {:?} (tiers {:?} and {:?})",
+                        String::from_utf8_lossy(&a.prefix),
+                        a.tier,
+                        b.tier
                     ));
                 }
             }
@@ -465,6 +533,17 @@ impl ColumnFamilyConfig {
             b.extend_from_slice(&r.prefix);
             append_uvarint(&mut b, r.name.len() as u64);
             b.extend_from_slice(r.name.as_bytes());
+        }
+        // Appended tail (same backward/forward-compatible scheme): storage-tier
+        // rules. An older manifest ends before this count byte, so `decode_into`
+        // returns via `?` and leaves `tier_rules` empty.
+        b.push(self.tier_rules.len().min(255) as u8);
+        for r in self.tier_rules.iter().take(255) {
+            append_uvarint(&mut b, r.prefix.len() as u64);
+            b.extend_from_slice(&r.prefix);
+            append_uvarint(&mut b, r.tier.len() as u64);
+            b.extend_from_slice(r.tier.as_bytes());
+            append_u64(&mut b, r.min_age.as_micros() as u64);
         }
         b
     }
@@ -580,6 +659,35 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         parts.push(PartitionRule { prefix, name });
     }
     cfg.partition_rules = parts;
+    // Appended-tail tier rules; an older manifest ends above and keeps the
+    // default (empty) list.
+    let n_tiers = byte(&mut p)?;
+    let mut tiers = Vec::with_capacity(n_tiers as usize);
+    for _ in 0..n_tiers {
+        let (plen, n) = uvarint(p)?;
+        p = &p[n..];
+        let plen = plen as usize;
+        if p.len() < plen {
+            return None;
+        }
+        let prefix = p[..plen].to_vec();
+        p = &p[plen..];
+        let (tlen, n) = uvarint(p)?;
+        p = &p[n..];
+        let tlen = tlen as usize;
+        if p.len() < tlen {
+            return None;
+        }
+        let tier = String::from_utf8_lossy(&p[..tlen]).into_owned();
+        p = &p[tlen..];
+        let min_age = std::time::Duration::from_micros(u64v(&mut p)?);
+        tiers.push(TierRule {
+            prefix,
+            tier,
+            min_age,
+        });
+    }
+    cfg.tier_rules = tiers;
     Some(())
 }
 
@@ -695,20 +803,112 @@ mod tests {
 
     #[test]
     fn legacy_config_without_partition_tail_decodes_to_empty() {
-        // A config encoded before partition_rules existed ends right after the
-        // compression_rules section: truncate the 1-byte partition-count tail
-        // and confirm the decoder falls back to an empty list.
+        // A config encoded before partition_rules / tier_rules existed ends right
+        // after the compression_rules section. The encoding now appends a 1-byte
+        // partition-count then a 1-byte tier-count; dropping both trailing count
+        // bytes simulates that older, shorter blob and both lists fall back empty.
         let c = ColumnFamilyConfig {
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        // The final byte is the partition-rule count (0 here); dropping it
-        // simulates an older, shorter blob.
-        let legacy = &full[..full.len() - 1];
+        let legacy = &full[..full.len() - 2];
         let d = ColumnFamilyConfig::decode(legacy);
         assert_eq!(d.comparator_name, "uint64");
         assert!(d.partition_rules.is_empty());
+        assert!(d.tier_rules.is_empty());
+    }
+
+    #[test]
+    fn tier_rules_survive_manifest_round_trip() {
+        let c = ColumnFamilyConfig {
+            tier_rules: vec![
+                TierRule {
+                    prefix: b"img/".to_vec(),
+                    tier: "hdd".into(),
+                    min_age: Duration::from_secs(30 * 24 * 3600),
+                },
+                TierRule {
+                    prefix: b"log/".to_vec(),
+                    tier: "cold".into(),
+                    min_age: Duration::from_secs(3600),
+                },
+            ],
+            // Coexists with partition_rules (both are appended tails).
+            partition_rules: vec![PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.tier_rules, c.tier_rules);
+        assert_eq!(d.partition_rules, c.partition_rules);
+    }
+
+    #[test]
+    fn legacy_config_with_partition_but_no_tier_tail_decodes_tiers_empty() {
+        // A P1-era blob carried the partition tail but no tier tail. Encode with
+        // a partition rule, drop only the trailing tier-count byte, and confirm
+        // the partition rule still decodes while tier_rules falls back empty.
+        let c = ColumnFamilyConfig {
+            partition_rules: vec![PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let full = c.encode();
+        let legacy = &full[..full.len() - 1];
+        let d = ColumnFamilyConfig::decode(legacy);
+        assert_eq!(d.partition_rules, c.partition_rules);
+        assert!(d.tier_rules.is_empty());
+    }
+
+    #[test]
+    fn tier_rule_resolution() {
+        let rules = vec![
+            TierRule {
+                prefix: b"img/".to_vec(),
+                tier: "hdd".into(),
+                min_age: Duration::from_secs(1),
+            },
+            TierRule {
+                prefix: b"img/thumb/".to_vec(),
+                tier: "ssd".into(),
+                min_age: Duration::from_secs(2),
+            },
+        ];
+        // Longest prefix wins regardless of order; unmatched keys resolve to None.
+        assert_eq!(tier_for_key(&rules, b"img/thumb/1").unwrap().tier, "ssd");
+        assert_eq!(tier_for_key(&rules, b"img/full/1").unwrap().tier, "hdd");
+        assert!(tier_for_key(&rules, b"log/2026").is_none());
+        let cfg = ColumnFamilyConfig {
+            tier_rules: rules,
+            ..Default::default()
+        };
+        assert_eq!(cfg.tier_for_key(b"img/thumb/x").unwrap().tier, "ssd");
+        assert!(cfg.tier_for_key(b"other").is_none());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tier_prefix() {
+        let dup = ColumnFamilyConfig {
+            tier_rules: vec![
+                TierRule {
+                    prefix: b"x/".to_vec(),
+                    tier: "hdd".into(),
+                    min_age: Duration::ZERO,
+                },
+                TierRule {
+                    prefix: b"x/".to_vec(),
+                    tier: "cold".into(),
+                    min_age: Duration::ZERO,
+                },
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(dup.validate().is_err());
     }
 
     #[test]
@@ -810,17 +1010,17 @@ mod tests {
     fn legacy_blob_without_sync_fields_decodes_to_defaults() {
         // Simulate a manifest written before the appended-tail fields
         // (sync_mode/sync_interval, compression_per_level, FIFO settings,
-        // compression_rules, partition_rules) were persisted: encode, then
-        // truncate the whole tail (9 bytes sync + 1 byte per-level count + 17
-        // bytes FIFO + 1 byte compression-rules count + 1 byte partition-rules
-        // count).
+        // compression_rules, partition_rules, tier_rules) were persisted:
+        // encode, then truncate the whole tail (9 bytes sync + 1 byte per-level
+        // count + 17 bytes FIFO + 1 byte compression-rules count + 1 byte
+        // partition-rules count + 1 byte tier-rules count).
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        let legacy = &full[..full.len() - 29];
+        let legacy = &full[..full.len() - 30];
         let d = ColumnFamilyConfig::decode(legacy);
         // Older fields still decode; the missing sync fields fall back to default.
         assert_eq!(d.comparator_name, "uint64");

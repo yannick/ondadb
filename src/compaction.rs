@@ -196,14 +196,22 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
     // level, where output is cut on partition boundaries; `None` elsewhere.
     let mut writer: Option<(Writer, String, u64, u64, Option<String>)> = None;
 
-    // Finish `writer`, stamping the accumulated partition onto its manifest
-    // record, and push it to `outputs`.
+    // Age carried onto every output: the maximum `max_entry_time` over the
+    // inputs. Carrying it forward (rather than stamping "now") means compaction
+    // rewriting cold data does not reset its age, so a bottom part keeps
+    // qualifying for a tier move; an input that predates timestamps contributes
+    // nothing, and if no input has one the output's age stays unknown (`None`).
+    let carry_entry_time: Option<i64> = inputs.iter().filter_map(|h| h.meta.max_entry_time).max();
+
+    // Finish `writer`, stamping the accumulated partition and carried age onto
+    // its manifest record, and push it to `outputs`.
     let finish_output = |writer: &mut Option<(Writer, String, u64, u64, Option<String>)>,
                          outputs: &mut Vec<SstMeta>|
      -> Result<()> {
         if let Some((wr, _klog, id, _bytes, part)) = writer.take() {
             let mut meta = wr.finish()?.to_sst_meta(id, target as u32);
             meta.partition = part;
+            meta.max_entry_time = carry_entry_time;
             outputs.push(meta);
         }
         Ok(())

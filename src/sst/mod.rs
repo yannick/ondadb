@@ -94,6 +94,9 @@ impl FileMeta {
             // Tier is assigned by the part mover / attach path, not at write
             // time — a freshly written file always lives on the default tier.
             tier: None,
+            // Age is stamped by the caller that knows the context: flush/ingest
+            // uses the write time, compaction carries the max over its inputs.
+            max_entry_time: None,
         }
     }
 }
