@@ -327,7 +327,13 @@ impl DB {
             if t.name == "ssd" {
                 continue;
             }
-            let storage = crate::storage::LocalStorage::new(fc.clone(), t.supports_mmap);
+            let storage: Arc<dyn crate::storage::Storage> = match &t.backend {
+                crate::config::TierBackend::Local => {
+                    crate::storage::LocalStorage::new(fc.clone(), t.supports_mmap)
+                }
+                #[cfg(feature = "s3")]
+                crate::config::TierBackend::S3(cfg) => crate::storage_s3::S3Storage::new(cfg)?,
+            };
             extra_tiers.push((t.name.clone(), t.root.clone(), storage));
         }
         let tiers = Arc::new(crate::storage::TierRegistry::new(

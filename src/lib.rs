@@ -42,6 +42,8 @@ pub mod parts;
 pub mod memtable_arena;
 pub mod sst;
 pub mod storage;
+#[cfg(feature = "s3")]
+pub mod storage_s3;
 pub mod txn;
 pub mod unified;
 pub mod util;
@@ -51,8 +53,12 @@ pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn
 pub use comparator::{Comparator, ComparatorRef};
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
-    Options, PartitionRule, SyncMode, TierDef, TierRule,
+    Options, PartitionRule, SyncMode, TierBackend, TierDef, TierRule,
 };
+#[cfg(feature = "s3")]
+pub use config::S3Config;
+#[cfg(feature = "s3")]
+pub use storage_s3::S3Storage;
 pub use db::DB;
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;

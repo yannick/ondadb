@@ -180,13 +180,49 @@ pub struct TierDef {
     /// Tier name, referenced by [`SstMeta::tier`](crate::manifest::SstMeta::tier).
     /// The name `"ssd"` is reserved for the implicit default tier (the DB dir).
     pub name: String,
-    /// Filesystem root for this tier. Per-CF files live under `<root>/cf-<name>/`.
+    /// Root for this tier. For a local tier it is a filesystem directory; for an
+    /// S3 tier it is the in-bucket key prefix. Either way per-CF files live under
+    /// `<root>/cf-<name>/`.
     pub root: String,
     /// Whether readers may mmap files on this tier. Local disks set this `true`;
     /// slow/remote-style mounts set it `false` so reads always use the buffered
     /// `pread` path plus the block cache (which matters more there). Defaults to
-    /// `true` via [`TierDef::new`].
+    /// `true` via [`TierDef::new`]. An S3 tier is always `false`.
     pub supports_mmap: bool,
+    /// The storage backend for this tier. Defaults to [`TierBackend::Local`]; an
+    /// S3-backed tier is built with [`TierDef::s3`] (requires the `s3` feature).
+    pub backend: TierBackend,
+}
+
+/// Which storage backend implements a [`TierDef`]. A local tier is a directory on
+/// some mount; an S3 tier lives in an S3-compatible object store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TierBackend {
+    /// A directory on a local (or NFS/SMB-mounted) filesystem.
+    Local,
+    /// An S3-compatible object store (feature-gated behind `s3`).
+    #[cfg(feature = "s3")]
+    S3(S3Config),
+}
+
+/// Connection parameters for an [`S3-backed tier`](TierBackend::S3). Credentials,
+/// endpoint, bucket and region come straight from `Options`. Use `path_style` for
+/// MinIO and other endpoints that address buckets by path rather than subdomain.
+#[cfg(feature = "s3")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Config {
+    /// Bucket name the tier's objects live in.
+    pub bucket: String,
+    /// Region name (e.g. `"us-east-1"`); any string the endpoint accepts.
+    pub region: String,
+    /// Endpoint URL, e.g. `http://192.168.65.11:9000` for a local MinIO.
+    pub endpoint: String,
+    /// Access key id.
+    pub access_key: String,
+    /// Secret access key.
+    pub secret_key: String,
+    /// Path-style addressing (`endpoint/bucket/key`). Required by MinIO.
+    pub path_style: bool,
 }
 
 impl TierDef {
@@ -196,6 +232,7 @@ impl TierDef {
             name: name.into(),
             root: root.into(),
             supports_mmap: true,
+            backend: TierBackend::Local,
         }
     }
 
@@ -204,6 +241,18 @@ impl TierDef {
     pub fn without_mmap(mut self) -> Self {
         self.supports_mmap = false;
         self
+    }
+
+    /// An S3-backed tier: objects live under the in-bucket prefix `root` and are
+    /// read via HTTP range GETs (never mmap'd). See [`S3Config`].
+    #[cfg(feature = "s3")]
+    pub fn s3(name: impl Into<String>, root: impl Into<String>, config: S3Config) -> Self {
+        TierDef {
+            name: name.into(),
+            root: root.into(),
+            supports_mmap: false,
+            backend: TierBackend::S3(config),
+        }
     }
 }
 

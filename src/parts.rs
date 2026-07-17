@@ -353,8 +353,12 @@ impl crate::db::DbInner {
             return Err(OndaError::NotFound);
         }
 
+        // The destination backend may be local or remote (S3); route all writes
+        // through it so the same mover protocol serves both — only the `Storage`
+        // impl differs (a local copy+fsync vs. a buffered single-shot PUT).
+        let dest_storage = cf.tiers().storage_for(Some(tier));
         let dest_cf_dir = cf.tiers().cf_dir(Some(tier), cf.name());
-        std::fs::create_dir_all(&dest_cf_dir)?;
+        dest_storage.ensure_dir(&dest_cf_dir)?;
 
         // Copy every file to the target tier and open new handles there, before
         // touching the manifest — the part stays fully live on its current tier
@@ -365,9 +369,9 @@ impl crate::db::DbInner {
             let src_vlog = vlog_path_for(&src_klog);
             let dst_klog = format!("{dest_cf_dir}/{}.klog", h.meta.id);
             let dst_vlog = format!("{dest_cf_dir}/{}.vlog", h.meta.id);
-            copy_and_sync(&src_klog, &dst_klog)?;
+            copy_to_storage(&src_klog, &dst_klog, &dest_storage)?;
             if Path::new(&src_vlog).exists() {
-                copy_and_sync(&src_vlog, &dst_vlog)?;
+                copy_to_storage(&src_vlog, &dst_vlog, &dest_storage)?;
             }
             let mut meta = h.meta.clone();
             meta.tier = Some(tier.to_string());
@@ -529,18 +533,17 @@ fn move_file(from: &str, to: &str) -> Result<()> {
     }
 }
 
-/// Copy `from` to `to`, fsyncing the destination file and its directory so the
-/// copy is durable before the manifest flip references it.
-fn copy_and_sync(from: &str, to: &str) -> Result<()> {
-    std::fs::copy(from, to)?;
-    if let Ok(f) = std::fs::File::open(to) {
-        let _ = f.sync_all();
-    }
-    if let Some(parent) = Path::new(to).parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
+/// Copy the local file `from` to `to` on `storage`, durably committing the
+/// destination before the manifest flip references it. For a local tier the
+/// [`StorageWriter`](crate::storage::StorageWriter) streams and fsyncs (file +
+/// parent dir); for an S3 tier it buffers and single-shot PUTs on finish. The
+/// source is always on a local tier (the mover only moves *onto* named tiers), so
+/// it is read with a plain file.
+fn copy_to_storage(from: &str, to: &str, storage: &Arc<dyn crate::storage::Storage>) -> Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = storage.create(to)?;
+    std::io::copy(&mut src, &mut *dst)?;
+    dst.finish()?;
     Ok(())
 }
 
