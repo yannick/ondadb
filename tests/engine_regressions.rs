@@ -789,7 +789,7 @@ fn iterate_while_flush_and_compaction_run() {
             );
             seen += 1;
             // Give the writer real time to rotate/flush/compact mid-scan.
-            if seen % 256 == 0 {
+            if seen.is_multiple_of(256) {
                 std::thread::sleep(Duration::from_millis(2));
             }
             it.next();

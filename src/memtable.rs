@@ -235,11 +235,6 @@ fn shard_of(h: u64) -> usize {
     ((h ^ (h >> 32)) & (NUM_SHARDS as u64 - 1)) as usize
 }
 
-#[inline]
-fn shard_index(user_key: &[u8]) -> usize {
-    shard_of(key_hash(user_key))
-}
-
 pub(crate) fn flag_bits(tombstone: bool, single_delete: bool, ttl: i64) -> u8 {
     let mut f = 0;
     if tombstone {
