@@ -17,7 +17,7 @@ use crate::comparator::ComparatorRef;
 use crate::db::DbInner;
 use crate::error::Result;
 use crate::manifest::SstMeta;
-use crate::sst::{Reader, SstIterator, Writer};
+use crate::sst::{SstIterator, Writer};
 use crate::util::now_nanos;
 
 /// Manual compaction (`DB::compact`): run the triggered rounds, then sweep
@@ -138,7 +138,12 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
 /// the in-place bottom rewrite manual compaction does — the only way tables
 /// in the last level that overlap no incoming data ever see the compaction
 /// filter or drop their tombstones again).
-fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target: usize) -> Result<()> {
+fn compact_into(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    target: usize,
+) -> Result<()> {
     let cmp = cf.cmp();
     debug_assert!(target == level || target == level + 1);
 
@@ -173,6 +178,15 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
     let oldest_snapshot = db.oldest_snapshot();
     let now = now_nanos();
     let filter = cf.compaction_filter();
+    // Snapshot the partition rules once for the whole run. A rule added
+    // concurrently (via `DB::add_partition_rule`) must not change this run's cut
+    // boundaries — it takes effect on the next bottom compaction. Only bottom
+    // output is cut on partitions, so upper-level runs need no snapshot.
+    let partition_rules = if bottom {
+        cf.partition_rules_snapshot()
+    } else {
+        Vec::new()
+    };
 
     // Merge-iterate all inputs and write new output SSTables.
     let mut its: Vec<SstIterator> = inputs.iter().map(|t| t.reader.iter()).collect();
@@ -182,7 +196,31 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
 
     let target_bytes = (cf.opts.write_buffer_size as u64).max(1);
     let mut outputs: Vec<SstMeta> = Vec::new();
-    let mut writer: Option<(Writer, String, u64, u64)> = None; // (writer, klog, id, bytes)
+    // (writer, klog, id, bytes, partition). `partition` is the partition every
+    // key in the current output file belongs to — only meaningful at the bottom
+    // level, where output is cut on partition boundaries; `None` elsewhere.
+    let mut writer: Option<(Writer, String, u64, u64, Option<String>)> = None;
+
+    // Age carried onto every output: the maximum `max_entry_time` over the
+    // inputs. Carrying it forward (rather than stamping "now") means compaction
+    // rewriting cold data does not reset its age, so a bottom part keeps
+    // qualifying for a tier move; an input that predates timestamps contributes
+    // nothing, and if no input has one the output's age stays unknown (`None`).
+    let carry_entry_time: Option<i64> = inputs.iter().filter_map(|h| h.meta.max_entry_time).max();
+
+    // Finish `writer`, stamping the accumulated partition and carried age onto
+    // its manifest record, and push it to `outputs`.
+    let finish_output = |writer: &mut Option<(Writer, String, u64, u64, Option<String>)>,
+                         outputs: &mut Vec<SstMeta>|
+     -> Result<()> {
+        if let Some((wr, _klog, id, _bytes, part)) = writer.take() {
+            let mut meta = wr.finish()?.to_sst_meta(id, target as u32);
+            meta.partition = part;
+            meta.max_entry_time = carry_entry_time;
+            outputs.push(meta);
+        }
+        Ok(())
+    };
 
     let mut last_key: Option<Vec<u8>> = None;
     let mut emitted_le_for_key = false;
@@ -261,11 +299,27 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
                 }
             }
             if keep {
+                // Bottom-level output is cut at partition boundaries so no
+                // bottom SSTable spans two partitions. Keys arrive in ascending
+                // user-key order, so a change in `partition_of` means we have
+                // crossed into a different partition: finish the current file
+                // (stamped with its partition) before opening the next. Upper
+                // levels leave `part = None`, so this never cuts there.
+                let part = if bottom {
+                    crate::config::partition_of(&partition_rules, &uk).map(str::to_string)
+                } else {
+                    None
+                };
+                if let Some((_, _, _, _, cur)) = writer.as_ref() {
+                    if *cur != part {
+                        finish_output(&mut writer, &mut outputs)?;
+                    }
+                }
                 if writer.is_none() {
                     let id = db.next_file_id();
                     let klog = cf.klog_path(id);
                     let w = Writer::new(&klog, cf_writer_opts(cf, &cmp, target as u32))?;
-                    writer = Some((w, klog, id, 0));
+                    writer = Some((w, klog, id, 0, part));
                 }
                 let w = writer.as_mut().unwrap();
                 w.0.add(
@@ -278,29 +332,20 @@ fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target:
                 )?;
                 w.3 += (uk.len() + value.len()) as u64;
                 if w.3 >= target_bytes {
-                    let (wr, _klog, id, _bytes) = writer.take().unwrap();
-                    outputs.push(wr.finish()?.to_sst_meta(id, target as u32));
+                    finish_output(&mut writer, &mut outputs)?;
                 }
             }
         }
 
         its[bi].next();
     }
-    if let Some((wr, _klog, id, _bytes)) = writer.take() {
-        outputs.push(wr.finish()?.to_sst_meta(id, target as u32));
-    }
+    finish_output(&mut writer, &mut outputs)?;
 
-    // Open readers for the new tables.
+    // Open readers for the new tables (compaction output always lands on the
+    // default tier, so `open_reader_for` resolves the default path).
     let mut new_handles = Vec::new();
     for meta in &outputs {
-        let klog = cf.klog_path(meta.id);
-        let reader = Reader::open(
-            &klog,
-            cf.ctx.fc.clone(),
-            cf.ctx.bc.clone(),
-            meta.id,
-            cmp.clone(),
-        )?;
+        let reader = cf.open_reader_for(meta)?;
         new_handles.push(Arc::new(SstHandle {
             meta: meta.clone(),
             reader,

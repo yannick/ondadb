@@ -88,6 +88,15 @@ impl FileMeta {
             vlog_size: self.vlog_size,
             min_key: self.min_key.clone(),
             max_key: self.max_key.clone(),
+            // Partition is a bottom-level compaction concern; the writer/flush
+            // paths leave it None and compaction stamps boundary-cut files.
+            partition: None,
+            // Tier is assigned by the part mover / attach path, not at write
+            // time — a freshly written file always lives on the default tier.
+            tier: None,
+            // Age is stamped by the caller that knows the context: flush/ingest
+            // uses the write time, compaction carries the max over its inputs.
+            max_entry_time: None,
         }
     }
 }

@@ -48,6 +48,8 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
 | `DbInner::file_deletion` | deferred-SST-delete state | short; `pause_deletions` returns an RAII guard |
 | `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating` | gate checks, rotation drain |
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
+| `ColumnFamily::compact_mu` (Mutex) | level-structure rewrites | a whole compaction run; also `detach_part`/`attach_part`/`relocate_part` (they snapshot + rewrite the bottom level, so they must not race a compaction). NB: a part move holds it across the copy to the target tier — on a remote (S3) tier that is network time, during which this CF cannot compact |
+| `ColumnFamily::live_partition_rules` (RwLock) | the live partition-rule set | `append_partition_rule` validates + appends under one write acquisition (concurrent duplicate adds: exactly one wins); released **before** `persist_manifest`, which re-reads the rules via `effective_config` |
 | `Wal::qstate` / per-stripe file mutexes | group-commit queue / file appends | one frame write |
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
 | `commit_hook` (Mutex) | hook fn | hook invocation |
@@ -152,6 +154,53 @@ it to its sticky stripe under that stripe's file mutex — no cross-thread
 coordination. Full mode: single stripe + group commit (leader drains
 `qstate.queue`, one write + one `sync_data`, wakes followers over bounded
 channels). `Wal::close` is idempotent and `&self` (callable through `Arc`).
+
+## Part lifecycle & the part mover (`parts.rs`)
+
+Ordering all part operations follow: in-memory swap under `state.write()` →
+`persist_manifest` (the crash-atomic commit point) → only then touch files.
+In-flight reads are never interrupted — they finish on the `Arc<SstHandle>`s
+(and pinned blocks / mmaps) they already hold, the same lifetime argument
+compaction uses when unlinking inputs. `detach_part` is therefore **not
+snapshot-consistent** by design: new reads lose the range immediately,
+whatever their snapshot seq; pre-existing iterators keep it.
+
+The mover pass (`DbInner::run_part_mover`) snapshots `bottom_parts()` under
+`state.read()`, then takes `compact_mu` per actual move. Between snapshot and
+move a compaction may rewrite a part — the relocate then re-snapshots under
+the lock, finds nothing for that partition and returns `NotFound`, which the
+pass treats as a benign miss. It can thus only skip work, never move stale
+data. The scheduled pass runs on the compaction worker (between jobs, every
+`part_mover_interval`), so a mover pass and a compaction never overlap on
+that thread; a concurrent *manual* `run_part_mover` is still safe via
+`compact_mu`.
+
+## S3Storage runtime & blocking contract (`storage_s3.rs`, feature `s3`)
+
+ondaDB has no async runtime; rust-s3 is async. Each `S3Storage` owns a
+dedicated **multi-thread tokio runtime** (2 worker threads) and drives every
+request with `Runtime::block_on` from whatever engine thread calls in —
+point-read threads on a block-cache miss, the compaction worker (mover pass,
+compaction reads of S3-resident inputs), and `DB::open` (reader opens).
+Contract:
+
+- **Concurrent `block_on` from many engine threads is supported** — that is
+  precisely what a multi-thread runtime permits (a `current_thread` runtime
+  would deadlock here; do not "simplify" to one).
+- Engine threads **block** for the full network round-trip. No engine lock
+  is held across a *read* (`read_exact_at` is called from the reader's
+  block-miss path, outside all locks), but a part move holds the CF's
+  `compact_mu` across its copy loop — S3 PUT latency stalls that CF's
+  compaction, accepted because moves are rare and background.
+- Never call `S3Storage` methods from inside the tokio runtime's own worker
+  context (`block_on` would panic); nothing in the engine does — all callers
+  are plain std threads.
+- `S3ReadHandle` holds no OS resource (`release` is a no-op); handles are
+  cheap to construct and never go through the `FileCache`, so the
+  `max_open_sstables` bound does not apply to S3-resident tables.
+- The runtime lives as long as its `S3Storage` (shared `Arc` into every
+  handle/writer), i.e. as long as the `TierRegistry` — dropped only when the
+  DB closes.
 
 ## Background workers
 

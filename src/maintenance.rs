@@ -156,7 +156,7 @@ impl DB {
         // Keep src's SSTables from being compacted away while we hard-link them.
         let _pause = self.inner.pause_deletions();
 
-        let dst_cf = self.create_column_family(dst, src_cf.config().clone())?;
+        let dst_cf = self.create_column_family(dst, src_cf.effective_config())?;
 
         // Hard-link each src SSTable into dst under a fresh id and register it.
         let src_metas: Vec<SstMeta> = src_cf.snapshot_ssts();

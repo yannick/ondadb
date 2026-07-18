@@ -1,7 +1,10 @@
 //! Configuration types for ondaDB.
 //!
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::storage::Storage;
 
 /// Compression algorithm applied per SSTable block (never to the WAL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,6 +159,148 @@ pub struct Options {
     pub unified_memtable_skip_list_probability: f64,
     pub unified_memtable_sync_mode: SyncMode,
     pub unified_memtable_sync_interval: Duration,
+    /// Named storage tiers, in addition to the implicit `"ssd"` tier (the
+    /// database directory). A bottom-level part may be moved to a tier; its
+    /// files then live under `<tier.root>/cf-<name>/`. WAL and upper levels
+    /// always stay on the default tier. Empty by default. See
+    /// [`TierDef`]. (The keyspace→tier policy and the background mover are a
+    /// later milestone; this release ships the storage substrate.)
+    pub tiers: Vec<TierDef>,
+    /// How often the background part mover scans for bottom-level parts to
+    /// relocate per their column family's
+    /// [`tier_rules`](ColumnFamilyConfig::tier_rules). The pass runs on the
+    /// compaction worker. `Duration::ZERO` disables the scheduled pass entirely
+    /// (a manual [`DB::run_part_mover`](crate::DB::run_part_mover) still works).
+    /// Defaults to 30s; the pass is a cheap no-op when no CF has tier rules.
+    pub part_mover_interval: Duration,
+}
+
+/// A named storage location — for now, a directory on some mount (ssd, hdd,
+/// nfs). A later milestone adds an S3-backed tier behind the same
+/// [`Storage`](crate::storage::Storage) trait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierDef {
+    /// Tier name, referenced by [`SstMeta::tier`](crate::manifest::SstMeta::tier).
+    /// The name `"ssd"` is reserved for the implicit default tier (the DB dir).
+    pub name: String,
+    /// Root for this tier. For a local tier it is a filesystem directory; for an
+    /// S3 tier it is the in-bucket key prefix. Either way per-CF files live under
+    /// `<root>/cf-<name>/`.
+    pub root: String,
+    /// Whether readers may mmap files on this tier. Local disks set this `true`;
+    /// slow/remote-style mounts set it `false` so reads always use the buffered
+    /// `pread` path plus the block cache (which matters more there). Defaults to
+    /// `true` via [`TierDef::new`]. An S3 tier is always `false`.
+    pub supports_mmap: bool,
+    /// The storage backend for this tier. Defaults to [`TierBackend::Local`]; an
+    /// S3-backed tier is built with [`TierDef::s3`] (requires the `s3` feature).
+    pub backend: TierBackend,
+}
+
+/// Which storage backend implements a [`TierDef`]. A local tier is a directory on
+/// some mount; an S3 tier lives in an S3-compatible object store; a `Custom` tier
+/// hands the engine a caller-built [`Storage`] so an embedder can interpose its
+/// own decorator (e.g. a read-through cache in front of an S3 tier — ayu's foyer
+/// layer, P8).
+#[derive(Debug, Clone)]
+pub enum TierBackend {
+    /// A directory on a local (or NFS/SMB-mounted) filesystem.
+    Local,
+    /// An S3-compatible object store (feature-gated behind `s3`).
+    #[cfg(feature = "s3")]
+    S3(S3Config),
+    /// A caller-provided [`Storage`] used verbatim for this tier. The engine
+    /// treats it opaquely (no mmap: [`TierDef::custom`] forces the buffered path),
+    /// so an embedder can wrap another backend — the intended seam for a
+    /// read-through cache in front of a remote tier.
+    Custom(Arc<dyn Storage>),
+}
+
+// `Arc<dyn Storage>` has no structural equality, so `TierBackend` cannot derive
+// `PartialEq`/`Eq`. Two `Custom` backends are equal iff they are the *same* Arc
+// (identity — a decorator has no meaningful value equality); `Local`/`S3` keep
+// their value semantics.
+impl PartialEq for TierBackend {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TierBackend::Local, TierBackend::Local) => true,
+            #[cfg(feature = "s3")]
+            (TierBackend::S3(a), TierBackend::S3(b)) => a == b,
+            (TierBackend::Custom(a), TierBackend::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TierBackend {}
+
+/// Connection parameters for an [`S3-backed tier`](TierBackend::S3). Credentials,
+/// endpoint, bucket and region come straight from `Options`. Use `path_style` for
+/// MinIO and other endpoints that address buckets by path rather than subdomain.
+#[cfg(feature = "s3")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Config {
+    /// Bucket name the tier's objects live in.
+    pub bucket: String,
+    /// Region name (e.g. `"us-east-1"`); any string the endpoint accepts.
+    pub region: String,
+    /// Endpoint URL, e.g. `http://192.168.65.11:9000` for a local MinIO.
+    pub endpoint: String,
+    /// Access key id.
+    pub access_key: String,
+    /// Secret access key.
+    pub secret_key: String,
+    /// Path-style addressing (`endpoint/bucket/key`). Required by MinIO.
+    pub path_style: bool,
+}
+
+impl TierDef {
+    /// A local tier at `root` with mmap reads enabled.
+    pub fn new(name: impl Into<String>, root: impl Into<String>) -> Self {
+        TierDef {
+            name: name.into(),
+            root: root.into(),
+            supports_mmap: true,
+            backend: TierBackend::Local,
+        }
+    }
+
+    /// Disable mmap reads for this tier (route reads through the buffered
+    /// `pread` path + block cache, as a remote tier would).
+    pub fn without_mmap(mut self) -> Self {
+        self.supports_mmap = false;
+        self
+    }
+
+    /// An S3-backed tier: objects live under the in-bucket prefix `root` and are
+    /// read via HTTP range GETs (never mmap'd). See [`S3Config`].
+    #[cfg(feature = "s3")]
+    pub fn s3(name: impl Into<String>, root: impl Into<String>, config: S3Config) -> Self {
+        TierDef {
+            name: name.into(),
+            root: root.into(),
+            supports_mmap: false,
+            backend: TierBackend::S3(config),
+        }
+    }
+
+    /// A tier backed by a caller-provided [`Storage`] (P8). Reads never mmap (the
+    /// buffered `pread` path + block cache is used, as for any remote-style tier),
+    /// so an embedder can wrap a slow/remote backend with its own read-through
+    /// cache and hand the wrapper here. `root` is still the in-backend key/dir
+    /// prefix the [`TierRegistry`](crate::storage::TierRegistry) prepends.
+    pub fn custom(
+        name: impl Into<String>,
+        root: impl Into<String>,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        TierDef {
+            name: name.into(),
+            root: root.into(),
+            supports_mmap: false,
+            backend: TierBackend::Custom(storage),
+        }
+    }
 }
 
 impl Options {
@@ -186,6 +331,8 @@ impl Default for Options {
             unified_memtable_skip_list_probability: 0.25,
             unified_memtable_sync_mode: SyncMode::None,
             unified_memtable_sync_interval: Duration::from_micros(128_000),
+            tiers: Vec::new(),
+            part_mover_interval: Duration::from_secs(30),
         }
     }
 }
@@ -212,6 +359,36 @@ pub struct ColumnFamilyConfig {
     /// write-side policy — SSTable blocks and vlog frames are self-describing,
     /// so rules can change at any time without rewriting existing data.
     pub compression_rules: Vec<CompressionRule>,
+    /// Prefix rules that carve the keyspace into named **partitions**. The
+    /// **longest** matching prefix wins (so rules may nest: `img/` and
+    /// `img/thumb/` are both legal and a key under `img/thumb/` resolves to the
+    /// latter); keys matching no rule live in the implicit default partition
+    /// (`partition_of` returns `None`). Exact-duplicate prefixes are rejected by
+    /// [`validate`](Self::validate).
+    ///
+    /// Partitions are the unit of the parts/tiers machinery: bottom-level
+    /// compaction cuts its output files at partition boundaries so that no
+    /// bottom SSTable ever spans two partitions (see
+    /// [`SstMeta::partition`](crate::manifest::SstMeta::partition)). Upper
+    /// levels are left mixed. Purely a write-side policy — changing the rules
+    /// only affects files written afterward; existing files keep whatever
+    /// partition they were cut into.
+    pub partition_rules: Vec<PartitionRule>,
+    /// Prefix rules that pin a partition's bottom-level part to a storage
+    /// **tier** (see [`TierDef`]). The **longest** matching prefix wins, exactly
+    /// like [`partition_rules`](Self::partition_rules) and
+    /// [`compression_rules`](Self::compression_rules); a part matching no rule
+    /// stays on the tier it was written to (the default `"ssd"` tier).
+    ///
+    /// The background **part mover** (`DB::run_part_mover`, and a scheduled
+    /// cadence) reads these: for each bottom-level part it resolves the target
+    /// tier by the part's key prefix and, once the part's newest entry is older
+    /// than [`TierRule::min_age`], relocates the part there (copy → fsync →
+    /// one-record manifest flip → delete source). Purely a placement policy —
+    /// changing the rules only affects where the mover *next* places a part;
+    /// data already on a tier is not rewritten until it qualifies for a move.
+    /// Exact-duplicate prefixes are rejected by [`validate`](Self::validate).
+    pub tier_rules: Vec<TierRule>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
     pub enable_block_indexes: bool,
@@ -250,6 +427,8 @@ impl Default for ColumnFamilyConfig {
             compression: Compression::None,
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
+            partition_rules: Vec::new(),
+            tier_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
             enable_block_indexes: true,
@@ -297,6 +476,50 @@ pub(crate) fn compression_for_key(
         .map(|r| r.compression)
 }
 
+/// One prefix → partition-name rule (see
+/// [`ColumnFamilyConfig::partition_rules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionRule {
+    /// Keys starting with this byte prefix belong to partition `name`.
+    pub prefix: Vec<u8>,
+    /// Partition name, recorded on bottom-level SSTables cut on this boundary.
+    pub name: String,
+}
+
+/// Resolve `user_key` to a partition name: longest matching prefix wins.
+/// `None` (the implicit default partition) when no rule matches.
+pub(crate) fn partition_of<'a>(rules: &'a [PartitionRule], user_key: &[u8]) -> Option<&'a str> {
+    rules
+        .iter()
+        .filter(|r| user_key.starts_with(&r.prefix))
+        .max_by_key(|r| r.prefix.len())
+        .map(|r| r.name.as_str())
+}
+
+/// One prefix → storage-tier rule (see
+/// [`ColumnFamilyConfig::tier_rules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierRule {
+    /// A part is targeted by this rule when its keys start with this prefix.
+    pub prefix: Vec<u8>,
+    /// Target tier name (a [`TierDef::name`], or the reserved `"ssd"` for the
+    /// default tier).
+    pub tier: String,
+    /// Move a part only once its newest entry
+    /// ([`SstMeta::max_entry_time`](crate::manifest::SstMeta::max_entry_time)) is
+    /// older than this — a part whose freshest data is younger stays put.
+    pub min_age: Duration,
+}
+
+/// Resolve `user_key` to a tier rule: longest matching prefix wins. `None` when
+/// no rule matches (the part keeps its current tier).
+pub(crate) fn tier_for_key<'a>(rules: &'a [TierRule], user_key: &[u8]) -> Option<&'a TierRule> {
+    rules
+        .iter()
+        .filter(|r| user_key.starts_with(&r.prefix))
+        .max_by_key(|r| r.prefix.len())
+}
+
 impl ColumnFamilyConfig {
     /// Compression algorithm for SSTables written at `level` (see
     /// `compression_per_level`).
@@ -313,6 +536,54 @@ impl ColumnFamilyConfig {
     pub fn compression_for_key(&self, user_key: &[u8], level: u32) -> Compression {
         compression_for_key(&self.compression_rules, user_key)
             .unwrap_or_else(|| self.compression_for_level(level))
+    }
+
+    /// Partition name for `user_key`: the longest matching entry in
+    /// [`partition_rules`](Self::partition_rules), or `None` for the implicit
+    /// default partition.
+    pub fn partition_of(&self, user_key: &[u8]) -> Option<&str> {
+        partition_of(&self.partition_rules, user_key)
+    }
+
+    /// The [`TierRule`] governing `user_key`: the longest matching entry in
+    /// [`tier_rules`](Self::tier_rules), or `None` if no rule applies.
+    pub fn tier_for_key(&self, user_key: &[u8]) -> Option<&TierRule> {
+        tier_for_key(&self.tier_rules, user_key)
+    }
+
+    /// Reject structurally invalid configuration. Currently: exact-duplicate
+    /// partition prefixes (two rules with the same `prefix`). Nested prefixes
+    /// are legal — longest-prefix-wins resolves them deterministically — so
+    /// only an exact collision (which would make resolution order-dependent) is
+    /// an error.
+    pub fn validate(&self) -> Result<(), String> {
+        for (i, a) in self.partition_rules.iter().enumerate() {
+            for b in &self.partition_rules[i + 1..] {
+                if a.prefix == b.prefix {
+                    return Err(format!(
+                        "duplicate partition prefix {:?} (rules {:?} and {:?})",
+                        String::from_utf8_lossy(&a.prefix),
+                        a.name,
+                        b.name
+                    ));
+                }
+            }
+        }
+        // Two tier rules with the same prefix would make longest-prefix
+        // resolution order-dependent (like duplicate partition prefixes above).
+        for (i, a) in self.tier_rules.iter().enumerate() {
+            for b in &self.tier_rules[i + 1..] {
+                if a.prefix == b.prefix {
+                    return Err(format!(
+                        "duplicate tier prefix {:?} (tiers {:?} and {:?})",
+                        String::from_utf8_lossy(&a.prefix),
+                        a.tier,
+                        b.tier
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Serialize the durable subset of the config for the manifest blob.
@@ -348,6 +619,27 @@ impl ColumnFamilyConfig {
             append_uvarint(&mut b, r.prefix.len() as u64);
             b.extend_from_slice(&r.prefix);
             b.push(r.compression as u8);
+        }
+        // Appended tail (same backward/forward-compatible scheme as above): an
+        // older manifest ends before this count, so `decode_into` returns via
+        // `?` and leaves `partition_rules` empty.
+        b.push(self.partition_rules.len().min(255) as u8);
+        for r in self.partition_rules.iter().take(255) {
+            append_uvarint(&mut b, r.prefix.len() as u64);
+            b.extend_from_slice(&r.prefix);
+            append_uvarint(&mut b, r.name.len() as u64);
+            b.extend_from_slice(r.name.as_bytes());
+        }
+        // Appended tail (same backward/forward-compatible scheme): storage-tier
+        // rules. An older manifest ends before this count byte, so `decode_into`
+        // returns via `?` and leaves `tier_rules` empty.
+        b.push(self.tier_rules.len().min(255) as u8);
+        for r in self.tier_rules.iter().take(255) {
+            append_uvarint(&mut b, r.prefix.len() as u64);
+            b.extend_from_slice(&r.prefix);
+            append_uvarint(&mut b, r.tier.len() as u64);
+            b.extend_from_slice(r.tier.as_bytes());
+            append_u64(&mut b, r.min_age.as_micros() as u64);
         }
         b
     }
@@ -439,6 +731,59 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         });
     }
     cfg.compression_rules = rules;
+    // Appended-tail partition rules; an older manifest ends above and keeps the
+    // default (empty) list.
+    let n_parts = byte(&mut p)?;
+    let mut parts = Vec::with_capacity(n_parts as usize);
+    for _ in 0..n_parts {
+        let (plen, n) = uvarint(p)?;
+        p = &p[n..];
+        let plen = plen as usize;
+        if p.len() < plen {
+            return None;
+        }
+        let prefix = p[..plen].to_vec();
+        p = &p[plen..];
+        let (nlen, n) = uvarint(p)?;
+        p = &p[n..];
+        let nlen = nlen as usize;
+        if p.len() < nlen {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&p[..nlen]).into_owned();
+        p = &p[nlen..];
+        parts.push(PartitionRule { prefix, name });
+    }
+    cfg.partition_rules = parts;
+    // Appended-tail tier rules; an older manifest ends above and keeps the
+    // default (empty) list.
+    let n_tiers = byte(&mut p)?;
+    let mut tiers = Vec::with_capacity(n_tiers as usize);
+    for _ in 0..n_tiers {
+        let (plen, n) = uvarint(p)?;
+        p = &p[n..];
+        let plen = plen as usize;
+        if p.len() < plen {
+            return None;
+        }
+        let prefix = p[..plen].to_vec();
+        p = &p[plen..];
+        let (tlen, n) = uvarint(p)?;
+        p = &p[n..];
+        let tlen = tlen as usize;
+        if p.len() < tlen {
+            return None;
+        }
+        let tier = String::from_utf8_lossy(&p[..tlen]).into_owned();
+        p = &p[tlen..];
+        let min_age = std::time::Duration::from_micros(u64v(&mut p)?);
+        tiers.push(TierRule {
+            prefix,
+            tier,
+            min_age,
+        });
+    }
+    cfg.tier_rules = tiers;
     Some(())
 }
 
@@ -500,6 +845,200 @@ mod tests {
         };
         assert_eq!(cfg.compression_for_key(b"az1", 0), Compression::Zstd);
         assert_eq!(cfg.compression_for_key(b"zz", 3), Compression::Snappy);
+    }
+
+    #[test]
+    fn partition_rule_resolution() {
+        let rules = vec![
+            PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            },
+            PartitionRule {
+                prefix: b"img/thumb/".to_vec(),
+                name: "thumb".into(),
+            },
+        ];
+        // Longest prefix wins; nesting is legal.
+        assert_eq!(partition_of(&rules, b"img/thumb/1.jpg"), Some("thumb"));
+        assert_eq!(partition_of(&rules, b"img/full/1.jpg"), Some("img"));
+        // Un-ruled keys fall into the implicit default partition.
+        assert_eq!(partition_of(&rules, b"logs/2026"), None);
+        let cfg = ColumnFamilyConfig {
+            partition_rules: rules,
+            ..Default::default()
+        };
+        assert_eq!(cfg.partition_of(b"img/thumb/x"), Some("thumb"));
+        assert_eq!(cfg.partition_of(b"other"), None);
+    }
+
+    #[test]
+    fn partition_rules_survive_manifest_round_trip() {
+        let c = ColumnFamilyConfig {
+            partition_rules: vec![
+                PartitionRule {
+                    prefix: b"a/".to_vec(),
+                    name: "alpha".into(),
+                },
+                PartitionRule {
+                    prefix: b"b/".to_vec(),
+                    name: "beta".into(),
+                },
+            ],
+            // Coexists with compression_rules (both are appended tails).
+            compression_rules: vec![CompressionRule {
+                prefix: b"a/".to_vec(),
+                compression: Compression::Zstd,
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.partition_rules, c.partition_rules);
+        assert_eq!(d.compression_rules, c.compression_rules);
+    }
+
+    #[test]
+    fn legacy_config_without_partition_tail_decodes_to_empty() {
+        // A config encoded before partition_rules / tier_rules existed ends right
+        // after the compression_rules section. The encoding now appends a 1-byte
+        // partition-count then a 1-byte tier-count; dropping both trailing count
+        // bytes simulates that older, shorter blob and both lists fall back empty.
+        let c = ColumnFamilyConfig {
+            comparator_name: "uint64".into(),
+            ..ColumnFamilyConfig::default()
+        };
+        let full = c.encode();
+        let legacy = &full[..full.len() - 2];
+        let d = ColumnFamilyConfig::decode(legacy);
+        assert_eq!(d.comparator_name, "uint64");
+        assert!(d.partition_rules.is_empty());
+        assert!(d.tier_rules.is_empty());
+    }
+
+    #[test]
+    fn tier_rules_survive_manifest_round_trip() {
+        let c = ColumnFamilyConfig {
+            tier_rules: vec![
+                TierRule {
+                    prefix: b"img/".to_vec(),
+                    tier: "hdd".into(),
+                    min_age: Duration::from_secs(30 * 24 * 3600),
+                },
+                TierRule {
+                    prefix: b"log/".to_vec(),
+                    tier: "cold".into(),
+                    min_age: Duration::from_secs(3600),
+                },
+            ],
+            // Coexists with partition_rules (both are appended tails).
+            partition_rules: vec![PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.tier_rules, c.tier_rules);
+        assert_eq!(d.partition_rules, c.partition_rules);
+    }
+
+    #[test]
+    fn legacy_config_with_partition_but_no_tier_tail_decodes_tiers_empty() {
+        // A P1-era blob carried the partition tail but no tier tail. Encode with
+        // a partition rule, drop only the trailing tier-count byte, and confirm
+        // the partition rule still decodes while tier_rules falls back empty.
+        let c = ColumnFamilyConfig {
+            partition_rules: vec![PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let full = c.encode();
+        let legacy = &full[..full.len() - 1];
+        let d = ColumnFamilyConfig::decode(legacy);
+        assert_eq!(d.partition_rules, c.partition_rules);
+        assert!(d.tier_rules.is_empty());
+    }
+
+    #[test]
+    fn tier_rule_resolution() {
+        let rules = vec![
+            TierRule {
+                prefix: b"img/".to_vec(),
+                tier: "hdd".into(),
+                min_age: Duration::from_secs(1),
+            },
+            TierRule {
+                prefix: b"img/thumb/".to_vec(),
+                tier: "ssd".into(),
+                min_age: Duration::from_secs(2),
+            },
+        ];
+        // Longest prefix wins regardless of order; unmatched keys resolve to None.
+        assert_eq!(tier_for_key(&rules, b"img/thumb/1").unwrap().tier, "ssd");
+        assert_eq!(tier_for_key(&rules, b"img/full/1").unwrap().tier, "hdd");
+        assert!(tier_for_key(&rules, b"log/2026").is_none());
+        let cfg = ColumnFamilyConfig {
+            tier_rules: rules,
+            ..Default::default()
+        };
+        assert_eq!(cfg.tier_for_key(b"img/thumb/x").unwrap().tier, "ssd");
+        assert!(cfg.tier_for_key(b"other").is_none());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tier_prefix() {
+        let dup = ColumnFamilyConfig {
+            tier_rules: vec![
+                TierRule {
+                    prefix: b"x/".to_vec(),
+                    tier: "hdd".into(),
+                    min_age: Duration::ZERO,
+                },
+                TierRule {
+                    prefix: b"x/".to_vec(),
+                    tier: "cold".into(),
+                    min_age: Duration::ZERO,
+                },
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(dup.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_partition_prefix() {
+        let dup = ColumnFamilyConfig {
+            partition_rules: vec![
+                PartitionRule {
+                    prefix: b"x/".to_vec(),
+                    name: "one".into(),
+                },
+                PartitionRule {
+                    prefix: b"x/".to_vec(),
+                    name: "two".into(),
+                },
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(dup.validate().is_err());
+
+        // Nested (non-equal) prefixes are legal — longest-prefix-wins.
+        let nested = ColumnFamilyConfig {
+            partition_rules: vec![
+                PartitionRule {
+                    prefix: b"x/".to_vec(),
+                    name: "one".into(),
+                },
+                PartitionRule {
+                    prefix: b"x/y/".to_vec(),
+                    name: "two".into(),
+                },
+            ],
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(nested.validate().is_ok());
     }
 
     #[test]
@@ -567,16 +1106,17 @@ mod tests {
     fn legacy_blob_without_sync_fields_decodes_to_defaults() {
         // Simulate a manifest written before the appended-tail fields
         // (sync_mode/sync_interval, compression_per_level, FIFO settings,
-        // compression_rules) were persisted: encode, then truncate the whole
-        // tail (9 bytes sync + 1 byte per-level count + 17 bytes FIFO + 1
-        // byte rules count).
+        // compression_rules, partition_rules, tier_rules) were persisted:
+        // encode, then truncate the whole tail (9 bytes sync + 1 byte per-level
+        // count + 17 bytes FIFO + 1 byte compression-rules count + 1 byte
+        // partition-rules count + 1 byte tier-rules count).
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.encode();
-        let legacy = &full[..full.len() - 28];
+        let legacy = &full[..full.len() - 30];
         let d = ColumnFamilyConfig::decode(legacy);
         // Older fields still decode; the missing sync fields fall back to default.
         assert_eq!(d.comparator_name, "uint64");

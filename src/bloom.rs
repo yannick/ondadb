@@ -108,8 +108,7 @@ impl Bloom {
     /// [`may_contain`](Bloom::may_contain) by a precomputed
     /// [`hash_of`](Bloom::hash_of) value.
     pub fn may_contain_hash(&self, h: u64) -> bool {
-        Bloom::positions(self.m, self.k, h)
-            .all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
+        Bloom::positions(self.m, self.k, h).all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
     }
 
     /// Number of hash functions.

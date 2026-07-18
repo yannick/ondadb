@@ -1,6 +1,6 @@
 [package]
 name = "ondadb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89" # std::fs::File advisory locking (DB LOCK file)
 license = "MPL-2.0"
@@ -50,7 +50,7 @@ rust-ini = "0.21"
 sha2 = "0.10"
 hmac = "0.12"
 rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tokio-rustls-tls"] }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 memmap2 = { version = "0.9", optional = true }
 smallvec = "1.15.2"
 

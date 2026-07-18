@@ -61,9 +61,28 @@ LSM storage engine.
   configuration.
 - **Observability** — `approximate_len()` plus per-CF read counters
   (point reads, bloom-filter skips, SSTable probes) and cache hit/miss stats.
+- **Partitions** (0.3.0) — prefix rules carve a CF's keyspace into named
+  partitions; bottom-level compaction cuts its output at the boundaries, so
+  each partition's bottom data is a clean, addressable **part**. Rules can be
+  added/removed on a live CF (`add_partition_rule`).
+- **Part lifecycle** (0.3.0) — ClickHouse-style `detach_part` / `attach_part`
+  / `freeze_part`: drop a part from the catalog atomically, re-attach a
+  same-lineage part, or export one as a standalone openable database.
+- **Storage tiers + part mover** (0.3.0) — named tiers (`Options::tiers`):
+  second disk, no-mmap NFS-style mounts, S3, or a caller-built `Storage`
+  backend (`TierDef::custom`). Per-CF `tier_rules` (prefix + `min_age`) drive
+  a background mover that relocates aged bottom parts crash-safely
+  (copy → fsync → atomic manifest flip → delete source).
+- **S3 tier** (0.3.0, cargo feature `s3`) — cold parts live in an
+  S3-compatible object store (MinIO-tested): block reads become bounded HTTP
+  range GETs fronted by the block cache (cold block = 1 GET, warm = 0),
+  writes are single-shot PUTs; no async runtime bleeds into the engine.
 
-Not implemented: the S3 / object-store connector and read replicas (intentionally
-out of scope).
+See **[docs/parts-and-tiers.md](docs/parts-and-tiers.md)** for the full guide
+to the 0.3.0 features (concepts, worked examples, S3 setup, operational
+notes).
+
+Not implemented: read replicas (intentionally out of scope).
 
 ## Benchmarks
 
@@ -93,6 +112,16 @@ cargo test                               # 137 tests, safe build
 cargo test --features unsafe-fastpath    # same suite over the fast path
 ```
 
+
+## Documentation
+
+| Doc | Covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Module map, write/read/flush/compaction/recovery data flow, partitions, storage tiers, part lifecycle & mover, S3 tier |
+| [docs/formats.md](docs/formats.md) | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest (incl. the 0.3.0 append-tolerant tail), internal keys |
+| [docs/concurrency-and-safety.md](docs/concurrency-and-safety.md) | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime contract, `unsafe` contracts |
+| [docs/parts-and-tiers.md](docs/parts-and-tiers.md) | User guide to partitions, parts and tiers — worked examples, S3 setup, operational notes |
+| [docs/performance.md](docs/performance.md) | Fast paths, benchmark methodology, known measurement artifacts |
 
 ## Usage
 
@@ -225,8 +254,11 @@ src/
   memtable.rs      sharded MVCC memtable (crossbeam, or arena under fastpath)
   memtable_arena.rs  arena skip-list shard (unsafe-fastpath only)
   sst/             SSTable writer/reader/iterator (+ B+tree hybrid klog)
+  storage.rs       Storage trait + LocalStorage + tier registry
+  storage_s3.rs    S3 tier backend (feature "s3")
+  parts.rs         part lifecycle (detach/attach/freeze) + part mover
   column_family.rs read path, rotation, flush, levels
-  compaction.rs    leveled compaction (+ filters) and FIFO eviction
+  compaction.rs    leveled compaction (+ filters, partition cuts) and FIFO eviction
   ingest.rs        bulk ingestion (sorted stream -> L0, no WAL/memtable)
   flush.rs / db.rs DB lifecycle, workers, sequence/snapshot mgmt, recovery
   txn.rs           transactions + single-op API

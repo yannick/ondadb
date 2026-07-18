@@ -13,17 +13,18 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use crate::cache::{BlockCache, FileCache};
+use crate::cache::BlockCache;
 use crate::comparator::ComparatorRef;
-use crate::config::ColumnFamilyConfig;
+use crate::config::{ColumnFamilyConfig, PartitionRule};
 use crate::error::{OndaError, Result};
 use crate::iterator::{ChildIter, Iterator};
 use crate::manifest::SstMeta;
 use crate::memtable::Memtable;
 use crate::sst::{Reader, Writer, WriterOptions};
-use smallvec::SmallVec;
+use crate::storage::TierRegistry;
 use crate::util::now_nanos;
 use crate::wal::{self, Wal};
+use smallvec::SmallVec;
 
 const DATA_BLOCK_SIZE: usize = 4 << 10;
 
@@ -76,7 +77,10 @@ pub struct ImmMemtable {
 
 /// Shared database context handed to each column family.
 pub(crate) struct CfCtx {
-    pub fc: Arc<FileCache>,
+    /// Storage-tier registry: resolves a table's tier to its root directory and
+    /// [`Storage`](crate::storage::Storage) backend. The default tier is the DB
+    /// directory, so untiered tables resolve exactly as before tiering existed.
+    pub tiers: Arc<TierRegistry>,
     pub bc: Arc<BlockCache>,
     pub flush_tx: Sender<FlushJob>,
     pub compact_tx: Sender<Arc<ColumnFamily>>,
@@ -129,6 +133,14 @@ pub struct ColumnFamily {
     id: u64,
     dir: String,
     pub(crate) opts: ColumnFamilyConfig,
+    /// Live partition rules — interior-mutable so [`crate::DB::add_partition_rule`]
+    /// can append to a *running* CF. Seeded from `opts.partition_rules` at
+    /// create/load; from then on this is the runtime authority for partitioning
+    /// (compaction and the manifest encode read it, never `opts.partition_rules`).
+    /// A compaction snapshots it once at the start of a run, so a rule added
+    /// mid-run only affects the *next* bottom compaction — write-side-only
+    /// semantics: existing bottom files keep the stamps they were cut with.
+    live_partition_rules: RwLock<Vec<PartitionRule>>,
     cmp: ComparatorRef,
 
     state: RwLock<CfState>,
@@ -176,6 +188,35 @@ impl ColumnFamily {
         format!("{}/{}.klog", self.dir, id)
     }
 
+    /// Absolute klog path for `meta`, honoring its storage tier. An untiered
+    /// table (`meta.tier == None`) resolves to the default-tier path — the same
+    /// `<db_dir>/cf-<name>/<id>.klog` as [`klog_path`](Self::klog_path); a tiered
+    /// bottom part resolves under that tier's root.
+    pub(crate) fn klog_path_for(&self, meta: &SstMeta) -> String {
+        match meta.tier.as_deref() {
+            None => self.klog_path(meta.id),
+            Some(t) => format!(
+                "{}/{}.klog",
+                self.ctx.tiers.cf_dir(Some(t), &self.name),
+                meta.id
+            ),
+        }
+    }
+
+    /// Open a reader for an already-on-disk table described by `meta`, using the
+    /// [`Storage`](crate::storage::Storage) backend for its tier (so a no-mmap
+    /// tier reads through the buffered path).
+    pub(crate) fn open_reader_for(&self, meta: &SstMeta) -> Result<Arc<Reader>> {
+        let storage = self.ctx.tiers.storage_for(meta.tier.as_deref());
+        Reader::open(
+            &self.klog_path_for(meta),
+            storage,
+            self.ctx.bc.clone(),
+            meta.id,
+            self.cmp.clone(),
+        )
+    }
+
     /// Create a fresh column family (directory + generation-0 WAL).
     pub(crate) fn create(
         ctx: Arc<CfCtx>,
@@ -194,12 +235,14 @@ impl ColumnFamily {
             w.set_poison(ctx.poison.clone());
             Some(Arc::new(w))
         };
+        let live_partition_rules = RwLock::new(opts.partition_rules.clone());
         let cf = Arc::new(ColumnFamily {
             ctx,
             id: crate::unified::cf_id(&name),
             name,
             dir,
             opts,
+            live_partition_rules,
             cmp,
             state: RwLock::new(CfState {
                 mem,
@@ -246,8 +289,15 @@ impl ColumnFamily {
         }
         let mut levels: Vec<Vec<Arc<SstHandle>>> = vec![Vec::new(); max_level];
         for s in ssts {
-            let klog = format!("{dir}/{}.klog", s.id);
-            let reader = Reader::open(&klog, ctx.fc.clone(), ctx.bc.clone(), s.id, cmp.clone())?;
+            // Resolve the tier before opening so a bottom part on another mount
+            // (and any no-mmap backend it carries) is read through the right
+            // storage. `None` tier == the default path used before tiering.
+            let storage = ctx.tiers.storage_for(s.tier.as_deref());
+            let klog = match s.tier.as_deref() {
+                None => format!("{dir}/{}.klog", s.id),
+                Some(t) => format!("{}/{}.klog", ctx.tiers.cf_dir(Some(t), &name), s.id),
+            };
+            let reader = Reader::open(&klog, storage, ctx.bc.clone(), s.id, cmp.clone())?;
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),
                 reader,
@@ -285,12 +335,14 @@ impl ColumnFamily {
             (Some(w), pend)
         };
 
+        let live_partition_rules = RwLock::new(opts.partition_rules.clone());
         let cf = Arc::new(ColumnFamily {
             ctx,
             id: crate::unified::cf_id(&name),
             name,
             dir,
             opts,
+            live_partition_rules,
             cmp,
             state: RwLock::new(CfState {
                 mem,
@@ -533,15 +585,14 @@ impl ColumnFamily {
         w: Writer,
         file_id: u64,
     ) -> Result<Arc<SstHandle>> {
-        let klog = self.klog_path(file_id);
-        let meta = w.finish()?.to_sst_meta(file_id, 0);
-        let reader = Reader::open(
-            &klog,
-            self.ctx.fc.clone(),
-            self.ctx.bc.clone(),
-            file_id,
-            self.cmp.clone(),
-        )?;
+        // Flush/ingest output always lands on the default tier (L0), so
+        // `meta.tier` is None and `open_reader_for` resolves the default path.
+        let mut meta = w.finish()?.to_sst_meta(file_id, 0);
+        // Stamp the write time as the table's max entry age: flush/ingest output
+        // holds freshly committed data, so the file's finish time approximates
+        // the newest entry's commit time (see `SstMeta::max_entry_time`).
+        meta.max_entry_time = Some(now_nanos());
+        let reader = self.open_reader_for(&meta)?;
         Ok(Arc::new(SstHandle { meta, reader }))
     }
 
@@ -870,10 +921,7 @@ impl ColumnFamily {
             }
         }
         drop(s);
-        let owned = (
-            bound_to_owned(bounds.0),
-            bound_to_owned(bounds.1),
-        );
+        let owned = (bound_to_owned(bounds.0), bound_to_owned(bounds.1));
         Iterator::new(self.cmp.clone(), children, read_seq, now_nanos(), owned)
     }
 
@@ -1049,20 +1097,208 @@ impl ColumnFamily {
 
     /// Build a handle for an already-on-disk SSTable id (used by clone).
     pub(crate) fn open_sst(&self, meta: SstMeta) -> Result<Arc<SstHandle>> {
-        let klog = self.klog_path(meta.id);
-        let reader = Reader::open(
-            &klog,
-            self.ctx.fc.clone(),
-            self.ctx.bc.clone(),
-            meta.id,
-            self.cmp.clone(),
-        )?;
+        let reader = self.open_reader_for(&meta)?;
         Ok(Arc::new(SstHandle { meta, reader }))
     }
 
-    pub(crate) fn config(&self) -> &ColumnFamilyConfig {
-        &self.opts
+    /// Snapshot the live partition rules. Compaction takes one snapshot per run
+    /// so a rule added mid-run cannot change that run's cut boundaries — it
+    /// takes effect on the next bottom compaction.
+    pub(crate) fn partition_rules_snapshot(&self) -> Vec<PartitionRule> {
+        self.live_partition_rules.read().clone()
     }
+
+    /// The effective durable config: `opts` with its partition rules replaced by
+    /// the live set. Every path that (re)encodes the config for persistence —
+    /// `DbInner::persist_manifest`, `freeze_part`, CF copy/clear — goes through
+    /// this so a live-added rule round-trips across reopen.
+    pub(crate) fn effective_config(&self) -> ColumnFamilyConfig {
+        let mut cfg = self.opts.clone();
+        cfg.partition_rules = self.live_partition_rules.read().clone();
+        cfg
+    }
+
+    /// Append `rule` to the live partition rules after validating the resulting
+    /// set with the same check [`ColumnFamilyConfig::validate`] runs at create
+    /// time (an exact-duplicate prefix is rejected). Validation and the append
+    /// happen under one write-lock acquisition, so two concurrent adds serialize
+    /// and the second observes the first (rejecting a duplicate). In-memory only;
+    /// the caller persists the manifest.
+    pub(crate) fn append_partition_rule(&self, rule: PartitionRule) -> Result<()> {
+        let mut rules = self.live_partition_rules.write();
+        let mut candidate = self.opts.clone();
+        candidate.partition_rules = rules.clone();
+        candidate.partition_rules.push(rule.clone());
+        candidate.validate().map_err(OndaError::InvalidArgs)?;
+        rules.push(rule);
+        Ok(())
+    }
+
+    /// Remove the partition rule whose prefix exactly equals `prefix` from the
+    /// live set, returning [`OndaError::NotFound`] if none matches. In-memory
+    /// only; the caller persists the manifest. Symmetric with
+    /// [`append_partition_rule`](Self::append_partition_rule): write-side-only,
+    /// so already-materialized bottom parts keep their stamps until a later
+    /// compaction rewrites them.
+    pub(crate) fn remove_partition_rule(&self, prefix: &[u8]) -> Result<()> {
+        let mut rules = self.live_partition_rules.write();
+        let before = rules.len();
+        rules.retain(|r| r.prefix != prefix);
+        if rules.len() == before {
+            return Err(OndaError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ---- part lifecycle support (used by parts.rs) ----
+
+    /// Snapshot the bottom-level handles belonging to `partition` (the unit of
+    /// DETACH / ATTACH / FREEZE). Only the last level is considered — upper
+    /// levels are "young data" and never partition-clean.
+    pub(crate) fn bottom_partition_handles(&self, partition: &str) -> Vec<Arc<SstHandle>> {
+        let s = self.state.read();
+        match s.levels.last() {
+            Some(bottom) => bottom
+                .iter()
+                .filter(|h| h.meta.partition.as_deref() == Some(partition))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove the tables with these ids from the bottom level, under the state
+    /// write-lock (the in-memory half of an atomic detach/move). Returns the
+    /// number actually removed.
+    pub(crate) fn remove_bottom_tables(&self, ids: &[u64]) -> usize {
+        let mut s = self.state.write();
+        let Some(bottom) = s.levels.last_mut() else {
+            return 0;
+        };
+        let before = bottom.len();
+        bottom.retain(|h| !ids.contains(&h.meta.id));
+        before - bottom.len()
+    }
+
+    /// Whether `[min_key, max_key]` overlaps any live bottom-level table. An
+    /// attached part with no overlap can slot straight into the bottom level;
+    /// otherwise it must go to L0 (which permits overlapping tables).
+    pub(crate) fn bottom_overlaps(&self, min_key: &[u8], max_key: &[u8]) -> bool {
+        let s = self.state.read();
+        let Some(bottom) = s.levels.last() else {
+            return false;
+        };
+        bottom.iter().any(|h| {
+            self.cmp.compare(min_key, &h.meta.max_key).is_le()
+                && self.cmp.compare(&h.meta.min_key, max_key).is_le()
+        })
+    }
+
+    /// Index of the bottom (last) level.
+    pub(crate) fn bottom_level_index(&self) -> usize {
+        self.state.read().levels.len().saturating_sub(1)
+    }
+
+    /// Insert `handle` into the bottom level, keeping it sorted by `min_key`
+    /// (the invariant leveled reads rely on for binary search).
+    pub(crate) fn insert_bottom_sorted(&self, handle: Arc<SstHandle>) {
+        let mut s = self.state.write();
+        let cmp = self.cmp.clone();
+        let bottom = s
+            .levels
+            .last_mut()
+            .expect("at least one level always exists");
+        bottom.push(handle);
+        bottom.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+    }
+
+    /// Replace the bottom-level tables with these ids by `replacements` (same
+    /// ids, new handles/metas) under the state write-lock. Used by the tier
+    /// mover to swap in relocated handles; in-flight reads finish on the old
+    /// handles they already hold.
+    pub(crate) fn swap_bottom_tables(&self, replacements: Vec<Arc<SstHandle>>) {
+        let mut s = self.state.write();
+        let cmp = self.cmp.clone();
+        let Some(bottom) = s.levels.last_mut() else {
+            return;
+        };
+        let ids: std::collections::HashSet<u64> = replacements.iter().map(|h| h.meta.id).collect();
+        bottom.retain(|h| !ids.contains(&h.meta.id));
+        bottom.extend(replacements);
+        bottom.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+    }
+
+    /// This CF's storage-tier registry (path/backend resolution).
+    pub(crate) fn tiers(&self) -> &Arc<TierRegistry> {
+        &self.ctx.tiers
+    }
+
+    /// This CF's storage-tier placement rules (see
+    /// [`ColumnFamilyConfig::tier_rules`]). Unlike partition rules these are not
+    /// live-mutable, so the durable `opts` copy is authoritative.
+    pub(crate) fn tier_rules(&self) -> &[crate::config::TierRule] {
+        &self.opts.tier_rules
+    }
+
+    /// Summarize the bottom-level parts (one per distinct partition name) for the
+    /// part mover: each part's smallest key, its current tier, and the age of its
+    /// newest entry. A part whose tables straddle more than one tier (only
+    /// possible after an interrupted move, before startup GC runs) is skipped so
+    /// the mover never acts on an inconsistent set. `max_entry_time` is the max
+    /// over the part's tables, or `None` if any table lacks a stamp (unknown age
+    /// is conservatively ineligible). The implicit default partition (`None`) is
+    /// not a mover part and is omitted.
+    pub(crate) fn bottom_parts(&self) -> Vec<BottomPart> {
+        let s = self.state.read();
+        let Some(bottom) = s.levels.last() else {
+            return Vec::new();
+        };
+        let mut groups: std::collections::HashMap<&str, Vec<&Arc<SstHandle>>> =
+            std::collections::HashMap::new();
+        for h in bottom {
+            if let Some(p) = h.meta.partition.as_deref() {
+                groups.entry(p).or_default().push(h);
+            }
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for (name, hs) in groups {
+            let tier = hs[0].meta.tier.clone();
+            if !hs.iter().all(|h| h.meta.tier == tier) {
+                continue; // straddles tiers — leave for startup GC / next pass
+            }
+            let min_key = hs
+                .iter()
+                .map(|h| &h.meta.min_key)
+                .min_by(|a, b| self.cmp.compare(a, b))
+                .expect("group is non-empty")
+                .clone();
+            let max_entry_time = if hs.iter().all(|h| h.meta.max_entry_time.is_some()) {
+                hs.iter().filter_map(|h| h.meta.max_entry_time).max()
+            } else {
+                None
+            };
+            out.push(BottomPart {
+                partition: name.to_string(),
+                min_key,
+                tier,
+                max_entry_time,
+            });
+        }
+        out
+    }
+}
+
+/// One bottom-level part as seen by the mover (see
+/// [`ColumnFamily::bottom_parts`]).
+pub(crate) struct BottomPart {
+    /// Partition name (the mover moves whole named partitions).
+    pub partition: String,
+    /// Smallest user key in the part (used to resolve its tier rule).
+    pub min_key: Vec<u8>,
+    /// Tier the part currently lives on (`None` = the default tier).
+    pub tier: Option<String>,
+    /// Age of the part's newest entry, or `None` if unknown.
+    pub max_entry_time: Option<i64>,
 }
 
 fn existing_wal_gens(dir: &str) -> Result<Vec<u64>> {

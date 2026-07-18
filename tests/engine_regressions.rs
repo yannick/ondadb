@@ -135,10 +135,7 @@ const BACKLOG_KEYS: u64 = 4000;
 /// the env vars are set; otherwise it's a no-op in normal suite runs.
 #[test]
 fn crash_helper() {
-    let (Ok(dir), Ok(mode)) = (
-        std::env::var(CRASH_DIR_ENV),
-        std::env::var(CRASH_MODE_ENV),
-    ) else {
+    let (Ok(dir), Ok(mode)) = (std::env::var(CRASH_DIR_ENV), std::env::var(CRASH_MODE_ENV)) else {
         return;
     };
     let dir = std::path::Path::new(&dir);
@@ -263,7 +260,9 @@ fn multi_cf_crash_reopen_loses_no_committed_writes() {
 
     let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
     let likes = db.get_column_family("likes").expect("likes CF recovered");
-    let unlikes = db.get_column_family("unlikes").expect("unlikes CF recovered");
+    let unlikes = db
+        .get_column_family("unlikes")
+        .expect("unlikes CF recovered");
 
     assert_eq!(
         count_keys(&db, &likes) as u64,
@@ -482,7 +481,8 @@ fn drop_and_recreate_cf_with_live_stale_handle() {
 
     let old = db.create_column_family("d", small_cfg()).unwrap();
     for i in 0..10u64 {
-        db.put(&old, format!("old{i}").as_bytes(), b"x", ZERO).unwrap();
+        db.put(&old, format!("old{i}").as_bytes(), b"x", ZERO)
+            .unwrap();
     }
     db.flush_memtable(&old).unwrap();
 
@@ -716,9 +716,7 @@ fn failed_commit_must_not_stall_visibility_or_lose_later_writes() {
     // Cross-thread visibility: the writing thread's read-your-own-writes
     // floor masks a stalled cursor, so the probe must come from another
     // thread.
-    let ok = std::thread::scope(|s| {
-        s.spawn(|| db.get(&cf, b"alive").is_ok()).join().unwrap()
-    });
+    let ok = std::thread::scope(|s| s.spawn(|| db.get(&cf, b"alive").is_ok()).join().unwrap());
     assert!(
         ok,
         "commit after a failed commit is invisible to other threads \
@@ -755,7 +753,8 @@ fn iterate_while_flush_and_compaction_run() {
     let cf = db.create_column_family("default", small_cfg()).unwrap();
 
     for i in 0..3000u64 {
-        db.put(&cf, format!("k{i:05}").as_bytes(), b"old", ZERO).unwrap();
+        db.put(&cf, format!("k{i:05}").as_bytes(), b"old", ZERO)
+            .unwrap();
     }
     db.flush_memtable(&cf).unwrap(); // snapshot spans SSTs + memtable
 
@@ -770,8 +769,10 @@ fn iterate_while_flush_and_compaction_run() {
             // this forces many rotations + flushes, then a full compaction
             // that unlinks tables the iterator may still hold open.
             for i in 0..3000u64 {
-                db.put(&cf, format!("k{i:05}").as_bytes(), b"new", ZERO).unwrap();
-                db.put(&cf, format!("z{i:05}").as_bytes(), b"new", ZERO).unwrap();
+                db.put(&cf, format!("k{i:05}").as_bytes(), b"new", ZERO)
+                    .unwrap();
+                db.put(&cf, format!("z{i:05}").as_bytes(), b"new", ZERO)
+                    .unwrap();
             }
             db.compact(&cf).unwrap();
         });
@@ -789,7 +790,7 @@ fn iterate_while_flush_and_compaction_run() {
             );
             seen += 1;
             // Give the writer real time to rotate/flush/compact mid-scan.
-            if seen % 256 == 0 {
+            if seen.is_multiple_of(256) {
                 std::thread::sleep(Duration::from_millis(2));
             }
             it.next();
@@ -874,7 +875,7 @@ fn prefix_adversarial_point_and_range_lookups() {
         b"\0",
         b"\0\0",
         b"a",
-        b"a\0",   // key_prefix8 zero-pads: collides with "a" in the u64 window
+        b"a\0", // key_prefix8 zero-pads: collides with "a" in the u64 window
         b"a\0b",
         b"aaaaaaa",   // 7 a's
         b"aaaaaaaa",  // 8 a's — full window
@@ -1003,7 +1004,10 @@ fn bounded_iterator_composite_key_bounds() {
             it.prev();
         }
         bwd.reverse();
-        assert_eq!(fwd, bwd, "forward/backward disagree for {lower:?}..{upper:?}");
+        assert_eq!(
+            fwd, bwd,
+            "forward/backward disagree for {lower:?}..{upper:?}"
+        );
         fwd
     };
     let vals = |s: &[&str]| -> Vec<Vec<u8>> { s.iter().map(|v| v.as_bytes().to_vec()).collect() };
@@ -1016,12 +1020,21 @@ fn bounded_iterator_composite_key_bounds() {
     // k3 extends the bound and therefore sorts after it.
     assert_eq!(collect(Included(&lo), Included(&hi)), vals(&["1", "2"]));
     // Bumping the upper prefix by one covers the whole last group.
-    assert_eq!(collect(Included(&lo), Included(&past)), vals(&["1", "2", "3"]));
-    assert_eq!(collect(Included(&lo), Excluded(&past)), vals(&["1", "2", "3"]));
+    assert_eq!(
+        collect(Included(&lo), Included(&past)),
+        vals(&["1", "2", "3"])
+    );
+    assert_eq!(
+        collect(Included(&lo), Excluded(&past)),
+        vals(&["1", "2", "3"])
+    );
     // Excluding a bare prefix never excludes its extensions.
     assert_eq!(collect(Excluded(&lo), Unbounded), vals(&["1", "2", "3"]));
     // Full-key bounds behave classically.
-    assert_eq!(collect(Included(&k1), Included(&k3)), vals(&["1", "2", "3"]));
+    assert_eq!(
+        collect(Included(&k1), Included(&k3)),
+        vals(&["1", "2", "3"])
+    );
     assert_eq!(collect(Excluded(&k1), Excluded(&k3)), vals(&["2"]));
     assert_eq!(collect(Excluded(&k1), Included(&k3)), vals(&["2", "3"]));
     assert_eq!(collect(Unbounded, Excluded(&k2)), vals(&["1"]));
@@ -1065,7 +1078,10 @@ fn stray_files_ignored_on_open() {
     let (db, cf) = open(dir.path());
     assert_eq!(count_keys(&db, &cf), 120);
     for i in (0..120u64).step_by(17) {
-        assert_eq!(db.get(&cf, format!("k{i:03}").as_bytes()).unwrap(), val(i, 32));
+        assert_eq!(
+            db.get(&cf, format!("k{i:03}").as_bytes()).unwrap(),
+            val(i, 32)
+        );
     }
     db.put(&cf, b"post-junk", b"1", ZERO).unwrap();
     db.close().unwrap();
@@ -1093,11 +1109,13 @@ fn comparator_and_config_persist_across_reopen() {
             )
             .unwrap();
         for n in &nums {
-            db.put(&cf, &n.to_be_bytes(), &val(*n as u64, 128), ZERO).unwrap();
+            db.put(&cf, &n.to_be_bytes(), &val(*n as u64, 128), ZERO)
+                .unwrap();
         }
         db.flush_memtable(&cf).unwrap();
         // One memtable-resident key so reopen merges SST + WAL sources.
-        db.put(&cf, &4i64.to_be_bytes(), &val(4, 128), ZERO).unwrap();
+        db.put(&cf, &4i64.to_be_bytes(), &val(4, 128), ZERO)
+            .unwrap();
         db.close().unwrap();
     }
 
