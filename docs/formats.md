@@ -143,16 +143,90 @@ magic u32 = 0x5756_4D46 ("WVMF") | version u32 = 1
 | per CF: name bytes* | config blob bytes* | sst_count uvarint
   | per SST: id, level, num_entries, num_tombstones, max_seq,
              klog_size, vlog_size (all uvarint) | min_key* | max_key*
+| append-tolerant tail (0–3 sections, see below)
 | crc32c u32
 ```
 
 (`*` = uvarint length prefix + bytes.) The config blob is the
 `ColumnFamilyConfig::encode` durable subset (comparator name, use_btree,
-compression, …). `Manifest::save` is crash-atomic: write `MANIFEST.tmp` →
-`sync_all` → rename over `MANIFEST` → parent-dir fsync. The temp path is
-fixed, so all saves MUST be serialized by `DbInner::manifest_mu` (a past
-data-loss bug). A CRC-invalid manifest fails `DB::open` (no partial
-recovery); a missing one is an empty database.
+compression, sync mode, per-level/per-prefix compression, FIFO settings,
+partition rules, tier rules — see § Config blob below). `Manifest::save` is
+crash-atomic: write `MANIFEST.tmp` → `sync_all` → rename over `MANIFEST` →
+parent-dir fsync. The temp path is fixed, so all saves MUST be serialized by
+`DbInner::manifest_mu` (a past data-loss bug). A CRC-invalid manifest fails
+`DB::open` (no partial recovery); a missing one is an empty database.
+
+### Append-tolerant tail (`SstMeta.partition` / `.tier` / `.max_entry_time`)
+
+The per-SST record list above is a flat sequential encoding with no framing,
+so optional per-record fields cannot be added in place without breaking older
+readers. Instead they live in a tail between the last CF's records and the
+CRC (the CRC covers the tail). The tail holds up to **three positional
+sections**, always in this order:
+
+```
+1. partition section   per CF, in manifest CF order:
+                         count uvarint
+                         { table_index uvarint | name* } × count
+2. tier section        same shape as 1 (payload = tier name)
+3. max-entry-time section
+                         count uvarint
+                         { table_index uvarint | value uvarint } × count
+```
+
+`table_index` is the table's position in that CF's `sst_count` list.
+`value` in section 3 is `SstMeta::max_entry_time` cast to `u64` (nanoseconds
+since the Unix epoch); tables not listed in a section decode that field as
+`None`.
+
+**Emission rules** (`Manifest::encode`) keep every earlier on-disk format
+byte-identical — a later section is emitted only when all earlier ones
+precede it, even if those are all-empty counts:
+
+| Fields set anywhere in the manifest | Tail emitted |
+|---|---|
+| none                                | no tail at all (legacy layout, byte-identical to pre-0.3.0) |
+| only `partition`                    | section 1 only (P1 layout) |
+| any `tier`, no `max_entry_time`     | sections 1 + 2 (P3 layout) |
+| any `max_entry_time`                | sections 1 + 2 + 3 |
+
+**Decoding** is positional: after the CF loop, if bytes remain before the
+CRC the first section is the partition section, the next (if bytes remain)
+the tier section, the next the time section. A manifest that stops short
+leaves the remaining fields `None` — every legacy layout decodes cleanly.
+
+**Compatibility rules:**
+
+- *Old reader, new manifest*: pre-tail decoders ignored trailing body bytes
+  (the CRC still validates — it covers the whole body), so a pre-0.3.0
+  binary opens a 0.3.0 manifest without error. **But** it reconstructs every
+  `SstMeta` without `partition`/`tier`/`max_entry_time`, and its next
+  manifest rewrite (any flush/compaction) re-encodes without the tail —
+  the metadata is silently and permanently stripped. For an untiered
+  database that only loses partition stamps (re-derivable by the next
+  bottom compaction); for a database with parts on a **named tier** it is
+  fatal-on-reopen: the stripped `tier` makes the engine resolve those
+  tables at the default-tier path, where the files do not exist. Do not
+  downgrade a tiered database (see `docs/parts-and-tiers.md` § Downgrade).
+- *New reader, old manifest*: a legacy (no-tail) manifest decodes with all
+  three fields `None` on every table — the pre-partitioning semantics.
+
+### Config blob (`ColumnFamilyConfig::encode`)
+
+The per-CF config blob uses the same append-tolerant idea *inside* the blob:
+a fixed prefix (comparator name`*`, compression u8, write_buffer_size u64,
+level_size_ratio u64, klog_value_threshold u64, enable_bloom u8, bloom_fpr
+f64-bits, l1_file_count_trigger u32, l0_queue_stall_threshold u32, use_btree
+u8 — all little-endian fixed width unless marked) followed by appended tails
+in this order: sync_mode u8 + sync_interval u64 (µs); compression_per_level
+(count u8 + algs); compaction_style u8 + fifo_max_bytes u64 + fifo_ttl u64
+(µs); compression_rules (count u8 + `{prefix* | alg u8}`); **partition_rules**
+(count u8 + `{prefix* | name*}`); **tier_rules** (count u8 + `{prefix* |
+tier_name* | min_age u64 (µs)}`). `decode_into` stops early on a short blob
+via `?`, so a blob from any older version reconstructs the missing trailing
+fields as struct defaults (empty rule lists) — backward compatible in both
+directions, with the same rewrite-strips-the-tail caveat as the manifest
+tail.
 
 ## Unified-memtable WAL (`unified.rs`)
 
