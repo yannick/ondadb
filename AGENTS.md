@@ -10,7 +10,8 @@ Deep documentation (read the one that matches your task):
 |---|---|
 | `docs/architecture.md` | Module map, write/read/flush/compaction/recovery data flow |
 | `docs/formats.md` | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest, internal keys |
-| `docs/concurrency-and-safety.md` | Lock inventory & ordering, MVCC, rotation protocol, all `unsafe` contracts |
+| `docs/concurrency-and-safety.md` | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime/blocking contract, all `unsafe` contracts |
+| `docs/parts-and-tiers.md` | User-facing guide to partitions, parts and storage tiers (0.3.0): concepts, worked examples, S3 setup, operational notes |
 | `docs/performance.md` | Fast paths, benchmark methodology, known measurement artifacts |
 
 ## Build, test, verify
@@ -116,3 +117,4 @@ ondaDB needs **no internal object CAS**: part objects use unique, never-reused i
 (one writer per key) and the commit point is the *local* manifest's fsync+rename,
 not an S3 object — CAS on a shared S3 pointer is ayu's layer, not the engine's.
 S3 tests are gated by `ONDADB_S3_ENDPOINT` (see `storage_s3.rs` / `tests/s3_tier.rs`).
+Full feature guide: `docs/parts-and-tiers.md`.
