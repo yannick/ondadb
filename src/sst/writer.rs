@@ -6,8 +6,8 @@ use std::path::Path;
 
 use super::{
     data_block_alg, encode_entry, vlog_path_for, BlockHandle, FileMeta, IndexEntry,
-    DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS,
-    FOOTER_SIZE, FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
+    DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE,
+    FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
 };
 use crate::block::write_block;
 use crate::bloom::Bloom;
@@ -208,7 +208,9 @@ impl Writer {
             has_vlog = true;
         }
 
-        if self.opts.restart_interval > 0 && self.cur_entries.is_multiple_of(self.opts.restart_interval) {
+        if self.opts.restart_interval > 0
+            && self.cur_entries.is_multiple_of(self.opts.restart_interval)
+        {
             self.cur_restarts.push(self.cur_block.len() as u32);
         }
         self.cur_entries += 1;
@@ -557,7 +559,7 @@ mod tests {
             shortest_separator(&[0xff, 0xff], &[0xff, 0xff, 0x01]),
             vec![0xff, 0xff]
         ); // increment overflow -> unshortened
-        // a[i]+1 == b[i] with b extending past i -> can shorten.
+           // a[i]+1 == b[i] with b extending past i -> can shorten.
         assert_eq!(shortest_separator(b"aa", b"ab0"), b"ab".to_vec());
         // a[i]+1 == b[i] with b NOT extending -> cannot (s would equal b).
         assert_eq!(shortest_separator(b"aa", b"ab"), b"aa".to_vec());
@@ -575,7 +577,13 @@ mod tests {
             let lb = (rnd() % 12 + 1) as usize;
             let a: Vec<u8> = (0..la).map(|_| (rnd() % 6) as u8 + b'a').collect();
             let b: Vec<u8> = (0..lb).map(|_| (rnd() % 6) as u8 + b'a').collect();
-            let (a, b) = if a < b { (a, b) } else if b < a { (b, a) } else { continue };
+            let (a, b) = if a < b {
+                (a, b)
+            } else if b < a {
+                (b, a)
+            } else {
+                continue;
+            };
             let s = shortest_separator(&a, &b);
             assert!(a.as_slice() <= s.as_slice(), "a={a:?} b={b:?} s={s:?}");
             assert!(s.as_slice() < b.as_slice(), "a={a:?} b={b:?} s={s:?}");

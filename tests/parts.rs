@@ -92,7 +92,10 @@ fn detach_hides_then_attach_restores_and_preexisting_iterator_unaffected() {
         }
         it.next();
     }
-    assert_eq!(img_seen, 5, "pre-detach iterator must still see all img keys");
+    assert_eq!(
+        img_seen, 5,
+        "pre-detach iterator must still see all img keys"
+    );
     drop(snap);
 
     // Attach the detached part back; the range is now free of live bottom
@@ -125,7 +128,10 @@ fn detach_is_durable_across_reopen() {
     {
         let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
         let cf = db.get_column_family("default").unwrap();
-        assert!(db.get(&cf, b"img/000").is_err(), "detach must survive reopen");
+        assert!(
+            db.get(&cf, b"img/000").is_err(),
+            "detach must survive reopen"
+        );
         assert_eq!(db.get(&cf, b"log/000").unwrap(), b"LOG");
 
         // And re-attaching after reopen restores it durably too.
@@ -323,9 +329,18 @@ fn add_partition_rule_live_cuts_only_future_bottom_compactions() {
 
     // All data still reads correctly across the re-partitioning.
     for i in 0..5u32 {
-        assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), b"IMG");
-        assert_eq!(db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(), b"LOG");
-        assert_eq!(db.get(&cf, format!("etc/{i:03}").as_bytes()).unwrap(), b"ETC");
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+        assert_eq!(
+            db.get(&cf, format!("log/{i:03}").as_bytes()).unwrap(),
+            b"LOG"
+        );
+        assert_eq!(
+            db.get(&cf, format!("etc/{i:03}").as_bytes()).unwrap(),
+            b"ETC"
+        );
     }
     db.close().unwrap();
 }
@@ -587,10 +602,7 @@ fn part_files(tier_root: &str) -> Vec<std::path::PathBuf> {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|x| x == "klog" || x == "vlog")
-            })
+            .filter(|p| p.extension().is_some_and(|x| x == "klog" || x == "vlog"))
             .collect(),
         Err(_) => Vec::new(),
     }

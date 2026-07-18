@@ -166,7 +166,11 @@ impl ReadHandle for S3ReadHandle {
         if bytes.len() < want {
             return Err(s3_err(
                 "get_range",
-                format!("short read on {}: wanted {want} got {}", self.key, bytes.len()),
+                format!(
+                    "short read on {}: wanted {want} got {}",
+                    self.key,
+                    bytes.len()
+                ),
             ));
         }
         buf.copy_from_slice(&bytes[..want]);

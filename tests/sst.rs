@@ -43,7 +43,14 @@ fn build_sst(
     w.finish().unwrap();
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 1, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        1,
+        default_comparator(),
+    )
+    .unwrap();
     (r, keys)
 }
 
@@ -78,7 +85,14 @@ fn large_value_vlog() {
 
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 2, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        2,
+        default_comparator(),
+    )
+    .unwrap();
     let (v, _, found, _) = r.get(b"b", u64::MAX, 0).unwrap();
     assert!(found && v.as_deref() == Some(big.as_slice()));
     let (v, _, found, _) = r.get(b"a", u64::MAX, 0).unwrap();
@@ -106,7 +120,14 @@ fn corrupt_vlog_value_is_detected() {
 
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 42, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        42,
+        default_comparator(),
+    )
+    .unwrap();
     let res = r.get(b"a", u64::MAX, 0);
     assert!(
         res.is_err(),
@@ -127,7 +148,14 @@ fn tombstone_and_mvcc() {
 
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 3, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        3,
+        default_comparator(),
+    )
+    .unwrap();
 
     let (_, _, found, deleted) = r.get(b"k", 100, 0).unwrap();
     assert!(found && deleted, "latest version should be tombstone");
@@ -201,7 +229,14 @@ fn btree_hybrid_klog_round_trip() {
 
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 7, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        7,
+        default_comparator(),
+    )
+    .unwrap();
 
     // Point reads (exercises find_block over the reconstructed index).
     for k in keys.iter().step_by(97) {
@@ -244,7 +279,6 @@ fn value_round_trip_via_iterator() {
     assert_eq!(i, keys.len());
 }
 
-
 // ---- vlog compression (v2 frames) + per-prefix rules -----------------------
 
 /// Large compressible values must shrink the vlog and round-trip intact.
@@ -268,7 +302,14 @@ fn vlog_compression_roundtrip_and_shrinks() {
         sizes.insert(alg, vlog_size);
         let fc = Arc::new(FileCache::new(16));
         let bc = Arc::new(BlockCache::new(1 << 20));
-        let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 1, default_comparator()).unwrap();
+        let r = Reader::open(
+            klog,
+            LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+            bc,
+            1,
+            default_comparator(),
+        )
+        .unwrap();
         for i in 0..n {
             let k = format!("key{i:06}");
             let (v, _seq, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
@@ -326,7 +367,14 @@ fn vlog_incompressible_stored_raw() {
     w.finish().unwrap();
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 1, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        1,
+        default_comparator(),
+    )
+    .unwrap();
     for i in 0..n {
         let k = format!("key{i:06}");
         let (v, _s, found, _d) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
@@ -382,7 +430,14 @@ fn per_prefix_compression_rules() {
     );
     let fc = Arc::new(FileCache::new(16));
     let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = Reader::open(klog, LocalStorage::new(fc, cfg!(feature = "mmap-reads")), bc, 1, default_comparator()).unwrap();
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(fc, cfg!(feature = "mmap-reads")),
+        bc,
+        1,
+        default_comparator(),
+    )
+    .unwrap();
     for k in &keys {
         let (v, _s, found, _d) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found, "missing {k}");

@@ -335,11 +335,7 @@ fn decode_name_section<'a>(
 /// order, a uvarint count of tables carrying a value (as selected by `pick`),
 /// then `(table_index, value)` uvarint pairs. Mirrors [`encode_name_section`]
 /// with a numeric payload in place of a byte string.
-fn encode_u64_section(
-    b: &mut Vec<u8>,
-    cfs: &[CfManifest],
-    pick: impl Fn(&SstMeta) -> Option<u64>,
-) {
+fn encode_u64_section(b: &mut Vec<u8>, cfs: &[CfManifest], pick: impl Fn(&SstMeta) -> Option<u64>) {
     for cf in cfs {
         let valued: Vec<(usize, u64)> = cf
             .sstables

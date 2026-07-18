@@ -739,7 +739,10 @@ fn bottom_level_compaction_cuts_at_partition_boundaries() {
     let m = Manifest::load(manifest_path(dir.path())).unwrap();
     let cfm = m.cfs.iter().find(|c| c.name == "default").unwrap();
     let bottom = cfm.sstables.iter().map(|s| s.level).max().unwrap();
-    assert!(bottom >= 1, "expected data pushed below L0, bottom = {bottom}");
+    assert!(
+        bottom >= 1,
+        "expected data pushed below L0, bottom = {bottom}"
+    );
 
     let mut seen_alpha = false;
     let mut seen_beta = false;

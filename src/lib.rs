@@ -37,9 +37,9 @@ pub mod iterator;
 pub mod maintenance;
 pub mod manifest;
 pub mod memtable;
-pub mod parts;
 #[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;
+pub mod parts;
 pub mod sst;
 pub mod storage;
 #[cfg(feature = "s3")]
@@ -51,14 +51,12 @@ pub mod wal;
 
 pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
+#[cfg(feature = "s3")]
+pub use config::S3Config;
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
     Options, PartitionRule, SyncMode, TierBackend, TierDef, TierRule,
 };
-#[cfg(feature = "s3")]
-pub use config::S3Config;
-#[cfg(feature = "s3")]
-pub use storage_s3::S3Storage;
 pub use db::DB;
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
@@ -66,4 +64,6 @@ pub use iterator::Iterator;
 pub use maintenance::{CfStats, DbStats};
 pub use parts::DetachedPart;
 pub use storage::{LocalStorage, Storage};
+#[cfg(feature = "s3")]
+pub use storage_s3::S3Storage;
 pub use txn::Txn;

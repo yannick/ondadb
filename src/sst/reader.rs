@@ -11,10 +11,10 @@ use crate::block::read_block;
 use crate::bloom::Bloom;
 use crate::cache::BlockCache;
 use crate::comparator::ComparatorRef;
-use crate::storage::{ReadHandle, Storage};
 use crate::config::Compression;
 use crate::encoding::{checksum, read_u32, read_u64, uvarint};
 use crate::error::{OndaError, Result};
+use crate::storage::{ReadHandle, Storage};
 
 /// Reads a finished SSTable.  The footer, index and bloom filter are loaded on
 /// open; data blocks are read on demand through the block cache (or, under

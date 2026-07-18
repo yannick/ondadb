@@ -22,9 +22,9 @@ use crate::manifest::SstMeta;
 use crate::memtable::Memtable;
 use crate::sst::{Reader, Writer, WriterOptions};
 use crate::storage::TierRegistry;
-use smallvec::SmallVec;
 use crate::util::now_nanos;
 use crate::wal::{self, Wal};
+use smallvec::SmallVec;
 
 const DATA_BLOCK_SIZE: usize = 4 << 10;
 
@@ -921,10 +921,7 @@ impl ColumnFamily {
             }
         }
         drop(s);
-        let owned = (
-            bound_to_owned(bounds.0),
-            bound_to_owned(bounds.1),
-        );
+        let owned = (bound_to_owned(bounds.0), bound_to_owned(bounds.1));
         Iterator::new(self.cmp.clone(), children, read_seq, now_nanos(), owned)
     }
 
@@ -1207,7 +1204,10 @@ impl ColumnFamily {
     pub(crate) fn insert_bottom_sorted(&self, handle: Arc<SstHandle>) {
         let mut s = self.state.write();
         let cmp = self.cmp.clone();
-        let bottom = s.levels.last_mut().expect("at least one level always exists");
+        let bottom = s
+            .levels
+            .last_mut()
+            .expect("at least one level always exists");
         bottom.push(handle);
         bottom.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
     }
@@ -1222,8 +1222,7 @@ impl ColumnFamily {
         let Some(bottom) = s.levels.last_mut() else {
             return;
         };
-        let ids: std::collections::HashSet<u64> =
-            replacements.iter().map(|h| h.meta.id).collect();
+        let ids: std::collections::HashSet<u64> = replacements.iter().map(|h| h.meta.id).collect();
         bottom.retain(|h| !ids.contains(&h.meta.id));
         bottom.extend(replacements);
         bottom.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));

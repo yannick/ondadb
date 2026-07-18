@@ -568,9 +568,7 @@ mod tests {
     fn concurrent_append_replay_complete() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = std::sync::Arc::new(
-            Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap(),
-        );
+        let wal = std::sync::Arc::new(Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap());
         let threads = 8;
         let batches = 500;
         let per_batch = 10;

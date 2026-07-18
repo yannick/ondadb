@@ -138,7 +138,12 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
 /// the in-place bottom rewrite manual compaction does — the only way tables
 /// in the last level that overlap no incoming data ever see the compaction
 /// filter or drop their tombstones again).
-fn compact_into(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize, target: usize) -> Result<()> {
+fn compact_into(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    target: usize,
+) -> Result<()> {
     let cmp = cf.cmp();
     debug_assert!(target == level || target == level + 1);
 
