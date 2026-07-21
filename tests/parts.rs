@@ -1,10 +1,13 @@
 //! Part lifecycle (P2) and storage-tier substrate (P3): detach / attach /
 //! freeze, and cross-tier moves.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ondadb::{ColumnFamily, ColumnFamilyConfig, Options, PartitionRule, TierDef, TierRule, DB};
+use ondadb::{
+    ColumnFamily, ColumnFamilyConfig, MovePhase, MovePhaseEvent, MovePhaseObserver, OndaError,
+    Options, PartitionRule, TierDef, TierRule, DB,
+};
 
 /// A CF configured so that `img/` and `log/` keys form their own bottom-level
 /// parts (compaction cuts bottom files at partition boundaries).
@@ -269,6 +272,112 @@ fn move_part_to_tier_reads_correctly_with_mmap_off() {
     }
     assert_eq!(db.get(&cf, b"log/000").unwrap(), b"LOG");
     db.close().unwrap();
+}
+
+#[derive(Debug)]
+struct RecordingMoveObserver {
+    phases: Mutex<Vec<MovePhase>>,
+    fail_at: Option<MovePhase>,
+}
+
+impl RecordingMoveObserver {
+    fn new(fail_at: Option<MovePhase>) -> Self {
+        Self {
+            phases: Mutex::new(Vec::new()),
+            fail_at,
+        }
+    }
+}
+
+impl MovePhaseObserver for RecordingMoveObserver {
+    fn observe(&self, event: &MovePhaseEvent<'_>) -> ondadb::Result<()> {
+        self.phases.lock().unwrap().push(event.phase.clone());
+        if self
+            .fail_at
+            .as_ref()
+            .is_some_and(|phase| phase.same_kind(&event.phase))
+        {
+            return Err(OndaError::InvalidArgs(format!(
+                "injected move failure at {:?}",
+                event.phase
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn observed_move_phases_cover_every_durability_boundary_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::new("hdd", hdd.path().to_str().unwrap())];
+    let db = DB::open(opts).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    let observer = RecordingMoveObserver::new(None);
+
+    db.move_part_to_tier_observed(&cf, "img", "hdd", &observer)
+        .unwrap();
+
+    let phases = observer.phases.lock().unwrap().clone();
+    assert!(matches!(
+        phases.first(),
+        Some(MovePhase::CopyComplete { .. })
+    ));
+    assert_eq!(
+        phases[phases.len() - 3..],
+        [
+            MovePhase::DestinationSynced,
+            MovePhase::ManifestFlipped,
+            MovePhase::SourceDeleteFinished { remaining_files: 0 },
+        ]
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn observed_move_failures_reopen_exactly_old_or_new_placement() {
+    for (phase, expect_new) in [
+        (
+            MovePhase::CopyComplete {
+                object_index: 1,
+                object_count: 1,
+            },
+            false,
+        ),
+        (MovePhase::DestinationSynced, false),
+        (MovePhase::ManifestFlipped, true),
+        (MovePhase::SourceDeleteFinished { remaining_files: 0 }, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let hdd_root = hdd.path().to_str().unwrap().to_string();
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.tiers = vec![TierDef::new("hdd", hdd_root.clone())];
+        {
+            let db = DB::open(opts.clone()).unwrap();
+            let cf = db.create_column_family("default", parts_cfg()).unwrap();
+            materialize_parts(&db, &cf);
+            let observer = RecordingMoveObserver::new(Some(phase.clone()));
+            let error = db
+                .move_part_to_tier_observed(&cf, "img", "hdd", &observer)
+                .unwrap_err();
+            assert!(error.to_string().contains("injected move failure"));
+            assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+            db.close().unwrap();
+        }
+
+        let db = DB::open(opts).unwrap();
+        let cf = db.get_column_family("default").unwrap();
+        assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+        assert_eq!(
+            klog_count(&hdd_root) > 0,
+            expect_new,
+            "wrong durable placement after {phase:?}"
+        );
+        db.close().unwrap();
+    }
 }
 
 // ---- A5: live partition-rule addition -------------------------------------

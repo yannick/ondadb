@@ -175,6 +175,15 @@ data. The scheduled pass runs on the compaction worker (between jobs, every
 that thread; a concurrent *manual* `run_part_mover` is still safe via
 `compact_mu`.
 
+`DB::move_part_to_tier_observed` is the deterministic crash-test form of the
+same mover. Its synchronous `MovePhaseObserver` runs under `compact_mu` at four
+semantic boundaries: copied bytes before each destination writer finishes, all
+destination objects durable, manifest flip durable, and source cleanup issued.
+An observer may block for an external subprocess kill or return an injected
+error. Before the manifest phase, reopen selects the source; at or after it,
+reopen selects the destination. Never install an observer on an ordinary
+latency-sensitive production move.
+
 ## S3Storage runtime & blocking contract (`storage_s3.rs`, feature `s3`)
 
 ondaDB has no async runtime; rust-s3 is async. Each `S3Storage` owns a

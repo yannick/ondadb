@@ -53,6 +53,57 @@ pub struct DetachedPart {
     pub files: Vec<String>,
 }
 
+/// A semantic boundary in the crash-safe part-move protocol.
+///
+/// These events are emitted only by [`DB::move_part_to_tier_observed`]. The
+/// ordinary mover does not allocate events or invoke a callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MovePhase {
+    /// One complete destination object has received all source bytes, but its
+    /// [`StorageWriter`](crate::storage::StorageWriter) has not been finished.
+    CopyComplete {
+        /// One-based object number within this part move.
+        object_index: usize,
+        /// Total destination objects in this part move.
+        object_count: usize,
+    },
+    /// Every destination writer finished, so all copied objects are durable.
+    DestinationSynced,
+    /// The crash-atomic manifest durably names the destination tier.
+    ManifestFlipped,
+    /// Every source deletion was issued. A nonzero count means checkpoint or
+    /// backup pinning deferred physical unlink; catalog authority has already
+    /// moved to the destination.
+    SourceDeleteFinished { remaining_files: usize },
+}
+
+impl MovePhase {
+    /// Whether two observations name the same semantic boundary, ignoring its
+    /// per-run counters. Useful for deterministic fault selection.
+    pub fn same_kind(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+/// Run-bound identity accompanying one observed move boundary.
+#[derive(Clone, Debug)]
+pub struct MovePhaseEvent<'a> {
+    pub cf_name: &'a str,
+    pub partition: &'a str,
+    pub destination_tier: &'a str,
+    pub phase: MovePhase,
+}
+
+/// Synchronous observer for deterministic crash/fault harnesses.
+///
+/// The callback runs while the column-family compaction mutex is held. It may
+/// block to coordinate a subprocess kill. Returning an error interrupts the
+/// move at the named boundary; the ordinary old-or-new recovery rules still
+/// apply. Production placement policy should use the unobserved mover APIs.
+pub trait MovePhaseObserver: Send + Sync {
+    fn observe(&self, event: &MovePhaseEvent<'_>) -> Result<()>;
+}
+
 impl DB {
     /// Detach the bottom-level part for `partition`: remove its tables from the
     /// catalog in one atomic manifest record and move their file pairs to
@@ -304,7 +355,24 @@ impl DB {
         partition: &str,
         tier: &str,
     ) -> Result<()> {
-        self.inner.relocate_part(cf, partition, tier)
+        self.inner.relocate_part(cf, partition, tier, None)
+    }
+
+    /// Move one part while reporting every durability boundary to `observer`.
+    ///
+    /// This is the deterministic fault-harness form of
+    /// [`move_part_to_tier`](Self::move_part_to_tier). It executes the exact
+    /// same persistence helper and ordering; the observer cannot replace or
+    /// acknowledge an engine mutation.
+    pub fn move_part_to_tier_observed(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        partition: &str,
+        tier: &str,
+        observer: &dyn MovePhaseObserver,
+    ) -> Result<()> {
+        self.inner
+            .relocate_part(cf, partition, tier, Some(observer))
     }
 
     /// Run one full pass of the background part mover across every column family
@@ -338,6 +406,7 @@ impl crate::db::DbInner {
         cf: &Arc<ColumnFamily>,
         partition: &str,
         tier: &str,
+        observer: Option<&dyn MovePhaseObserver>,
     ) -> Result<()> {
         if self.opts.read_only {
             return Err(OndaError::ReadOnly("database is read-only".into()));
@@ -363,15 +432,47 @@ impl crate::db::DbInner {
         // Copy every file to the target tier and open new handles there, before
         // touching the manifest — the part stays fully live on its current tier
         // until the flip.
+        let object_count = handles
+            .iter()
+            .map(|handle| {
+                let source_klog = cf.klog_path_for(&handle.meta);
+                1 + usize::from(Path::new(&vlog_path_for(&source_klog)).exists())
+            })
+            .sum();
+        let mut object_index = 0;
         let mut new_handles: Vec<Arc<SstHandle>> = Vec::new();
         for h in &handles {
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
             let dst_klog = format!("{dest_cf_dir}/{}.klog", h.meta.id);
             let dst_vlog = format!("{dest_cf_dir}/{}.vlog", h.meta.id);
-            copy_to_storage(&src_klog, &dst_klog, &dest_storage)?;
+            object_index += 1;
+            copy_to_storage(&src_klog, &dst_klog, &dest_storage, || {
+                observe_move(
+                    observer,
+                    cf.name(),
+                    partition,
+                    tier,
+                    MovePhase::CopyComplete {
+                        object_index,
+                        object_count,
+                    },
+                )
+            })?;
             if Path::new(&src_vlog).exists() {
-                copy_to_storage(&src_vlog, &dst_vlog, &dest_storage)?;
+                object_index += 1;
+                copy_to_storage(&src_vlog, &dst_vlog, &dest_storage, || {
+                    observe_move(
+                        observer,
+                        cf.name(),
+                        partition,
+                        tier,
+                        MovePhase::CopyComplete {
+                            object_index,
+                            object_count,
+                        },
+                    )
+                })?;
             }
             let mut meta = h.meta.clone();
             meta.tier = Some(tier.to_string());
@@ -380,11 +481,25 @@ impl crate::db::DbInner {
                 reader: cf.open_reader_for(&meta)?,
             }));
         }
+        observe_move(
+            observer,
+            cf.name(),
+            partition,
+            tier,
+            MovePhase::DestinationSynced,
+        )?;
 
         // Flip: swap the handles in memory, then persist the manifest (the
         // durable commit point that records tier=<tier> for these ids).
         cf.swap_bottom_tables(new_handles);
         self.persist_manifest()?;
+        observe_move(
+            observer,
+            cf.name(),
+            partition,
+            tier,
+            MovePhase::ManifestFlipped,
+        )?;
 
         // Delete the now-obsolete source files (default-tier copies). Crash
         // before this leaves harmless orphans on the source tier; the manifest
@@ -398,6 +513,22 @@ impl crate::db::DbInner {
                 self.remove_sst_file(&src_vlog);
             }
         }
+        let remaining_files = handles
+            .iter()
+            .flat_map(|handle| {
+                let klog = cf.klog_path_for(&handle.meta);
+                let vlog = vlog_path_for(&klog);
+                [klog, vlog]
+            })
+            .filter(|path| Path::new(path).exists())
+            .count();
+        observe_move(
+            observer,
+            cf.name(),
+            partition,
+            tier,
+            MovePhase::SourceDeleteFinished { remaining_files },
+        )?;
         Ok(())
     }
 
@@ -446,7 +577,7 @@ impl crate::db::DbInner {
                 if now.saturating_sub(newest) <= rule.min_age.as_nanos() as i64 {
                     continue;
                 }
-                match self.relocate_part(cf, &part.partition, target) {
+                match self.relocate_part(cf, &part.partition, target, None) {
                     Ok(()) => moved += 1,
                     // A part that vanished (compacted/detached) between snapshot
                     // and move is a benign miss; a genuine durability failure has
@@ -539,12 +670,36 @@ fn move_file(from: &str, to: &str) -> Result<()> {
 /// parent dir); for an S3 tier it buffers and single-shot PUTs on finish. The
 /// source is always on a local tier (the mover only moves *onto* named tiers), so
 /// it is read with a plain file.
-fn copy_to_storage(from: &str, to: &str, storage: &Arc<dyn crate::storage::Storage>) -> Result<()> {
+fn copy_to_storage(
+    from: &str,
+    to: &str,
+    storage: &Arc<dyn crate::storage::Storage>,
+    copied: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let mut src = std::fs::File::open(from)?;
     let mut dst = storage.create(to)?;
     std::io::copy(&mut src, &mut *dst)?;
+    copied()?;
     dst.finish()?;
     Ok(())
+}
+
+fn observe_move(
+    observer: Option<&dyn MovePhaseObserver>,
+    cf_name: &str,
+    partition: &str,
+    destination_tier: &str,
+    phase: MovePhase,
+) -> Result<()> {
+    match observer {
+        Some(observer) => observer.observe(&MovePhaseEvent {
+            cf_name,
+            partition,
+            destination_tier,
+            phase,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn file_len(path: &str) -> u64 {
