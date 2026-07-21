@@ -611,4 +611,58 @@ mod tests {
             "partition tail must add bytes on top of the legacy body"
         );
     }
+    /// Sizing probe for the whole-manifest rewrite cost.
+    ///
+    /// `save()` encodes and fsyncs the ENTIRE manifest on every flush,
+    /// compaction, and part move. Measured encoded sizes with realistic
+    /// namespace/cluster-key/segment keys:
+    ///
+    /// | parts   | manifest | per persist        |
+    /// |---------|----------|--------------------|
+    /// | 1,000   | 0.1 MiB  | fine               |
+    /// | 10,000  | 1.2 MiB  | noticeable         |
+    /// | 100,000 | 12.4 MiB | untenable          |
+    ///
+    /// At 100k parts a single flush writes and fsyncs 12 MiB of unchanged
+    /// metadata to record one new table. This is the motivation for an
+    /// incremental (edit-log) manifest; the test exists so the number is
+    /// measured rather than estimated, and regressions are visible.
+    #[test]
+    #[ignore = "sizing probe, not a gate — run with --ignored --nocapture"]
+    fn manifest_encoded_size_at_scale() {
+        for n in [1_000usize, 10_000, 100_000] {
+            let ssts: Vec<SstMeta> = (0..n)
+                .map(|i| SstMeta {
+                    id: i as u64,
+                    level: 6,
+                    num_entries: 100_000,
+                    num_tombstones: 0,
+                    max_seq: i as u64,
+                    klog_size: 64 << 20,
+                    vlog_size: 0,
+                    // Realistic spada keys: namespace name + cluster key + segment.
+                    min_key: format!("tenant-{i:06}/2026-07/seg-{i:08}/").into_bytes(),
+                    max_key: format!("tenant-{i:06}/2026-07/seg-{i:08}/~").into_bytes(),
+                    partition: Some(format!("tenant-{i:06}/2026-07")),
+                    tier: Some("s3".to_string()),
+                    max_entry_time: Some(1_700_000_000_000_000),
+                })
+                .collect();
+            let m = Manifest {
+                next_file_id: n as u64,
+                global_seq: 1,
+                cfs: vec![CfManifest {
+                    name: "t_post".into(),
+                    config: Vec::new(),
+                    sstables: ssts,
+                }],
+            };
+            let bytes = m.encode().len();
+            println!(
+                "parts={n:>7}  manifest={:>8} bytes ({:.1} MiB) — rewritten on EVERY flush/compaction/part-move",
+                bytes,
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
 }

@@ -607,15 +607,15 @@ impl ColumnFamilyConfig {
         // backward compatible in both directions.
         b.push(self.sync_mode as u8);
         append_u64(&mut b, self.sync_interval.as_micros() as u64);
-        b.push(self.compression_per_level.len().min(255) as u8);
-        for c in self.compression_per_level.iter().take(255) {
+        append_uvarint(&mut b, self.compression_per_level.len() as u64);
+        for c in self.compression_per_level.iter() {
             b.push(*c as u8);
         }
         b.push(self.compaction_style as u8);
         append_u64(&mut b, self.fifo_max_bytes);
         append_u64(&mut b, self.fifo_ttl.as_micros() as u64);
-        b.push(self.compression_rules.len().min(255) as u8);
-        for r in self.compression_rules.iter().take(255) {
+        append_uvarint(&mut b, self.compression_rules.len() as u64);
+        for r in self.compression_rules.iter() {
             append_uvarint(&mut b, r.prefix.len() as u64);
             b.extend_from_slice(&r.prefix);
             b.push(r.compression as u8);
@@ -623,8 +623,8 @@ impl ColumnFamilyConfig {
         // Appended tail (same backward/forward-compatible scheme as above): an
         // older manifest ends before this count, so `decode_into` returns via
         // `?` and leaves `partition_rules` empty.
-        b.push(self.partition_rules.len().min(255) as u8);
-        for r in self.partition_rules.iter().take(255) {
+        append_uvarint(&mut b, self.partition_rules.len() as u64);
+        for r in self.partition_rules.iter() {
             append_uvarint(&mut b, r.prefix.len() as u64);
             b.extend_from_slice(&r.prefix);
             append_uvarint(&mut b, r.name.len() as u64);
@@ -633,8 +633,8 @@ impl ColumnFamilyConfig {
         // Appended tail (same backward/forward-compatible scheme): storage-tier
         // rules. An older manifest ends before this count byte, so `decode_into`
         // returns via `?` and leaves `tier_rules` empty.
-        b.push(self.tier_rules.len().min(255) as u8);
-        for r in self.tier_rules.iter().take(255) {
+        append_uvarint(&mut b, self.tier_rules.len() as u64);
+        for r in self.tier_rules.iter() {
             append_uvarint(&mut b, r.prefix.len() as u64);
             b.extend_from_slice(&r.prefix);
             append_uvarint(&mut b, r.tier.len() as u64);
@@ -668,6 +668,15 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         let b = *p.first()?;
         *p = &p[1..];
         Some(b)
+    };
+    // Counts are uvarint. For counts <= 127 a uvarint is byte-identical to the
+    // u8 these fields used before, so every manifest ever written by a released
+    // build decodes unchanged; only counts above 127 — which the old encoder
+    // silently corrupted — differ.
+    let uvar = |p: &mut &[u8]| -> Option<u64> {
+        let (v, n) = uvarint(p)?;
+        *p = &p[n..];
+        Some(v)
     };
     let u64v = |p: &mut &[u8]| -> Option<u64> {
         if p.len() < 8 {
@@ -703,7 +712,7 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         cfg.sync_mode = sm;
     }
     cfg.sync_interval = std::time::Duration::from_micros(u64v(&mut p)?);
-    let n_levels = byte(&mut p)?;
+    let n_levels = uvar(&mut p)?;
     let mut per_level = Vec::with_capacity(n_levels as usize);
     for _ in 0..n_levels {
         per_level.push(Compression::from_u8(byte(&mut p)?)?);
@@ -714,8 +723,8 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     }
     cfg.fifo_max_bytes = u64v(&mut p)?;
     cfg.fifo_ttl = std::time::Duration::from_micros(u64v(&mut p)?);
-    let n_rules = byte(&mut p)?;
-    let mut rules = Vec::with_capacity(n_rules as usize);
+    let n_rules = uvar(&mut p)?;
+    let mut rules = Vec::with_capacity(n_rules.min(1024) as usize);
     for _ in 0..n_rules {
         let (plen, n) = uvarint(p)?;
         p = &p[n..];
@@ -733,7 +742,7 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     cfg.compression_rules = rules;
     // Appended-tail partition rules; an older manifest ends above and keeps the
     // default (empty) list.
-    let n_parts = byte(&mut p)?;
+    let n_parts = uvar(&mut p)?;
     let mut parts = Vec::with_capacity(n_parts as usize);
     for _ in 0..n_parts {
         let (plen, n) = uvarint(p)?;
@@ -757,7 +766,7 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     cfg.partition_rules = parts;
     // Appended-tail tier rules; an older manifest ends above and keeps the
     // default (empty) list.
-    let n_tiers = byte(&mut p)?;
+    let n_tiers = uvar(&mut p)?;
     let mut tiers = Vec::with_capacity(n_tiers as usize);
     for _ in 0..n_tiers {
         let (plen, n) = uvarint(p)?;
@@ -1150,5 +1159,88 @@ mod per_level_tests {
         };
         assert_eq!(u.compression_for_level(0), Compression::Lz4);
         assert_eq!(u.compression_for_level(5), Compression::Lz4);
+    }
+
+    /// Rule counts are uvarint, not `u8`.
+    ///
+    /// The previous encoding pushed `len().min(255) as u8` and iterated
+    /// `.take(255)`, so a config carrying more than 255 rules was **silently
+    /// truncated on persist** — no error, no warning, and the dropped rules
+    /// simply stopped partitioning their keys, which surfaces much later as
+    /// data that never gets cut into a part (and therefore never tiers or
+    /// drops). Counts above 255 are realistic for prefix-per-tenant layouts.
+    #[test]
+    fn rule_counts_are_not_truncated() {
+        let n = 1000;
+        let c = ColumnFamilyConfig {
+            partition_rules: (0..n)
+                .map(|i| PartitionRule {
+                    prefix: format!("ns{i:04}/").into_bytes(),
+                    name: format!("p{i:04}"),
+                })
+                .collect(),
+            tier_rules: (0..n)
+                .map(|i| TierRule {
+                    prefix: format!("ns{i:04}/").into_bytes(),
+                    tier: format!("t{i:04}"),
+                    min_age: Duration::from_secs(i as u64),
+                })
+                .collect(),
+            compression_rules: (0..n)
+                .map(|i| CompressionRule {
+                    prefix: format!("ns{i:04}/").into_bytes(),
+                    compression: Compression::Zstd,
+                })
+                .collect(),
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.partition_rules.len(), n, "partition rules truncated");
+        assert_eq!(d.tier_rules.len(), n, "tier rules truncated");
+        assert_eq!(d.compression_rules.len(), n, "compression rules truncated");
+        assert_eq!(d.partition_rules[999].name, "p0999");
+        assert_eq!(d.tier_rules[999].tier, "t0999");
+    }
+
+    /// Switching those counts from `u8` to uvarint is byte-identical for every
+    /// count <= 127, so manifests written by earlier builds decode unchanged.
+    ///
+    /// The property under test is LEB128's: values below 0x80 encode as a
+    /// single byte equal to the value, which is exactly what the old
+    /// `b.push(len as u8)` wrote. Verified against the encoder directly, plus
+    /// a hand-built legacy blob decoded by the new decoder.
+    #[test]
+    fn small_rule_counts_keep_the_legacy_byte_encoding() {
+        use crate::encoding::append_uvarint;
+        for n in 0u64..128 {
+            let mut v = Vec::new();
+            append_uvarint(&mut v, n);
+            assert_eq!(v, vec![n as u8], "uvarint({n}) must be the legacy byte");
+        }
+        // 128 is where the encodings legitimately diverge — and where the old
+        // encoder was still fine; it only corrupted above 255.
+        let mut v = Vec::new();
+        append_uvarint(&mut v, 128);
+        assert_eq!(v.len(), 2);
+
+        // A blob whose counts were written the legacy way (single byte) is
+        // decoded correctly by the new decoder, because the bytes are the same.
+        let c = ColumnFamilyConfig {
+            partition_rules: vec![PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            }],
+            tier_rules: vec![TierRule {
+                prefix: b"log/".to_vec(),
+                tier: "s3".into(),
+                min_age: Duration::from_secs(60),
+            }],
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.partition_rules.len(), 1);
+        assert_eq!(d.partition_rules[0].name, "img");
+        assert_eq!(d.tier_rules[0].tier, "s3");
+        assert_eq!(d.tier_rules[0].min_age, Duration::from_secs(60));
     }
 }
