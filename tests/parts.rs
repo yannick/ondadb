@@ -337,18 +337,13 @@ fn observed_move_phases_cover_every_durability_boundary_in_order() {
 }
 
 #[test]
-fn observed_move_failures_reopen_exactly_old_or_new_placement() {
-    for (phase, expect_new) in [
-        (
-            MovePhase::CopyComplete {
-                object_index: 1,
-                object_count: 1,
-            },
-            false,
-        ),
-        (MovePhase::DestinationSynced, false),
-        (MovePhase::ManifestFlipped, true),
-        (MovePhase::SourceDeleteFinished { remaining_files: 0 }, true),
+fn observed_move_pre_commit_failures_reopen_source_placement() {
+    for phase in [
+        MovePhase::CopyComplete {
+            object_index: 1,
+            object_count: 1,
+        },
+        MovePhase::DestinationSynced,
     ] {
         let dir = tempfile::tempdir().unwrap();
         let hdd = tempfile::tempdir().unwrap();
@@ -371,11 +366,65 @@ fn observed_move_failures_reopen_exactly_old_or_new_placement() {
         let db = DB::open(opts).unwrap();
         let cf = db.get_column_family("default").unwrap();
         assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
-        assert_eq!(
-            klog_count(&hdd_root) > 0,
-            expect_new,
+        assert!(
+            klog_count(&hdd_root) == 0,
             "wrong durable placement after {phase:?}"
         );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn observed_move_lost_response_after_manifest_flip_is_safe_to_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::new("hdd", hdd.path().to_str().unwrap())];
+
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        let observer = RecordingMoveObserver::new(Some(MovePhase::ManifestFlipped));
+
+        // Model a caller that loses the first response after the durable commit
+        // and therefore cannot know whether the move took effect.
+        let _lost_response = db.move_part_to_tier_observed(&cf, "img", "hdd", &observer);
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+
+        assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+        db.close().unwrap();
+    }
+
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+    db.close().unwrap();
+}
+
+#[test]
+fn observed_move_post_commit_observer_errors_do_not_hide_success() {
+    for fail_at in [
+        MovePhase::ManifestFlipped,
+        MovePhase::SourceDeleteFinished { remaining_files: 0 },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let hdd = tempfile::tempdir().unwrap();
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.tiers = vec![TierDef::new("hdd", hdd.path().to_str().unwrap())];
+        let db = DB::open(opts).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        let observer = RecordingMoveObserver::new(Some(fail_at));
+
+        db.move_part_to_tier_observed(&cf, "img", "hdd", &observer)
+            .unwrap();
+
+        assert!(matches!(
+            observer.phases.lock().unwrap().last(),
+            Some(MovePhase::SourceDeleteFinished { .. })
+        ));
+        assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
         db.close().unwrap();
     }
 }

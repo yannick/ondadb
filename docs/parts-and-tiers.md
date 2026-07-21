@@ -222,10 +222,13 @@ Deterministic crash harnesses can call `DB::move_part_to_tier_observed` with a
 `MovePhaseObserver`. It executes the same mover and reports, synchronously,
 each object-copy completion before `StorageWriter::finish`, completion of all
 destination syncs, the durable manifest flip, and completion/deferment of
-source deletion. Returning an error stops at that boundary; blocking there lets
-a subprocess controller kill the process without timing sleeps. This API is an
-observation/fault seam only: it cannot replace the manifest commit, and normal
-policy/manual moves pay no callback or event-allocation cost.
+source deletion. Blocking at a boundary lets a subprocess controller kill the
+process without timing sleeps. Returning an error stops the move only before
+`ManifestFlipped`; at and after that durable commit point hook errors are
+ignored, cleanup continues, and the call reports success. Retrying a move after
+a lost response is idempotent when the part already names the target tier. This
+API is an observation/fault seam only: it cannot replace the manifest commit,
+and normal policy/manual moves pay no callback or event-allocation cost.
 
 Notes:
 

@@ -97,9 +97,11 @@ pub struct MovePhaseEvent<'a> {
 /// Synchronous observer for deterministic crash/fault harnesses.
 ///
 /// The callback runs while the column-family compaction mutex is held. It may
-/// block to coordinate a subprocess kill. Returning an error interrupts the
-/// move at the named boundary; the ordinary old-or-new recovery rules still
-/// apply. Production placement policy should use the unobserved mover APIs.
+/// block to coordinate a subprocess kill. Returning an error before
+/// [`MovePhase::ManifestFlipped`] interrupts the move. At and after that durable
+/// commit point the engine reports the event but deliberately ignores callback
+/// errors: a diagnostic hook cannot turn a committed move into an apparent
+/// failure. Production placement policy should use the unobserved mover APIs.
 pub trait MovePhaseObserver: Send + Sync {
     fn observe(&self, event: &MovePhaseEvent<'_>) -> Result<()>;
 }
@@ -363,7 +365,9 @@ impl DB {
     /// This is the deterministic fault-harness form of
     /// [`move_part_to_tier`](Self::move_part_to_tier). It executes the exact
     /// same persistence helper and ordering; the observer cannot replace or
-    /// acknowledge an engine mutation.
+    /// acknowledge an engine mutation. Observer errors before the durable
+    /// manifest flip are returned; errors at or after it are ignored so a
+    /// committed move is never reported as failed.
     pub fn move_part_to_tier_observed(
         &self,
         cf: &Arc<ColumnFamily>,
@@ -420,6 +424,16 @@ impl crate::db::DbInner {
         let handles = cf.bottom_partition_handles(partition);
         if handles.is_empty() {
             return Err(OndaError::NotFound);
+        }
+        // A caller can lose the response after the manifest commit and retry
+        // the same move. In that case the handles already resolve to `tier`;
+        // copying them onto themselves would truncate the source when the
+        // destination writer is created.
+        if handles
+            .iter()
+            .all(|handle| handle.meta.tier.as_deref() == Some(tier))
+        {
+            return Ok(());
         }
 
         // The destination backend may be local or remote (S3); route all writes
@@ -493,13 +507,13 @@ impl crate::db::DbInner {
         // durable commit point that records tier=<tier> for these ids).
         cf.swap_bottom_tables(new_handles);
         self.persist_manifest()?;
-        observe_move(
+        observe_committed_move(
             observer,
             cf.name(),
             partition,
             tier,
             MovePhase::ManifestFlipped,
-        )?;
+        );
 
         // Delete the now-obsolete source files (default-tier copies). Crash
         // before this leaves harmless orphans on the source tier; the manifest
@@ -522,13 +536,13 @@ impl crate::db::DbInner {
             })
             .filter(|path| Path::new(path).exists())
             .count();
-        observe_move(
+        observe_committed_move(
             observer,
             cf.name(),
             partition,
             tier,
             MovePhase::SourceDeleteFinished { remaining_files },
-        )?;
+        );
         Ok(())
     }
 
@@ -700,6 +714,19 @@ fn observe_move(
         }),
         None => Ok(()),
     }
+}
+
+fn observe_committed_move(
+    observer: Option<&dyn MovePhaseObserver>,
+    cf_name: &str,
+    partition: &str,
+    destination_tier: &str,
+    phase: MovePhase,
+) {
+    // The manifest already durably names the destination. Returning a hook
+    // error now would tell callers the move failed even though retry/recovery
+    // must treat it as committed.
+    let _ = observe_move(observer, cf_name, partition, destination_tier, phase);
 }
 
 fn file_len(path: &str) -> u64 {

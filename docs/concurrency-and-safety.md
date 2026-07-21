@@ -179,10 +179,13 @@ that thread; a concurrent *manual* `run_part_mover` is still safe via
 same mover. Its synchronous `MovePhaseObserver` runs under `compact_mu` at four
 semantic boundaries: copied bytes before each destination writer finishes, all
 destination objects durable, manifest flip durable, and source cleanup issued.
-An observer may block for an external subprocess kill or return an injected
-error. Before the manifest phase, reopen selects the source; at or after it,
-reopen selects the destination. Never install an observer on an ordinary
-latency-sensitive production move.
+An observer may block for an external subprocess kill. An injected error before
+the manifest phase aborts and reopen selects the source. Callback errors at or
+after `ManifestFlipped` are ignored because the destination is already durably
+committed; cleanup continues and the API reports success. A lost response is
+safe to retry: a move whose live handles already name the requested tier returns
+without copying. Never install an observer on an ordinary latency-sensitive
+production move.
 
 ## S3Storage runtime & blocking contract (`storage_s3.rs`, feature `s3`)
 
