@@ -425,14 +425,16 @@ impl crate::db::DbInner {
         if handles.is_empty() {
             return Err(OndaError::NotFound);
         }
-        // A caller can lose the response after the manifest commit and retry
-        // the same move. In that case the handles already resolve to `tier`;
-        // copying them onto themselves would truncate the source when the
-        // destination writer is created.
-        if handles
-            .iter()
-            .all(|handle| handle.meta.tier.as_deref() == Some(tier))
-        {
+        // A retry may find all or part of the partition already on `tier`.
+        // Reuse those handles in place: their source and destination paths are
+        // identical, so passing them through `Storage::create` would truncate
+        // live data. Moving only the remaining handles also heals a mixed-tier
+        // part produced by a disjoint attach or partial bottom compaction.
+        let handles: Vec<_> = handles
+            .into_iter()
+            .filter(|handle| handle.meta.tier.as_deref() != Some(tier))
+            .collect();
+        if handles.is_empty() {
             return Ok(());
         }
 

@@ -403,6 +403,61 @@ fn observed_move_lost_response_after_manifest_flip_is_safe_to_retry() {
 }
 
 #[test]
+fn moving_a_mixed_tier_part_reuses_already_placed_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::new("hdd", hdd.path().to_str().unwrap())];
+
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db
+            .create_column_family(
+                "default",
+                ColumnFamilyConfig {
+                    partition_rules: vec![PartitionRule {
+                        prefix: b"img/".to_vec(),
+                        name: "img".into(),
+                    }],
+                    l1_file_count_trigger: 1,
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+
+        db.put(&cf, b"img/a", b"A", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        let detached = db.detach_part(&cf, "img").unwrap();
+
+        db.put(&cf, b"img/z", b"Z", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+
+        // The detached, disjoint range slots directly into the bottom level on
+        // the default tier beside the img table that already lives on hdd.
+        db.attach_part(&cf, &detached.dir).unwrap();
+        assert_eq!(db.get(&cf, b"img/a").unwrap(), b"A");
+        assert_eq!(db.get(&cf, b"img/z").unwrap(), b"Z");
+
+        // Healing the mixed placement must copy only img/a's table. Recopying
+        // img/z's already-placed table aliases source and destination paths and
+        // truncates the live klog.
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+        assert_eq!(db.get(&cf, b"img/a").unwrap(), b"A");
+        assert_eq!(db.get(&cf, b"img/z").unwrap(), b"Z");
+        db.close().unwrap();
+    }
+
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(db.get(&cf, b"img/a").unwrap(), b"A");
+    assert_eq!(db.get(&cf, b"img/z").unwrap(), b"Z");
+    db.close().unwrap();
+}
+
+#[test]
 fn observed_move_post_commit_observer_errors_do_not_hide_success() {
     for fail_at in [
         MovePhase::ManifestFlipped,

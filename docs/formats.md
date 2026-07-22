@@ -228,6 +228,14 @@ fields as struct defaults (empty rule lists) — backward compatible in both
 directions, with the same rewrite-strips-the-tail caveat as the manifest
 tail.
 
+Version 0.3.1 retains those four `u8` counts and their first 255 entries
+byte-for-byte. If any list is longer, the normal config blob is followed by
+`ONDAOVF1`, then four overflow lists in the same order. Each overflow list is
+`extra_count uvarint` followed by the entries beyond index 254, using the same
+entry encoding shown above. A 0.3.0 reader ignores this tagged tail and keeps
+the first 255 entries; a 0.3.1 reader appends every overflow entry. The tag is
+inside the manifest body and is therefore covered by the manifest CRC32-C.
+
 ## Unified-memtable WAL (`unified.rs`)
 
 Same WAL format; file names `unified-wal-<gen>.log[.sN]`; record keys carry an

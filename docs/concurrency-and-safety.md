@@ -183,9 +183,10 @@ An observer may block for an external subprocess kill. An injected error before
 the manifest phase aborts and reopen selects the source. Callback errors at or
 after `ManifestFlipped` are ignored because the destination is already durably
 committed; cleanup continues and the API reports success. A lost response is
-safe to retry: a move whose live handles already name the requested tier returns
-without copying. Never install an observer on an ordinary latency-sensitive
-production move.
+safe to retry: live handles already on the requested tier are reused without
+copying, while any remaining handles are moved. This also heals a mixed-tier
+part created by attaching a disjoint bottom table. Never install an observer on
+an ordinary latency-sensitive production move.
 
 ## S3Storage runtime & blocking contract (`storage_s3.rs`, feature `s3`)
 
@@ -220,5 +221,7 @@ Contract:
 by unbounded crossbeam channels, polling with 50 ms tick to observe `stop`.
 `DB::close`: set `closing` → rotate every CF (+unified) with `force` → spin
 until `pending_flush == 0` → set `stop`, join workers → final
-`persist_manifest` → close WALs/readers. `DB::drop` closes only when it holds
-the last `Arc` (workers hold no `DB` clone).
+`persist_manifest` → close WALs/readers. `DB::clone` increments an explicit
+public-handle count; `DB::drop` closes only when that count reaches zero.
+Worker-held `Arc<DbInner>` references therefore cannot keep the directory lock
+after the final public `DB` handle is dropped.

@@ -226,8 +226,10 @@ source deletion. Blocking at a boundary lets a subprocess controller kill the
 process without timing sleeps. Returning an error stops the move only before
 `ManifestFlipped`; at and after that durable commit point hook errors are
 ignored, cleanup continues, and the call reports success. Retrying a move after
-a lost response is idempotent when the part already names the target tier. This
-API is an observation/fault seam only: it cannot replace the manifest commit,
+a lost response is idempotent: tables already on the target tier are reused and
+only off-target tables are copied. The same rule safely heals a mixed-tier part
+created by attaching a disjoint bottom table. This API is an observation/fault
+seam only: it cannot replace the manifest commit,
 and normal policy/manual moves pay no callback or event-allocation cost.
 
 Notes:

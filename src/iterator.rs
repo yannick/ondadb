@@ -14,6 +14,9 @@ use crate::sst::{Block, SstIterator};
 /// internal order (user key ascending, sequence descending), every version.
 /// An enum (not a trait object) so the merge hot loop dispatches with a branch
 /// and can inline the per-entry accessors.
+// Boxing the larger variant would add indirection to this scan hot path; the
+// size difference under `unsafe-fastpath` is deliberate and benchmarked.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ChildIter {
     Mem(MemIter),
     Sst(SstIterator),
