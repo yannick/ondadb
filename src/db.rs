@@ -59,6 +59,15 @@ pub struct DbInner {
 
     next_file_id: AtomicU64,
     pub(crate) closing: Arc<AtomicBool>,
+    /// Number of live [`DB`] handles.
+    ///
+    /// `Drop` cannot use `Arc::strong_count(&inner)` to decide whether it is
+    /// the last handle: the flush and compaction workers each hold an
+    /// `Arc<DbInner>` clone, so that count never reaches 1 while the database
+    /// is running, and the close-on-drop path was therefore dead. Counting
+    /// handles explicitly separates "the user still has a `DB`" from "a worker
+    /// still holds the inner state".
+    pub(crate) handles: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<AtomicBool>,
     pub(crate) pending_flush: Arc<AtomicUsize>,
 
@@ -101,7 +110,7 @@ impl std::fmt::Debug for DbInner {
 }
 
 /// A handle to an open ondaDB database.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DB {
     pub(crate) inner: Arc<DbInner>,
 }
@@ -406,6 +415,7 @@ impl DB {
             file_deletion: Mutex::new(FileDeletionState::default()),
             workers: Mutex::new(Vec::new()),
             lock_file: Mutex::new(Some(lock_file)),
+            handles: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             poison,
         });
         inner.observe_seq(unified_max_seq);
@@ -708,10 +718,25 @@ fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
     }
 }
 
+impl Clone for DB {
+    fn clone(&self) -> DB {
+        self.inner.handles.fetch_add(1, Ordering::SeqCst);
+        DB {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 impl Drop for DB {
     fn drop(&mut self) {
-        // Close only when this is the last handle (workers hold no DB clone).
-        if Arc::strong_count(&self.inner) == 1 {
+        // Close when the LAST `DB` handle goes away. Using
+        // `Arc::strong_count(&self.inner)` here was wrong: the flush and
+        // compaction workers hold `Arc<DbInner>` clones for the lifetime of
+        // the database, so the count never fell to 1 and this path never ran
+        // — leaving the `<dir>/LOCK` advisory lock held until the process
+        // exited. Reopening a directory in the same process (restore, fork,
+        // restart, or any test doing so) then failed with `Locked`.
+        if self.inner.handles.fetch_sub(1, Ordering::SeqCst) == 1 {
             let _ = self.close();
         }
     }
