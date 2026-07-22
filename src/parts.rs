@@ -248,11 +248,13 @@ impl DB {
                 meta.vlog_size = if has_vlog { file_len(&dst_vlog) } else { 0 };
                 meta.min_key = min_key;
                 meta.max_key = max_key;
-                // A bottom part is partition-clean: recover its partition tag
-                // from the rules. L0 is never partition-clean, so leave None.
+                // A bottom part is partition-clean, so its tag is recoverable
+                // from any key it holds — resolved through the CF's scheme so a
+                // derived partitioner tags attached parts the same way
+                // compaction would have. L0 is never partition-clean, so leave
+                // None.
                 meta.partition = if at_bottom {
-                    crate::config::partition_of(&cf.partition_rules_snapshot(), &meta.min_key)
-                        .map(str::to_string)
+                    cf.partition_resolver_snapshot()?.name_of(&meta.min_key)
                 } else {
                     None
                 };
@@ -733,4 +735,194 @@ fn observe_committed_move(
 
 fn file_len(path: &str) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod derived_partition_tests {
+    //! Structural properties of derived partitioning (A5).
+    //!
+    //! These live in-crate because they assert on `ColumnFamily::bottom_parts`,
+    //! which is crate-private: the properties under test are about how
+    //! compaction *cuts* files, which the public API deliberately does not
+    //! expose.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::{ColumnFamilyConfig, Options, PartitionFn, PartitionScheme, DB};
+
+    /// Keys are `<name>\0\0<8-byte bucket><rest>`; a partition is one
+    /// `(name, bucket)` pair — the shape this feature was asked for.
+    #[derive(Debug)]
+    struct NameAndBucket;
+
+    impl NameAndBucket {
+        fn key(name: &str, bucket: u64, rest: &str) -> Vec<u8> {
+            let mut k = Vec::new();
+            k.extend_from_slice(name.as_bytes());
+            k.extend_from_slice(&[0, 0]);
+            k.extend_from_slice(&bucket.to_be_bytes());
+            k.extend_from_slice(rest.as_bytes());
+            k
+        }
+    }
+
+    impl PartitionFn for NameAndBucket {
+        fn boundary_len(&self, key: &[u8]) -> usize {
+            match key.windows(2).position(|w| w == [0, 0]) {
+                Some(end) => (end + 2 + 8).min(key.len()),
+                None => key.len(),
+            }
+        }
+        fn name(&self, key: &[u8]) -> String {
+            key[..self.boundary_len(key)]
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect()
+        }
+        fn scheme_name(&self) -> &str {
+            "test.name-and-bucket.v1"
+        }
+    }
+
+    fn open(dir: &tempfile::TempDir) -> DB {
+        let mut o = Options::new(dir.path().to_str().unwrap());
+        o.partition_fns = vec![Arc::new(NameAndBucket)];
+        DB::open(o).unwrap()
+    }
+
+    fn derived_cfg() -> ColumnFamilyConfig {
+        ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Derived(Arc::new(NameAndBucket)),
+            l1_file_count_trigger: 1,
+            ..ColumnFamilyConfig::default()
+        }
+    }
+
+    /// Bottom compaction cuts a new file whenever the derived boundary changes.
+    #[test]
+    fn boundary_changes_cut_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir);
+        let cf = db.create_column_family("default", derived_cfg()).unwrap();
+
+        for tenant in ["alpha", "beta", "gamma"] {
+            for bucket in [1u64, 2] {
+                for i in 0..4u32 {
+                    db.put(
+                        &cf,
+                        &NameAndBucket::key(tenant, bucket, &format!("{i:03}")),
+                        b"v",
+                        Duration::ZERO,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+
+        assert_eq!(
+            cf.bottom_parts().len(),
+            6,
+            "each (tenant, bucket) pair is its own part"
+        );
+    }
+
+    /// Every bottom part is a contiguous key range belonging to one partition.
+    ///
+    /// This is the property detach/attach, freeze and tiering all rest on: a
+    /// part that spanned a boundary would move data belonging to another
+    /// partition along with it.
+    #[test]
+    fn each_part_is_a_contiguous_key_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir);
+        let cf = db.create_column_family("default", derived_cfg()).unwrap();
+
+        for tenant in ["a", "b", "c"] {
+            for bucket in [7u64, 9] {
+                for i in 0..6u32 {
+                    db.put(
+                        &cf,
+                        &NameAndBucket::key(tenant, bucket, &format!("{i:03}")),
+                        b"v",
+                        Duration::ZERO,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+
+        let f = NameAndBucket;
+        let parts = cf.bottom_parts();
+        assert_eq!(parts.len(), 6);
+        for p in &parts {
+            // Check every SSTable in the part, not just the aggregate: a file
+            // whose min and max keys resolve to different partitions has
+            // spanned a boundary, which is exactly what must not happen.
+            for h in cf.bottom_partition_handles(&p.partition) {
+                assert_eq!(
+                    f.name(&h.meta.min_key),
+                    p.partition,
+                    "min_key outside its part"
+                );
+                assert_eq!(
+                    f.name(&h.meta.max_key),
+                    p.partition,
+                    "max_key outside its part — the file spans a boundary"
+                );
+            }
+        }
+    }
+
+    /// Partition count is not bounded by the durable rule-vector ceiling.
+    ///
+    /// This is the whole reason the feature exists: 300 partitions is already
+    /// past the 255-entry limit that constrains enumerated rules.
+    #[test]
+    fn partition_count_is_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir);
+        let cf = db.create_column_family("default", derived_cfg()).unwrap();
+
+        for t in 0..300u32 {
+            db.put(
+                &cf,
+                &NameAndBucket::key(&format!("t{t:04}"), 1, "x"),
+                b"v",
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+
+        assert_eq!(
+            cf.bottom_parts().len(),
+            300,
+            "derived partitioning must not inherit the 255-rule ceiling"
+        );
+    }
+
+    /// A column family whose scheme could not be resolved refuses to compact
+    /// rather than silently cutting on rule boundaries.
+    #[test]
+    fn an_unresolved_scheme_refuses_to_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cfg = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Unresolved("test.absent.v1".into()),
+            l1_file_count_trigger: 1,
+            ..ColumnFamilyConfig::default()
+        };
+        let cf = db.create_column_family("default", cfg).unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+
+        let err = db.compact(&cf).expect_err("must not partition blindly");
+        assert!(format!("{err:?}").contains("test.absent.v1"));
+    }
 }

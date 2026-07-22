@@ -182,10 +182,12 @@ fn compact_into(
     // concurrently (via `DB::add_partition_rule`) must not change this run's cut
     // boundaries — it takes effect on the next bottom compaction. Only bottom
     // output is cut on partitions, so upper-level runs need no snapshot.
-    let partition_rules = if bottom {
-        cf.partition_rules_snapshot()
+    // Snapshotted once per run for both schemes; see
+    // `ColumnFamily::partition_resolver_snapshot`.
+    let partitioner = if bottom {
+        Some(cf.partition_resolver_snapshot()?)
     } else {
-        Vec::new()
+        None
     };
 
     // Merge-iterate all inputs and write new output SSTables.
@@ -224,6 +226,9 @@ fn compact_into(
 
     let mut last_key: Option<Vec<u8>> = None;
     let mut emitted_le_for_key = false;
+    // Boundary bytes of the key currently being written, so a change can be
+    // detected without re-resolving the previous key.
+    let mut last_boundary: Option<Vec<u8>> = None;
 
     loop {
         // pick the smallest (user_key asc, seq desc) across iterators
@@ -305,16 +310,30 @@ fn compact_into(
                 // crossed into a different partition: finish the current file
                 // (stamped with its partition) before opening the next. Upper
                 // levels leave `part = None`, so this never cuts there.
-                let part = if bottom {
-                    crate::config::partition_of(&partition_rules, &uk).map(str::to_string)
-                } else {
-                    None
+                let part = match &partitioner {
+                    Some(p) => p.name_of(&uk),
+                    None => None,
                 };
+                // Cut on a change in the *boundary bytes*, not the name. For
+                // rules the two are equivalent (a name is a function of the
+                // matched prefix). For a derived scheme the boundary is the
+                // stronger test: it keeps a part a contiguous key range even
+                // if an implementation's `name` collides across boundaries,
+                // which is what detach/attach, freeze and tiering rely on.
                 if let Some((_, _, _, _, cur)) = writer.as_ref() {
-                    if *cur != part {
+                    let crossed = match (&partitioner, last_boundary.as_deref()) {
+                        (Some(p), Some(prev)) => p.boundary(&uk) != Some(prev),
+                        (Some(p), None) => p.boundary(&uk).is_some(),
+                        (None, _) => false,
+                    };
+                    if crossed || *cur != part {
                         finish_output(&mut writer, &mut outputs)?;
                     }
                 }
+                last_boundary = partitioner
+                    .as_ref()
+                    .and_then(|p| p.boundary(&uk))
+                    .map(<[u8]>::to_vec);
                 if writer.is_none() {
                     let id = db.next_file_id();
                     let klog = cf.klog_path(id);
