@@ -173,6 +173,20 @@ pub struct Options {
     /// (a manual [`DB::run_part_mover`](crate::DB::run_part_mover) still works).
     /// Defaults to 30s; the pass is a cheap no-op when no CF has tier rules.
     pub part_mover_interval: Duration,
+    /// Derived partitioners available to this database, resolved by
+    /// [`PartitionFn::scheme_name`](crate::PartitionFn::scheme_name).
+    ///
+    /// A column family that was created with
+    /// [`PartitionScheme::Derived`] records only its scheme *name* in the
+    /// manifest, because a boxed function is not serializable. On open the
+    /// engine looks the name up here; if it is absent the open fails rather
+    /// than silently reverting the column family to
+    /// [`partition_rules`](ColumnFamilyConfig::partition_rules), which would
+    /// mis-cut every part written afterwards.
+    ///
+    /// This is the same name-and-registry indirection used for comparators,
+    /// made extensible because partitioners are consumer-defined.
+    pub partition_fns: Vec<Arc<dyn PartitionFn>>,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -333,6 +347,7 @@ impl Default for Options {
             unified_memtable_sync_interval: Duration::from_micros(128_000),
             tiers: Vec::new(),
             part_mover_interval: Duration::from_secs(30),
+            partition_fns: Vec::new(),
         }
     }
 }
@@ -374,6 +389,20 @@ pub struct ColumnFamilyConfig {
     /// only affects files written afterward; existing files keep whatever
     /// partition they were cut into.
     pub partition_rules: Vec<PartitionRule>,
+    /// How partitions are decided: the
+    /// [`partition_rules`](Self::partition_rules) vector (the default, and the
+    /// behaviour of every earlier release) or a computed
+    /// [`PartitionFn`](crate::PartitionFn).
+    ///
+    /// Setting [`PartitionScheme::Derived`] makes `partition_rules` inert. The
+    /// scheme is *policy*, like the rules it replaces: changing it rewrites
+    /// nothing, and bottom SSTables keep whatever partition they were cut with
+    /// until a later compaction rewrites them.
+    ///
+    /// Only the [`PartitionFn::scheme_name`](crate::PartitionFn::scheme_name)
+    /// is persisted; register the implementation in
+    /// [`Options::partition_fns`] so reopening can resolve it.
+    pub partition_scheme: PartitionScheme,
     /// Prefix rules that pin a partition's bottom-level part to a storage
     /// **tier** (see [`TierDef`]). The **longest** matching prefix wins, exactly
     /// like [`partition_rules`](Self::partition_rules) and
@@ -428,6 +457,7 @@ impl Default for ColumnFamilyConfig {
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
             partition_rules: Vec::new(),
+            partition_scheme: PartitionScheme::Rules,
             tier_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
@@ -494,6 +524,177 @@ pub(crate) fn partition_of<'a>(rules: &'a [PartitionRule], user_key: &[u8]) -> O
         .filter(|r| user_key.starts_with(&r.prefix))
         .max_by_key(|r| r.prefix.len())
         .map(|r| r.name.as_str())
+}
+
+/// A partitioner that **computes** a key's partition instead of looking it up
+/// in a rule vector.
+///
+/// [`partition_rules`](ColumnFamilyConfig::partition_rules) enumerates
+/// partitions, which is the right shape when there are a handful of them and
+/// the wrong shape when the partition is a function of the key. A consumer
+/// keying by `(tenant, time-bucket)` needs one partition per pair — thousands
+/// per column family — which no enumeration can carry (the durable rule vector
+/// is bounded, and resolution is a longest-prefix scan of it for *every key* a
+/// bottom compaction writes).
+///
+/// A `PartitionFn` replaces the vector with two functions of the key. The
+/// engine's cutting mechanism is unchanged: a part is still a contiguous key
+/// range, still cut only at the bottom level, still write-side-only policy.
+///
+/// # Contract
+///
+/// Implementations MUST satisfy all of the following. The engine does not (and
+/// cannot cheaply) verify them, and violating them produces parts that are not
+/// contiguous key ranges — which breaks detach/attach, freeze, and tiering.
+///
+/// 1. **Prefix-determined.** `boundary_len(k)` MUST be `<= k.len()`, and any
+///    two keys sharing the prefix `k[..boundary_len(k)]` MUST yield the same
+///    boundary length and the same [`name`](Self::name).
+/// 2. **Order-compatible.** Under the column family's comparator, keys of one
+///    partition MUST form a contiguous range. Deriving the boundary from a
+///    leading, order-significant portion of the key satisfies this; hashing
+///    does not.
+/// 3. **Pure and stable.** Same key ⇒ same answer, for the life of the data.
+/// 4. **Cheap.** Called once per key written by a bottom compaction.
+///
+/// # Example
+///
+/// ```
+/// use ondadb::{PartitionFn, PartitionScheme};
+/// use std::sync::Arc;
+///
+/// /// Keys are `<name>\0\0<8-byte bucket><rest>`; a partition is `(name, bucket)`.
+/// #[derive(Debug)]
+/// struct NameAndBucket;
+///
+/// impl PartitionFn for NameAndBucket {
+///     fn boundary_len(&self, key: &[u8]) -> usize {
+///         match key.windows(2).position(|w| w == [0, 0]) {
+///             // terminator + the 8-byte bucket that follows it
+///             Some(end) => (end + 2 + 8).min(key.len()),
+///             None => key.len(),
+///         }
+///     }
+///     fn name(&self, key: &[u8]) -> String {
+///         hex(&key[..self.boundary_len(key)])
+///     }
+///     fn scheme_name(&self) -> &str {
+///         "example.name-and-bucket.v1"
+///     }
+/// }
+/// # fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+/// let scheme = PartitionScheme::Derived(Arc::new(NameAndBucket));
+/// ```
+pub trait PartitionFn: Send + Sync + std::fmt::Debug {
+    /// Length of the prefix of `key` that determines its partition.
+    ///
+    /// Bottom compaction cuts its output whenever `key[..boundary_len(key)]`
+    /// changes, so this is the function that decides part boundaries.
+    fn boundary_len(&self, key: &[u8]) -> usize;
+
+    /// Stable, unique name for the partition containing `key`.
+    ///
+    /// Recorded on the bottom-level SSTables cut on this boundary and used to
+    /// address the part in `detach_part` / `freeze_part` / `move_part_to_tier`,
+    /// so it must be filesystem-safe: it becomes a directory component.
+    fn name(&self, key: &[u8]) -> String;
+
+    /// Stable identifier for *this partitioner*, persisted in the column
+    /// family's manifest blob.
+    ///
+    /// A boxed function cannot be serialized, so the manifest records this name
+    /// and the caller re-supplies the implementation through
+    /// [`Options::partition_fns`] when reopening — the same
+    /// name-plus-registry indirection the engine already uses for comparators.
+    /// Reopening with a different or missing implementation is an error rather
+    /// than a fallback, because silently resolving keys with the wrong
+    /// partitioner would mis-cut every part written afterwards.
+    ///
+    /// Change it whenever the boundary or naming behaviour changes.
+    fn scheme_name(&self) -> &str;
+}
+
+/// How a column family decides which partition a key belongs to.
+///
+/// Defaults to [`Rules`](Self::Rules), which is the behaviour of every release
+/// before derived partitioning existed.
+#[derive(Clone, Default)]
+pub enum PartitionScheme {
+    /// Longest-matching-prefix over
+    /// [`partition_rules`](ColumnFamilyConfig::partition_rules).
+    #[default]
+    Rules,
+    /// Boundaries computed from the key by a [`PartitionFn`].
+    ///
+    /// [`partition_rules`](ColumnFamilyConfig::partition_rules) is ignored
+    /// while this is set.
+    Derived(Arc<dyn PartitionFn>),
+    /// A derived scheme read from the manifest whose implementation has not
+    /// been supplied yet.
+    ///
+    /// Only `ColumnFamilyConfig::decode` produces this: the manifest carries
+    /// the scheme *name*, and `DB::open` exchanges it for the registered
+    /// implementation in [`Options::partition_fns`], failing if there is none.
+    /// Encoding a config in this state preserves the name, so a column family
+    /// cannot be silently demoted to rule-based partitioning by a round trip
+    /// through a reader that could not resolve it.
+    Unresolved(String),
+}
+
+impl std::fmt::Debug for PartitionScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PartitionScheme::Rules => f.write_str("Rules"),
+            PartitionScheme::Derived(p) => {
+                write!(f, "Derived({})", p.scheme_name())
+            }
+            PartitionScheme::Unresolved(n) => write!(f, "Unresolved({n})"),
+        }
+    }
+}
+
+/// A partition resolver snapshotted for the duration of one compaction run.
+///
+/// Compaction takes one of these at the start of a run so that a concurrent
+/// `add_partition_rule` cannot move this run's cut boundaries — the same
+/// guarantee the rule-vector snapshot has always given, extended to the
+/// derived case.
+#[derive(Debug, Clone)]
+pub(crate) enum PartitionResolver {
+    Rules(Vec<PartitionRule>),
+    Derived(Arc<dyn PartitionFn>),
+}
+
+impl PartitionResolver {
+    /// The partition name for `user_key`, or `None` for the implicit default
+    /// partition (rules only — a derived scheme names every key).
+    pub(crate) fn name_of(&self, user_key: &[u8]) -> Option<String> {
+        match self {
+            PartitionResolver::Rules(rules) => partition_of(rules, user_key).map(str::to_string),
+            PartitionResolver::Derived(f) => Some(f.name(user_key)),
+        }
+    }
+
+    /// The bytes that must stay constant within one part.
+    ///
+    /// For a derived scheme this is `key[..boundary_len(key)]`, which is a
+    /// finer and more direct test than comparing names: it depends only on
+    /// [`PartitionFn::boundary_len`], so a part is a contiguous key range even
+    /// if an implementation's [`name`](PartitionFn::name) collides. For rules
+    /// the boundary is the matched prefix.
+    pub(crate) fn boundary<'k>(&self, user_key: &'k [u8]) -> Option<&'k [u8]> {
+        match self {
+            PartitionResolver::Rules(rules) => rules
+                .iter()
+                .filter(|r| user_key.starts_with(&r.prefix))
+                .max_by_key(|r| r.prefix.len())
+                .map(|r| &user_key[..r.prefix.len()]),
+            PartitionResolver::Derived(f) => {
+                let n = f.boundary_len(user_key).min(user_key.len());
+                Some(&user_key[..n])
+            }
+        }
+    }
 }
 
 /// One prefix → storage-tier rule (see
@@ -696,7 +897,33 @@ impl ColumnFamilyConfig {
                 append_u64(&mut b, r.min_age.as_micros() as u64);
             }
         }
+
+        // Derived-partitioner marker, in its own tagged tail for the same
+        // reason the overflow tail has one: a reader that predates it stops at
+        // the end of the section it knows and reconstructs the rest as
+        // defaults, so a config with no derived scheme is byte-for-byte what
+        // earlier releases wrote. Only the scheme *name* is durable — the
+        // implementation is re-supplied through `Options::partition_fns`.
+        if let Some(name) = self.derived_scheme_name() {
+            b.extend_from_slice(CONFIG_PARTITION_FN_MAGIC);
+            append_uvarint(&mut b, name.len() as u64);
+            b.extend_from_slice(name.as_bytes());
+        }
         b
+    }
+
+    /// The scheme name to persist: from a live derived partitioner, or the one
+    /// read from the manifest if it has not been resolved yet.
+    ///
+    /// The unresolved case matters because a read-only or not-yet-resolved
+    /// config must not *lose* the marker when it is re-encoded — dropping it
+    /// would silently demote the column family to rule-based partitioning.
+    fn derived_scheme_name(&self) -> Option<&str> {
+        match &self.partition_scheme {
+            PartitionScheme::Derived(f) => Some(f.scheme_name()),
+            PartitionScheme::Unresolved(n) => Some(n.as_str()),
+            PartitionScheme::Rules => None,
+        }
     }
 
     /// Reconstruct a config from a manifest blob; unknown/short blobs fall back
@@ -709,6 +936,8 @@ impl ColumnFamilyConfig {
 }
 
 const CONFIG_OVERFLOW_MAGIC: &[u8; 8] = b"ONDAOVF1";
+/// Tag introducing the derived-partitioner tail (scheme name only).
+const CONFIG_PARTITION_FN_MAGIC: &[u8; 8] = b"ONDAPFN1";
 
 fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     use crate::encoding::{read_u32, read_u64, uvarint};
@@ -848,6 +1077,8 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     cfg.tier_rules = tiers;
 
     let Some(rest) = p.strip_prefix(CONFIG_OVERFLOW_MAGIC) else {
+        // No overflow section; the derived-partitioner tail may still follow.
+        read_partition_fn_tail(p, cfg);
         return Some(());
     };
     p = rest;
@@ -928,7 +1159,34 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
             min_age,
         });
     }
+    read_partition_fn_tail(p, cfg);
     Some(())
+}
+
+/// Read the optional derived-partitioner tail, recording the scheme name for
+/// `DB::open` to resolve.
+///
+/// Absent tail ⇒ rule-based partitioning, which is what every config written
+/// before derived schemes existed decodes to. A malformed tail is ignored
+/// rather than fatal, matching how the rest of this decoder treats a truncated
+/// blob; the consequence is a column family that opens as rule-partitioned,
+/// and `DB::open` cannot then mis-resolve it because there is no name to
+/// resolve.
+fn read_partition_fn_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    use crate::encoding::uvarint;
+    let Some(rest) = p.strip_prefix(CONFIG_PARTITION_FN_MAGIC) else {
+        return;
+    };
+    let Some((len, n)) = uvarint(rest) else {
+        return;
+    };
+    let rest = &rest[n..];
+    let len = len as usize;
+    if rest.len() < len {
+        return;
+    }
+    cfg.partition_scheme =
+        PartitionScheme::Unresolved(String::from_utf8_lossy(&rest[..len]).into_owned());
 }
 
 #[cfg(test)]

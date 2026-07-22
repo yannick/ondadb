@@ -422,10 +422,33 @@ impl DB {
 
         // Recover column families from the manifest.
         for cfm in &manifest.cfs {
-            let cfg = ColumnFamilyConfig::decode(&cfm.config);
+            let mut cfg = ColumnFamilyConfig::decode(&cfm.config);
             let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
                 OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
             })?;
+            // A derived partitioner is persisted by name only; exchange it for
+            // the registered implementation, exactly as the comparator above is
+            // resolved. Failing here — rather than proceeding with rule-based
+            // partitioning — is deliberate: the CF's existing parts were cut on
+            // derived boundaries, and silently reverting would cut every part
+            // written afterwards differently while every operation appeared to
+            // succeed. The damage would surface much later, as parts that
+            // detach, freeze and tier incorrectly.
+            if let crate::config::PartitionScheme::Unresolved(name) = &cfg.partition_scheme {
+                let found = opts
+                    .partition_fns
+                    .iter()
+                    .find(|f| f.scheme_name() == name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OndaError::InvalidArgs(format!(
+                            "column family {:?} was written with derived partition scheme {name:?}, \
+                             which is not registered in Options::partition_fns",
+                            cfm.name
+                        ))
+                    })?;
+                cfg.partition_scheme = crate::config::PartitionScheme::Derived(found);
+            }
             let (cf, max_seq) = ColumnFamily::load(
                 inner.ctx.clone(),
                 cfm.name.clone(),

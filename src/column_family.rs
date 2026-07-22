@@ -1108,6 +1108,36 @@ impl ColumnFamily {
         self.live_partition_rules.read().clone()
     }
 
+    /// Snapshot whatever decides partitions for this CF — the live rule vector
+    /// or the configured [`PartitionFn`](crate::PartitionFn).
+    ///
+    /// Same one-snapshot-per-run contract as
+    /// [`partition_rules_snapshot`](Self::partition_rules_snapshot): the
+    /// derived case is immutable for the life of the CF, so snapshotting it is
+    /// just an `Arc` clone.
+    pub(crate) fn partition_resolver_snapshot(&self) -> Result<crate::config::PartitionResolver> {
+        match &self.opts.partition_scheme {
+            crate::config::PartitionScheme::Derived(f) => {
+                Ok(crate::config::PartitionResolver::Derived(f.clone()))
+            }
+            crate::config::PartitionScheme::Rules => Ok(crate::config::PartitionResolver::Rules(
+                self.partition_rules_snapshot(),
+            )),
+            // `DB::open` resolves every persisted scheme before any CF becomes
+            // reachable, so this is unreachable in a correctly opened database.
+            // It is an error rather than a fallback to `Rules` because falling
+            // back would cut every part written afterwards on the wrong
+            // boundaries while appearing to succeed.
+            crate::config::PartitionScheme::Unresolved(name) => {
+                Err(OndaError::InvalidArgs(format!(
+                    "column family {:?} uses derived partition scheme {name:?}, which was not \
+                     registered in Options::partition_fns",
+                    self.name()
+                )))
+            }
+        }
+    }
+
     /// The effective durable config: `opts` with its partition rules replaced by
     /// the live set. Every path that (re)encodes the config for persistence —
     /// `DbInner::persist_manifest`, `freeze_part`, CF copy/clear — goes through

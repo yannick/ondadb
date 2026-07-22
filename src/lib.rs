@@ -55,7 +55,7 @@ pub use comparator::{Comparator, ComparatorRef};
 pub use config::S3Config;
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
-    Options, PartitionRule, SyncMode, TierBackend, TierDef, TierRule,
+    Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend, TierDef, TierRule,
 };
 pub use db::DB;
 pub use error::{OndaError, Result};
