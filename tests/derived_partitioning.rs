@@ -312,3 +312,93 @@ fn detach_and_attach_preserve_derived_partitions() {
     // Reattached with the same derived tag: it can be detached again by name.
     db.detach_part(&cf, &target).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// A consumer can verify its partitioner through the public read-only listing
+// (Q4). Without this, a `PartitionScheme` can be declared but its physical
+// result cannot be checked — which for a correctness-driven partitioner (a
+// time bucket that must be independently droppable) is the property that
+// actually matters.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_partitions_reports_the_materialized_bottom_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(opts_with_fn(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", derived_cfg()).unwrap();
+
+    for tenant in ["alpha", "beta", "gamma"] {
+        for bucket in [1u64, 2] {
+            for i in 0..4u32 {
+                db.put(
+                    &cf,
+                    &NameAndBucket::key(tenant, bucket, &format!("{i:03}")),
+                    b"v",
+                    Duration::ZERO,
+                )
+                .unwrap();
+            }
+        }
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+
+    let parts = db.list_partitions(&cf);
+    // Six (tenant, bucket) pairs, each its own part — the listing lets a
+    // consumer assert exactly this without reaching into engine internals.
+    assert_eq!(parts.len(), 6, "one part per (tenant, bucket)");
+
+    // Every listed partition name is the one the partitioner would assign to
+    // its own min_key: the physical cut agrees with the logical scheme.
+    let f = NameAndBucket;
+    for p in &parts {
+        assert_eq!(f.name(&p.min_key), p.partition);
+        assert!(p.tier.is_none(), "nothing was moved off the default tier");
+    }
+    // Stable, sorted ordering.
+    let mut names: Vec<_> = parts.iter().map(|p| p.partition.clone()).collect();
+    let sorted = {
+        let mut s = names.clone();
+        s.sort();
+        s
+    };
+    assert_eq!(names, sorted, "listing is ordered by partition name");
+    names.dedup();
+    assert_eq!(names.len(), 6, "partition names are distinct");
+}
+
+#[test]
+fn a_rules_column_family_lists_only_its_cut_partitions() {
+    // The rules path reports through the same listing, and only bottom-cut
+    // parts appear — a rule whose keys are still in upper levels is not yet a
+    // physical partition, which is the honest thing to report.
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cfg = ColumnFamilyConfig {
+        partition_rules: vec![
+            PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            },
+            PartitionRule {
+                prefix: b"log/".to_vec(),
+                name: "log".into(),
+            },
+        ],
+        l1_file_count_trigger: 1,
+        ..ColumnFamilyConfig::default()
+    };
+    let cf = db.create_column_family("default", cfg).unwrap();
+    for k in ["img/a", "img/b", "log/a", "log/b"] {
+        db.put(&cf, k.as_bytes(), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+
+    let names: Vec<_> = db
+        .list_partitions(&cf)
+        .into_iter()
+        .map(|p| p.partition)
+        .collect();
+    assert_eq!(names, vec!["img".to_string(), "log".to_string()]);
+}

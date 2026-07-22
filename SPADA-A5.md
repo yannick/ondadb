@@ -138,3 +138,48 @@ Both build configurations, `clippy --all-targets -D warnings`, `fmt --check`.
    enumerate parts; my structural tests had to live in-crate. A read-only
    public listing would help consumers verify their own partitioners. Out of
    scope here — flagging it.
+
+---
+
+## Owner rulings (0.4.0)
+
+Reviewed against `v0.3.2` (the derived-partitioning merge) with a full test run
+and the rules-path additivity assertions confirmed. The design is accepted as
+merged; the four questions are resolved as follows.
+
+1. **`Rules` variant shape — keep the unit variant.** The argument against
+   `Rules(Vec<PartitionRule>)` is decisive on its own terms: it would either
+   delete the public `partition_rules` field (breaking every consumer) or
+   duplicate it and clone the vector per compaction run. The unit variant that
+   defers to the existing field is the better design *independent of version*,
+   so there is no reason to take the break even though 0.4.0 would permit it.
+   A0-1's requested shape is declined.
+
+2. **Validate `PartitionFn` — done, debug-only.** A misimplemented partitioner
+   that is not order-compatible reopens a finalized boundary and produces a
+   bottom SSTable spanning two partitions, which every operation would report as
+   success. A `debug_assertions`-only guard in the bottom-compaction cut now
+   catches exactly that (a boundary reappearing after its part was finalized),
+   with no release-build cost. Note that a genuinely *prefix-determined*
+   partitioner cannot trip it under sorted keys — which is the point: the guard
+   fires only on the contract violation, and a test drives a deliberately
+   non-prefix-determined partitioner to prove it does.
+
+3. **Rules→Derived allowed, Derived→Rules stranding — keep the asymmetry.** It
+   is the safe direction. Rules→Derived is write-side-only policy (future
+   compactions cut differently; existing parts keep their stamp), exactly like
+   adding a live rule. Derived→Rules would strand parts cut on derived
+   boundaries and is correctly refused by the persisted marker plus fail-closed
+   open. No change.
+
+4. **`bottom_parts` visibility — added, minimally, read-only.** A consumer whose
+   partitioner is correctness-driven (a time bucket that must be independently
+   droppable) needs to verify the physical cut, and there was no public way.
+   `DB::list_partitions` now returns `PartitionInfo { partition, min_key, tier }`
+   for the materialized bottom parts, name-sorted. Read-only, no new mutation
+   surface, and it reports only bottom-cut parts — a rule declared but not yet
+   compacted is honestly absent.
+
+Not breaking: everything added in 0.4.0 is additive (`PartitionInfo`,
+`list_partitions`, an internal debug guard). 0.4.0 marks the derived-partitioning
+milestone rather than a compatibility break.

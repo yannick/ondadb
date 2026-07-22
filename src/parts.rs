@@ -609,7 +609,56 @@ impl crate::db::DbInner {
     }
 }
 
+/// One materialized bottom-level partition, as reported by
+/// [`DB::list_partitions`].
+///
+/// A partition appears here only once bottom compaction has cut a clean part on
+/// its boundary. A rule or derived boundary that has been *configured* but whose
+/// keys still live in upper (uncut) levels is not yet listed — which is exactly
+/// what a consumer wants to verify: that its partitioner actually produced the
+/// physical separation it intended, not merely that it was declared.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartitionInfo {
+    /// The partition name — the same string [`detach_part`](DB::detach_part),
+    /// [`freeze_part`](DB::freeze_part) and
+    /// [`move_part_to_tier`](DB::move_part_to_tier) address.
+    pub partition: String,
+    /// The smallest user key currently in the part.
+    pub min_key: Vec<u8>,
+    /// The storage tier the part lives on, or `None` for the default tier.
+    pub tier: Option<String>,
+}
+
 impl DB {
+    /// List the materialized bottom-level partitions of `cf`, read-only.
+    ///
+    /// This is how a consumer confirms its partitioner — rule-based or derived —
+    /// actually cut the parts it intended: that no bottom part spans two of its
+    /// logical partitions, and that the boundaries it expects exist. Without it
+    /// a consumer can declare a `PartitionScheme` but has no way to check the
+    /// result, which for a correctness-driven partitioner (a time bucket that
+    /// must be independently droppable) is the property that actually matters.
+    ///
+    /// Only **bottom-level** parts are listed, because only bottom compaction
+    /// cuts on partition boundaries; keys still in upper levels are not yet
+    /// partition-clean and are deliberately excluded. A part that straddles
+    /// tiers mid-move is omitted until the move settles, matching what the mover
+    /// itself sees. Ordered by partition name for a stable listing.
+    #[must_use]
+    pub fn list_partitions(&self, cf: &Arc<ColumnFamily>) -> Vec<PartitionInfo> {
+        let mut out: Vec<PartitionInfo> = cf
+            .bottom_parts()
+            .into_iter()
+            .map(|p| PartitionInfo {
+                partition: p.partition,
+                min_key: p.min_key,
+                tier: p.tier,
+            })
+            .collect();
+        out.sort_by(|a, b| a.partition.cmp(&b.partition));
+        out
+    }
+
     /// Add a partition rule to a **live** column family, carving out a new named
     /// partition of the keyspace (see
     /// [`ColumnFamilyConfig::partition_rules`](crate::ColumnFamilyConfig::partition_rules)).
@@ -924,5 +973,59 @@ mod derived_partition_tests {
 
         let err = db.compact(&cf).expect_err("must not partition blindly");
         assert!(format!("{err:?}").contains("test.absent.v1"));
+    }
+
+    /// A `PartitionFn` that violates the prefix-determined contract: the key
+    /// `xy` gets a 2-byte boundary while every other key under the `x` prefix
+    /// gets 1, so the boundary `x` is finalized when we cross into `xy` and then
+    /// reappears at `xz`. A correct (prefix-determined) partitioner cannot do
+    /// this under sorted keys; this one is deliberately wrong.
+    #[derive(Debug)]
+    struct NonPrefixDetermined;
+
+    impl PartitionFn for NonPrefixDetermined {
+        fn boundary_len(&self, key: &[u8]) -> usize {
+            if key == b"xy" {
+                2
+            } else {
+                1.min(key.len())
+            }
+        }
+        fn name(&self, key: &[u8]) -> String {
+            key[..self.boundary_len(key)]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+        fn scheme_name(&self) -> &str {
+            "test.non-prefix-determined.v1"
+        }
+    }
+
+    /// The debug-only guard (Q2) catches a partitioner that reopens a finalized
+    /// boundary — the misimplementation that would silently produce a bottom
+    /// SSTable spanning two partitions. Release builds do not pay for this, so
+    /// the test only asserts the behaviour under `debug_assertions`.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "not order-compatible")]
+    fn a_non_order_compatible_partitioner_is_caught_in_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = Options::new(dir.path().to_str().unwrap());
+        o.partition_fns = vec![Arc::new(NonPrefixDetermined)];
+        let db = DB::open(o).unwrap();
+        let cfg = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Derived(Arc::new(NonPrefixDetermined)),
+            l1_file_count_trigger: 1,
+            ..ColumnFamilyConfig::default()
+        };
+        let cf = db.create_column_family("default", cfg).unwrap();
+        // Sorted order is x < xy < xz; xy's odd 2-byte boundary makes `x`
+        // reappear at xz.
+        for k in [b"x".as_slice(), b"xy".as_slice(), b"xz".as_slice()] {
+            db.put(&cf, k, b"v", Duration::ZERO).unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        let _ = db.compact(&cf);
     }
 }

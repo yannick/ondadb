@@ -229,6 +229,17 @@ fn compact_into(
     // Boundary bytes of the key currently being written, so a change can be
     // detected without re-resolving the previous key.
     let mut last_boundary: Option<Vec<u8>> = None;
+    // Debug-only guard against a misimplemented consumer `PartitionFn`. The
+    // documented contract is that boundaries are prefix-determined and
+    // order-compatible: keys arrive in ascending user-key order, so once
+    // compaction leaves a boundary it must never see it again. A partitioner
+    // that violates this reopens a finalized part, producing a bottom SSTable
+    // that spans two partitions — precisely the corruption partitioning exists
+    // to prevent, and one every operation would report as success. Cheap to
+    // catch here, invisible in release builds.
+    #[cfg(debug_assertions)]
+    let mut finalized_boundaries: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::new();
 
     loop {
         // pick the smallest (user_key asc, seq desc) across iterators
@@ -327,6 +338,23 @@ fn compact_into(
                         (None, _) => false,
                     };
                     if crossed || *cur != part {
+                        // The boundary we are leaving is now sealed into a part.
+                        // Re-entering it later would mean the partitioner is not
+                        // order-compatible (see `finalized_boundaries`).
+                        #[cfg(debug_assertions)]
+                        if crossed {
+                            if let Some(prev) = &last_boundary {
+                                finalized_boundaries.insert(prev.clone());
+                            }
+                            if let Some(next) = partitioner.as_ref().and_then(|p| p.boundary(&uk)) {
+                                debug_assert!(
+                                    !finalized_boundaries.contains(next),
+                                    "PartitionFn is not order-compatible: boundary {next:?} \
+                                     reappeared after its part was finalized, which would make a \
+                                     bottom SSTable span two partitions"
+                                );
+                            }
+                        }
                         finish_output(&mut writer, &mut outputs)?;
                     }
                 }
