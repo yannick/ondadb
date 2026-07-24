@@ -19,7 +19,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -178,12 +178,21 @@ struct Shared {
     /// DB-wide fail-stop flag, tripped on any fsync failure (see
     /// [`crate::util::Poison`]). `None` only for standalone WALs in tests.
     poison: Mutex<Option<Arc<crate::util::Poison>>>,
+    /// DB-wide counter of successful physical `sync_data` calls; survives WAL
+    /// rotation because the DB owns the `Arc`. `None` for standalone WALs.
+    syncs: Mutex<Option<Arc<AtomicU64>>>,
 }
 
 impl Shared {
     fn poison(&self, why: String) {
         if let Some(p) = self.poison.lock().as_ref() {
             p.set(why);
+        }
+    }
+
+    fn count_sync(&self) {
+        if let Some(c) = self.syncs.lock().as_ref() {
+            c.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -235,6 +244,7 @@ impl Wal {
                 flushing: false,
             }),
             poison: Mutex::new(None),
+            syncs: Mutex::new(None),
         });
         let (mut stop_tx, mut bg) = (None, None);
         if mode == SyncMode::Interval {
@@ -263,6 +273,12 @@ impl Wal {
     /// commit, interval sync, manual sync) will trip it.
     pub(crate) fn set_poison(&self, p: Arc<crate::util::Poison>) {
         *self.shared.poison.lock() = Some(p);
+    }
+
+    /// Wire this WAL to the DB-wide physical-sync counter (see
+    /// [`crate::DB::wal_sync_count`]); every successful `sync_data` increments it.
+    pub(crate) fn set_sync_counter(&self, c: Arc<AtomicU64>) {
+        *self.shared.syncs.lock() = Some(c);
     }
 
     /// Append a single record.
@@ -382,6 +398,7 @@ impl Wal {
                         .poison(format!("wal group-commit fsync failed: {e}"));
                     return OndaError::from(e).code();
                 }
+                self.shared.count_sync();
             }
             SyncMode::Interval => self.shared.dirty.store(true, Ordering::Relaxed),
             SyncMode::None => {}
@@ -402,6 +419,7 @@ impl Wal {
                         self.shared.poison(format!("wal fsync failed: {e}"));
                         return Err(e.into());
                     }
+                    self.shared.count_sync();
                 }
                 None => return Err(OndaError::InvalidDb("wal closed".into())),
             }
@@ -425,6 +443,7 @@ impl Wal {
         for file in &self.shared.files {
             if let Some(f) = file.lock().take() {
                 f.sync_data()?;
+                self.shared.count_sync();
             }
         }
         Ok(())

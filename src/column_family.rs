@@ -92,6 +92,9 @@ pub(crate) struct CfCtx {
     /// DB-wide fail-stop flag; write commits check it, WALs and background
     /// workers trip it on durability failures.
     pub poison: Arc<crate::util::Poison>,
+    /// DB-wide counter of successful physical WAL `sync_data` calls; wired into
+    /// every WAL this DB opens (see [`crate::DB::wal_sync_count`]).
+    pub wal_syncs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for CfCtx {
@@ -233,6 +236,7 @@ impl ColumnFamily {
         } else {
             let w = Wal::open(&wal0, opts.sync_mode, opts.sync_interval)?;
             w.set_poison(ctx.poison.clone());
+            w.set_sync_counter(ctx.wal_syncs.clone());
             Some(Arc::new(w))
         };
         let live_partition_rules = RwLock::new(opts.partition_rules.clone());
@@ -329,6 +333,7 @@ impl ColumnFamily {
             let p = format!("{dir}/wal-{next_gen}.log");
             let w = Wal::open(&p, opts.sync_mode, opts.sync_interval)?;
             w.set_poison(ctx.poison.clone());
+            w.set_sync_counter(ctx.wal_syncs.clone());
             let w = Arc::new(w);
             let mut pend = replay_paths;
             pend.push(p);
@@ -502,6 +507,7 @@ impl ColumnFamily {
                     .ok()
                     .map(|w| {
                         w.set_poison(self.ctx.poison.clone());
+                        w.set_sync_counter(self.ctx.wal_syncs.clone());
                         Arc::new(w)
                     })
             };
@@ -1146,6 +1152,13 @@ impl ColumnFamily {
         let mut cfg = self.opts.clone();
         cfg.partition_rules = self.live_partition_rules.read().clone();
         cfg
+    }
+
+    /// Public read-only view of the effective durable config (see
+    /// [`Self::effective_config`]); also reachable via
+    /// [`crate::DB::column_family_config`].
+    pub fn config(&self) -> ColumnFamilyConfig {
+        self.effective_config()
     }
 
     /// Append `rule` to the live partition rules after validating the resulting

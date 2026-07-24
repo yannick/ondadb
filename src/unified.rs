@@ -80,6 +80,8 @@ pub(crate) struct UnifiedStore {
     closing: Arc<AtomicBool>,
     /// DB-wide fail-stop flag, wired into every WAL this store opens.
     poison: Arc<crate::util::Poison>,
+    /// DB-wide physical-sync counter, wired into every WAL this store opens.
+    wal_syncs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for UnifiedStore {
@@ -104,6 +106,7 @@ impl UnifiedStore {
         pending_flush: Arc<AtomicUsize>,
         closing: Arc<AtomicBool>,
         poison: Arc<crate::util::Poison>,
+        wal_syncs: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<(Arc<UnifiedStore>, u64)> {
         let mem = Memtable::new(default_comparator());
         let mut max_seq = 0;
@@ -148,6 +151,7 @@ impl UnifiedStore {
                 opts.unified_memtable_sync_interval,
             )?;
             w.set_poison(poison.clone());
+            w.set_sync_counter(wal_syncs.clone());
             let w = Arc::new(w);
             let mut pend = replay_paths;
             pend.push(p);
@@ -175,6 +179,7 @@ impl UnifiedStore {
             pending_flush,
             closing,
             poison,
+            wal_syncs,
         });
         Ok((store, max_seq))
     }
@@ -311,6 +316,7 @@ impl UnifiedStore {
                         .ok()
                         .map(|w| {
                             w.set_poison(self.poison.clone());
+                            w.set_sync_counter(self.wal_syncs.clone());
                             Arc::new(w)
                         })
                 };

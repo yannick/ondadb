@@ -93,6 +93,11 @@ pub struct DbInner {
     /// Fail-stop flag: tripped by any durability failure (WAL fsync, background
     /// flush, manifest persist); checked at every write commit.
     pub(crate) poison: Arc<crate::util::Poison>,
+
+    /// Count of successful physical WAL `sync_data` calls across every WAL this
+    /// DB has opened (per-CF, unified, and post-rotation). Observability/test
+    /// hook (see [`DB::wal_sync_count`]); relaxed increments on an fsync-bound path.
+    pub(crate) wal_syncs: Arc<AtomicU64>,
 }
 
 /// RAII guard that pauses obsolete-SSTable deletion while held (see
@@ -374,6 +379,7 @@ impl DB {
         let (flush_tx, flush_rx) = unbounded::<FlushJob>();
         let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
         let poison = Arc::new(crate::util::Poison::new());
+        let wal_syncs = Arc::new(AtomicU64::new(0));
         let closing = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let pending_flush = Arc::new(AtomicUsize::new(0));
@@ -388,6 +394,7 @@ impl DB {
                 pending_flush.clone(),
                 closing.clone(),
                 poison.clone(),
+                wal_syncs.clone(),
             )?;
             unified_max_seq = max_seq;
             Some(store)
@@ -405,6 +412,7 @@ impl DB {
             pending_flush: pending_flush.clone(),
             unified: unified.clone(),
             poison: poison.clone(),
+            wal_syncs: wal_syncs.clone(),
         });
 
         let manifest = Manifest::load(manifest_path(&dir))?;
@@ -435,6 +443,7 @@ impl DB {
             lock_file: Mutex::new(Some(lock_file)),
             handles: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             poison,
+            wal_syncs,
         });
         inner.observe_seq(unified_max_seq);
 
@@ -612,6 +621,24 @@ impl DB {
     /// Look up a column family by name.
     pub fn get_column_family(&self, name: &str) -> Option<Arc<ColumnFamily>> {
         self.inner.cfs.read().get(name).cloned()
+    }
+
+    /// The effective durable configuration of the column family `name` — what a
+    /// reopen would restore, including live-added partition rules. Lets callers
+    /// verify durability-critical settings (e.g. that a WAL-backed CF really
+    /// records [`SyncMode::Full`](crate::config::SyncMode)) instead of assuming
+    /// the config they opened with.
+    pub fn column_family_config(&self, name: &str) -> Result<crate::config::ColumnFamilyConfig> {
+        let cf = self.get_column_family(name).ok_or(OndaError::NotFound)?;
+        Ok(cf.config())
+    }
+
+    /// Total successful physical WAL `sync_data` calls this DB has performed,
+    /// across per-CF WALs, the unified WAL, and rotations. Under
+    /// [`SyncMode::None`](crate::config::SyncMode) this never advances — which
+    /// is exactly what a durability test should assert on.
+    pub fn wal_sync_count(&self) -> u64 {
+        self.inner.wal_syncs.load(Ordering::Relaxed)
     }
 
     /// List column family names.
@@ -1011,6 +1038,47 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two durability-inspection hooks: `column_family_config` reports the
+    /// effective (reopen-faithful) config, and `wal_sync_count` counts only
+    /// physical `sync_data` calls — zero under `SyncMode::None`, advancing per
+    /// commit under `SyncMode::Full`.
+    #[test]
+    fn config_readback_and_physical_sync_count() {
+        use crate::config::SyncMode;
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let lazy = db
+            .create_column_family("lazy", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&lazy, b"k", b"v", Duration::ZERO).unwrap();
+        assert_eq!(
+            db.column_family_config("lazy").unwrap().sync_mode,
+            SyncMode::None
+        );
+        assert!(matches!(
+            db.column_family_config("missing"),
+            Err(OndaError::NotFound)
+        ));
+        // A None-mode commit performs no physical sync.
+        assert_eq!(db.wal_sync_count(), 0);
+
+        let durable_cfg = ColumnFamilyConfig {
+            sync_mode: SyncMode::Full,
+            ..ColumnFamilyConfig::default()
+        };
+        let durable = db.create_column_family("durable", durable_cfg).unwrap();
+        assert_eq!(
+            db.column_family_config("durable").unwrap().sync_mode,
+            SyncMode::Full
+        );
+        db.put(&durable, b"k", b"v", Duration::ZERO).unwrap();
+        let after_one = db.wal_sync_count();
+        assert!(after_one >= 1, "a Full-mode commit must sync_data");
+        db.put(&durable, b"k2", b"v", Duration::ZERO).unwrap();
+        assert!(db.wal_sync_count() > after_one);
+        db.close().unwrap();
+    }
 
     #[test]
     fn poisoned_db_rejects_writes_allows_reads() {
