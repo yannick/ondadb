@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use s3::creds::Credentials;
+use s3::error::S3Error;
 use s3::region::Region;
 use s3::Bucket;
 use tokio::runtime::Runtime;
@@ -46,6 +47,79 @@ fn s3_err(op: &str, e: impl std::fmt::Display) -> OndaError {
 /// True for the 2xx success range (200 OK, 204 No Content, 206 Partial Content).
 fn is_ok(code: u16) -> bool {
     (200..300).contains(&code)
+}
+
+/// Maximum attempts for one idempotent S3 request (1 try + up to 3 retries).
+///
+/// rust-s3 0.35's tokio backend drives a raw `hyper::Client` (hyper 0.14) with
+/// the default keep-alive connection pool and **no retry**. When the store —
+/// MinIO here, or the NAT in front of it — closes a pooled idle connection
+/// before hyper's own 90 s idle timeout, the next request that reuses that
+/// connection dies mid-flight with `hyper::Error(IncompleteMessage)`, whose
+/// message is the classic "connection closed before message completed"
+/// (hyperium/hyper#2136). A bodied PUT is the most exposed request because
+/// hyper 0.14 will not silently replay it. rust-s3 0.35 exposes no hook to tune
+/// the pool, so a bounded retry at this layer is the available lever — and it is
+/// safe here because **every** request this backend issues is idempotent
+/// (whole-object PUT, range GET, HEAD, server-side COPY, DELETE, prefix LIST),
+/// so re-issuing a request that never completed cannot double-apply anything.
+const S3_MAX_ATTEMPTS: u32 = 4;
+
+/// Backoff before the retry that follows failed `attempt` (1-based): 25, 50,
+/// 100 ms. Deterministic and short — the race is a stale-socket reconnect, not
+/// server overload, so a brief pause to let a fresh connection open is enough;
+/// total added latency across all retries is bounded below ~200 ms.
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(25u64 << (attempt.clamp(1, 3) - 1))
+}
+
+/// A transport-level failure that is safe to retry for an **idempotent**
+/// request. hyper surfaces the keep-alive reuse race (server dropped a pooled
+/// idle connection) as [`S3Error::Hyper`] — "connection closed before message
+/// completed"; a reset / broken pipe mid-request arrives as [`S3Error::Io`].
+/// Both mean the request did not complete against the store.
+///
+/// HTTP status failures are deliberately **not** retried here: this backend
+/// surfaces a non-2xx response as `Ok(resp)` with a non-2xx `status_code()`,
+/// never as an `Err`, so a 4xx/5xx never reaches this classifier. Credential,
+/// region, and XML-decode errors are not transient and fall through to `false`.
+fn is_transient(e: &S3Error) -> bool {
+    matches!(e, S3Error::Hyper(_) | S3Error::Io(_))
+}
+
+/// Bounded-retry driver, factored out from [`with_retry`] so the control flow is
+/// testable without a live endpoint. Calls `op` up to `max_attempts` times,
+/// retrying only while `is_transient` holds for the returned error, invoking
+/// `sleep(attempt)` between a failed attempt and the next one. Returns the last
+/// error when attempts are exhausted or the error is not transient.
+fn retry_loop<T, E>(
+    max_attempts: u32,
+    mut op: impl FnMut() -> std::result::Result<T, E>,
+    mut is_transient: impl FnMut(&E) -> bool,
+    mut sleep: impl FnMut(u32),
+) -> std::result::Result<T, E> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < max_attempts && is_transient(&e) => sleep(attempt),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Drive an idempotent S3 request to completion, retrying the hyper keep-alive
+/// reuse race up to [`S3_MAX_ATTEMPTS`] times (see [`is_transient`]). `call`
+/// must be safe to run more than once — every caller in this module is.
+fn with_retry<T>(
+    op: &str,
+    call: impl FnMut() -> std::result::Result<T, S3Error>,
+) -> Result<T> {
+    retry_loop(S3_MAX_ATTEMPTS, call, is_transient, |attempt| {
+        std::thread::sleep(backoff_delay(attempt))
+    })
+    .map_err(|e| s3_err(op, e))
 }
 
 /// Map a tier-relative path to an S3 object key. Keys never carry a leading `/`
@@ -152,10 +226,10 @@ impl ReadHandle for S3ReadHandle {
         // extra byte in that case. S3 clamps an over-long range to the object
         // size, so requesting past EOF never fails — we just truncate to `want`.
         let end = offset + (want.max(2) as u64) - 1;
-        let data = self
-            .rt
-            .block_on(self.bucket.get_object_range(&self.key, offset, Some(end)))
-            .map_err(|e| s3_err("get_range", e))?;
+        let data = with_retry("get_range", || {
+            self.rt
+                .block_on(self.bucket.get_object_range(&self.key, offset, Some(end)))
+        })?;
         if !is_ok(data.status_code()) {
             return Err(s3_err(
                 "get_range",
@@ -182,10 +256,8 @@ impl ReadHandle for S3ReadHandle {
             return Ok(s);
         }
         self.metrics.heads.fetch_add(1, Ordering::Relaxed);
-        let (head, code) = self
-            .rt
-            .block_on(self.bucket.head_object(&self.key))
-            .map_err(|e| s3_err("head", e))?;
+        let (head, code) =
+            with_retry("head", || self.rt.block_on(self.bucket.head_object(&self.key)))?;
         if !is_ok(code) {
             return Err(s3_err("head", format!("status {code} for {}", self.key)));
         }
@@ -221,10 +293,9 @@ impl StorageWriter for S3StorageWriter {
     fn finish(self: Box<Self>) -> Result<()> {
         let this = *self;
         this.metrics.puts.fetch_add(1, Ordering::Relaxed);
-        let resp = this
-            .rt
-            .block_on(this.bucket.put_object(&this.key, &this.buf))
-            .map_err(|e| s3_err("put", e))?;
+        let resp = with_retry("put", || {
+            this.rt.block_on(this.bucket.put_object(&this.key, &this.buf))
+        })?;
         if !is_ok(resp.status_code()) {
             return Err(s3_err(
                 "put",
@@ -262,10 +333,10 @@ impl Storage for S3Storage {
     }
 
     fn delete(&self, path: &str) -> Result<()> {
-        let resp = self
-            .rt
-            .block_on(self.bucket.delete_object(object_key(path)))
-            .map_err(|e| s3_err("delete", e))?;
+        let key = object_key(path);
+        let resp = with_retry("delete", || {
+            self.rt.block_on(self.bucket.delete_object(&key))
+        })?;
         let code = resp.status_code();
         // A missing object (404) is not an error, matching LocalStorage::delete.
         if code == 404 || is_ok(code) {
@@ -277,13 +348,11 @@ impl Storage for S3Storage {
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         // S3 has no rename: server-side copy, then delete the source.
-        let code = self
-            .rt
-            .block_on(
-                self.bucket
-                    .copy_object_internal(object_key(from), object_key(to)),
-            )
-            .map_err(|e| s3_err("copy", e))?;
+        let (from_key, to_key) = (object_key(from), object_key(to));
+        let code = with_retry("copy", || {
+            self.rt
+                .block_on(self.bucket.copy_object_internal(&from_key, &to_key))
+        })?;
         if !is_ok(code) {
             return Err(s3_err("copy", format!("status {code} for {from} -> {to}")));
         }
@@ -295,10 +364,10 @@ impl Storage for S3Storage {
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
-        let results = self
-            .rt
-            .block_on(self.bucket.list(prefix.clone(), Some("/".to_string())))
-            .map_err(|e| s3_err("list", e))?;
+        let results = with_retry("list", || {
+            self.rt
+                .block_on(self.bucket.list(prefix.clone(), Some("/".to_string())))
+        })?;
         let mut out = Vec::new();
         for page in results {
             for obj in page.contents {
@@ -499,5 +568,122 @@ mod tests {
 
         // Clean up the uploaded object.
         s3.delete(&key).unwrap();
+    }
+
+    /// Canary for the keep-alive reuse race the bounded retry guards
+    /// ([`with_retry`]): drive many sequential PUT/HEAD/GET/DELETE requests over
+    /// the shared bucket client so hyper's connection pool is reused across each.
+    /// A pooled connection the store closes between requests would surface as
+    /// "connection closed before message completed"; the retry absorbs it, so
+    /// this must stay green. Env-gated like the other MinIO tests.
+    #[test]
+    fn s3_repeated_requests_reuse_connections() {
+        let Some(cfg) = env_config() else {
+            eprintln!("skipping s3_repeated_requests: ONDADB_S3_ENDPOINT not set");
+            return;
+        };
+        let s3 = S3Storage::new(&cfg).unwrap();
+        let prefix = unique_prefix("reuse");
+        let payload: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        for i in 0..40 {
+            let key = format!("{prefix}/obj-{i:03}.bin");
+            let mut w = s3.create(&key).unwrap();
+            w.write_all(&payload).unwrap();
+            w.finish().unwrap(); // PUT
+            let h = s3.open_read(&key).unwrap();
+            assert_eq!(h.size().unwrap(), payload.len() as u64); // HEAD
+            let mut got = vec![0u8; 64];
+            h.read_exact_at(&mut got, 100).unwrap(); // range GET
+            assert_eq!(got, &payload[100..164]);
+            s3.delete(&key).unwrap(); // DELETE
+        }
+    }
+
+    // --- Hermetic retry-logic tests (no network) --------------------------
+
+    /// A synthetic error to drive [`retry_loop`] without constructing an
+    /// `S3Error` (hyper's error has no public constructor).
+    #[derive(Debug, PartialEq)]
+    enum FakeErr {
+        Transient,
+        Fatal,
+    }
+
+    fn is_fake_transient(e: &FakeErr) -> bool {
+        matches!(e, FakeErr::Transient)
+    }
+
+    #[test]
+    fn retry_loop_succeeds_after_transient_failures() {
+        let mut calls = 0u32;
+        let mut slept: Vec<u32> = Vec::new();
+        let out: std::result::Result<&str, FakeErr> = retry_loop(
+            S3_MAX_ATTEMPTS,
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(FakeErr::Transient)
+                } else {
+                    Ok("ok")
+                }
+            },
+            is_fake_transient,
+            |attempt| slept.push(attempt),
+        );
+        assert_eq!(out, Ok("ok"));
+        assert_eq!(calls, 3, "two failures then success");
+        assert_eq!(slept, vec![1, 2], "slept once per retried failure");
+    }
+
+    #[test]
+    fn retry_loop_does_not_retry_fatal() {
+        let mut calls = 0u32;
+        let mut slept = 0u32;
+        let out: std::result::Result<(), FakeErr> = retry_loop(
+            S3_MAX_ATTEMPTS,
+            || {
+                calls += 1;
+                Err(FakeErr::Fatal)
+            },
+            is_fake_transient,
+            |_| slept += 1,
+        );
+        assert_eq!(out, Err(FakeErr::Fatal));
+        assert_eq!(calls, 1, "a non-transient error must not be retried");
+        assert_eq!(slept, 0);
+    }
+
+    #[test]
+    fn retry_loop_exhausts_bounded_attempts() {
+        let mut calls = 0u32;
+        let mut slept: Vec<u32> = Vec::new();
+        let out: std::result::Result<(), FakeErr> = retry_loop(
+            S3_MAX_ATTEMPTS,
+            || {
+                calls += 1;
+                Err(FakeErr::Transient)
+            },
+            is_fake_transient,
+            |attempt| slept.push(attempt),
+        );
+        assert_eq!(out, Err(FakeErr::Transient));
+        assert_eq!(calls, S3_MAX_ATTEMPTS, "exactly max_attempts calls");
+        assert_eq!(
+            slept,
+            vec![1, 2, 3],
+            "sleeps between attempts, none after the last"
+        );
+    }
+
+    #[test]
+    fn is_transient_classifies_transport_errors() {
+        // A connection reset / broken pipe mid-request lands in Io -> retry.
+        assert!(is_transient(&S3Error::Io(std::io::Error::other("reset"))));
+        // An HTTP status failure is surfaced as Ok(resp) elsewhere; if it ever
+        // arrives as an error it is NOT a transport race and must not retry.
+        assert!(!is_transient(&S3Error::HttpFailWithBody(
+            500,
+            "server".into()
+        )));
     }
 }
