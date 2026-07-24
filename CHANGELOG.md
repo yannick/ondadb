@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+Two additive changes, no API or format break.
+
+- **Batch column-family creation** — new
+  `DB::create_column_families(&[(&str, ColumnFamilyConfig)])` creates a batch
+  of CFs and persists the manifest **once** for the whole batch instead of
+  once per CF. Semantics are identical to N sequential `create_column_family`
+  calls (handles returned in input order); all names are validated up front
+  (length, comparator, config, collisions against existing CFs, duplicates
+  within the batch), so a conflicting batch creates nothing and never
+  persists, and the registry write lock is held across the batch so a
+  concurrent creator can never observe it half-built. Motivation: each
+  per-CF creation ran a full manifest rebuild + persist — a temp-file
+  `sync_all()` (`F_FULLFSYNC` on macOS) plus a directory fsync — and the
+  manifest is a full rebuild over all CFs, so after N creations the last
+  write already contained everything the first N−1 wrote. A consumer opening
+  11 CFs at boot paid ~22 fsyncs for the information content of 2; measured
+  209.8 ms per-CF vs **22.5 ms batched** for 11 CFs (median of 8, real
+  `F_FULLFSYNC`, ~9.3×). The single-CF path is untouched. Deliberately *not*
+  done: lazy WAL materialization — `Wal::open` performs no fsync in any sync
+  mode (WAL creation was never the cost), and deferring it would complicate
+  the crash-consistency-critical commit/rotation path to save ~22 ms of file
+  creates.
+- **S3 backend: bounded retry on transport errors** (feature `s3`) —
+  every request the backend issues is wrapped in a bounded retry: up to 4
+  attempts, 25/50/100 ms backoff, retrying **only** transport-level
+  `S3Error::Hyper`/`S3Error::Io`. This closes the hyper 0.14 keep-alive
+  reuse race (hyperium/hyper#2136): rust-s3 0.35's tokio backend drives a
+  raw `hyper::Client` with a 90 s idle pool and no retry, so a store (or a
+  NAT in front of it) that drops a pooled idle connection first kills the
+  next request mid-flight with `IncompleteMessage` — a bodied PUT is the
+  most exposed because hyper will not replay it. Retrying is sound because
+  every operation this backend performs is idempotent by construction:
+  part objects use unique never-reused ids and are written whole (single
+  PUT), and reads/HEAD/COPY/DELETE/LIST are idempotent by nature. HTTP
+  status failures surface as `Ok` with a non-2xx code and can never
+  trigger a retry; nothing non-idempotent exists to be retried.
+
 ## 0.4.0
 
 Derived-partitioning milestone (A5). Additive — no manifest or API break; a

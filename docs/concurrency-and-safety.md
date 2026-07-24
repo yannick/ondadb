@@ -208,6 +208,18 @@ Contract:
 - Never call `S3Storage` methods from inside the tokio runtime's own worker
   context (`block_on` would panic); nothing in the engine does — all callers
   are plain std threads.
+- **Retries stay inside the backend** (0.4.1): each `block_on` is wrapped in
+  a bounded retry (4 attempts, 25/50/100 ms backoff) that fires **only** on
+  transport-level `S3Error::Hyper`/`S3Error::Io` — never on an HTTP status,
+  which this backend reports as `Ok` with a non-2xx code. The engine thread
+  simply blocks a little longer on a retried request; no engine-visible
+  state changes between attempts, and every request the backend issues is
+  idempotent (unique never-reused object ids, whole-object single PUTs), so
+  a retry after an ambiguous transport failure can at worst overwrite an
+  identical object. Callers must not add their own retry layers on top —
+  the worst-case added latency under total outage is bounded (~175 ms of
+  backoff plus the request timeouts) and already accounted for in the
+  "part move holds `compact_mu`" stall analysis above.
 - `S3ReadHandle` holds no OS resource (`release` is a no-op); handles are
   cheap to construct and never go through the `FileCache`, so the
   `max_open_sstables` bound does not apply to S3-resident tables.

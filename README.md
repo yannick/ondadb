@@ -59,6 +59,12 @@ LSM storage engine.
   semantics, RocksDB-FIFO-style).
 - **`clear_column_family()`** — atomically empty a CF, preserving its
   configuration.
+- **Batch CF creation** (0.4.1) — `create_column_families(&[(name, config)])`
+  creates many CFs with **one** manifest persist instead of one per CF
+  (each persist is an `F_FULLFSYNC` + directory fsync on macOS). All-or-
+  nothing on validation: a conflicting batch creates nothing. 11 CFs:
+  209.8 ms per-CF → 22.5 ms batched. Use it whenever a consumer opens a
+  fixed CF layout at boot.
 - **Observability** — `approximate_len()` plus per-CF read counters
   (point reads, bloom-filter skips, SSTable probes) and cache hit/miss stats.
 - **Partitions** (0.3.0) — prefix rules carve a CF's keyspace into named
@@ -77,6 +83,11 @@ LSM storage engine.
   S3-compatible object store (MinIO-tested): block reads become bounded HTTP
   range GETs fronted by the block cache (cold block = 1 GET, warm = 0),
   writes are single-shot PUTs; no async runtime bleeds into the engine.
+  Since 0.4.1 every request carries a bounded retry (4 attempts, 25/50/100 ms
+  backoff) on **transport-level** errors only — sound because every operation
+  the backend issues is idempotent — closing the hyper keep-alive reuse race
+  that intermittently killed requests with "connection closed before message
+  completed".
 
 See **[docs/parts-and-tiers.md](docs/parts-and-tiers.md)** for the full guide
 to the 0.3.0 features (concepts, worked examples, S3 setup, operational
@@ -131,6 +142,14 @@ use ondadb::{DB, Options, ColumnFamilyConfig, IsolationLevel};
 
 let db = DB::open(Options::new("/tmp/onda"))?;
 let cf = db.create_column_family("default", ColumnFamilyConfig::default())?;
+
+// Opening a fixed multi-CF layout? Create them as ONE batch — one manifest
+// persist (two fsyncs) for the lot instead of two per CF:
+let cfs = db.create_column_families(&[
+    ("events", ColumnFamilyConfig::default()),
+    ("index",  ColumnFamilyConfig::default()),
+])?;
+let _ = cfs; // handles in input order
 
 // Single-op API (auto-committed at ReadCommitted).
 db.put(&cf, b"key", b"value", Duration::ZERO)?;

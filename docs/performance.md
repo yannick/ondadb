@@ -46,6 +46,19 @@ Flush path:
   no `Vec<Entry>` (was 2 allocs + 2 copies per entry) and no sort; borrowed
   slices flow straight into `Writer::add`.
 
+Open path:
+- `create_column_families` (0.4.1): one manifest persist per **batch**, not
+  per CF. Each persist is a temp-file `sync_all()` (`F_FULLFSYNC` on macOS,
+  tens to hundreds of ms on Apple SSDs) + a directory fsync, and the
+  manifest is a full rebuild over all CFs — so N sequential creations pay
+  ~2N fsyncs for the information content of 2. Measured for an 11-CF boot
+  layout: 209.8 ms per-CF vs 22.5 ms batched (median of 8, ~9.3×). If a
+  consumer opens a fixed CF layout at boot, use the batch API. Deliberately
+  NOT pursued: lazy WAL materialization — `Wal::open` performs no fsync in
+  any sync mode, so WAL creation was never the cost, and deferring it would
+  push new failure modes into the crash-consistency-critical
+  commit/rotation path to save ~22 ms of file creates.
+
 ## Measurement methodology
 
 ```sh

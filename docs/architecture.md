@@ -335,6 +335,18 @@ protocol.
   backend owns a small multi-thread tokio runtime and `block_on`s each
   request; engine worker threads call in synchronously (see
   `docs/concurrency-and-safety.md` § S3Storage).
+- **Transport retry** (0.4.1): every request is wrapped in `with_retry` —
+  up to 4 attempts, 25/50/100 ms backoff, retrying **only** transport-level
+  `S3Error::Hyper`/`S3Error::Io`. This absorbs the hyper 0.14 keep-alive
+  reuse race (hyperium/hyper#2136: the store or a NAT drops a pooled idle
+  connection, the next request reusing that socket dies with
+  `IncompleteMessage`; a bodied PUT is the most exposed because hyper never
+  replays it). Retrying is sound here because every operation this backend
+  issues is idempotent by construction — part objects use unique
+  never-reused ids written whole in a single PUT (see "no internal object
+  CAS" above), and GET/HEAD/COPY/DELETE/LIST are idempotent by nature. An
+  HTTP status failure surfaces as `Ok` with a non-2xx `status_code()` and
+  can never trigger a retry.
 
 ## Recovery (`DB::open`)
 

@@ -408,6 +408,17 @@ whose id the current manifest does not place on that tier (the startup
 sweep's rule, applied externally). Do not run the audit against a manifest
 older than the bucket listing.
 
+**Transient network failures (0.4.1).** Every S3 request carries a bounded
+in-backend retry — 4 attempts, 25/50/100 ms backoff, transport-level errors
+only (`Hyper`/`Io`; an HTTP 4xx/5xx is never retried). This absorbs the
+hyper keep-alive reuse race, whose signature is an *intermittent*
+`connection closed before message completed` on an endpoint that otherwise
+works (the classic tell: `aws` CLI succeeds against the same
+endpoint/credentials while a PUT from the engine fails). If you see that
+error *persist* through the retries, the problem is real connectivity, not
+the race. Do not wrap engine calls in an outer retry layer — puts are
+idempotent and already retried where the failure is visible.
+
 **Downgrade caveat.** Pre-0.3.0 binaries open a 0.3.0 database fine but
 re-encode the manifest **without** the partition/tier/max-entry-time tail on
 their first flush or compaction (see `docs/formats.md`). Partition stamps
