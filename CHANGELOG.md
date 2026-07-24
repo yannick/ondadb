@@ -1,8 +1,22 @@
 # Changelog
 
-## 0.4.1 (unreleased)
+## 0.5.0
 
-Two additive changes, no API or format break.
+Three additive changes, no API or format break. Minor bump: two new public
+`DB` methods (the durability-inspection hooks).
+
+- **Durability-inspection hooks** — new `DB::column_family_config(name)`
+  returns a column family's *effective* durable configuration (what a reopen
+  restores, including live-added partition rules), and
+  `DB::wal_sync_count()` counts successful physical `sync_data()` calls
+  across every WAL the DB opens (per-CF, unified, and post-rotation; wired
+  like the poison flag, so rotation never resets it). Motivation: a consumer
+  whose correctness depends on `SyncMode::Full` (spada's raft O1 boundary)
+  can now *verify* the recorded mode instead of assuming the config it
+  opened with, and tests can assert on real physical syncs — under
+  `SyncMode::None` the counter never advances, which is exactly what a
+  durability test should pin. Added by the spada raft-correctness
+  remediation (its S-077/S-082 decisions).
 
 - **Batch column-family creation** — new
   `DB::create_column_families(&[(&str, ColumnFamilyConfig)])` creates a batch
