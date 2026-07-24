@@ -76,6 +76,11 @@ pub struct DbInner {
     /// this they would race on the shared temp file and could publish a torn manifest.
     manifest_mu: Mutex<()>,
 
+    /// Count of successful manifest persists over this DB's lifetime. Cheap
+    /// (a single relaxed increment on an already fsync-bound path); exists so
+    /// batch operations can assert they collapse N per-item persists into one.
+    manifest_persists: AtomicU64,
+
     file_deletion: Mutex<FileDeletionState>,
 
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -257,13 +262,25 @@ impl DbInner {
             });
         }
         let res = m.save(manifest_path(&self.dir));
-        if let Err(e) = &res {
-            // A failed manifest write is a durability failure: fsync may have
-            // dropped pages, and every caller's WAL-reclaim / file-delete step
-            // depends on this succeeding. Fail-stop rather than limp on.
-            self.poison.set(format!("manifest persist failed: {e}"));
+        match &res {
+            Ok(()) => {
+                self.manifest_persists.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // A failed manifest write is a durability failure: fsync may have
+                // dropped pages, and every caller's WAL-reclaim / file-delete step
+                // depends on this succeeding. Fail-stop rather than limp on.
+                self.poison.set(format!("manifest persist failed: {e}"));
+            }
         }
         res
+    }
+
+    /// Number of successful manifest persists so far (see `manifest_persists`).
+    /// A test/observability lever — batch operations assert they persist once.
+    #[allow(dead_code)]
+    pub(crate) fn manifest_persist_count(&self) -> u64 {
+        self.manifest_persists.load(Ordering::Relaxed)
     }
 
     pub(crate) fn cf_dir(&self, name: &str) -> String {
@@ -412,6 +429,7 @@ impl DB {
             stop,
             pending_flush,
             manifest_mu: Mutex::new(()),
+            manifest_persists: AtomicU64::new(0),
             file_deletion: Mutex::new(FileDeletionState::default()),
             workers: Mutex::new(Vec::new()),
             lock_file: Mutex::new(Some(lock_file)),
@@ -506,6 +524,89 @@ impl DB {
         self.inner.cf_by_id.write().insert(cf.id(), cf.clone());
         self.inner.persist_manifest()?;
         Ok(cf)
+    }
+
+    /// Create several column families in one shot, persisting the manifest
+    /// **once** for the whole batch instead of once per family.
+    ///
+    /// This is semantically identical to calling [`create_column_family`] for
+    /// each `(name, config)` in order — the returned handles are in input order
+    /// — but avoids the per-family manifest fsync storm. The manifest is a full
+    /// rebuild over every live CF, so a single persist after the batch records
+    /// exactly what N sequential persists would have; on an SSD where each
+    /// persist is a flush-to-medium (`F_FULLFSYNC` on macOS), collapsing 2N
+    /// fsyncs (temp + directory per family) into 2 is the cold-boot win.
+    ///
+    /// The batch is atomic on its precondition: names are fully validated —
+    /// including collisions against existing families and duplicates *within*
+    /// the batch — before any filesystem work, so a conflicting batch creates
+    /// nothing and never touches the manifest. (If a per-family filesystem
+    /// create fails midway, already-created directories may linger exactly as a
+    /// crash between single-CF create and manifest persist would leave them;
+    /// they are unreferenced by the manifest and harmless.)
+    ///
+    /// Passing an empty slice is a no-op that returns an empty vector without
+    /// persisting.
+    pub fn create_column_families(
+        &self,
+        specs: &[(&str, ColumnFamilyConfig)],
+    ) -> Result<Vec<Arc<ColumnFamily>>> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Validate every spec up front — name length, comparator, config, and
+        // duplicates within the batch — so a bad batch fails before any
+        // directory or WAL is created.
+        let mut seen: HashMap<&str, ()> = HashMap::with_capacity(specs.len());
+        for (name, config) in specs {
+            if name.is_empty() || name.len() > MAX_CF_NAME_LEN {
+                return Err(OndaError::InvalidArgs("invalid column family name".into()));
+            }
+            comparator_by_name(&config.comparator_name).ok_or_else(|| {
+                OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
+            })?;
+            config.validate().map_err(OndaError::InvalidArgs)?;
+            if seen.insert(name, ()).is_some() {
+                return Err(OndaError::Exists((*name).into()));
+            }
+        }
+
+        // Hold the registry write lock across the whole batch: check every name
+        // is free, then create and insert them, so a concurrent creator can
+        // neither observe a half-built batch nor collide with one.
+        let mut cfs = self.inner.cfs.write();
+        for (name, _) in specs {
+            if cfs.contains_key(*name) {
+                return Err(OndaError::Exists((*name).into()));
+            }
+        }
+        let mut created = Vec::with_capacity(specs.len());
+        for (name, config) in specs {
+            let cmp = comparator_by_name(&config.comparator_name)
+                .expect("comparator validated above");
+            let cf = ColumnFamily::create(
+                self.inner.ctx.clone(),
+                (*name).to_string(),
+                self.inner.cf_dir(name),
+                config.clone(),
+                cmp,
+            )?;
+            cfs.insert((*name).to_string(), cf.clone());
+            created.push(cf);
+        }
+        drop(cfs);
+        {
+            let mut by_id = self.inner.cf_by_id.write();
+            for cf in &created {
+                by_id.insert(cf.id(), cf.clone());
+            }
+        }
+        // One manifest persist for the entire batch.
+        self.inner.persist_manifest()?;
+        Ok(created)
     }
 
     /// Look up a column family by name.
@@ -960,5 +1061,125 @@ mod tests {
         }
         assert_eq!(db.get(&cf, b"pre").unwrap(), b"v");
         let _ = db.close(); // close may surface the poison; must not panic
+    }
+
+    /// Batch CF creation must be semantically identical to N single creates —
+    /// every family present, gettable, and recovered after reopen — while
+    /// persisting the manifest exactly ONCE for the whole batch (the cold-boot
+    /// fsync-storm fix: the manifest is a full rebuild over all CFs, so one
+    /// persist after the batch records everything N per-CF persists would have).
+    #[test]
+    fn create_column_families_persists_manifest_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["a", "b", "c", "d", "e"];
+        {
+            let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+            let before = db.inner.manifest_persist_count();
+            let specs: Vec<(&str, ColumnFamilyConfig)> = names
+                .iter()
+                .map(|n| (*n, ColumnFamilyConfig::default()))
+                .collect();
+            let cfs = db.create_column_families(&specs).unwrap();
+            assert_eq!(cfs.len(), names.len());
+            // One persist for the whole batch, not one per CF.
+            assert_eq!(db.inner.manifest_persist_count() - before, 1);
+            // All families are live and usable immediately.
+            for (i, n) in names.iter().enumerate() {
+                assert!(db.get_column_family(n).is_some(), "missing {n}");
+                db.put(&cfs[i], b"k", b"v", Duration::ZERO).unwrap();
+            }
+            db.close().unwrap();
+        }
+        // Reopen: every batched family recovered from the single manifest write.
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        for n in names {
+            let cf = db
+                .get_column_family(n)
+                .unwrap_or_else(|| panic!("family {n} not recovered"));
+            assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+        }
+        db.close().unwrap();
+    }
+
+    /// Micro-benchmark (ignored; run with
+    /// `cargo test --release create_column_families_bench -- --ignored --nocapture`):
+    /// times creating 11 CFs one-by-one vs. in a single batch on fresh dirs,
+    /// isolating the manifest-fsync cost from process startup. Illustrates the
+    /// cold-boot fix; not a pass/fail gate (fsync latency is machine-dependent).
+    #[test]
+    #[ignore]
+    fn create_column_families_bench() {
+        use std::time::Instant;
+        let names: Vec<String> = (0..11).map(|i| format!("cf{i}")).collect();
+        let trials = 8;
+        let mut per_cf = Vec::new();
+        let mut batched = Vec::new();
+        for _ in 0..trials {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+            let t = Instant::now();
+            for n in &names {
+                db.create_column_family(n, ColumnFamilyConfig::default())
+                    .unwrap();
+            }
+            per_cf.push(t.elapsed().as_secs_f64() * 1e3);
+            db.close().unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+            let specs: Vec<(&str, ColumnFamilyConfig)> = names
+                .iter()
+                .map(|n| (n.as_str(), ColumnFamilyConfig::default()))
+                .collect();
+            let t = Instant::now();
+            db.create_column_families(&specs).unwrap();
+            batched.push(t.elapsed().as_secs_f64() * 1e3);
+            db.close().unwrap();
+        }
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        println!(
+            "11 CFs: per-CF create median {:.1} ms, batched median {:.1} ms (n={trials})",
+            med(per_cf),
+            med(batched)
+        );
+    }
+
+    /// A batch that names an existing family, or repeats a name within itself,
+    /// is rejected as a whole and writes nothing — no partial creation, no
+    /// manifest persist.
+    #[test]
+    fn create_column_families_rejects_conflicts_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        db.create_column_family("existing", ColumnFamilyConfig::default())
+            .unwrap();
+
+        let before = db.inner.manifest_persist_count();
+        // Collides with an existing family.
+        let specs = [
+            ("new1", ColumnFamilyConfig::default()),
+            ("existing", ColumnFamilyConfig::default()),
+        ];
+        assert!(matches!(
+            db.create_column_families(&specs),
+            Err(OndaError::Exists(_))
+        ));
+        // Duplicate within the batch.
+        let specs = [
+            ("dup", ColumnFamilyConfig::default()),
+            ("dup", ColumnFamilyConfig::default()),
+        ];
+        assert!(matches!(
+            db.create_column_families(&specs),
+            Err(OndaError::Exists(_))
+        ));
+        // Nothing was created and the manifest was never touched.
+        assert!(db.get_column_family("new1").is_none());
+        assert!(db.get_column_family("dup").is_none());
+        assert_eq!(db.inner.manifest_persist_count() - before, 0);
+        db.close().unwrap();
     }
 }
