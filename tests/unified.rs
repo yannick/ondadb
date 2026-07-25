@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ondadb::{ColumnFamily, ColumnFamilyConfig, Options, DB};
+use ondadb::{ColumnFamily, ColumnFamilyConfig, Options, SyncMode, DB};
 
 fn open_unified(path: &str) -> DB {
     let opts = Options {
@@ -154,5 +154,97 @@ fn unified_sync_wal() {
     db.put(&a, b"k", b"v", Duration::ZERO).unwrap();
     db.sync_wal().unwrap();
     assert_eq!(db.get(&a, b"k").unwrap(), b"v");
+    db.close().unwrap();
+}
+
+#[test]
+fn unified_database_refuses_per_cf_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    {
+        let db = open_unified(path);
+        let cf = db
+            .create_column_family("data", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.close().unwrap();
+    }
+
+    let err = DB::open(Options::new(path)).expect_err("layout mismatch must fail");
+    assert_eq!(err.kind(), "invalid_args");
+}
+
+#[test]
+fn per_cf_database_refuses_unified_reopen_without_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    {
+        let db = DB::open(Options::new(path)).unwrap();
+        let cf = db
+            .create_column_family("data", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.close().unwrap();
+    }
+
+    let err = DB::open(Options {
+        unified_memtable: true,
+        ..Options::new(path)
+    })
+    .expect_err("layout mismatch must fail");
+    assert_eq!(err.kind(), "invalid_args");
+}
+
+#[test]
+fn explicit_migration_preserves_per_cf_data_and_one_cross_cf_txn_syncs_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    {
+        let db = DB::open(Options::new(path)).unwrap();
+        let a = db
+            .create_column_family("a", ColumnFamilyConfig::default())
+            .unwrap();
+        let b = db
+            .create_column_family("b", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&a, b"old-a", b"A", Duration::ZERO).unwrap();
+        db.put(&b, b"old-b", b"B", Duration::ZERO).unwrap();
+        db.close().unwrap();
+    }
+
+    let db = DB::open(Options {
+        unified_memtable: true,
+        migrate_to_unified: true,
+        unified_memtable_sync_mode: SyncMode::Full,
+        ..Options::new(path)
+    })
+    .unwrap();
+    let a = db.get_column_family("a").unwrap();
+    let b = db.get_column_family("b").unwrap();
+    assert_eq!(db.get(&a, b"old-a").unwrap(), b"A");
+    assert_eq!(db.get(&b, b"old-b").unwrap(), b"B");
+
+    let before = db.wal_sync_count();
+    let mut tx = db.begin();
+    tx.put(&a, b"log", b"entry", Duration::ZERO).unwrap();
+    tx.put(&b, b"hs", b"hardstate", Duration::ZERO).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        db.wal_sync_count() - before,
+        1,
+        "one unified Full WAL frame performs one physical sync"
+    );
+    db.close().unwrap();
+
+    let db = DB::open(Options {
+        unified_memtable: true,
+        unified_memtable_sync_mode: SyncMode::Full,
+        ..Options::new(path)
+    })
+    .unwrap();
+    let a = db.get_column_family("a").unwrap();
+    let b = db.get_column_family("b").unwrap();
+    assert_eq!(db.get(&a, b"log").unwrap(), b"entry");
+    assert_eq!(db.get(&b, b"hs").unwrap(), b"hardstate");
     db.close().unwrap();
 }

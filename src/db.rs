@@ -21,7 +21,7 @@ use crate::compaction;
 use crate::comparator::comparator_by_name;
 use crate::config::{ColumnFamilyConfig, Options};
 use crate::error::{OndaError, Result};
-use crate::manifest::{manifest_path, CfManifest, Manifest};
+use crate::manifest::{manifest_path, CfManifest, Manifest, WalLayout};
 
 const MAX_CF_NAME_LEN: usize = 128;
 const WORKER_TICK: Duration = Duration::from_millis(50);
@@ -75,6 +75,8 @@ pub struct DbInner {
     /// worker, and CF create/drop all call `persist_manifest` concurrently; without
     /// this they would race on the shared temp file and could publish a torn manifest.
     manifest_mu: Mutex<()>,
+    /// Durable database-wide WAL layout written by `persist_manifest`.
+    wal_layout: Mutex<WalLayout>,
 
     /// Count of successful manifest persists over this DB's lifetime. Cheap
     /// (a single relaxed increment on an already fsync-bound path); exists so
@@ -258,6 +260,7 @@ impl DbInner {
             next_file_id: self.next_file_id.load(Ordering::SeqCst),
             global_seq: self.visible_seq(),
             cfs: Vec::new(),
+            wal_layout: *self.wal_layout.lock(),
         };
         for cf in cfs.values() {
             m.cfs.push(CfManifest {
@@ -334,6 +337,25 @@ impl DB {
         if opts.path.is_empty() {
             return Err(OndaError::InvalidArgs("empty path".into()));
         }
+        if opts.migrate_to_unified {
+            if !opts.unified_memtable {
+                return Err(OndaError::InvalidArgs(
+                    "migrate_to_unified requires unified_memtable".into(),
+                ));
+            }
+            if opts.read_only {
+                return Err(OndaError::InvalidArgs(
+                    "cannot migrate WAL layout in read-only mode".into(),
+                ));
+            }
+            Self::migrate_to_unified(&opts)?;
+        }
+        Self::open_impl(opts)
+    }
+
+    /// Open without running layout migration. Kept separate so migration can
+    /// recover and flush the legacy layout under the ordinary DB invariants.
+    fn open_impl(opts: Options) -> Result<DB> {
         std::fs::create_dir_all(&opts.path)?;
         let dir = opts.path.clone();
 
@@ -384,6 +406,22 @@ impl DB {
         let stop = Arc::new(AtomicBool::new(false));
         let pending_flush = Arc::new(AtomicUsize::new(0));
 
+        // The WAL layout is a durable database-wide choice once the catalog
+        // contains a column family. Opening under the other layout would make
+        // recovery consult one set of WALs while new commits write another.
+        let manifest = Manifest::load(manifest_path(&dir))?;
+        let requested_layout = if opts.unified_memtable {
+            WalLayout::Unified
+        } else {
+            WalLayout::PerColumnFamily
+        };
+        if !manifest.cfs.is_empty() && manifest.wal_layout != requested_layout {
+            return Err(OndaError::InvalidArgs(format!(
+                "WAL layout mismatch: database is {:?}, requested {:?}",
+                manifest.wal_layout, requested_layout
+            )));
+        }
+
         // Unified memtable (shared across CFs), if enabled.
         let mut unified_max_seq = 0u64;
         let unified = if opts.unified_memtable {
@@ -415,8 +453,6 @@ impl DB {
             wal_syncs: wal_syncs.clone(),
         });
 
-        let manifest = Manifest::load(manifest_path(&dir))?;
-
         let inner = Arc::new(DbInner {
             opts: opts.clone(),
             dir,
@@ -437,6 +473,7 @@ impl DB {
             stop,
             pending_flush,
             manifest_mu: Mutex::new(()),
+            wal_layout: Mutex::new(requested_layout),
             manifest_persists: AtomicU64::new(0),
             file_deletion: Mutex::new(FileDeletionState::default()),
             workers: Mutex::new(Vec::new()),
@@ -499,6 +536,32 @@ impl DB {
             spawn_workers(&inner, flush_rx, compact_rx);
         }
         Ok(DB { inner })
+    }
+
+    /// Crash-safe per-CF → unified migration. Until the manifest flip, reopen
+    /// sees the legacy layout and can repeat recovery+flush. After the flip,
+    /// every recovered byte is already in an SSTable and the next ordinary
+    /// open creates/replays the unified WAL before accepting writes.
+    fn migrate_to_unified(opts: &Options) -> Result<()> {
+        let manifest = Manifest::load(manifest_path(&opts.path))?;
+        if manifest.cfs.is_empty() || manifest.wal_layout == WalLayout::Unified {
+            return Ok(());
+        }
+
+        let mut legacy_opts = opts.clone();
+        legacy_opts.unified_memtable = false;
+        legacy_opts.migrate_to_unified = false;
+        let db = Self::open_impl(legacy_opts)?;
+
+        let cfs: Vec<Arc<ColumnFamily>> = db.inner.cfs.read().values().cloned().collect();
+        for cf in &cfs {
+            db.flush_memtable(cf)?;
+        }
+        db.inner.poison.check()?;
+
+        *db.inner.wal_layout.lock() = WalLayout::Unified;
+        db.inner.persist_manifest()?;
+        db.close()
     }
 
     /// Create a new column family.
@@ -594,8 +657,8 @@ impl DB {
         }
         let mut created = Vec::with_capacity(specs.len());
         for (name, config) in specs {
-            let cmp = comparator_by_name(&config.comparator_name)
-                .expect("comparator validated above");
+            let cmp =
+                comparator_by_name(&config.comparator_name).expect("comparator validated above");
             let cf = ColumnFamily::create(
                 self.inner.ctx.clone(),
                 (*name).to_string(),

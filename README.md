@@ -251,6 +251,13 @@ let db = DB::open(opts)?;
 # Ok::<(), ondadb::OndaError>(())
 ```
 
+The layout is persisted once the database has column families; reopening it
+with the other layout is rejected. To convert an existing per-CF database,
+open once with both `unified_memtable: true` and `migrate_to_unified: true`.
+Migration recovers and flushes every legacy WAL before atomically recording the
+unified layout. `unified_memtable_stall_threshold` (default 6) bounds sealed
+memtables when flush falls behind.
+
 Point reads work under any per-CF comparator (exact prefixed-key lookup); ordered
 iteration and flush re-sort a CF's slice with that CF's comparator. Implemented in
 [`src/unified.rs`](src/unified.rs).
@@ -308,4 +315,3 @@ replay, DB locking — kept name-for-name so the two suites diff side by side.
 ondaDB is wired into the shared harness at [`../bench`](../bench) (its standalone
 binary mirrors the C harness and the Go output format). Run
 `./bench_graphs.sh` there to regenerate the four-engine charts.
-

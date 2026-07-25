@@ -159,6 +159,14 @@ pub struct Options {
     pub unified_memtable_skip_list_probability: f64,
     pub unified_memtable_sync_mode: SyncMode,
     pub unified_memtable_sync_interval: Duration,
+    /// Maximum number of sealed unified memtables awaiting flush before new
+    /// writers stall. Bounds recovery/WAL-backed memory when flush falls
+    /// behind; one flush completion wakes the blocked writers.
+    pub unified_memtable_stall_threshold: usize,
+    /// Explicitly migrate an existing per-column-family database to the
+    /// unified WAL layout during open. The migration flushes all recovered
+    /// per-CF WAL state before atomically flipping the manifest layout.
+    pub migrate_to_unified: bool,
     /// Named storage tiers, in addition to the implicit `"ssd"` tier (the
     /// database directory). A bottom-level part may be moved to a tier; its
     /// files then live under `<tier.root>/cf-<name>/`. WAL and upper levels
@@ -345,6 +353,8 @@ impl Default for Options {
             unified_memtable_skip_list_probability: 0.25,
             unified_memtable_sync_mode: SyncMode::None,
             unified_memtable_sync_interval: Duration::from_micros(128_000),
+            unified_memtable_stall_threshold: 6,
+            migrate_to_unified: false,
             tiers: Vec::new(),
             part_mover_interval: Duration::from_secs(30),
             partition_fns: Vec::new(),

@@ -19,6 +19,17 @@ use crate::error::{OndaError, Result};
 
 const MAGIC: u32 = 0x5756_4D46; // "WVMF"
 const VERSION: u32 = 1;
+const WAL_LAYOUT_TAG: &[u8; 8] = b"ONDAWAL1";
+
+/// WAL/memtable layout persisted for the whole database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalLayout {
+    /// Legacy/default layout: one WAL and memtable per column family.
+    #[default]
+    PerColumnFamily,
+    /// One database-wide WAL and memtable, with CF-id-prefixed keys.
+    Unified,
+}
 
 /// One SSTable in the catalog.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,6 +80,7 @@ pub struct Manifest {
     pub next_file_id: u64,
     pub global_seq: u64,
     pub cfs: Vec<CfManifest>,
+    pub wal_layout: WalLayout,
 }
 
 impl Default for Manifest {
@@ -77,6 +89,7 @@ impl Default for Manifest {
             next_file_id: 1,
             global_seq: 0,
             cfs: Vec::new(),
+            wal_layout: WalLayout::PerColumnFamily,
         }
     }
 }
@@ -176,14 +189,19 @@ impl Manifest {
             .cfs
             .iter()
             .any(|cf| cf.sstables.iter().any(|s| s.max_entry_time.is_some()));
-        if has_part || has_tier || has_time {
+        let has_layout = self.wal_layout == WalLayout::Unified;
+        if has_part || has_tier || has_time || has_layout {
             encode_name_section(&mut b, &self.cfs, |s| s.partition.as_deref());
         }
-        if has_tier || has_time {
+        if has_tier || has_time || has_layout {
             encode_name_section(&mut b, &self.cfs, |s| s.tier.as_deref());
         }
-        if has_time {
+        if has_time || has_layout {
             encode_u64_section(&mut b, &self.cfs, |s| s.max_entry_time.map(|t| t as u64));
+        }
+        if has_layout {
+            b.extend_from_slice(WAL_LAYOUT_TAG);
+            b.push(1);
         }
         let crc = checksum(&b);
         append_u32(&mut b, crc);
@@ -277,11 +295,21 @@ impl Manifest {
         if !p.is_empty() {
             p = decode_u64_section(p, &mut cfs, |sst, v| sst.max_entry_time = Some(v as i64))?;
         }
-        let _ = p;
+        let wal_layout = if p.is_empty() {
+            WalLayout::PerColumnFamily
+        } else if p.len() == WAL_LAYOUT_TAG.len() + 1
+            && &p[..WAL_LAYOUT_TAG.len()] == WAL_LAYOUT_TAG
+            && p[WAL_LAYOUT_TAG.len()] == 1
+        {
+            WalLayout::Unified
+        } else {
+            return Err(bad());
+        };
         Ok(Manifest {
             next_file_id,
             global_seq,
             cfs,
+            wal_layout,
         })
     }
 }
@@ -397,6 +425,7 @@ mod tests {
         Manifest {
             next_file_id: 42,
             global_seq: 99,
+            wal_layout: WalLayout::PerColumnFamily,
             cfs: vec![CfManifest {
                 name: "default".into(),
                 config: vec![1, 2, 3, 4],
@@ -444,6 +473,21 @@ mod tests {
         assert_eq!(d.cfs.len(), 1);
         assert_eq!(d.cfs[0].name, "default");
         assert_eq!(d.cfs[0].config, vec![1, 2, 3, 4]);
+        assert_eq!(d.cfs[0].sstables, m.cfs[0].sstables);
+    }
+
+    #[test]
+    fn legacy_manifest_decodes_as_per_column_family_wal_layout() {
+        let d = Manifest::decode(&sample().encode()).unwrap();
+        assert_eq!(d.wal_layout, WalLayout::PerColumnFamily);
+    }
+
+    #[test]
+    fn unified_wal_layout_survives_manifest_round_trip() {
+        let mut m = sample();
+        m.wal_layout = WalLayout::Unified;
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(d.wal_layout, WalLayout::Unified);
         assert_eq!(d.cfs[0].sstables, m.cfs[0].sstables);
     }
 
@@ -651,6 +695,7 @@ mod tests {
             let m = Manifest {
                 next_file_id: n as u64,
                 global_seq: 1,
+                wal_layout: WalLayout::PerColumnFamily,
                 cfs: vec![CfManifest {
                     name: "t_post".into(),
                     config: Vec::new(),

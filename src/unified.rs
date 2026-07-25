@@ -69,6 +69,7 @@ pub(crate) struct UnifiedStore {
     write_buffer_size: usize,
     sync_mode: crate::config::SyncMode,
     sync_interval: std::time::Duration,
+    stall_threshold: usize,
     read_only: bool,
     state: RwLock<UState>,
     rot: Mutex<RotState>,
@@ -162,6 +163,7 @@ impl UnifiedStore {
             write_buffer_size: wbs,
             sync_mode: opts.unified_memtable_sync_mode,
             sync_interval: opts.unified_memtable_sync_interval,
+            stall_threshold: opts.unified_memtable_stall_threshold.max(1),
             read_only: opts.read_only,
             state: RwLock::new(UState {
                 mem,
@@ -189,8 +191,15 @@ impl UnifiedStore {
     pub(crate) fn apply(self: &Arc<Self>, items: &[(u64, wal::RecordRef<'_>)]) -> Result<()> {
         {
             let mut g = self.rot.lock();
-            while g.rotating {
-                self.cond.wait(&mut g);
+            loop {
+                let stalled = g.rotating
+                    || (self.state.read().imm.len() >= self.stall_threshold
+                        && !self.closing.load(Ordering::Relaxed));
+                if stalled {
+                    self.cond.wait(&mut g);
+                } else {
+                    break;
+                }
             }
             g.active_writers += 1;
         }
@@ -337,10 +346,15 @@ impl UnifiedStore {
 
     /// Remove a flushed immutable from the queue.
     pub(crate) fn remove_imm(&self, imm: &Arc<UnifiedImm>) {
+        // Match the writer predicate's lock order (`rot` then `state`) so a
+        // completion cannot notify between a writer's predicate check and wait.
+        let _g = self.rot.lock();
         let mut s = self.state.write();
         if let Some(pos) = s.imm.iter().position(|i| Arc::ptr_eq(i, imm)) {
             s.imm.remove(pos);
         }
+        drop(s);
+        self.cond.notify_all();
     }
 
     /// fsync the active WAL (no-op when read-only / WAL-less).
@@ -381,4 +395,72 @@ pub(crate) fn split_by_cf(imm: &UnifiedImm) -> Vec<(u64, Vec<Entry>)> {
         }
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use std::time::Duration;
+
+    fn record<'a>(key: &'a [u8], seq: u64) -> wal::RecordRef<'a> {
+        wal::RecordRef {
+            key,
+            value: b"value",
+            seq,
+            ttl: 0,
+            tombstone: false,
+            single_delete: false,
+        }
+    }
+
+    #[test]
+    fn unified_writers_stall_at_the_immutable_threshold_and_resume_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flush_tx, flush_rx) = unbounded();
+        let opts = Options {
+            unified_memtable: true,
+            unified_memtable_write_buffer_size: 1,
+            unified_memtable_stall_threshold: 6,
+            ..Options::new(dir.path().to_str().unwrap())
+        };
+        let (store, _) = UnifiedStore::open(
+            dir.path().to_str().unwrap(),
+            &opts,
+            flush_tx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::util::Poison::new()),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+
+        for seq in 1..=6 {
+            let key = format!("key-{seq}");
+            store.apply(&[(7, record(key.as_bytes(), seq))]).unwrap();
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let join = std::thread::spawn(move || {
+            let result = writer.apply(&[(7, record(b"blocked", 7))]);
+            done_tx.send(result).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the seventh immutable must stall its writer"
+        );
+
+        let imm = match flush_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            FlushJob::Unified { imm } => imm,
+            FlushJob::PerCf { .. } => panic!("unexpected per-CF flush"),
+        };
+        store.remove_imm(&imm);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer resumes after immutable removal")
+            .unwrap();
+        join.join().unwrap();
+    }
 }

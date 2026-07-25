@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Unified memtable mode now has bounded immutable backpressure
+  (`unified_memtable_stall_threshold`, default 6), persists its WAL layout in
+  the manifest, rejects accidental per-CF/unified reopen mismatches, and
+  supports an explicit crash-safe per-CF migration via
+  `migrate_to_unified`. A cross-CF transaction in unified `SyncMode::Full`
+  remains one checksummed WAL frame and now has a regression test proving it
+  performs exactly one physical WAL sync and survives reopen.
+
 ## 0.5.0
 
 Three additive changes, no API or format break. Minor bump: two new public

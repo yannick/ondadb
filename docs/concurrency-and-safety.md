@@ -78,6 +78,12 @@ Consequences agents rely on:
   span, so rotation can never split a batch across memtables (its WAL
   generation always covers its memtable).
 
+Unified rotation uses the same `rot → state` lock order. Writers additionally
+wait while the sealed unified queue is at
+`Options::unified_memtable_stall_threshold`; `remove_imm` takes `rot` before
+removing from `state` and notifying, so a completion cannot be lost between a
+writer's predicate check and its condition-variable wait.
+
 ## Memtable
 
 256 shards (`NUM_SHARDS`), routed by `xxh3(user_key)`. Default build: one
@@ -154,6 +160,12 @@ it to its sticky stripe under that stripe's file mutex — no cross-thread
 coordination. Full mode: single stripe + group commit (leader drains
 `qstate.queue`, one write + one `sync_data`, wakes followers over bounded
 channels). `Wal::close` is idempotent and `&self` (callable through `Arc`).
+
+The WAL layout is persisted in the manifest. Explicit per-CF→unified migration
+recovers and flushes all legacy memtables while the manifest still says
+per-CF, then flips the manifest to unified before the first unified open accepts
+writes. A crash before the flip repeats legacy recovery; a crash after it opens
+the unified layout over already-durable SSTables.
 
 ## Part lifecycle & the part mover (`parts.rs`)
 

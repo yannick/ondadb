@@ -79,7 +79,8 @@ in the database directory; only bottom-level parts may live on a named tier
 8. Run commit hooks (outside `commit_mu`).
 
 Unified-memtable mode replaces step 6 with `UnifiedStore::apply` (records get
-an 8-byte big-endian CF-id key prefix, one shared WAL + memtable).
+an 8-byte big-endian CF-id key prefix, one shared WAL + memtable). Its sealed
+queue is bounded by `unified_memtable_stall_threshold` (default 6).
 
 ## Read path
 
@@ -350,7 +351,10 @@ protocol.
 
 ## Recovery (`DB::open`)
 
-1. `Manifest::load` — missing file = empty DB; CRC failure = hard error.
+1. `Manifest::load` — missing file = empty DB; CRC failure = hard error. The
+   persisted WAL layout must match the requested mode. An explicit
+   per-CF→unified migration first recovers and flushes the legacy layout, then
+   atomically flips the manifest; an implicit layout change is rejected.
 2. Per CF: open every SST listed (levels rebuilt, level ≥1 sorted by min key),
    then replay every WAL generation found on disk (`existing_wal_gens` scans
    `wal-<gen>.log` stripe-0 names; `Wal::replay` reads all stripes of each

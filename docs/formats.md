@@ -143,7 +143,7 @@ magic u32 = 0x5756_4D46 ("WVMF") | version u32 = 1
 | per CF: name bytes* | config blob bytes* | sst_count uvarint
   | per SST: id, level, num_entries, num_tombstones, max_seq,
              klog_size, vlog_size (all uvarint) | min_key* | max_key*
-| append-tolerant tail (0–3 sections, see below)
+| append-tolerant tail (0–4 sections, see below)
 | crc32c u32
 ```
 
@@ -156,12 +156,12 @@ parent-dir fsync. The temp path is fixed, so all saves MUST be serialized by
 `DbInner::manifest_mu` (a past data-loss bug). A CRC-invalid manifest fails
 `DB::open` (no partial recovery); a missing one is an empty database.
 
-### Append-tolerant tail (`SstMeta.partition` / `.tier` / `.max_entry_time`)
+### Append-tolerant tail (SST metadata and WAL layout)
 
 The per-SST record list above is a flat sequential encoding with no framing,
 so optional per-record fields cannot be added in place without breaking older
 readers. Instead they live in a tail between the last CF's records and the
-CRC (the CRC covers the tail). The tail holds up to **three positional
+CRC (the CRC covers the tail). The tail holds up to **four
 sections**, always in this order:
 
 ```
@@ -172,6 +172,7 @@ sections**, always in this order:
 3. max-entry-time section
                          count uvarint
                          { table_index uvarint | value uvarint } × count
+4. unified WAL layout    "ONDAWAL1" | layout u8 (1 = unified)
 ```
 
 `table_index` is the table's position in that CF's `sst_count` list.
@@ -189,11 +190,15 @@ precede it, even if those are all-empty counts:
 | only `partition`                    | section 1 only (P1 layout) |
 | any `tier`, no `max_entry_time`     | sections 1 + 2 (P3 layout) |
 | any `max_entry_time`                | sections 1 + 2 + 3 |
+| unified WAL layout                  | sections 1 + 2 + 3 + tagged section 4 |
 
 **Decoding** is positional: after the CF loop, if bytes remain before the
 CRC the first section is the partition section, the next (if bytes remain)
-the tier section, the next the time section. A manifest that stops short
-leaves the remaining fields `None` — every legacy layout decodes cleanly.
+the tier section, the next the time section, and the tagged layout section
+last. A manifest that stops before the layout tag decodes as
+`PerColumnFamily`; every legacy layout therefore decodes cleanly. Unified
+manifests emit the preceding three sections even when empty so the tag is
+unambiguous.
 
 **Compatibility rules:**
 
@@ -240,4 +245,5 @@ inside the manifest body and is therefore covered by the manifest CRC32-C.
 
 Same WAL format; file names `unified-wal-<gen>.log[.sN]`; record keys carry an
 8-byte big-endian CF-id prefix (`cf_id = fnv64(cf_name)`). Split flush strips
-the prefix and re-sorts each CF's slice with that CF's comparator.
+the prefix and re-sorts each CF's slice with that CF's comparator. The manifest
+tag above prevents reopening a non-empty database under a different WAL layout.

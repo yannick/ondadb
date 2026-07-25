@@ -34,7 +34,7 @@ use std::sync::Arc;
 use crate::column_family::{ColumnFamily, SstHandle};
 use crate::db::DB;
 use crate::error::{OndaError, Result};
-use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta};
+use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
 use crate::sst::vlog_path_for;
 
 /// The result of a [`DB::detach_part`]: where the part's files now live and
@@ -334,6 +334,11 @@ impl DB {
         let manifest = Manifest {
             next_file_id: max_id + 1,
             global_seq: self.inner.visible_seq(),
+            wal_layout: if self.inner.opts.unified_memtable {
+                WalLayout::Unified
+            } else {
+                WalLayout::PerColumnFamily
+            },
             cfs: vec![CfManifest {
                 name: cf.name().to_string(),
                 config: cf.effective_config().encode(),
