@@ -37,6 +37,117 @@ use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
 use crate::sst::vlog_path_for;
 
+/// One SSTable of an exported part, described independently of this database.
+///
+/// Everything here except [`content`](Self::content) is copied from the
+/// catalog. `content` is read from the bytes, which is what makes the
+/// description an *identity* rather than a summary: two databases can compare
+/// parts without trusting each other's metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartTable {
+    /// The table's file id **in the exporting database**. Local to that
+    /// database and not an identity — see [`PartManifest`].
+    pub id: u64,
+    /// Smallest user key in the table.
+    pub min_key: Vec<u8>,
+    /// Largest user key in the table.
+    pub max_key: Vec<u8>,
+    /// Highest sequence number in the table.
+    pub max_seq: u64,
+    /// Live entries (including tombstones).
+    pub num_entries: u64,
+    /// Size of the key log in bytes.
+    pub klog_size: u64,
+    /// Size of the value log in bytes; `0` when the table has none.
+    pub vlog_size: u64,
+    /// Tier the bytes currently live on, or `None` for the default tier.
+    pub tier: Option<String>,
+    /// SHA-256 over the klog bytes followed by the vlog bytes — the table's
+    /// content identity.
+    pub content: [u8; 32],
+}
+
+/// A part, described so another database (or another process entirely) can
+/// recognise it: its tables, their key ranges, and a digest over their bytes.
+///
+/// # Why this exists
+///
+/// A part is identified inside a database by its tables' **file ids**, which
+/// are local counters — id 7 in one database has nothing to do with id 7 in
+/// another. A consumer coordinating parts across machines (replicating them,
+/// placing them in a shared object store, proving two replicas hold the same
+/// bytes) needs an identity that travels, and until now had to maintain that
+/// mapping itself, outside the engine that owns the facts.
+///
+/// [`digest`](Self::digest) is that identity. It covers every table's content
+/// hash, key range and sequence bound, in a fixed order.
+///
+/// # It is a PHYSICAL identity, not a logical one
+///
+/// Read this before using the digest to decide anything.
+///
+/// The digest is independent of file ids, of file paths, of which tier the
+/// bytes sit on, and of which database instance produced it: two databases
+/// that performed the same writes produce the same digest, which is what makes
+/// it usable across machines at all.
+///
+/// It is **not** independent of a database's write history. SSTable entries
+/// carry sequence numbers, and those are database-global counters, so
+/// unrelated earlier writes shift them and change the bytes. Two parts holding
+/// logically identical data that arrived by different routes hash
+/// *differently*.
+///
+/// So:
+///
+/// - **Right question:** "I am about to ship this part — does the peer already
+///   have exactly these bytes?" The digest answers it, and answers it without
+///   trusting either side's metadata.
+/// - **Wrong question:** "Did two replicas independently rebuild the same
+///   data?" The digest will say no even when they did. That comparison needs a
+///   hash over *logical* content, which is the consumer's business, not the
+///   engine's — only the consumer knows which parts of an entry are meaningful
+///   to it.
+///
+/// Both tests for this live in `tests/parts.rs`, including one that asserts the
+/// limitation, so a change that made the digest logical cannot land without
+/// updating this paragraph.
+///
+/// # Cost
+///
+/// Exporting **reads every byte of the part** to hash it. That is the price of
+/// an identity rather than an assertion, and it is deliberately not optional:
+/// a metadata-only digest would compare catalog entries, which is precisely
+/// the thing a consumer cannot afford to trust when it is checking whether two
+/// machines agree. A part on a remote tier is hashed where it lives, through
+/// that tier's backend, rather than being brought local first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartManifest {
+    /// Column family the part belongs to.
+    pub cf: String,
+    /// The partition this part materialises.
+    pub partition: String,
+    /// The part's tables, ordered by `min_key` then `id` so the digest is
+    /// independent of catalog iteration order.
+    pub tables: Vec<PartTable>,
+    /// SHA-256 over the canonical encoding of [`tables`](Self::tables).
+    pub digest: [u8; 32],
+}
+
+impl PartManifest {
+    /// Total bytes across every table of the part.
+    pub fn size_bytes(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|t| t.klog_size + t.vlog_size)
+            .sum()
+    }
+
+    /// The digest as lowercase hex — the form a consumer names objects with.
+    pub fn digest_hex(&self) -> String {
+        self.digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 /// The result of a [`DB::detach_part`]: where the part's files now live and
 /// which table ids were removed from the catalog. Pass [`DetachedPart::dir`] to
 /// [`DB::attach_part`] to bring the part back.
@@ -284,6 +395,76 @@ impl DB {
         }
         self.inner.persist_manifest()?;
         Ok(())
+    }
+
+    /// Describe the bottom-level part for `partition` as a
+    /// [`PartManifest`] — its tables, their key ranges, and a digest over
+    /// their bytes.
+    ///
+    /// Unlike [`freeze_part`](Self::freeze_part), which produces an openable
+    /// *database directory*, this produces a *description*: nothing is
+    /// written, nothing is linked, and the caller gets an identity it can send
+    /// somewhere else. Use it to name a part in an external catalog, or to
+    /// check that two databases hold the same part without shipping either.
+    ///
+    /// Deletions are paused for the duration, exactly as `freeze_part` and
+    /// `checkpoint` do, so a concurrent compaction cannot unlink a file
+    /// half-way through hashing it.
+    ///
+    /// Errors with [`NotFound`](OndaError::NotFound) if the partition has no
+    /// materialized bottom-level tables (flush + compact first).
+    ///
+    /// **Reads the whole part.** See [`PartManifest`] for why that is the
+    /// point rather than an oversight.
+    pub fn export_part(&self, cf: &Arc<ColumnFamily>, partition: &str) -> Result<PartManifest> {
+        self.inner.poison.check()?;
+        let _pause = self.inner.pause_deletions();
+
+        let mut handles = cf.bottom_partition_handles(partition);
+        if handles.is_empty() {
+            return Err(OndaError::NotFound);
+        }
+        // A fixed order, derived from the data rather than from however the
+        // level happened to be laid out, so the digest is reproducible.
+        handles.sort_by(|a, b| {
+            a.meta
+                .min_key
+                .cmp(&b.meta.min_key)
+                .then(a.meta.id.cmp(&b.meta.id))
+        });
+
+        let mut tables = Vec::with_capacity(handles.len());
+        for h in &handles {
+            let klog = cf.klog_path_for(&h.meta);
+            let vlog = vlog_path_for(&klog);
+            // Through the tier's own backend, so a part that lives on a remote
+            // tier exports without being brought local first.
+            let storage = cf.ctx.tiers.storage_for(h.meta.tier.as_deref());
+            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+            hash_file(storage.as_ref(), &klog, h.meta.klog_size, &mut hasher)?;
+            if h.meta.vlog_size > 0 {
+                hash_file(storage.as_ref(), &vlog, h.meta.vlog_size, &mut hasher)?;
+            }
+            let content: [u8; 32] = <sha2::Sha256 as sha2::Digest>::finalize(hasher).into();
+            tables.push(PartTable {
+                id: h.meta.id,
+                min_key: h.meta.min_key.clone(),
+                max_key: h.meta.max_key.clone(),
+                max_seq: h.meta.max_seq,
+                num_entries: h.meta.num_entries,
+                klog_size: h.meta.klog_size,
+                vlog_size: h.meta.vlog_size,
+                tier: h.meta.tier.clone(),
+                content,
+            });
+        }
+
+        Ok(PartManifest {
+            cf: cf.name().to_string(),
+            partition: partition.to_string(),
+            digest: part_digest(&tables),
+            tables,
+        })
     }
 
     /// Freeze the bottom-level part for `partition` into `dir`: hard-link its
@@ -789,6 +970,60 @@ fn observe_committed_move(
 
 fn file_len(path: &str) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Chunk size for [`hash_file`]. Large enough that a remote tier issues few
+/// range GETs, small enough that hashing a multi-gigabyte part does not
+/// allocate a multi-gigabyte buffer.
+const HASH_CHUNK: usize = 1 << 20;
+
+/// Feed `len` bytes of `path` into `hasher`, reading through `storage` so a
+/// tier-resident file is hashed where it lives rather than being copied local.
+fn hash_file(
+    storage: &dyn crate::storage::Storage,
+    path: &str,
+    len: u64,
+    hasher: &mut sha2::Sha256,
+) -> Result<()> {
+    use sha2::Digest as _;
+    let handle = storage.open_read(path)?;
+    let mut buf = vec![0u8; HASH_CHUNK.min(len.max(1) as usize)];
+    let mut off = 0u64;
+    while off < len {
+        let n = HASH_CHUNK.min((len - off) as usize);
+        let chunk = &mut buf[..n];
+        handle.read_exact_at(chunk, off)?;
+        hasher.update(&*chunk);
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// SHA-256 over a canonical encoding of a part's tables.
+///
+/// Length-prefixed, fixed field order, big-endian lengths: two different table
+/// lists cannot produce the same byte stream by shifting a boundary, which is
+/// the classic way a naive concatenation becomes forgeable. The file **id** is
+/// deliberately excluded — it is local to the exporting database, and
+/// including it would make the same bytes hash differently on two machines,
+/// defeating the entire purpose.
+fn part_digest(tables: &[PartTable]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ondadb/part/v1");
+    h.update((tables.len() as u64).to_be_bytes());
+    for t in tables {
+        h.update(t.content);
+        h.update(t.max_seq.to_be_bytes());
+        h.update(t.num_entries.to_be_bytes());
+        h.update(t.klog_size.to_be_bytes());
+        h.update(t.vlog_size.to_be_bytes());
+        h.update((t.min_key.len() as u64).to_be_bytes());
+        h.update(&t.min_key);
+        h.update((t.max_key.len() as u64).to_be_bytes());
+        h.update(&t.max_key);
+    }
+    h.finalize().into()
 }
 
 #[cfg(test)]

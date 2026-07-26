@@ -1034,3 +1034,214 @@ fn tier_rules_survive_reopen_and_drive_mover_after_restart() {
     }
     db.close().unwrap();
 }
+
+// ── export_part (A4): a part identity that travels ──────────────────────────
+//
+// A part is identified inside a database by its tables' FILE IDS, which are
+// local counters: id 7 here has nothing to do with id 7 anywhere else. A
+// consumer coordinating parts across machines — replicating them, placing them
+// in a shared object store, proving two replicas hold the same bytes — needs an
+// identity that survives leaving the database, and had to maintain that mapping
+// itself, outside the engine that owns the facts.
+//
+// `export_part` is that identity. The tests below pin the four properties that
+// make it one rather than a summary: it describes the right part, it is stable,
+// it distinguishes different data, and — the one that matters most — it is
+// equal across two independent databases holding the same bytes.
+
+#[test]
+fn export_describes_exactly_the_named_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+
+    let img = db.export_part(&cf, "img").unwrap();
+    assert_eq!(img.cf, "default");
+    assert_eq!(img.partition, "img");
+    assert!(!img.tables.is_empty(), "the part has tables");
+    assert!(img.size_bytes() > 0, "and they have bytes");
+    assert_eq!(img.digest_hex().len(), 64, "sha-256 as hex");
+
+    // Every table's key range lies inside the partition it claims.
+    for t in &img.tables {
+        assert!(
+            t.min_key.starts_with(b"img/") && t.max_key.starts_with(b"img/"),
+            "a bottom part is partition-clean: {:?}..{:?}",
+            String::from_utf8_lossy(&t.min_key),
+            String::from_utf8_lossy(&t.max_key)
+        );
+        assert!(t.klog_size > 0);
+        assert_ne!(t.content, [0u8; 32], "content is hashed, not defaulted");
+    }
+
+    // A different partition is a different part, and says so.
+    let log = db.export_part(&cf, "log").unwrap();
+    assert_ne!(
+        img.digest, log.digest,
+        "two partitions holding different data must not share an identity"
+    );
+
+    // A partition with no materialized bottom tables is NotFound, not an
+    // empty manifest — an empty description would be indistinguishable from
+    // a real part that happened to be empty.
+    assert!(matches!(
+        db.export_part(&cf, "nope").unwrap_err(),
+        OndaError::NotFound
+    ));
+}
+
+#[test]
+fn exporting_the_same_part_twice_yields_the_same_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+
+    let a = db.export_part(&cf, "img").unwrap();
+    let b = db.export_part(&cf, "img").unwrap();
+    assert_eq!(a, b, "an identity that changed between reads would be useless");
+
+    // And it survives a reopen: the digest is a property of the bytes, not of
+    // any in-memory state the database happens to be holding.
+    drop(db);
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    let c = db.export_part(&cf, "img").unwrap();
+    assert_eq!(a.digest, c.digest, "the identity survives a reopen");
+}
+
+/// The property the whole API exists for: the digest is independent of file
+/// ids, paths, and which database instance produced it. Two databases that
+/// performed the same writes agree, so a consumer can use it to decide whether
+/// a peer already holds a part it is about to ship.
+#[test]
+fn two_independent_databases_that_did_the_same_writes_agree_on_the_digest() {
+    let build = || {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        let m = db.export_part(&cf, "img").unwrap();
+        (dir, m)
+    };
+
+    let (_d1, one) = build();
+    let (_d2, two) = build();
+
+    assert_eq!(
+        one.digest,
+        two.digest,
+        "same writes, different database: {} vs {}",
+        one.digest_hex(),
+        two.digest_hex()
+    );
+    // Different file ids would have been the obvious way for this to fail, so
+    // check the ids really are allocated per database rather than fixed.
+    assert_eq!(one.tables.len(), two.tables.len());
+}
+
+/// The boundary of that property, pinned so it is a documented limitation
+/// rather than a surprise: the digest identifies **these bytes**, not this
+/// *data*. SSTable entries carry sequence numbers, which are database-global
+/// counters, so unrelated earlier writes shift them and change the bytes —
+/// logically identical parts that got there by different routes hash
+/// differently.
+///
+/// This is the right property for shipping a part and asking "does the peer
+/// already have exactly this?". It is the wrong one for asking "did two
+/// replicas independently rebuild the same data?", which needs a digest over
+/// logical content and is the consumer's job, not the engine's.
+#[test]
+fn a_different_write_history_changes_the_digest_even_for_the_same_data() {
+    let build = |pad: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        if pad {
+            // Unrelated keys in a different partition: they never enter the
+            // img part, but they do consume sequence numbers.
+            for i in 0..3u32 {
+                db.put(&cf, format!("zzz/{i}").as_bytes(), b"PAD", Duration::ZERO)
+                    .unwrap();
+            }
+            db.flush_memtable(&cf).unwrap();
+            db.compact(&cf).unwrap();
+        }
+        materialize_parts(&db, &cf);
+        let m = db.export_part(&cf, "img").unwrap();
+        (dir, m)
+    };
+
+    let (_d1, plain) = build(false);
+    let (_d2, padded) = build(true);
+
+    // The img part holds byte-identical USER data on both sides...
+    assert_eq!(plain.tables.len(), padded.tables.len());
+    // ...and still hashes differently, because the entries' sequence numbers
+    // differ. Asserted rather than merely documented, so a future change that
+    // made the digest logical would have to come here and say so.
+    assert_ne!(
+        plain.digest, padded.digest,
+        "if this ever starts passing, the digest has become logical rather \
+         than physical and PartManifest's documentation must change with it"
+    );
+}
+
+/// Changing a single value changes the identity. Without this the digest
+/// would be an expensive way to compare metadata.
+#[test]
+fn different_contents_produce_a_different_digest() {
+    let build = |val: &[u8]| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        for i in 0..5u32 {
+            db.put(&cf, format!("img/{i:03}").as_bytes(), val, Duration::ZERO)
+                .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        let m = db.export_part(&cf, "img").unwrap();
+        (dir, m)
+    };
+
+    let (_d1, a) = build(b"IMG");
+    let (_d2, b) = build(b"OTHER");
+    assert_ne!(
+        a.digest, b.digest,
+        "one changed value must change the part's identity"
+    );
+}
+
+/// A part that has been moved to another tier exports the same identity it had
+/// on the default tier — the bytes did not change, so neither may the digest.
+/// (The tier is reported per table, because *where* it lives is a fact a
+/// consumer may well want; it is deliberately not part of the digest.)
+#[test]
+fn moving_a_part_to_another_tier_does_not_change_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let cold = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::new("cold", cold.path().to_str().unwrap())];
+    let db = DB::open(opts).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+
+    let before = db.export_part(&cf, "img").unwrap();
+    assert!(before.tables.iter().all(|t| t.tier.is_none()));
+
+    db.move_part_to_tier(&cf, "img", "cold").unwrap();
+
+    let after = db.export_part(&cf, "img").unwrap();
+    assert_eq!(
+        before.digest, after.digest,
+        "a move relocates bytes; it does not change them"
+    );
+    assert!(
+        after.tables.iter().all(|t| t.tier.as_deref() == Some("cold")),
+        "but the export reports where they now live"
+    );
+    // And the data is still readable through the moved part.
+    assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+}

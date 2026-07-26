@@ -1,14 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
-- Unified memtable mode now has bounded immutable backpressure
-  (`unified_memtable_stall_threshold`, default 6), persists its WAL layout in
-  the manifest, rejects accidental per-CF/unified reopen mismatches, and
-  supports an explicit crash-safe per-CF migration via
-  `migrate_to_unified`. A cross-CF transaction in unified `SyncMode::Full`
-  remains one checksummed WAL frame and now has a regression test proving it
-  performs exactly one physical WAL sync and survives reopen.
+Two additive changes, no API or format break. Minor bump for the new public
+surface: `DB::export_part` (plus the `PartManifest`/`PartTable` types) and
+unified-mode's `unified_memtable_stall_threshold` and `migrate_to_unified`.
+
+- **Part export (`DB::export_part`)** — new method returning a `PartManifest`:
+  a part's tables (key ranges, sequence bounds, sizes, tier) plus a SHA-256
+  content digest, computed by reading the bytes. Where `freeze_part` produces
+  an openable *database directory*, this produces a *description* a caller can
+  send elsewhere. Motivation: inside a database a part is identified by its
+  tables' file ids, which are local counters, so a consumer coordinating parts
+  across machines had to maintain a content→part mapping itself, outside the
+  engine that owns the facts.
+
+  The digest is a **physical** identity, and the documentation says so
+  prominently because the stronger reading is the natural one to assume: it is
+  independent of file ids, paths, tier and database instance (two databases
+  that did the same writes agree), but *not* of write history, since SSTable
+  entries carry database-global sequence numbers. It answers "does the peer
+  already have exactly these bytes?" and deliberately does not answer "did two
+  replicas independently rebuild the same data?" — that needs a hash over
+  logical content, which only the consumer can compute. Both properties have
+  tests, including one asserting the limitation, so a change that made the
+  digest logical cannot land without updating the docs with it.
+
+  A remote-tier part is hashed through its own tier backend rather than being
+  pulled local; a tier move leaves the digest unchanged. Deletions are paused
+  for the duration, the same discipline as `checkpoint`/`freeze_part`.
+
+- **Unified WAL durability hardening** — unified memtable mode now has bounded
+  immutable backpressure (`unified_memtable_stall_threshold`, default 6),
+  persists its WAL layout in the manifest, rejects accidental
+  per-CF/unified reopen mismatches, and supports an explicit crash-safe per-CF
+  migration via `migrate_to_unified`. A cross-CF transaction in unified
+  `SyncMode::Full` remains one checksummed WAL frame and now has a regression
+  test proving it performs exactly one physical WAL sync and survives reopen.
 
 ## 0.5.0
 
