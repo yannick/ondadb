@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **Part export (`DB::export_part`)** — new method returning a `PartManifest`:
+  a part's tables (key ranges, sequence bounds, sizes, tier) plus a SHA-256
+  content digest, computed by reading the bytes. Where `freeze_part` produces
+  an openable *database directory*, this produces a *description* a caller can
+  send elsewhere. Motivation: inside a database a part is identified by its
+  tables' file ids, which are local counters, so a consumer coordinating parts
+  across machines had to maintain a content→part mapping itself, outside the
+  engine that owns the facts.
+
+  The digest is a **physical** identity, and the documentation says so
+  prominently because the stronger reading is the natural one to assume: it is
+  independent of file ids, paths, tier and database instance (two databases
+  that did the same writes agree), but *not* of write history, since SSTable
+  entries carry database-global sequence numbers. It answers "does the peer
+  already have exactly these bytes?" and deliberately does not answer "did two
+  replicas independently rebuild the same data?" — that needs a hash over
+  logical content, which only the consumer can compute. Both properties have
+  tests, including one asserting the limitation, so a change that made the
+  digest logical cannot land without updating the docs with it.
+
+  A remote-tier part is hashed through its own tier backend rather than being
+  pulled local; a tier move leaves the digest unchanged. Deletions are paused
+  for the duration, the same discipline as `checkpoint`/`freeze_part`.
+  Additive: no API or format break.
+
 ## 0.5.0
 
 Three additive changes, no API or format break. Minor bump: two new public

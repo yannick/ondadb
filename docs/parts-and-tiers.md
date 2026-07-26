@@ -169,6 +169,65 @@ Limitation: detach/attach/freeze move and link files with `std::fs`, so they
 operate on parts resident on the **default tier**. A part already moved to a
 remote tier cannot be detached or frozen in 0.3.0.
 
+## Describing a part: `export_part`
+
+`freeze_part` produces an openable *database directory*. `export_part` produces
+a *description* — nothing is written, nothing is linked, and you get an
+identity you can send somewhere else:
+
+```rust,no_run
+# use ondadb::{DB, Options};
+# let db = DB::open(Options::new("/tmp/onda-export")).unwrap();
+# let cf = db.get_column_family("default").unwrap();
+let part = db.export_part(&cf, "log")?;
+
+println!("{} tables, {} bytes", part.tables.len(), part.size_bytes());
+println!("identity: {}", part.digest_hex());
+
+for t in &part.tables {
+    println!(
+        "  {:?}..{:?} on {}",
+        String::from_utf8_lossy(&t.min_key),
+        String::from_utf8_lossy(&t.max_key),
+        t.tier.as_deref().unwrap_or("default")
+    );
+}
+# Ok::<(), ondadb::OndaError>(())
+```
+
+Why it exists: inside a database a part is identified by its tables' **file
+ids**, which are local counters — id 7 here has nothing to do with id 7
+anywhere else. A consumer coordinating parts across machines (replicating them,
+placing them in a shared object store, checking whether a peer already holds
+one) needs an identity that survives leaving the database, and otherwise has to
+maintain that mapping itself, outside the engine that owns the facts.
+
+**The digest is a physical identity, not a logical one.** It is independent of
+file ids, paths, tier, and database instance: two databases that performed the
+same writes produce the same digest. It is *not* independent of write history —
+SSTable entries carry sequence numbers, which are database-global counters, so
+unrelated earlier writes shift them and change the bytes. Two parts holding
+logically identical data that arrived by different routes hash differently.
+
+| Question | `digest` answers it? |
+|---|---|
+| "Does the peer already have exactly these bytes?" | **Yes** — and without trusting either side's metadata |
+| "Did two replicas independently rebuild the same data?" | **No** — it will say no even when they did |
+
+The second needs a hash over *logical* content, which only the consumer can
+compute: only it knows which parts of an entry are meaningful to it.
+
+Cost: exporting reads every byte of the part to hash it. That is the price of
+an identity rather than an assertion. A part on a remote tier is hashed where
+it lives, through that tier's backend, rather than being pulled local first —
+and a move between tiers does not change the digest, because it relocates bytes
+without changing them.
+
+Deletions are paused for the duration (the same discipline as `checkpoint` and
+`freeze_part`), so a concurrent compaction cannot unlink a file mid-hash.
+Returns `OndaError::NotFound` when the partition has no materialized
+bottom-level tables.
+
 ## Local multi-tier setup + age policy
 
 Declare tiers in `Options`, pin partitions to them with per-CF `tier_rules`,

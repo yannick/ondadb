@@ -62,7 +62,10 @@ pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;
 pub use maintenance::{CfStats, DbStats};
-pub use parts::{DetachedPart, MovePhase, MovePhaseEvent, MovePhaseObserver, PartitionInfo};
+pub use parts::{
+    DetachedPart, MovePhase, MovePhaseEvent, MovePhaseObserver, PartManifest, PartTable,
+    PartitionInfo,
+};
 pub use storage::{LocalStorage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;
