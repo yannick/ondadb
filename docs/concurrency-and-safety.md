@@ -37,6 +37,40 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   reads only** (`read_set`/`read_cfs`) — range scans are not tracked; phantoms
   are possible and this is documented API behavior, not a bug to "fix"
   silently.
+- **Read-your-own-writes floor** (`de50da9`): `visible_seq` advances gap-free,
+  so while another thread's earlier-reserved commit is in flight, a thread's
+  own completed commit sits *above* the watermark and a ReadCommitted `get()`
+  right after `put()` returned the PREVIOUS value. `THREAD_COMMIT_FLOOR` (a
+  thread-local keyed by `DbInner` address) gives ReadCommitted point reads and
+  iterators `max(visible_seq, own_floor)`. Fixed-snapshot levels keep the
+  gap-free watermark on purpose — the floor may sit inside a publication gap,
+  which is acceptable for read-committed but not for repeatable reads.
+
+### Known defect: the floor does not fully hold under `unsafe-fastpath`
+
+`tests/read_your_writes.rs::get_sees_own_put_under_concurrent_writes` fails
+intermittently, **but only with `--features unsafe-fastpath`**. The failure is
+not the lost-write assertion the test was written for: it panics on the `Err`
+arm with **`get failed: NotFound`** — a `get` returns NotFound for a key the
+same thread just successfully `put`.
+
+Measured with 8 concurrent copies of the test binary: **2/48 on v0.6.0, 1/48 on
+v0.5.0**. Never reproduced running the test alone (0/8 isolated, 0/24 under
+synthetic CPU load) — it needs real multi-process contention. Failures land
+within 0.06–0.20 s, i.e. in the first handful of the 50,000 iterations, which
+points at an early/rotation window rather than slow drift.
+
+**Pre-existing, not a 0.6.0 regression** — v0.5.0 reproduces it. Recorded here
+rather than silently carried: the default (safe) build is unaffected, and no
+consumer that builds with default features is exposed.
+
+Two unverified leads, in order of suspicion:
+1. `ArenaShard` publication ordering (below) — the arena is one of exactly two
+   things this feature swaps in, and it is the one on the write path.
+2. `db_key()` keying `THREAD_COMMIT_FLOOR` by `DbInner` *address*: a dropped DB
+   whose allocation is reused would hand a stale floor to its successor. Not
+   demonstrated to be the cause here (the test opens one DB per process), but
+   it is a latent hazard independent of this failure.
 
 ## Lock inventory (order within = acquisition order; never invert)
 
