@@ -102,13 +102,59 @@ The waiver applies here. Each row says whether the number is **measured** or
 | `klog_value_threshold` | 512 (`config.rs:465`) | **4096** | Judgement + spada's 1.5× at 16 KiB. **Sweep 512/1k/4k/16k/64k required.** |
 | `block_cache_size` | 64 MiB (`config.rs:344`) | **256 MiB** | ondadb's own `BENCHMARK-RESULTS.md` uses 512 MiB. 64 MiB is not a serious default for a storage engine; 512 MiB is too much to impose. **Needs an owner decision, not a measurement.** |
 | `max_open_sstables` | 256 (`config.rs:345`) | **1024** | Straight bug-adjacent: spada had 308 SSTables against a 256 cap, so the file cache thrashed. Any default below a realistic table count is wrong. |
-| `compression` | `None` (`config.rs:466`) | **unchanged**; add `compression_per_level` guidance | Changing this default alters every consumer's disk format *and* CPU profile. Recommend documenting `[None, Lz4, Zstd]` and letting callers opt in. **Open question — see below.** |
+| `compression` | `None` (`config.rs:466`) | **unchanged** | The scalar default stays `None`. See the feature flag below. |
+| `compression_per_level` | `vec![]` (`config.rs:467`) | `[None, Lz4, Zstd]` **behind a Cargo feature** | Owner decision: make it available and default-on when the feature is enabled, rather than imposing it unconditionally. |
 
 **On `klog_value_threshold` specifically:** with item 1 landed, the threshold
 governs write-time layout and cache granularity rather than read cost, so the
 pressure to get it exactly right drops a lot. 4096 is defensible because a
 value below one page costs a whole extra seek to save under 4 KiB of block
 space. Above that the trade genuinely turns.
+
+### 2a. Compression behind a Cargo feature
+
+`lz4_flex`, `zstd` and `snap` are **unconditional dependencies**
+(`Cargo.toml:45-47`), so every codec is already compiled into every build and
+`Compression` already has the variants (`config.rs:12-19`). The only thing
+missing is a sensible default — which is why a Cargo feature is exactly the
+right lever here: it changes a default, not a capability.
+
+```toml
+# Default the data levels to lz4/zstd instead of storing blocks raw. The codecs
+# are compiled in regardless; this only changes ColumnFamilyConfig::default().
+# No format change — every block records its own `alg` byte, so a database
+# written with this on is readable by a build with it off, and vice versa.
+compress-by-default = []
+```
+
+```rust
+compression_per_level: if cfg!(feature = "compress-by-default") {
+    vec![Compression::None, Compression::Lz4, Compression::Zstd]
+} else {
+    Vec::new()
+},
+```
+
+Level 0 stays uncompressed: it is the write-hot level, it is read most often,
+and it is compacted away soonest — paying CPU there buys the least.
+
+**Why this is safe.** Blocks are self-describing: `[alg u8][comp_len][raw_len]
+[crc][payload]` (`docs/formats.md`), and *"if compression does not shrink a
+block it is stored with `alg = None`"*. So the flag can be turned on or off
+between runs on the same directory, and mixed-compression databases already
+work by construction.
+
+**Two things to state plainly in the changelog:**
+
+- **Cargo features are additive across a dependency graph.** If any crate in a
+  build enables `compress-by-default`, every consumer in that build gets it.
+  For a single-consumer engine that is fine; it would not be for a widely
+  depended-on library.
+- **The CPU cost is unmeasured.** spada writes 1.0 GiB for 94 MiB of text, so
+  the space win should be large (~3-4× is the estimate), but I have not
+  measured decompression cost on the read path. The threshold sweep in item 2
+  should be run with the feature both on and off, and `BENCHMARK-RESULTS.md`
+  should carry both columns before this is recommended to anyone.
 
 **Format impact:** none of these change on-disk *formats*. `klog_value_threshold`
 changes on-disk *layout* for newly written tables only; blocks and vlog frames
