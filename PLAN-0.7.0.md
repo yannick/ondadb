@@ -199,10 +199,17 @@ never compacts for a whole class of writer is broken, not slow. It deserves its
 own changelog paragraph and a regression test asserting `l0_len()` falls after
 ingestion.
 
-⚠️ **Consumer note:** spada must land its posting-list cursor *before* taking
-this fix, because compaction fills posting frames from ~4 entries toward 128,
-which multiplies spada's current per-frame re-decode cost. Coordinate the
-version bump with spada's plan ordering.
+⚠️ **Consumer note, resolved by owner decision (2026-07-28):** compaction fills
+posting frames from ~4 entries toward 128, which multiplies spada's *current*
+per-frame re-decode cost — so taking this fix before spada's posting cursor
+lands would make spada queries measurably worse.
+
+**0.7.0 ships whole anyway, with the trigger on by default.** An engine that
+silently never compacts for an entire class of writer is broken, and shipping
+a known bug still active by default is not defensible in a changelog. The
+coordination happens on the consumer side instead: **spada stays pinned to
+`v0.6.0` and bumps `ONDADB_REF` once, after its two-phase cursor lands.** Note
+this explicitly in the changelog so the ordering is not rediscovered.
 
 ---
 
