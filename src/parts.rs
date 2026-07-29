@@ -255,7 +255,7 @@ impl DB {
         std::fs::create_dir_all(&dest_dir)?;
         let mut files = Vec::new();
         for h in &handles {
-            h.reader.close(); // drop cached fds for the old paths
+            h.close(); // drop cached fds for the old paths
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
             let dst_klog = format!("{dest_dir}/{}.klog", h.meta.id);
@@ -373,7 +373,7 @@ impl DB {
                 // age so the mover treats it as freshly written (it must age
                 // `min_age` again before qualifying for a tier move).
                 meta.max_entry_time = Some(crate::util::now_nanos());
-                staged.push((Arc::new(SstHandle { meta, reader }), at_bottom));
+                staged.push((cf.handle_for(meta), at_bottom));
             }
             Ok(())
         })();
@@ -680,10 +680,7 @@ impl crate::db::DbInner {
             }
             let mut meta = h.meta.clone();
             meta.tier = Some(tier.to_string());
-            new_handles.push(Arc::new(SstHandle {
-                meta: meta.clone(),
-                reader: cf.open_reader_for(&meta)?,
-            }));
+            new_handles.push(cf.handle_for(meta.clone()));
         }
         observe_move(
             observer,
@@ -709,7 +706,7 @@ impl crate::db::DbInner {
         // before this leaves harmless orphans on the source tier; the manifest
         // already points readers at the new tier.
         for h in &handles {
-            h.reader.close();
+            h.close();
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
             self.remove_sst_file(&src_klog);

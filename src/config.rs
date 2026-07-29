@@ -148,6 +148,17 @@ pub struct Options {
     pub num_compaction_threads: usize,
     pub log_level: LogLevel,
     pub block_cache_size: usize,
+    /// Maximum SSTable readers held open at once — the `max_open_files`
+    /// analogue.
+    ///
+    /// Opening a table loads its whole block index and bloom filter, and both
+    /// stay resident while the reader does. Without a bound, opening every table
+    /// in the manifest made resident memory proportional to **total stored
+    /// bytes**: 6.6 GB twelve seconds into startup on a 48 GiB store of 14,051
+    /// tables, 12 GB at twenty-five and still going. Closing a reader costs a
+    /// re-open and cannot change an answer, so this bounds memory by count
+    /// rather than by corpus size. There is no "unlimited" value.
+    pub max_open_readers: usize,
     pub max_open_sstables: usize,
     pub max_memory_usage: u64,
     pub read_only: bool,
@@ -342,6 +353,7 @@ impl Default for Options {
             num_compaction_threads: 2,
             log_level: LogLevel::None,
             block_cache_size: 64 << 20, // 64 MiB
+            max_open_readers: crate::table_cache::DEFAULT_MAX_OPEN_READERS,
             max_open_sstables: 256,
             max_memory_usage: 0, // 0 => auto (≈75% system memory)
             read_only: false,

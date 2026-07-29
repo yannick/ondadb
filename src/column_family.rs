@@ -65,7 +65,36 @@ pub type CompactionFilterFn = Arc<dyn Fn(&[u8], &[u8]) -> FilterDecision + Send 
 #[derive(Debug)]
 pub struct SstHandle {
     pub meta: SstMeta,
-    pub reader: Arc<Reader>,
+    /// How to (re)open this table, and the bounded cache that holds it.
+    ///
+    /// The reader is **not** owned here. Opening one loads the table's whole
+    /// block index and bloom filter, and holding every table's reader for the
+    /// lifetime of the column family made resident memory proportional to total
+    /// stored bytes: 6.6 GB twelve seconds into startup on a 48 GiB store, 12 GB
+    /// at twenty-five and still opening. See [`crate::table_cache`].
+    tref: crate::table_cache::TableRef,
+    cache: Arc<crate::table_cache::TableCache>,
+}
+
+impl SstHandle {
+    /// This table's reader, opening it if the cache has closed it.
+    ///
+    /// Fallible where a field access was infallible: a closed reader has to be
+    /// re-opened, and that is I/O. Callers that previously could not fail now
+    /// propagate — which is correct, because the alternative is panicking on a
+    /// disk error deep inside a read path.
+    pub fn reader(&self) -> Result<Arc<Reader>> {
+        self.cache.get(&self.tref)
+    }
+
+    /// Release this table's file handles and drop it from the reader cache.
+    ///
+    /// A table that is not open needs no close, so nothing is opened here.
+    pub fn close(&self) {
+        if let Some(r) = self.cache.close(self.tref.file_id) {
+            r.close();
+        }
+    }
 }
 
 /// An immutable (sealed) memtable awaiting flush.
@@ -82,6 +111,8 @@ pub(crate) struct CfCtx {
     /// directory, so untiered tables resolve exactly as before tiering existed.
     pub tiers: Arc<TierRegistry>,
     pub bc: Arc<BlockCache>,
+    /// Bounded cache of open SSTable readers — see [`crate::table_cache`].
+    pub tables: Arc<crate::table_cache::TableCache>,
     pub flush_tx: Sender<FlushJob>,
     pub compact_tx: Sender<Arc<ColumnFamily>>,
     pub closing: Arc<AtomicBool>,
@@ -191,26 +222,15 @@ impl ColumnFamily {
         self.state.read().levels[0].len()
     }
 
-    /// `(resident bytes, index bytes, bloom bytes, sstables, index entries)`
-    /// across every open SSTable in this column family.
+    /// `(resident, index, bloom, open readers, index entries)` for the
+    /// **database-wide** reader cache.
     ///
-    /// Every SSTable named in the manifest is opened at CF open
-    /// (`Reader::open` loads its block index and bloom filter eagerly), so this
-    /// is memory the process holds from startup regardless of what is read.
+    /// No longer per-column-family: readers live in one shared bounded cache
+    /// (see [`crate::table_cache`]), so attributing resident bytes to a CF would
+    /// mean opening its tables to measure them — the very thing the cache
+    /// exists to avoid.
     pub fn resident_reader_bytes(&self) -> (usize, usize, usize, usize, usize) {
-        let inner = self.state.read();
-        let mut total = (0usize, 0usize, 0usize, 0usize, 0usize);
-        for lvl in inner.levels.iter() {
-            for h in lvl.iter() {
-                let (idx, bloom, entries) = h.reader.resident_breakdown();
-                total.0 += idx + bloom;
-                total.1 += idx;
-                total.2 += bloom;
-                total.3 += 1;
-                total.4 += entries;
-            }
-        }
-        total
+        self.ctx.tables.resident_breakdown()
     }
 
     pub(crate) fn wal_path(&self, gen: u64) -> String {
@@ -239,6 +259,22 @@ impl ColumnFamily {
     /// Open a reader for an already-on-disk table described by `meta`, using the
     /// [`Storage`](crate::storage::Storage) backend for its tier (so a no-mmap
     /// tier reads through the buffered path).
+    /// Build the handle for `meta`, without opening its reader.
+    pub(crate) fn handle_for(&self, meta: SstMeta) -> Arc<SstHandle> {
+        let tref = crate::table_cache::TableRef {
+            klog: self.klog_path_for(&meta),
+            storage: self.ctx.tiers.storage_for(meta.tier.as_deref()),
+            bc: self.ctx.bc.clone(),
+            file_id: meta.id,
+            cmp: self.cmp.clone(),
+        };
+        Arc::new(SstHandle {
+            meta,
+            tref,
+            cache: Arc::clone(&self.ctx.tables),
+        })
+    }
+
     pub(crate) fn open_reader_for(&self, meta: &SstMeta) -> Result<Arc<Reader>> {
         let storage = self.ctx.tiers.storage_for(meta.tier.as_deref());
         Reader::open(
@@ -326,15 +362,24 @@ impl ColumnFamily {
             // Resolve the tier before opening so a bottom part on another mount
             // (and any no-mmap backend it carries) is read through the right
             // storage. `None` tier == the default path used before tiering.
-            let storage = ctx.tiers.storage_for(s.tier.as_deref());
+            // NOT opened here. Opening every table in the manifest at startup
+            // is what made resident memory track total stored bytes; the reader
+            // is fetched on first use through the bounded table cache.
             let klog = match s.tier.as_deref() {
                 None => format!("{dir}/{}.klog", s.id),
                 Some(t) => format!("{}/{}.klog", ctx.tiers.cf_dir(Some(t), &name), s.id),
             };
-            let reader = Reader::open(&klog, storage, ctx.bc.clone(), s.id, cmp.clone())?;
+            let tref = crate::table_cache::TableRef {
+                klog,
+                storage: ctx.tiers.storage_for(s.tier.as_deref()),
+                bc: ctx.bc.clone(),
+                file_id: s.id,
+                cmp: cmp.clone(),
+            };
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),
-                reader,
+                tref,
+                cache: Arc::clone(&ctx.tables),
             }));
         }
         for lvl in levels.iter_mut().skip(1) {
@@ -628,8 +673,7 @@ impl ColumnFamily {
         // holds freshly committed data, so the file's finish time approximates
         // the newest entry's commit time (see `SstMeta::max_entry_time`).
         meta.max_entry_time = Some(now_nanos());
-        let reader = self.open_reader_for(&meta)?;
-        Ok(Arc::new(SstHandle { meta, reader }))
+        Ok(self.handle_for(meta))
     }
 
     /// Register already-finished SSTables as the newest L0 files, atomically.
@@ -819,13 +863,14 @@ impl ColumnFamily {
         for th in &tables {
             // One bloom hash + one check per table; the probe below skips the
             // filter (it was just consulted).
-            let h = th.reader.bloom_hash(user_key);
-            if !th.reader.bloom_may_contain_hash(h) {
+            let rd = th.reader()?;
+            let h = rd.bloom_hash(user_key);
+            if !rd.bloom_may_contain_hash(h) {
                 self.bloom_skips.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
-            let (v, seq, found, deleted) = th.reader.get_unfiltered(user_key, read_seq, now)?;
+            let (v, seq, found, deleted) = rd.get_unfiltered(user_key, read_seq, now)?;
             if found && (!best_found || seq > best_seq) {
                 best_found = true;
                 best_seq = seq;
@@ -879,7 +924,7 @@ impl ColumnFamily {
             }
         }
         for th in &tables {
-            let (_, seq, found, _) = th.reader.get(user_key, u64::MAX, now)?;
+            let (_, seq, found, _) = th.reader()?.get(user_key, u64::MAX, now)?;
             if found {
                 best = best.max(seq);
             }
@@ -946,13 +991,21 @@ impl ColumnFamily {
         }
         for th in &s.levels[0] {
             if Self::sst_in_bounds(th, &self.cmp, &bounds) {
-                children.push(ChildIter::Sst(th.reader.iter()));
+                match th.reader() {
+                    Ok(r) => children.push(ChildIter::Sst(r.iter())),
+                    // Omitting the table would return a short answer that
+                    // looks complete. Fail the iterator instead.
+                    Err(e) => return Iterator::failed(self.cmp.clone(), e),
+                }
             }
         }
         for lvl in s.levels.iter().skip(1) {
             for th in lvl {
                 if Self::sst_in_bounds(th, &self.cmp, &bounds) {
-                    children.push(ChildIter::Sst(th.reader.iter()));
+                    match th.reader() {
+                        Ok(r) => children.push(ChildIter::Sst(r.iter())),
+                        Err(e) => return Iterator::failed(self.cmp.clone(), e),
+                    }
                 }
             }
         }
@@ -999,7 +1052,7 @@ impl ColumnFamily {
         }
         for lvl in &s.levels {
             for th in lvl {
-                th.reader.close();
+                th.close();
             }
         }
     }
@@ -1133,8 +1186,7 @@ impl ColumnFamily {
 
     /// Build a handle for an already-on-disk SSTable id (used by clone).
     pub(crate) fn open_sst(&self, meta: SstMeta) -> Result<Arc<SstHandle>> {
-        let reader = self.open_reader_for(&meta)?;
-        Ok(Arc::new(SstHandle { meta, reader }))
+        Ok(self.handle_for(meta))
     }
 
     /// Snapshot the live partition rules. Compaction takes one snapshot per run

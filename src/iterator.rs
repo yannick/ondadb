@@ -435,6 +435,26 @@ impl Iterator {
     pub fn valid(&self) -> bool {
         self.valid
     }
+    /// An iterator that yields nothing and reports `e`.
+    ///
+    /// Used when a child could not be opened. Silently omitting that child
+    /// would return a **short answer that looks complete**, which is the one
+    /// outcome a storage engine must never produce; surfacing the error through
+    /// [`Self::err`] keeps the existing contract, where callers check `err()`
+    /// after a walk goes invalid.
+    pub(crate) fn failed(cmp: crate::comparator::ComparatorRef, e: crate::error::OndaError) -> Iterator {
+        let mut it = Iterator::new(
+            cmp,
+            Vec::new(),
+            0,
+            0,
+            (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        );
+        it.err = Some(e);
+        it.valid = false;
+        it
+    }
+
     pub fn err(&self) -> Option<&crate::error::OndaError> {
         self.err.as_ref()
     }

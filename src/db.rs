@@ -440,9 +440,13 @@ impl DB {
             None
         };
 
+        let tables = Arc::new(crate::table_cache::TableCache::new(
+            opts.max_open_readers,
+        ));
         let ctx = Arc::new(CfCtx {
             tiers,
             bc,
+            tables,
             flush_tx,
             compact_tx,
             closing: closing.clone(),
@@ -705,6 +709,22 @@ impl DB {
     }
 
     /// List column family names.
+    /// `(open readers, opens, hits, closes)` for the bounded reader cache.
+    pub fn table_cache_stats(&self) -> (usize, u64, u64, u64) {
+        self.inner.ctx.tables.stats()
+    }
+
+    /// `(resident, index, bloom, open readers, index entries)` bytes/counts held
+    /// by the readers currently open.
+    pub fn reader_memory(&self) -> (usize, usize, usize, usize, usize) {
+        self.inner.ctx.tables.resident_breakdown()
+    }
+
+    /// Change the open-reader bound at runtime.
+    pub fn set_max_open_readers(&self, n: usize) {
+        self.inner.ctx.tables.set_max_open(n);
+    }
+
     pub fn list_column_families(&self) -> Vec<String> {
         self.inner.cfs.read().keys().cloned().collect()
     }

@@ -191,7 +191,10 @@ fn compact_into(
     };
 
     // Merge-iterate all inputs and write new output SSTables.
-    let mut its: Vec<SstIterator> = inputs.iter().map(|t| t.reader.iter()).collect();
+    let mut its: Vec<SstIterator> = inputs
+        .iter()
+        .map(|t| t.reader().map(|r| r.iter()))
+        .collect::<Result<_>>()?;
     for it in its.iter_mut() {
         it.seek_to_first();
     }
@@ -388,15 +391,12 @@ fn compact_into(
     }
     finish_output(&mut writer, &mut outputs)?;
 
-    // Open readers for the new tables (compaction output always lands on the
-    // default tier, so `open_reader_for` resolves the default path).
+    // Handles for the new tables. Readers are NOT opened here: compaction
+    // output is often not read for a while, and opening it would put its index
+    // and bloom in memory on the writer's behalf.
     let mut new_handles = Vec::new();
     for meta in &outputs {
-        let reader = cf.open_reader_for(meta)?;
-        new_handles.push(Arc::new(SstHandle {
-            meta: meta.clone(),
-            reader,
-        }));
+        new_handles.push(cf.handle_for(meta.clone()));
     }
 
     // Build the new level set.
@@ -442,7 +442,7 @@ fn compact_into(
     // Delete and evict the obsolete input files (deferred if a checkpoint/backup
     // has paused deletions, so it can copy a consistent file set).
     for th in &inputs {
-        th.reader.close();
+        th.close();
         let klog = cf.klog_path(th.meta.id);
         let vlog = format!("{}/{}.vlog", cf.dir(), th.meta.id);
         db.remove_sst_file(&klog);
