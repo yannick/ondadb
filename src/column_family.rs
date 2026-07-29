@@ -183,6 +183,28 @@ impl std::fmt::Debug for ColumnFamily {
 }
 
 impl ColumnFamily {
+    /// `(resident bytes, index bytes, bloom bytes, sstables, index entries)`
+    /// across every open SSTable in this column family.
+    ///
+    /// Every SSTable named in the manifest is opened at CF open
+    /// (`Reader::open` loads its block index and bloom filter eagerly), so this
+    /// is memory the process holds from startup regardless of what is read.
+    pub fn resident_reader_bytes(&self) -> (usize, usize, usize, usize, usize) {
+        let inner = self.state.read();
+        let mut total = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for lvl in inner.levels.iter() {
+            for h in lvl.iter() {
+                let (idx, bloom, entries) = h.reader.resident_breakdown();
+                total.0 += idx + bloom;
+                total.1 += idx;
+                total.2 += bloom;
+                total.3 += 1;
+                total.4 += entries;
+            }
+        }
+        total
+    }
+
     pub(crate) fn wal_path(&self, gen: u64) -> String {
         format!("{}/wal-{}.log", self.dir, gen)
     }

@@ -56,6 +56,11 @@ fn hash_key(key: &[u8]) -> u64 {
 }
 
 impl Bloom {
+    /// Heap bytes this filter holds. For memory accounting only.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.bits.len() * std::mem::size_of::<u64>()
+    }
+
     /// Build an empty filter sized for `n` entries at `fpr`.
     pub fn new(n: usize, fpr: f64) -> Bloom {
         let (m, k) = bloom_params(n, fpr);

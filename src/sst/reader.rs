@@ -84,6 +84,40 @@ impl BlockRef<'_> {
 }
 
 impl Reader {
+    /// Heap bytes this reader holds **resident for the lifetime of the CF**:
+    /// the block index and the bloom filter, both loaded eagerly at open.
+    ///
+    /// Accounting exists because this is the dominant memory term at scale and
+    /// it was previously invisible. A 48 GiB store of 14,051 SSTables at the
+    /// 4 KiB default block size carries ~12 million index entries, each with a
+    /// heap-allocated key — and every one is loaded at open, before a single
+    /// read, whether or not that table is ever touched.
+    pub fn resident_bytes(&self) -> usize {
+        // A Vec<u8> key costs its header plus its bytes plus allocator
+        // rounding; count the header and bytes and treat the rest as noise.
+        let index: usize = self
+            .index
+            .iter()
+            .map(|e| {
+                std::mem::size_of::<IndexEntry>() + e.user_key.len()
+            })
+            .sum();
+        let bloom = self.bloom.as_ref().map_or(0, |b| b.resident_bytes());
+        index + bloom + self.min_key.len() + self.max_key.len()
+    }
+
+    /// `(index bytes, bloom bytes, index entries)` — so the split can be
+    /// reported rather than inferred.
+    pub fn resident_breakdown(&self) -> (usize, usize, usize) {
+        let index: usize = self
+            .index
+            .iter()
+            .map(|e| std::mem::size_of::<IndexEntry>() + e.user_key.len())
+            .sum();
+        let bloom = self.bloom.as_ref().map_or(0, |b| b.resident_bytes());
+        (index, bloom, self.index.len())
+    }
+
     /// Open the SSTable at `klog_path` on `storage`. `file_id` must be unique
     /// per file for block-cache keying. When `storage.supports_mmap()` is false
     /// (a slow/remote tier), the reader never mmaps and every read goes through
