@@ -349,3 +349,82 @@ I found it by profiling a consumer, not by reading the docs.
 - **Item 5:** assert one manifest persist for an N-CF grouped ingestion.
 - **Item 2:** the threshold sweep, recorded in `BENCHMARK-RESULTS.md` with the
   hardware and the workload shape.
+
+---
+
+# ADDENDUM (2026-07-30): resident reader memory is the priority, and the fix
+# is a table cache, not a partitioned index
+
+Measured after this plan was written: a spada server on a 48 GiB ondadb store
+(14,051 SSTables, 1M documents) reaches **6.6 GB resident 12 s into startup and
+12 GB at 25 s, still opening**, before serving a single request. `ColumnFamily::
+open` opens *every* SSTable in the manifest and `Reader::open` eagerly loads
+each one's full block index and bloom filter, held for the CF's lifetime. See
+spada `decisions.md` S-120 → S-122.
+
+**This outranks item 1 below.** A vlog value cache *adds* memory; it must not
+land first.
+
+## How RocksDB handles the same problem
+
+RocksDB also loads index and filter blocks eagerly per table by default. It
+gets away with it because of a bound ondadb does not have:
+
+> *"If `cache_index_and_filter_blocks` is false (which is default), the number
+> of index/filter blocks is controlled by option `max_open_files`."*
+> — [Memory usage in RocksDB](https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB)
+
+`max_open_files` bounds how many table readers may hold index/filter resident;
+the table cache evicts readers LRU. **ondadb copied the eager per-table load and
+omitted the bound.** That is the defect, stated precisely.
+
+The two other RocksDB mechanisms, and why they are *not* the first move here:
+
+- **`cache_index_and_filter_blocks = true`** puts index/filter in the block
+  cache so they are evictable under one budget. RocksDB warns against it as a
+  default: *"in most cases it will hurt your performance, since you need to have
+  index and filter to access a certain file."* Evicting a monolithic index means
+  reloading all of it to read one block.
+- **Partitioned index/filters** (`kTwoLevelIndexSearch`, `partition_filters`)
+  exist to make the above viable: split the index into partitions with a small
+  always-resident top level, load partitions on demand.
+  [Partitioned Index/Filters](https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters)
+  motivates it with *"a filter of size 5MB is occupying the space that could
+  otherwise be used to cache 1000s of data blocks"* and a single point lookup
+  loading *"multiple megabytes of index/filter blocks"*.
+
+**Partitioning is the wrong fix for ondadb today, and the reason is the shape of
+the files.** RocksDB is reasoning about ~256 MB SSTables with 0.5 MB indexes and
+5 MB filters. ondadb's 14,051 tables average ~3.3 MB of klog — at the new 16 KiB
+block size that is roughly *200 index entries*, tens of kilobytes. Partitioning
+a 20 KB index buys nothing. **ondadb's problem is table COUNT, not per-table
+index size.**
+
+## The fix, in order
+
+1. **A bounded table cache — the `max_open_files` equivalent.** Open readers on
+   demand and evict them LRU under a configured limit, instead of opening every
+   table at CF open and never closing one. Closing a reader releases its index
+   and bloom, so this bounds resident memory **by count, independent of store
+   size** — the property none of the other changes give. This is the fix.
+2. **Make compaction actually run.** 14,051 tables for a million documents is
+   itself the anomaly, and item 3 of this plan already records the cause:
+   `Ingestion::finish` never sends to `compact_tx`. Fewer, larger tables cut
+   total index memory *and* per-query fan-out. This is the fix that stops the
+   count growing in the first place.
+3. **Measure the index/bloom split before doing more.** The accounting is now in
+   place (`Reader::resident_breakdown`, `ColumnFamily::resident_reader_bytes`,
+   reported in spada's startup banner) but the number has not been captured — the
+   server had not finished opening when the sample was taken. If bloom dominates,
+   skipping filters on the bottom level (RocksDB's
+   `optimize_filters_for_hits`) or a Ribbon filter is a cheaper win than
+   anything structural.
+4. **Only then** consider unifying index/filter into the block cache, and
+   partitioning **only if** compaction produces tables large enough for a
+   monolithic index to be a problem. Doing this before (1) reproduces the
+   regression RocksDB documents.
+
+Already applied as a stopgap: `DEFAULT_BLOCK_SIZE` 4 KiB → 16 KiB, a quarter of
+the index entries. It scales the problem down by a constant; it does not bound
+it, and it is **not yet validated end-to-end** (new block size affects only
+newly written tables, so it needs a fresh ingest).
