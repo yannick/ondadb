@@ -133,6 +133,25 @@ impl Ingestion {
         if !self.done.is_empty() {
             self.cf.install_handles_l0(std::mem::take(&mut self.done));
             self.db.persist_manifest()?;
+            // Bulk ingest must arm compaction, exactly as a memtable flush
+            // does. It did not, and the consequence was not subtle: a
+            // bulk-loaded store accumulated **14,051 L0 SSTables for a million
+            // documents**, because nothing ever asked the compactor to look.
+            // Every one of those tables is opened at startup with its block
+            // index and bloom filter resident, which is how a reader reached
+            // 12 GB before it finished opening.
+            //
+            // Same condition as the flush path (`db.rs`): FIFO column families
+            // enforce their bound after every install, leveled ones wait for the
+            // L0 file trigger. Sending is best-effort — a full or closed channel
+            // means the compactor is busy or the database is shutting down, and
+            // in both cases the next install will ask again.
+            let fifo = self.cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
+            if !self.db.closing.load(std::sync::atomic::Ordering::Relaxed)
+                && (fifo || self.cf.l0_len() >= self.cf.opts.l1_file_count_trigger as usize)
+            {
+                let _ = self.db.ctx.compact_tx.send(Arc::clone(&self.cf));
+            }
         }
         self.pending_files.clear(); // referenced by the manifest now
         Ok(self.written)

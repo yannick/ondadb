@@ -183,6 +183,14 @@ impl std::fmt::Debug for ColumnFamily {
 }
 
 impl ColumnFamily {
+    /// Number of SSTables currently in L0.
+    ///
+    /// Public because L0 growth is the observable symptom of compaction not
+    /// running, and a test that cannot see it can only assert on timing.
+    pub fn l0_file_count(&self) -> usize {
+        self.state.read().levels[0].len()
+    }
+
     /// `(resident bytes, index bytes, bloom bytes, sstables, index entries)`
     /// across every open SSTable in this column family.
     ///
