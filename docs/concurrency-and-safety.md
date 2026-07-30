@@ -37,6 +37,68 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   reads only** (`read_set`/`read_cfs`) — range scans are not tracked; phantoms
   are possible and this is documented API behavior, not a bug to "fix"
   silently.
+- **Read-your-own-writes floor** (`de50da9`): `visible_seq` advances gap-free,
+  so while another thread's earlier-reserved commit is in flight, a thread's
+  own completed commit sits *above* the watermark and a ReadCommitted `get()`
+  right after `put()` returned the PREVIOUS value. `THREAD_COMMIT_FLOOR` (a
+  thread-local keyed by `DbInner` address) gives ReadCommitted point reads and
+  iterators `max(visible_seq, own_floor)`. Fixed-snapshot levels keep the
+  gap-free watermark on purpose — the floor may sit inside a publication gap,
+  which is acceptable for read-committed but not for repeatable reads.
+
+### Known defect: the floor does not fully hold under `unsafe-fastpath`
+
+`tests/read_your_writes.rs::get_sees_own_put_under_concurrent_writes` fails
+intermittently, **but only with `--features unsafe-fastpath`**. The failure is
+not the lost-write assertion the test was written for: it panics on the `Err`
+arm with **`get failed: NotFound`** — a `get` returns NotFound for a key the
+same thread just successfully `put`.
+
+Measured with 8 concurrent copies of the test binary: **2/48 on v0.6.0, 1/48 on
+v0.5.0**. Never reproduced running the test alone (0/8 isolated, 0/24 under
+synthetic CPU load) — it needs real multi-process contention. Failures land
+within 0.06–0.20 s, i.e. in the first handful of the 50,000 iterations, which
+points at an early/rotation window rather than slow drift.
+
+**Pre-existing, not a 0.6.0 regression** — v0.5.0 reproduces it. Recorded here
+rather than silently carried: the default (safe) build is unaffected, and no
+consumer that builds with default features is exposed.
+
+**Narrowed 2026-07-28 by two measured experiments** (the diagnostics were
+throwaway; the reproduction lives in `tests/read_your_writes.rs`):
+
+1. **It is transient, not a lost write.** Re-reading the key immediately after
+   the failure returns the correct value, and so does a read after a
+   `yield_now`. So nothing is dropped or overwritten — a read momentarily fails
+   to see data that is present the whole time. This is a read-visibility
+   defect, not a durability one.
+2. **Rotation, flush, compaction and the SSTable path are all excluded.** With
+   `write_buffer_size` raised to 2 GiB, so the memtable can never rotate and no
+   flush or L0 install can occur, the failure still reproduces. It is therefore
+   inside the arena memtable itself — `ArenaShard::get` / `find_ge` /
+   `descend` / `insert_node` — and not in any interaction with the rest of the
+   engine. The unified store is likewise not involved: `unified_memtable`
+   defaults to `false`.
+
+What has been checked and found sound: the arena is chunked with boxed
+fixed-size chunks, so node pointers never move; inserts are serialized by the
+arena lock; the link loop publishes each level with `Release` against the
+reader's `Acquire`; `ColumnFamily::get` takes one consistent
+`(mem, imms, tables)` snapshot under the state read lock; rotation swaps the
+memtable and pushes the imm under a single `state.write()`; and both flush
+paths install the SSTable *before* removing the immutable.
+
+Still unexplained, and the place to look next: `self.height` is stored and
+loaded `Relaxed` and is raised *before* the new node's levels are linked. Each
+individual interleaving traced by hand so far comes out correct, so either the
+argument has a hole or the race is elsewhere in the traversal — `cmp_node`'s
+8-byte prefix shortcut and the shard selection used by `put` versus `get` are
+the two unexamined candidates.
+
+One latent hazard noticed while reading, independent of this failure and not
+demonstrated to cause it: `db_key()` keys `THREAD_COMMIT_FLOOR` by `DbInner`
+*address*, so a dropped DB whose allocation is reused would hand a stale
+read floor to its successor.
 
 ## Lock inventory (order within = acquisition order; never invert)
 

@@ -29,6 +29,12 @@ cargo clippy --all-targets --features unsafe-fastpath
 compile different memtable/reader code (`memtable_arena.rs` and the mmap paths
 exist only under `unsafe-fastpath`). CI-equivalent = 4 commands above.
 
+When scripting the gate, check each test binary for the *presence of*
+`test result: ok`, not the *absence of* `FAILED`, and never pipe `cargo test`
+through `tail` — it shows only the last binary's result and silently hides a
+failure in any earlier one. A known intermittent `unsafe-fastpath` failure
+(`read_your_writes`, see `docs/concurrency-and-safety.md`) was masked this way.
+
 Benchmarks (harness lives in `../bench`, compares 4 engines):
 
 ```sh
