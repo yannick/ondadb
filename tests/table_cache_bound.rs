@@ -149,3 +149,62 @@ fn txn_iter(db: &DB, cf: &std::sync::Arc<ondadb::ColumnFamily>) -> ondadb::Itera
     it.seek_to_first();
     it
 }
+
+/// The runtime setter must actually change the bound.
+///
+/// `Options::max_open_readers` is set at open; `DB::set_max_open_readers`
+/// changes it afterwards, and that is the path spada's configuration uses. It
+/// was plumbed and appeared to do nothing in a live experiment — both arms of a
+/// 512-vs-20,000 comparison reported 512 open readers — so the setter itself is
+/// pinned here rather than trusted.
+#[test]
+fn the_runtime_setter_changes_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    const TABLES: usize = 30;
+
+    // Open with a SMALL bound, then raise it well above the table count.
+    let db = DB::open(opts(dir.path(), 4)).expect("open");
+    let cf = db
+        .create_column_family(
+            "t",
+            ColumnFamilyConfig {
+                l1_file_count_trigger: 10_000,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .expect("create cf");
+    write_tables(&db, &cf, TABLES, 30);
+
+    db.set_max_open_readers(1000);
+
+    let mut txn = db.begin();
+    for t in 0..TABLES {
+        txn.get(&cf, format!("{t:04}/{:08}", 0).as_bytes()).expect("get");
+    }
+    txn.rollback().expect("rollback");
+
+    let (open, opens, _hits, closes) = db.table_cache_stats();
+    assert_eq!(
+        open, TABLES,
+        "after raising the bound to 1000, all {TABLES} readers should be open; \
+         {open} are (opens={opens} closes={closes}) — the runtime setter is not \
+         taking effect, which is what spada's storage.max_open_readers relies on"
+    );
+    assert_eq!(
+        closes, 0,
+        "nothing should have been evicted under a bound of 1000 with {TABLES} \
+         tables, but {closes} readers were closed"
+    );
+
+    // And lowering it must evict immediately, not lazily on the next insert.
+    db.set_max_open_readers(5);
+    let (open_after, _, _, closes_after) = db.table_cache_stats();
+    assert!(
+        open_after <= 5,
+        "lowering the bound to 5 left {open_after} readers open — set_max_open \
+         must evict on the spot, or a memory limit does not take hold until the \
+         next read"
+    );
+    assert!(closes_after > 0, "no eviction recorded after lowering the bound");
+    db.close().expect("close");
+}

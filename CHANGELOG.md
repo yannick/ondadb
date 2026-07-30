@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.7.0
+
+Memory and compaction. Two behaviour changes and one changed default, all
+driven by a consumer that reached **10 GB resident and was killed by the kernel
+opening a 48 GiB store**, before serving a single request.
+
+- **Bounded open readers (`Options::max_open_readers`, default 512).** Opening
+  an SSTable eagerly loads its whole block index and bloom filter, and both stay
+  resident while the reader does. `ColumnFamily::open` opened *every* table named
+  in the manifest and never closed one, so resident memory was proportional to
+  **total stored bytes** rather than to the working set — paid at startup,
+  whether or not a table was ever read.
+
+  This is RocksDB's mechanism, which this engine had omitted while copying its
+  eager per-table load: *"If `cache_index_and_filter_blocks` is false (which is
+  default), the number of index/filter blocks is controlled by option
+  `max_open_files`."* `SstHandle` no longer owns a reader; it holds the
+  information to re-open one and asks a shared least-recently-used `TableCache`.
+
+  Closing is safe because a reader is a pure, re-derivable view of an immutable
+  file: it costs a re-open and cannot change an answer. **Memory is bounded by
+  `max_open` plus concurrent in-flight readers**, not by `max_open` alone — an
+  in-flight caller holds an `Arc`, so eviction drops only the cache's reference.
+  Measured on the store above: 6.6 GB at ten seconds into startup became 784 MB,
+  and flat rather than climbing.
+
+  **`Iterator` behaviour change:** `new_iterator` cannot return a `Result`, so a
+  reader that fails to open now yields an iterator that is invalid and carries
+  the error on `err()`. **Callers that walk `while it.valid()` without checking
+  `err()` will read a failed scan as an empty one.** Omitting the table instead
+  would return a short answer that looks complete, which is worse; but the
+  contract is now load-bearing where it previously could not fire.
+
+- **Bulk ingest arms compaction.** `Ingestion::finish` installed its L0 tables,
+  persisted the manifest, and omitted the `compact_tx` send that a memtable
+  flush performs — so a bulk-loaded store grew one permanent L0 table per
+  ingestion and nothing ever asked the compactor to look. A real store reached
+  **14,051 L0 tables for a million documents**; rebuilt with this fix, the same
+  corpus shape produced **58**. Verified by removal: with the send deleted, the
+  test reports "after 12 bulk-ingested tables, L0 still holds 12 files".
+
+- **`DEFAULT_BLOCK_SIZE` 4 KiB → 16 KiB.** Every data block costs one resident
+  index entry. Measured afterwards at ~3 % of the resident total (the bloom
+  filter dominates an un-compacted store by 32×), so this is a small win
+  honestly labelled: it scales the index down by a constant and bounds nothing.
+  Existing files are unaffected — block size is a property of the file that
+  wrote it. Callers doing many small random point reads should set
+  `SstOptions::block_size` down.
+
+- **New accounting:** `Reader::resident_bytes`/`resident_breakdown`,
+  `ColumnFamily::resident_reader_bytes`, `ColumnFamily::l0_file_count`,
+  `DB::table_cache_stats`, `DB::reader_memory`, `DB::set_max_open_readers`.
+  Added *before* optimising, because this memory grew to dominate while being
+  invisible, and two successive diagnoses were wrong without it.
+
+**Not in this release:** the vlog value cache. It is a latency fix that *adds*
+memory, and it should not land before resident memory is settled.
+
+
 ## 0.6.0
 
 Two additive changes, no API or format break. Minor bump for the new public
