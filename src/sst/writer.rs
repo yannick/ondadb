@@ -77,7 +77,24 @@ pub struct Writer {
     klog_off: u64,
     vlog_off: u64,
 
-    bloom: Option<Bloom>,
+    /// One hash per key written, or `None` when the filter is disabled.
+    ///
+    /// The filter is built in [`finish`](Self::finish), not here, because a
+    /// bloom filter's bit count and hash count are fixed at construction and
+    /// cannot be resized — so sizing it up front means sizing it from a guess.
+    /// Every such guess this writer was given turned out to be wrong:
+    /// compaction passed a hardcoded 4,096 for tables holding a million
+    /// entries, and bulk ingestion divided a byte target by an assumed 64-byte
+    /// entry. An overloaded filter sets every bit and admits every key, which
+    /// costs memory, a hash and a probe per lookup, and skips nothing.
+    ///
+    /// Buffering costs 8 bytes per entry until `finish`. It is bounded by the
+    /// writer's roll target, not by the store: at the default 64 MiB target and
+    /// the smallest entries a real consumer writes (~21 bytes), a full table is
+    /// ~3.2M entries and the buffer peaks near 26 MB — one writer at a time,
+    /// freed when the table closes. That is the price of a filter that works;
+    /// the alternative measured 0 skips in 400,000 lookups.
+    bloom_hashes: Option<Vec<u64>>,
     num_entries: u64,
     num_tombstones: u64,
     max_seq: u64,
@@ -112,8 +129,12 @@ impl Writer {
             .truncate(true)
             .write(true)
             .open(klog_path)?;
-        let bloom = if opts.enable_bloom {
-            Some(Bloom::new(opts.expected_entries.max(1024), opts.bloom_fpr))
+        // `expected_entries` is now only a capacity hint for the hash buffer —
+        // getting it wrong costs a realloc, not a filter that admits
+        // everything. Cap the pre-allocation so a wildly optimistic hint
+        // cannot reserve hundreds of MB for a table that ends up small.
+        let bloom_hashes = if opts.enable_bloom {
+            Some(Vec::with_capacity(opts.expected_entries.clamp(1024, 1 << 20)))
         } else {
             None
         };
@@ -132,7 +153,7 @@ impl Writer {
             pending_index: None,
             klog_off: 0,
             vlog_off: 0,
-            bloom,
+            bloom_hashes,
             num_entries: 0,
             num_tombstones: 0,
             max_seq: 0,
@@ -197,8 +218,8 @@ impl Writer {
         if self.min_key.is_none() {
             self.min_key = Some(user_key.to_vec());
         }
-        if let Some(b) = self.bloom.as_mut() {
-            b.add(user_key);
+        if let Some(h) = self.bloom_hashes.as_mut() {
+            h.push(crate::bloom::hash_for_new(user_key));
         }
 
         let mut has_vlog = false;
@@ -431,7 +452,12 @@ impl Writer {
             footer_flags |= FOOTER_RESTARTS;
         }
         let mut bloom_handle = BlockHandle::default();
-        if let Some(b) = self.bloom.take() {
+        // Size the filter from the keys actually written, not from a hint.
+        if let Some(hashes) = self.bloom_hashes.take() {
+            let mut b = Bloom::new(hashes.len().max(1), self.opts.bloom_fpr);
+            for h in hashes {
+                b.add_hash(h);
+            }
             let enc = b.encode();
             bloom_handle = self.write_meta_block(&enc)?;
             footer_flags |= FOOTER_HAS_BLOOM;

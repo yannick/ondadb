@@ -96,6 +96,50 @@ Rules learned the hard way:
   writes.
 - `#[cold]` on multi-byte `uvarint` decode would pessimize sequence decoding
   (seqs are 3–4 byte varints) — only the 1-byte path is the fast path.
+- **Bloom filters sized from a caller's guess (fixed)**: `Bloom::new` allocates
+  a fixed bit array that cannot grow, and the writer sized it from
+  `WriterOptions::expected_entries` before seeing a single key. Compaction
+  passed a hardcoded `4096` for every table it produced, so a compacted table
+  holding a million entries carried a filter designed for four thousand — every
+  bit set, every key admitted. Because a leveled LSM keeps nearly all its data
+  in compacted levels, **blooms were effectively off for the whole steady-state
+  database**: measured on a consumer store with 33.5M entries in one CF,
+  400,000 point reads for keys that provably did not exist produced **zero**
+  bloom skips, while still paying to build, store, load and hash against the
+  filter. Bulk ingestion had a milder form of the same bug
+  (`roll_bytes / 64`, an assumed 64-byte entry).
+
+  The writer now buffers one hash per key and builds the filter in `finish()`
+  from the count it actually wrote, so no caller can size a filter wrongly.
+  Identical data through ingest / put / compact now measures 99.0 % skips on
+  all three paths (was 100 % / 99 % / **0 %**), and the filters get *smaller*:
+  9.59 bits/key, against the 9.6 the 0.01 target implies, where the old L0
+  tables were over-provisioned at 17.4. Cost: 8 bytes per entry buffered until
+  the table closes — bounded by the roll target, ~26 MB at the default 64 MiB
+  target and 21-byte entries, one writer at a time. Pinned by
+  `tests/bloom_survives_compaction.rs`, whose non-vacuity guard asserts the
+  filter works *before* compaction so the test cannot pass for the wrong
+  reason.
+
+  Measured end to end on a real 3.7 GB consumer store (8,947,487 entries in the
+  probed CF), same data and same process with one compaction between the arms,
+  so only the filter changes:
+
+  | | before | after |
+  |---|---|---|
+  | skip rate on absent keys | 400,000 probed, **0 skipped (0.0 %)** | 1 probed, 199,999 skipped (**100.0 %**) |
+  | absent-key lookup | 875 ns | **201 ns** (4.4×) |
+  | present-key lookup | 901 ns | 569 ns |
+  | resident reader bytes | 9.6 MB | 3.3 MB |
+
+  What that does **not** show: the compaction which rewrote the filters also
+  merged the CF's nine tables into one, so the present-key figure and part of
+  the reader-byte drop are compaction shape, not the filter. The skip rate is
+  unconfounded — 0 % to 100 % is the filter alone, and it is what makes the
+  absent-key number move.
+
+  **Existing SSTables keep their broken filters until rewritten** — the fix
+  applies to newly written tables, and a full compaction migrates the rest.
 
 ## Open performance items
 

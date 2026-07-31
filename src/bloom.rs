@@ -55,6 +55,17 @@ fn hash_key(key: &[u8]) -> u64 {
     h
 }
 
+/// The hash a filter built by [`Bloom::new`] will use.
+///
+/// A writer cannot size a filter until it knows how many keys it wrote, so it
+/// buffers each key's hash and constructs the filter at `finish()`. Those
+/// hashes must be computed with the same function the finished filter uses, and
+/// nothing in the type system enforces that — so it lives here, next to
+/// [`Bloom::new`], with `hash_matches_new` pinning the agreement.
+pub fn hash_for_new(key: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(key)
+}
+
 impl Bloom {
     /// Heap bytes this filter holds. For memory accounting only.
     pub(crate) fn resident_bytes(&self) -> usize {
@@ -357,5 +368,57 @@ mod tests {
         for i in 0..50u32 {
             assert!(d.may_contain(&i.to_le_bytes()));
         }
+    }
+
+    /// `hash_for_new` must agree with what `Bloom::new` actually uses, or a
+    /// writer that buffers hashes builds a filter over a different hash space
+    /// than the reader consults — which silently loses every key.
+    #[test]
+    fn hash_matches_new() {
+        let b = Bloom::new(1000, 0.01);
+        for k in [b"".as_slice(), b"a", b"abcdefghijklmnop", &[0xFF; 257]] {
+            assert_eq!(
+                b.hash_of(k),
+                super::hash_for_new(k),
+                "hash_for_new disagrees with Bloom::new's hash function"
+            );
+        }
+    }
+
+    /// A filter built from the entries actually written must filter, whatever
+    /// a caller guessed. This is the unit-level statement of the compaction
+    /// regression in `tests/bloom_survives_compaction.rs`.
+    #[test]
+    fn a_filter_sized_for_its_real_load_still_rejects() {
+        const N: usize = 200_000;
+        let mut b = Bloom::new(N, 0.01);
+        for i in 0..N as u64 {
+            b.add_hash(super::hash_for_new(&(2 * i).to_be_bytes()));
+        }
+        let admitted = (0..10_000u64)
+            .filter(|i| b.may_contain_hash(super::hash_for_new(&(2 * i + 1).to_be_bytes())))
+            .count();
+        assert!(
+            admitted < 500,
+            "{admitted}/10000 absent keys admitted at fpr 0.01 — the filter is              saturated, which is what sizing from a guess produces"
+        );
+    }
+
+    /// And the failure mode itself, so the cost of guessing is on the record:
+    /// size for 4,096 (what compaction used to pass) and load 200,000.
+    #[test]
+    fn a_filter_sized_by_a_guess_admits_everything() {
+        const N: usize = 200_000;
+        let mut b = Bloom::new(4096, 0.01);
+        for i in 0..N as u64 {
+            b.add_hash(super::hash_for_new(&(2 * i).to_be_bytes()));
+        }
+        let admitted = (0..10_000u64)
+            .filter(|i| b.may_contain_hash(super::hash_for_new(&(2 * i + 1).to_be_bytes())))
+            .count();
+        assert_eq!(
+            admitted, 10_000,
+            "a 49x-overloaded filter should admit everything; if this ever              fails the sizing math changed and the regression test above is              measuring something else"
+        );
     }
 }

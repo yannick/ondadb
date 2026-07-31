@@ -464,6 +464,12 @@ fn cf_writer_opts(
         bloom_fpr: cf.opts.bloom_fpr,
         klog_value_threshold: cf.opts.klog_value_threshold,
         block_size: 4 << 10,
+        // Capacity hint for the writer's bloom-hash buffer ONLY. It used to
+        // size the filter itself, which is why every compacted table carried a
+        // filter built for 4,096 keys while holding a million — saturated, and
+        // skipping nothing. The writer now sizes the filter from the keys it
+        // actually wrote (`tests/bloom_survives_compaction.rs`), so a wrong
+        // hint costs a few reallocs and nothing else.
         expected_entries: 4096,
         use_btree: cf.opts.use_btree,
         restart_interval: crate::sst::RESTART_INTERVAL,
