@@ -440,9 +440,7 @@ impl DB {
             None
         };
 
-        let tables = Arc::new(crate::table_cache::TableCache::new(
-            opts.max_open_readers,
-        ));
+        let tables = Arc::new(crate::table_cache::TableCache::new(opts.max_open_readers));
         let ctx = Arc::new(CfCtx {
             tiers,
             bc,

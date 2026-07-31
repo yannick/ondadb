@@ -98,9 +98,7 @@ impl Reader {
         let index: usize = self
             .index
             .iter()
-            .map(|e| {
-                std::mem::size_of::<IndexEntry>() + e.user_key.len()
-            })
+            .map(|e| std::mem::size_of::<IndexEntry>() + e.user_key.len())
             .sum();
         let bloom = self.bloom.as_ref().map_or(0, |b| b.resident_bytes());
         index + bloom + self.min_key.len() + self.max_key.len()

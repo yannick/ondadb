@@ -112,10 +112,7 @@ fn retry_loop<T, E>(
 /// Drive an idempotent S3 request to completion, retrying the hyper keep-alive
 /// reuse race up to [`S3_MAX_ATTEMPTS`] times (see [`is_transient`]). `call`
 /// must be safe to run more than once — every caller in this module is.
-fn with_retry<T>(
-    op: &str,
-    call: impl FnMut() -> std::result::Result<T, S3Error>,
-) -> Result<T> {
+fn with_retry<T>(op: &str, call: impl FnMut() -> std::result::Result<T, S3Error>) -> Result<T> {
     retry_loop(S3_MAX_ATTEMPTS, call, is_transient, |attempt| {
         std::thread::sleep(backoff_delay(attempt))
     })
@@ -256,8 +253,9 @@ impl ReadHandle for S3ReadHandle {
             return Ok(s);
         }
         self.metrics.heads.fetch_add(1, Ordering::Relaxed);
-        let (head, code) =
-            with_retry("head", || self.rt.block_on(self.bucket.head_object(&self.key)))?;
+        let (head, code) = with_retry("head", || {
+            self.rt.block_on(self.bucket.head_object(&self.key))
+        })?;
         if !is_ok(code) {
             return Err(s3_err("head", format!("status {code} for {}", self.key)));
         }
@@ -294,7 +292,8 @@ impl StorageWriter for S3StorageWriter {
         let this = *self;
         this.metrics.puts.fetch_add(1, Ordering::Relaxed);
         let resp = with_retry("put", || {
-            this.rt.block_on(this.bucket.put_object(&this.key, &this.buf))
+            this.rt
+                .block_on(this.bucket.put_object(&this.key, &this.buf))
         })?;
         if !is_ok(resp.status_code()) {
             return Err(s3_err(

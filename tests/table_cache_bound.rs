@@ -141,11 +141,8 @@ fn every_key_is_readable_under_a_bound_of_one() {
 
 fn txn_iter(db: &DB, cf: &std::sync::Arc<ondadb::ColumnFamily>) -> ondadb::Iterator {
     let txn = db.begin();
-    let mut it = txn.new_iterator_bounded(
-        cf,
-        std::ops::Bound::Unbounded,
-        std::ops::Bound::Unbounded,
-    );
+    let mut it =
+        txn.new_iterator_bounded(cf, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
     it.seek_to_first();
     it
 }
@@ -179,7 +176,8 @@ fn the_runtime_setter_changes_the_bound() {
 
     let mut txn = db.begin();
     for t in 0..TABLES {
-        txn.get(&cf, format!("{t:04}/{:08}", 0).as_bytes()).expect("get");
+        txn.get(&cf, format!("{t:04}/{:08}", 0).as_bytes())
+            .expect("get");
     }
     txn.rollback().expect("rollback");
 
@@ -205,6 +203,9 @@ fn the_runtime_setter_changes_the_bound() {
          must evict on the spot, or a memory limit does not take hold until the \
          next read"
     );
-    assert!(closes_after > 0, "no eviction recorded after lowering the bound");
+    assert!(
+        closes_after > 0,
+        "no eviction recorded after lowering the bound"
+    );
     db.close().expect("close");
 }

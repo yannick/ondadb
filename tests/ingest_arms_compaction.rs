@@ -112,7 +112,9 @@ fn every_key_survives_the_compaction_that_ingest_now_triggers() {
         ..Options::default()
     })
     .expect("reopen");
-    let cf = db.get_column_family("bulk").expect("cf present after reopen");
+    let cf = db
+        .get_column_family("bulk")
+        .expect("cf present after reopen");
     let mut txn = db.begin();
     for b in 0..BATCHES {
         for i in 0..PER {

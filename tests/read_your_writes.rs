@@ -152,6 +152,11 @@ fn get_sees_own_put_under_heavy_multi_db_contention() {
         failures.is_empty(),
         "{} read-your-own-writes violations across {DBS} databases; first few:\n{}",
         failures.len(),
-        failures.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

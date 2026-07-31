@@ -442,7 +442,10 @@ impl Iterator {
     /// outcome a storage engine must never produce; surfacing the error through
     /// [`Self::err`] keeps the existing contract, where callers check `err()`
     /// after a walk goes invalid.
-    pub(crate) fn failed(cmp: crate::comparator::ComparatorRef, e: crate::error::OndaError) -> Iterator {
+    pub(crate) fn failed(
+        cmp: crate::comparator::ComparatorRef,
+        e: crate::error::OndaError,
+    ) -> Iterator {
         let mut it = Iterator::new(
             cmp,
             Vec::new(),

@@ -1100,7 +1100,10 @@ fn exporting_the_same_part_twice_yields_the_same_identity() {
 
     let a = db.export_part(&cf, "img").unwrap();
     let b = db.export_part(&cf, "img").unwrap();
-    assert_eq!(a, b, "an identity that changed between reads would be useless");
+    assert_eq!(
+        a, b,
+        "an identity that changed between reads would be useless"
+    );
 
     // And it survives a reopen: the digest is a property of the bytes, not of
     // any in-memory state the database happens to be holding.
@@ -1239,7 +1242,10 @@ fn moving_a_part_to_another_tier_does_not_change_its_identity() {
         "a move relocates bytes; it does not change them"
     );
     assert!(
-        after.tables.iter().all(|t| t.tier.as_deref() == Some("cold")),
+        after
+            .tables
+            .iter()
+            .all(|t| t.tier.as_deref() == Some("cold")),
         "but the export reports where they now live"
     );
     // And the data is still readable through the moved part.

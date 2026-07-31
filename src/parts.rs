@@ -136,10 +136,7 @@ pub struct PartManifest {
 impl PartManifest {
     /// Total bytes across every table of the part.
     pub fn size_bytes(&self) -> u64 {
-        self.tables
-            .iter()
-            .map(|t| t.klog_size + t.vlog_size)
-            .sum()
+        self.tables.iter().map(|t| t.klog_size + t.vlog_size).sum()
     }
 
     /// The digest as lowercase hex — the form a consumer names objects with.

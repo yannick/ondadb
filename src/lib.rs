@@ -41,10 +41,10 @@ pub mod memtable;
 pub mod memtable_arena;
 pub mod parts;
 pub mod sst;
-pub mod table_cache;
 pub mod storage;
 #[cfg(feature = "s3")]
 pub mod storage_s3;
+pub mod table_cache;
 pub mod txn;
 pub mod unified;
 pub mod util;
