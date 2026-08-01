@@ -111,6 +111,9 @@ unexplained red test, and because the rate means roughly one CI run in four will
 show it. Not diagnosed: whether the loss is in WAL replay or in the flush of
 recovered generations.
 
+**Diagnosed and fixed in 0.7.3** — and it was neither of those. The WAL was
+reclaimed correctly; a concurrent compaction discarded the flushed table.
+
 ## 0.7.0
 
 Memory and compaction. Two behaviour changes and one changed default, all
