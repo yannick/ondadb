@@ -63,6 +63,29 @@ pub fn uvarint(b: &[u8]) -> Option<(u64, usize)> {
             return Some((u64::from(b[0] & 0x7f) | (u64::from(b1) << 7), 2));
         }
     }
+    // Three- and four-byte paths: real stores carry sequence numbers well
+    // past 2^14 within days, so the block-decode loops were falling into
+    // the byte-at-a-time loop for EVERY entry's seq field — measured as the
+    // single largest slice of a warm point get (profiled via spada, S-142).
+    if let Some(&b2) = b.get(2) {
+        if b2 < 0x80 {
+            return Some((
+                u64::from(b[0] & 0x7f) | (u64::from(b[1] & 0x7f) << 7) | (u64::from(b2) << 14),
+                3,
+            ));
+        }
+    }
+    if let Some(&b3) = b.get(3) {
+        if b3 < 0x80 {
+            return Some((
+                u64::from(b[0] & 0x7f)
+                    | (u64::from(b[1] & 0x7f) << 7)
+                    | (u64::from(b[2] & 0x7f) << 14)
+                    | (u64::from(b3) << 21),
+                4,
+            ));
+        }
+    }
     uvarint_slow(b)
 }
 

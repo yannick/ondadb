@@ -22,8 +22,8 @@
 
 use std::time::Duration;
 
-use ondadb::DB;
 use ondadb::config::{ColumnFamilyConfig, Options};
+use ondadb::DB;
 
 /// Entries the shape a search index writes: a small key and a small value.
 /// The bug is about entry COUNT versus the writer's guess, and small entries
@@ -70,7 +70,8 @@ fn fill(db: &DB, cf: &std::sync::Arc<ondadb::ColumnFamily>) {
     let value = vec![0x5A; 8];
     let mut ing = db.start_ingestion(cf).expect("start_ingestion");
     for i in 0..N {
-        ing.write(&key(2 * i), &value, Duration::ZERO).expect("write");
+        ing.write(&key(2 * i), &value, Duration::ZERO)
+            .expect("write");
     }
     ing.finish().expect("finish");
 }
@@ -106,7 +107,10 @@ fn the_filter_still_skips_after_compaction() {
     // this ever drops, the test is failing for some reason other than the one
     // it exists to catch.
     let (cand0, _, skips0) = miss_stats(&db, &cf);
-    assert!(cand0 > 0, "no table was even considered; the corpus is wrong");
+    assert!(
+        cand0 > 0,
+        "no table was even considered; the corpus is wrong"
+    );
     let before_rate = skips0 as f64 / cand0 as f64;
     assert!(
         before_rate > 0.9,

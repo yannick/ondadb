@@ -134,7 +134,9 @@ impl Writer {
         // everything. Cap the pre-allocation so a wildly optimistic hint
         // cannot reserve hundreds of MB for a table that ends up small.
         let bloom_hashes = if opts.enable_bloom {
-            Some(Vec::with_capacity(opts.expected_entries.clamp(1024, 1 << 20)))
+            Some(Vec::with_capacity(
+                opts.expected_entries.clamp(1024, 1 << 20),
+            ))
         } else {
             None
         };

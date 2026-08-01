@@ -22,7 +22,7 @@ use crate::manifest::SstMeta;
 use crate::memtable::Memtable;
 use crate::sst::{Reader, Writer, WriterOptions};
 use crate::storage::TierRegistry;
-use crate::util::now_nanos;
+use crate::util::{coarse_now_nanos, now_nanos};
 use crate::wal::{self, Wal};
 use smallvec::SmallVec;
 
@@ -810,7 +810,7 @@ impl ColumnFamily {
     /// Resolve `user_key` as of `read_seq`. Returns the value, or `NotFound`.
     pub(crate) fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
         self.point_reads.fetch_add(1, Ordering::Relaxed);
-        let now = now_nanos();
+        let now = coarse_now_nanos();
         let (mem, imms, tables) = {
             let s = self.state.read();
             let mem = s.mem.clone();
@@ -890,7 +890,7 @@ impl ColumnFamily {
     /// snapshots), or `0` if the key has never been written.  Used for
     /// write-write conflict detection.
     pub(crate) fn peek_seq(&self, user_key: &[u8]) -> Result<u64> {
-        let now = now_nanos();
+        let now = coarse_now_nanos();
         let (mem, imms, tables) = {
             let s = self.state.read();
             let mut tables: SmallVec<[Arc<SstHandle>; 4]> = SmallVec::new();
@@ -999,19 +999,46 @@ impl ColumnFamily {
                 }
             }
         }
+        // Levels >= 1 are sorted by key and disjoint, so the overlapping
+        // tables form one contiguous run: binary-search its start, walk
+        // until the upper bound. Iterator construction used to walk EVERY
+        // table in the CF (two comparator calls each), which made even an
+        // empty bounded scan O(total tables) — ~40 ns per resident table,
+        // and a reader-open for each when the table cache had evicted it.
         for lvl in s.levels.iter().skip(1) {
-            for th in lvl {
-                if Self::sst_in_bounds(th, &self.cmp, &bounds) {
-                    match th.reader() {
-                        Ok(r) => children.push(ChildIter::Sst(r.iter())),
-                        Err(e) => return Iterator::failed(self.cmp.clone(), e),
-                    }
+            let start = match bounds.0 {
+                Bound::Unbounded => 0,
+                Bound::Included(l) => {
+                    lvl.partition_point(|th| self.cmp.compare(&th.meta.max_key, l).is_lt())
+                }
+                Bound::Excluded(l) => {
+                    lvl.partition_point(|th| self.cmp.compare(&th.meta.max_key, l).is_le())
+                }
+            };
+            for th in &lvl[start..] {
+                let below_upper = match bounds.1 {
+                    Bound::Unbounded => true,
+                    Bound::Included(u) => self.cmp.compare(&th.meta.min_key, u).is_le(),
+                    Bound::Excluded(u) => self.cmp.compare(&th.meta.min_key, u).is_lt(),
+                };
+                if !below_upper {
+                    break;
+                }
+                match th.reader() {
+                    Ok(r) => children.push(ChildIter::Sst(r.iter())),
+                    Err(e) => return Iterator::failed(self.cmp.clone(), e),
                 }
             }
         }
         drop(s);
         let owned = (bound_to_owned(bounds.0), bound_to_owned(bounds.1));
-        Iterator::new(self.cmp.clone(), children, read_seq, now_nanos(), owned)
+        Iterator::new(
+            self.cmp.clone(),
+            children,
+            read_seq,
+            coarse_now_nanos(),
+            owned,
+        )
     }
 
     /// Snapshot the SSTable metadata for the manifest.
