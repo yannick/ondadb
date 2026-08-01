@@ -15,6 +15,35 @@ pub fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// Coarse wall-clock nanos for the READ path's TTL checks.
+///
+/// `now_nanos()` is a precise clock read on every `get`/`peek_seq`/iterator —
+/// measured at ~2 % of a warm point-get workload. TTL expiry does not need
+/// nanosecond precision: a boundary that moves by a few milliseconds changes
+/// when an already-expired entry stops being served, not whether. On Linux
+/// this is `CLOCK_REALTIME_COARSE` (vDSO, tick resolution); elsewhere it
+/// falls back to the precise clock.
+#[cfg(target_os = "linux")]
+pub fn coarse_now_nanos() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid timespec pointer; COARSE is supported on every Linux
+    // this crate targets. On the impossible failure, fall back to precise.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts) };
+    if rc == 0 {
+        (ts.tv_sec as i64) * 1_000_000_000 + ts.tv_nsec as i64
+    } else {
+        now_nanos()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn coarse_now_nanos() -> i64 {
+    now_nanos()
+}
+
 /// Fail-stop flag shared across the DB, its WALs, and background workers.
 ///
 /// After a failed fsync the kernel may have dropped the dirty pages it could

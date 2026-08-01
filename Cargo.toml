@@ -53,6 +53,7 @@ rust-s3 = { version = "0.35", optional = true, default-features = false, feature
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 memmap2 = { version = "0.9", optional = true }
 smallvec = "1.15.2"
+libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3"
