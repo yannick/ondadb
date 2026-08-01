@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.2
+
+Read-path concurrency and cost. Everything in 0.7.1 plus the work that had been
+sitting on the `parts-and-tiers` branch — which is what the consumer actually
+compiled against, so this release makes the tag match reality.
+
+- **The table cache stops serializing reads.** It was one process-global
+  `Mutex`, and its *hit* path wrote a recency tick — so a cache hit took an
+  exclusive lock, shared by every column family. Measured on an 8-core box,
+  point-read throughput through the engine was **flat from 1 to 8 threads**
+  with SSTables present, and scaled 4.6x with none: the difference was this
+  lock. It is now sixteen shards with second-chance (CLOCK) replacement; a hit
+  takes a shard **read** lock and one relaxed bit store. The `max_open` bound
+  stays **global and exact** via a shared open count with rotating cross-shard
+  eviction — it is a memory contract (0.7.0), so sharding it would have been a
+  regression dressed as a speedup.
+- **TTL checks use `CLOCK_REALTIME_COARSE`.** A precise `SystemTime::now` per
+  get measured ~2 % of warm reads.
+- **`uvarint` gains 3- and 4-byte fast paths.** Real sequence numbers made
+  every block decode fall into the general byte loop.
+- **`new_iterator` binary-searches sorted levels** for the overlapping run
+  instead of testing every table in the column family — O(log n + overlap) per
+  level.
+
+No format change and no API change.
+
 ## 0.7.1
 
 One bug fix, and it is a large one: **bloom filters were effectively off for the
