@@ -149,23 +149,23 @@ fn compact_into(
 
     // Snapshot the input handles. An in-place rewrite takes the whole level;
     // a push-down merges the level with overlapping tables below it.
-    let (inputs, retained_next, num_levels): (Vec<Arc<SstHandle>>, Vec<Arc<SstHandle>>, usize) = cf
-        .with_levels(|levels| {
-            let mut inputs: Vec<Arc<SstHandle>> = levels[level].clone();
-            let (min_key, max_key) = key_span(&inputs, &cmp);
-            let mut retained_next = Vec::new();
-            if target != level && target < levels.len() {
-                for th in &levels[target] {
-                    if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, &min_key, &max_key)
-                    {
-                        inputs.push(th.clone());
-                    } else {
-                        retained_next.push(th.clone());
-                    }
+    // `retained_next` is deliberately NOT captured here: it would be a snapshot
+    // of the target level taken before the compaction ran, and re-installing it
+    // afterwards would drop any table added meanwhile. It is re-derived from
+    // live state inside `update_levels` below, as `levels[target]` minus the
+    // inputs — which is the same set, plus concurrent arrivals.
+    let (inputs, num_levels): (Vec<Arc<SstHandle>>, usize) = cf.with_levels(|levels| {
+        let mut inputs: Vec<Arc<SstHandle>> = levels[level].clone();
+        let (min_key, max_key) = key_span(&inputs, &cmp);
+        if target != level && target < levels.len() {
+            for th in &levels[target] {
+                if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, &min_key, &max_key) {
+                    inputs.push(th.clone());
                 }
             }
-            (inputs, retained_next, levels.len())
-        });
+        }
+        (inputs, levels.len())
+    });
 
     if inputs.is_empty() {
         return Ok(());
@@ -401,7 +401,7 @@ fn compact_into(
 
     // Build the new level set.
     let input_ids: std::collections::HashSet<u64> = inputs.iter().map(|t| t.meta.id).collect();
-    let new_levels = cf.with_levels(|levels| {
+    cf.update_levels(|levels| {
         let mut out: Vec<Vec<Arc<SstHandle>>> = Vec::new();
         let needed = (target + 1).max(levels.len());
         for i in 0..needed {
@@ -424,7 +424,18 @@ fn compact_into(
                 }
                 out.push(kept);
             } else if i == target {
-                let mut lvl = retained_next.clone();
+                // Live state minus the inputs — never a pre-compaction
+                // snapshot, so a table that arrived while this compaction ran
+                // survives instead of being overwritten.
+                let mut lvl: Vec<Arc<SstHandle>> = levels
+                    .get(i)
+                    .map(|l| {
+                        l.iter()
+                            .filter(|t| !input_ids.contains(&t.meta.id))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 lvl.extend(new_handles.iter().cloned());
                 lvl.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
                 out.push(lvl);
@@ -432,9 +443,25 @@ fn compact_into(
                 out.push(levels.get(i).cloned().unwrap_or_default());
             }
         }
+        // Silent loss is the failure mode this rebuild had, so make it loud:
+        // every table present before must either be a compaction input or
+        // still be here. Debug-only — it is O(tables) and the invariant is
+        // structural, not data-dependent.
+        debug_assert!(
+            {
+                let before: std::collections::HashSet<u64> =
+                    levels.iter().flatten().map(|t| t.meta.id).collect();
+                let after: std::collections::HashSet<u64> =
+                    out.iter().flatten().map(|t| t.meta.id).collect();
+                before
+                    .difference(&after)
+                    .all(|id| input_ids.contains(id))
+            },
+            "compaction dropped a table that was not one of its inputs — that \
+             is committed data becoming unreachable (level={level} target={target})"
+        );
         out
     });
-    cf.replace_levels(new_levels);
 
     // Persist the manifest before deleting old files.
     db.persist_manifest()?;

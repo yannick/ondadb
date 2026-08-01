@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.3
+
+**Committed writes could be silently lost.** This fixes the durability bug
+recorded as a known issue in 0.7.1, and it was never a WAL bug.
+
+- **A compaction could discard a table a concurrent flush had just installed.**
+  The level-set swap was a non-atomic read-modify-write: compaction read the
+  levels under a read lock, built a replacement, dropped the lock, and then
+  overwrote the whole vector. A flush finishing in that window inserted its new
+  L0 table and had it thrown away by the overwrite.
+
+  Nothing deleted the orphaned file — it had never been a compaction input — so
+  the bytes stayed on disk while the level set, and the manifest persisted
+  immediately afterwards, no longer referenced them. Worse, the flush that
+  produced that table had already reclaimed its WAL, correctly, against an
+  earlier manifest that *did* contain it. So the data existed in exactly one
+  place that nothing would ever read.
+
+  The rebuild now happens inside a single exclusive lock (`update_levels`), and
+  the target level is re-derived from live state rather than from a
+  pre-compaction snapshot, so a table arriving mid-compaction survives instead
+  of being overwritten. A debug assertion makes the invariant loud: a table may
+  leave the level set only if it was one of that compaction's inputs.
+
+  **Measured:** `writes_progress_after_crash_recovery_with_wal_backlog` failed
+  2 runs in 8 before and 0 in 16 after. The signature was always the same —
+  one contiguous run of ~122 keys, a single memtable generation, gone. Whole
+  generations vanishing rather than scattered keys is what pointed at a table,
+  not at frames.
+
+  Found by instrumenting the swap: it reported dropping non-input table 10, and
+  the first missing key was then located inside `10.klog`, on disk, absent from
+  the manifest.
+
 ## 0.7.2
 
 Read-path concurrency and cost. Everything in 0.7.1 plus the work that had been

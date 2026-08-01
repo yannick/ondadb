@@ -1104,6 +1104,31 @@ impl ColumnFamily {
         s.levels = levels;
     }
 
+    /// Rebuild the level set **atomically**: `f` sees the same state the result
+    /// overwrites, under one exclusive lock.
+    ///
+    /// Compaction used to do this as `with_levels` (read lock, build, release)
+    /// followed by `replace_levels` (write lock, wholesale overwrite). A flush
+    /// completing in that window called [`Self::install_handles_l0`] and had
+    /// its table inserted into L0 — and then the overwrite discarded it. The
+    /// file stayed on disk (it was never a compaction input, so nothing deleted
+    /// it) but vanished from the level set, and the manifest persisted right
+    /// after recorded a database that did not contain it. Its data was
+    /// unreachable, while the flush that produced it had already reclaimed its
+    /// WAL on the strength of an earlier, correct manifest.
+    ///
+    /// That is silent committed-write loss, so the read and the write must not
+    /// be separable. `f` must do in-memory work only and must not call back
+    /// into anything that touches `state` — it would deadlock.
+    pub(crate) fn update_levels(
+        &self,
+        f: impl FnOnce(&[Vec<Arc<SstHandle>>]) -> Vec<Vec<Arc<SstHandle>>>,
+    ) {
+        let mut s = self.state.write();
+        let next = f(&s.levels);
+        s.levels = next;
+    }
+
     pub(crate) fn l0_len(&self) -> usize {
         self.state.read().levels[0].len()
     }
