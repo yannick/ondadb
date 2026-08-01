@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.7.1
+
+One bug fix, and it is a large one: **bloom filters were effectively off for the
+whole steady-state database.**
+
+- **A filter is sized from the keys actually written, not from a caller's
+  guess.** `Bloom::new` allocates a fixed bit array that cannot grow, and the
+  SSTable writer sized it from `WriterOptions::expected_entries` *before seeing
+  a single key* — so every caller had to guess, and both guessed wrong:
+  compaction passed a hardcoded `4096` for every table it produced, and bulk
+  ingestion divided a byte target by an assumed 64-byte entry.
+
+  A compacted table holding a million entries therefore carried a filter
+  designed for four thousand. Every bit ends up set, so `may_contain` answers
+  "maybe" to everything — strictly worse than no filter at all, because the
+  bytes are still built, written, loaded into memory and hashed against on
+  every lookup, and nothing is ever skipped. Because a leveled LSM keeps nearly
+  all of its data in compacted levels, this meant blooms did nothing for the
+  steady state. Measured on a real consumer store with 33.5M entries in one
+  column family: **400,000 point reads for keys that provably did not exist
+  produced zero bloom skips.**
+
+  The fix removes the guess rather than improving it. The writer buffers one
+  hash per key and builds the filter in `finish()` from the count it actually
+  wrote, so no caller can size a filter wrongly; `expected_entries` survives
+  only as a capacity hint for that buffer. Identical data through
+  ingest / put / compact now measures **99.0 % skips on all three paths**
+  (was 100 % / 99 % / **0 %**), and the filters get *smaller*: 9.59 bits/key
+  against the 9.6 the 0.01 target implies, where the old L0 tables were
+  over-provisioned at 17.4.
+
+  **Cost:** 8 bytes per entry buffered until `finish`, bounded by the writer's
+  roll target rather than by the store — at a 64 MiB target and the smallest
+  entries a real consumer writes (~21 bytes), a full table is ~3.2M entries and
+  the buffer peaks near 26 MB, for one writer at a time.
+
+  No format change: a filter written by 0.7.0 is still readable, it was simply
+  useless. Existing tables get correct filters as compaction rewrites them.
+  Pinned by `tests/bloom_survives_compaction.rs`.
+
+**Known issue, pre-existing and not fixed here.**
+`writes_progress_after_crash_recovery_with_wal_backlog` fails intermittently:
+after a crash with a WAL backlog, a reopened database counted **8,878 of 9,000**
+keys — 122 writes lost across the crash boundary. Measured at **2 failures in 8
+runs, and the same 2 in 8 at v0.7.0**, so this release neither introduces nor
+worsens it; it was already present in 0.7.0 as shipped. It is recorded here
+because an intermittent *durability* failure is the wrong thing to leave as an
+unexplained red test, and because the rate means roughly one CI run in four will
+show it. Not diagnosed: whether the loss is in WAL replay or in the flush of
+recovered generations.
+
 ## 0.7.0
 
 Memory and compaction. Two behaviour changes and one changed default, all

@@ -15,7 +15,6 @@
 //! compaction is asynchronous, so the test waits for the observable outcome with
 //! a deadline and reports the count it actually saw.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ondadb::{ColumnFamilyConfig, Options, DB};
