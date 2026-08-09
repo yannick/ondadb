@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.7.5
+
+**The open-reader cache is now bounded in bytes, and bounded by default.**
+
+- **BEHAVIOUR CHANGE — `Options::max_open_reader_bytes` defaults to 1 GiB.**
+  There was no byte bound before; a store that relied on that now has a
+  ceiling. Set it to `0` to restore the old unbounded-in-bytes behaviour. The
+  count bound (`max_open_readers`, default 512) is unchanged in both value and
+  meaning.
+
+- **Why a count was not enough.** `max_open_readers` bounds memory only if
+  readers cost the same, and they do not: per-reader resident cost (block index
+  plus bloom filter) tracks the table's key count. Measured on spada's staging
+  cluster on 2026-08-09, it varied about **30x with segment size alone** — under
+  a megabyte per reader at 256-document segments, about 20 MB at 8192-document
+  segments. spada's configured count of 4096 did not change; the memory it
+  implied went from a few hundred megabytes to roughly 10 GiB, and nodes OOMed
+  repeatedly. Nothing in a count could have expressed that, because the count
+  was never the constraint. (spada `decisions.md` S-161; the original count
+  bound is S-122/S-123.)
+
+- **Both bounds are enforced.** The cache evicts least-recently-used readers
+  until the open count is within `max_open_readers` **and** their resident bytes
+  are within `max_open_reader_bytes`. Either bound set to `0`/unlimited leaves
+  the other in force. Victims are chosen by recency, not by size: evicting the
+  largest reader would free the budget fastest and then re-open the most
+  expensive table.
+
+- **The budget bounds what the cache pins, not the process peak.** Eviction
+  drops the cache's `Arc`; a caller mid-read keeps its own, so the reader lives
+  until that caller is done. Peak is `max_open_reader_bytes` plus the bytes of
+  concurrent in-flight readers — the same honest caveat the count bound has
+  always carried, now stated in bytes.
+
+- **A budget below one reader's cost keeps one reader**, rather than emptying
+  the cache and re-opening on every access. `DB::table_cache_bytes` will then
+  read above the budget, which is where an operator should see it.
+
+- New API, all additive: `Options::max_open_reader_bytes`,
+  `DB::table_cache_bytes() -> (resident, budget)`,
+  `DB::set_max_open_reader_bytes`, `TableCache::with_byte_budget`,
+  `TableCache::byte_stats`, `TableCache::set_max_bytes`, and
+  `table_cache::DEFAULT_MAX_OPEN_READER_BYTES`. `TableCache::new` keeps its
+  signature and stays byte-unbounded.
+
+## 0.7.4
+
+- **A fixed snapshot never predates its own thread's last commit.**
+
 ## 0.7.3
 
 **Committed writes could be silently lost.** This fixes the durability bug
