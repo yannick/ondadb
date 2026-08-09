@@ -169,8 +169,41 @@ impl DbInner {
     /// inside a publication gap, which is fine for read-committed semantics
     /// but not for a repeatable snapshot.
     pub(crate) fn read_floor_seq(&self) -> u64 {
-        let own = THREAD_COMMIT_FLOOR.with(|f| f.borrow().get(&self.db_key()).copied());
-        self.visible_seq().max(own.unwrap_or(0))
+        self.visible_seq().max(self.own_commit_floor())
+    }
+
+    /// Highest sequence THIS THREAD has committed on this DB, or 0.
+    pub(crate) fn own_commit_floor(&self) -> u64 {
+        THREAD_COMMIT_FLOOR
+            .with(|f| f.borrow().get(&self.db_key()).copied())
+            .unwrap_or(0)
+    }
+
+    /// Wait (bounded) until the published watermark reaches this thread's own
+    /// commit floor.
+    ///
+    /// A fixed snapshot pinned BELOW the caller's own last commit is a trap:
+    /// its write-write conflict check then refuses against the caller's OWN
+    /// earlier, strictly-serial write (found live: a raft store's serial
+    /// group commits — same thread, same hot HardState key — poisoned
+    /// fail-stop whenever a slow commit on another thread straddled two of
+    /// them and held the gap-free cursor down; spada S-158). Publication is
+    /// guaranteed even for failed applies, so the gap closes as soon as the
+    /// in-flight commit publishes — the wait is transient by construction.
+    /// The timeout only guards a torn process (a thread that died between
+    /// reserve and publish); on expiry the caller proceeds with the plain
+    /// watermark, i.e. exactly the pre-fix behaviour.
+    pub(crate) fn wait_visible_at_own_floor(&self) {
+        let floor = self.own_commit_floor();
+        if self.visible_seq() >= floor {
+            return;
+        }
+        let start = std::time::Instant::now();
+        while self.visible_seq() < floor
+            && start.elapsed() < std::time::Duration::from_secs(1)
+        {
+            std::thread::yield_now();
+        }
     }
 
     /// Mark `[start, end)` committed; advance the visible sequence gap-free.

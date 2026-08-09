@@ -142,8 +142,14 @@ impl DB {
                 | IsolationLevel::Serializable
         );
         // ReadCommitted floats on the read floor (read-your-own-writes);
-        // fixed-snapshot levels pin the gap-free published watermark.
+        // fixed-snapshot levels pin the gap-free published watermark — but
+        // never BELOW this thread's own last commit: a snapshot predating
+        // the caller's own serial write makes the conflict check refuse
+        // against itself (see `wait_visible_at_own_floor`). Gaps are
+        // transient, so this waits them out rather than weakening the
+        // conflict check.
         let read_seq = if fixed {
+            self.inner.wait_visible_at_own_floor();
             self.inner.visible_seq()
         } else {
             self.inner.read_floor_seq()
