@@ -78,3 +78,92 @@ fn serial_snapshot_rewrites_survive_a_slow_concurrent_committer() {
          {conflicts} times in {rounds} rounds"
     );
 }
+
+/// Read-your-own-INGEST under concurrent commits: a fixed snapshot begun
+/// right after `Ingestion::finish` must see every ingested row, even while
+/// another thread's slow auto-commit holds the gap-free watermark down.
+/// (The 0.7.4 fix covered `Txn::commit` via the thread floor; the ingestion
+/// path never noted its floor, and spada's seal read-back verification came
+/// up short — reported as segment corruption — until it did.)
+#[test]
+fn a_fixed_snapshot_after_finish_sees_the_ingested_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("d", ColumnFamilyConfig::default())
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Two noise lanes with LARGE values: each auto-commit's reserve→publish
+    // window spans its whole WAL write, maximizing the chance one straddles
+    // an entire ingestion (reserve at start_ingestion → begin after finish).
+    let slows: Vec<_> = (0..2)
+        .map(|t| {
+            let db = db.clone();
+            let cf = cf.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let big = vec![0x5Au8; 4 * 1024 * 1024];
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let k = format!("noise-{t}-{i}");
+                    db.put(&cf, k.as_bytes(), &big, std::time::Duration::ZERO)
+                        .unwrap();
+                    i += 1;
+                }
+            })
+        })
+        .collect();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    let mut rounds = 0u64;
+    let mut short_reads = 0u64;
+    while std::time::Instant::now() < deadline {
+        let prefix = format!("seg-{rounds}/");
+        let mut ing = db.start_ingestion(&cf).unwrap();
+        for j in 0..8 {
+            ing.write(
+                format!("{prefix}{j:04}").as_bytes(),
+                b"lane-entry",
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+        }
+        ing.finish().unwrap();
+
+        // The read-back a seal verification does: fixed snapshot, bounded
+        // scan over the prefix.
+        let txn = db.begin();
+        let mut seen = 0u64;
+        {
+            let start = prefix.clone().into_bytes();
+            let mut end = start.clone();
+            *end.last_mut().unwrap() += 1;
+            let mut it = txn.new_iterator_bounded(
+                &cf,
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Excluded(end.as_slice()),
+            );
+            it.seek(&start);
+            while it.valid() {
+                seen += 1;
+                it.next();
+            }
+            assert!(it.err().is_none(), "scan errored: {:?}", it.err());
+        }
+        if seen != 8 {
+            short_reads += 1;
+        }
+        rounds += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for s in slows {
+        s.join().unwrap();
+    }
+
+    assert!(rounds > 20, "the loop must actually have cycled ({rounds})");
+    assert_eq!(
+        short_reads, 0,
+        "{short_reads} of {rounds} read-backs missed their own ingested rows"
+    );
+}

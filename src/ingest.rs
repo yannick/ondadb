@@ -154,6 +154,18 @@ impl Ingestion {
             }
         }
         self.pending_files.clear(); // referenced by the manifest now
+        // Read-your-own-ingest: record this thread's floor exactly as
+        // `Txn::commit` does. Without it, a fixed-snapshot transaction begun
+        // right after `finish` could pin BELOW this ingestion's seq whenever
+        // another thread's earlier-reserved commit still held the gap-free
+        // watermark down — and a read-back of the just-ingested rows came up
+        // SHORT. spada's seal verification hit exactly that ("materialized
+        // key count differs from the prepared lane", intermittent, live
+        // only, biased to its most frequently sealing segments) and spent
+        // three fixes on its own side before the trail led here — the same
+        // publication-gap family as the 0.7.4 self-conflict fix, on the
+        // read side.
+        self.db.note_thread_commit(self.seq);
         Ok(self.written)
     }
 }
