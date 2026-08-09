@@ -473,7 +473,10 @@ impl DB {
             None
         };
 
-        let tables = Arc::new(crate::table_cache::TableCache::new(opts.max_open_readers));
+        let tables = Arc::new(crate::table_cache::TableCache::with_byte_budget(
+            opts.max_open_readers,
+            opts.max_open_reader_bytes,
+        ));
         let ctx = Arc::new(CfCtx {
             tiers,
             bc,
@@ -751,9 +754,24 @@ impl DB {
         self.inner.ctx.tables.resident_breakdown()
     }
 
+    /// `(resident bytes held by cached readers, byte budget)`. A budget of `0`
+    /// means the byte bound is off. This is the counterpart of
+    /// [`table_cache_stats`](Self::table_cache_stats) in the unit that actually
+    /// bounds memory — see
+    /// [`Options::max_open_reader_bytes`](crate::Options::max_open_reader_bytes).
+    pub fn table_cache_bytes(&self) -> (usize, usize) {
+        self.inner.ctx.tables.byte_stats()
+    }
+
     /// Change the open-reader bound at runtime.
     pub fn set_max_open_readers(&self, n: usize) {
         self.inner.ctx.tables.set_max_open(n);
+    }
+
+    /// Change the open-reader **byte** budget at runtime; `0` disables it.
+    /// Lowering it evicts immediately.
+    pub fn set_max_open_reader_bytes(&self, n: usize) {
+        self.inner.ctx.tables.set_max_bytes(n);
     }
 
     pub fn list_column_families(&self) -> Vec<String> {

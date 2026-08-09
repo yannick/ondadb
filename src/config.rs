@@ -158,7 +158,34 @@ pub struct Options {
     /// tables, 12 GB at twenty-five and still going. Closing a reader costs a
     /// re-open and cannot change an answer, so this bounds memory by count
     /// rather than by corpus size. There is no "unlimited" value.
+    ///
+    /// A count alone is not the real constraint — see
+    /// [`max_open_reader_bytes`](Self::max_open_reader_bytes), which bounds the
+    /// same memory in the unit an operator actually has.
     pub max_open_readers: usize,
+    /// Maximum **resident bytes** (block index + bloom) across open SSTable
+    /// readers. `0` disables the byte bound; default 1 GiB.
+    ///
+    /// [`max_open_readers`](Self::max_open_readers) assumes readers cost roughly
+    /// the same, and they do not: per-reader cost scales with the table's key
+    /// count. Measured on spada's staging cluster (2026-08-09) it varied about
+    /// **30x with segment size alone** — under a megabyte per reader at
+    /// 256-document segments, about 20 MB at 8192-document segments. The count
+    /// stayed at spada's configured 4096; the memory it implied went from a few
+    /// hundred megabytes to roughly 10 GiB, and nodes OOMed repeatedly. Nothing
+    /// in the count expressed that, because the count is not the constraint —
+    /// bytes are.
+    ///
+    /// Both bounds are enforced: the cache evicts least-recently-used readers
+    /// until the open count is within `max_open_readers` **and** their resident
+    /// bytes are within this. Setting either to `0`/unlimited leaves the other
+    /// in force. Read the occupancy back with
+    /// [`DB::table_cache_bytes`](crate::DB::table_cache_bytes).
+    ///
+    /// The bound covers what the cache holds. A reader being read right now is
+    /// kept alive by its caller past eviction, so peak memory is this budget
+    /// plus the concurrent in-flight readers.
+    pub max_open_reader_bytes: usize,
     pub max_open_sstables: usize,
     pub max_memory_usage: u64,
     pub read_only: bool,
@@ -354,6 +381,7 @@ impl Default for Options {
             log_level: LogLevel::None,
             block_cache_size: 64 << 20, // 64 MiB
             max_open_readers: crate::table_cache::DEFAULT_MAX_OPEN_READERS,
+            max_open_reader_bytes: crate::table_cache::DEFAULT_MAX_OPEN_READER_BYTES,
             max_open_sstables: 256,
             max_memory_usage: 0, // 0 => auto (≈75% system memory)
             read_only: false,
