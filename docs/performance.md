@@ -39,6 +39,8 @@ Read/scan path:
   block transition, not per entry.
 - CRC-once-per-block bitmap in `Reader` — N scanning threads don't re-verify
   the same immutable block N times.
+- CRC-once-per-vlog-frame set in `Reader` — the same rule for large values, on
+  both the mmap and buffered paths (see "Vlog reads" below).
 - `uvarint` single-byte inline fast path; mmap + `madvise(WillNeed)` prefault.
 
 Flush path:
@@ -140,6 +142,57 @@ Rules learned the hard way:
 
   **Existing SSTables keep their broken filters until rewritten** — the fix
   applies to newly written tables, and a full compaction migrates the rest.
+
+## Vlog reads: CRC-once, and why the values are not cached
+
+Large values (`>= klog_value_threshold`) live in the vlog, and every read of one
+used to re-checksum the whole stored payload — a klog data block was verified
+once per open reader, a vlog frame every single time. On a value big enough to
+matter that checksum is most of the read: CRC32-C runs at about 6.3 GB/s here,
+so a 5 MB value cost roughly 800 µs of pure re-verification per read, and
+spada's S-208 probe measured vlog reads at 6.96 GB/s against 11.3 GB/s for
+cached klog frames.
+
+`Reader::verify_vlog_frame` now checks a frame at most once per open reader.
+Repeat-read throughput, `tests/vlog_read_bench.rs`, same build with the arm
+selected at runtime, median of 3 runs, `--test-threads=1`:
+
+| | 400 KiB value | 5 MiB value |
+|---|---|---|
+| mmap (`unsafe-fastpath`), before | 6.97 GB/s | 6.52 GB/s |
+| mmap, **CRC-once** | **45.1 GB/s** (6.5×) | **47.3 GB/s** (7.2×) |
+| mmap, CRC-once + block cache | 30.8 GB/s | (above the cap — uncached) |
+| buffered `pread`, before | 4.85 GB/s | 3.87 GB/s |
+| buffered, **CRC-once** | **9.29 GB/s** (1.9×) | **6.47 GB/s** (1.7×) |
+| buffered, CRC-once + block cache | 29.0 GB/s (3.1×) | (above the cap — uncached) |
+
+**Vlog values are deliberately not put in the block cache.** The measurement is
+why, and it splits by path. On the mmap path caching is a **32% regression**
+(45.1 → 30.8 GB/s): the caller wants an owned `Vec`, so a cached value is
+memcpy'd out of an `Arc` instead of straight from the page-cache-resident
+mapping — the cache adds a copy and a shard lock and removes no work, because
+the bytes were already resident. That is the path spada compiles
+(`ondadb = { features = ["mmap-reads"] }`), and the path this was reported from.
+
+On the buffered path caching does win (3.1×), by skipping a `pread` — but it
+pays for that with the shared 64 MiB block-cache budget, at up to the per-value
+cap each, evicting roughly 256 klog blocks per MiB of value, to avoid re-reading
+bytes the OS page cache is already holding. Trading the index-and-hot-block
+cache for a second copy of the page cache is the wrong trade at the default
+size, so it is not made.
+
+The case that would genuinely change this is a **remote tier** (`s3`), where a
+miss is an HTTP GET rather than a page-cache hit and the arithmetic is not close.
+Vlog values on S3 tiers are re-fetched per read today; caching them is real
+future work, deliberately not done here because it cannot be measured on this
+machine (S3 tests need `ONDADB_S3_ENDPOINT`) and this repo does not ship
+unmeasured performance changes.
+
+Scope, honestly: this is once per *open reader*, not once per process — closing
+and re-opening a table re-verifies, which is the same guarantee the klog bitmap
+has always given. The first read of every frame still verifies, and a frame that
+fails verification is never marked, so corruption is reported on every read
+(`tests/sst.rs::corrupt_vlog_value_is_detected_on_every_read`).
 
 ## Open performance items
 

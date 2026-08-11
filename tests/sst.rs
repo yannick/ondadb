@@ -135,6 +135,111 @@ fn corrupt_vlog_value_is_detected() {
     );
 }
 
+/// A vlog frame's CRC is verified once per open reader, not once per read
+/// (`Reader::vlog_verified`). The mark must never turn a corrupt frame into a
+/// readable one, so a frame that fails has to keep failing — on every read, on
+/// every thread, for the life of the reader.
+#[test]
+fn corrupt_vlog_value_is_detected_on_every_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("vr.klog");
+    let klog = klog.to_str().unwrap();
+    let mut w = Writer::new(klog, opts(Compression::None, 4, 64, 1024)).unwrap();
+    let good = vec![b'G'; 8192];
+    let bad = vec![b'B'; 8192];
+    w.add(b"good", &good, 1, 0, false, false).unwrap();
+    w.add(b"zbad", &bad, 2, 0, false, false).unwrap();
+    w.finish().unwrap();
+
+    // Corrupt only the second frame; the first must stay readable.
+    let vlog = dir.path().join("vr.vlog");
+    let mut bytes = std::fs::read(&vlog).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xFF;
+    std::fs::write(&vlog, &bytes).unwrap();
+
+    let r = Reader::open(
+        klog,
+        LocalStorage::new(Arc::new(FileCache::new(16)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        43,
+        default_comparator(),
+    )
+    .unwrap();
+
+    for i in 0..5 {
+        let res = r.get(b"zbad", u64::MAX, 0);
+        assert!(
+            res.is_err(),
+            "read {i} of a corrupt frame succeeded: {res:?}"
+        );
+        let (v, _, found, _) = r.get(b"good", u64::MAX, 0).unwrap();
+        assert!(found && v.as_deref() == Some(good.as_slice()), "read {i}");
+    }
+
+    // Same from several threads at once: the failing frame must never be
+    // marked verified by a racing reader of the frame beside it.
+    let r = Arc::new(r);
+    let good = Arc::new(good);
+    let mut hs = Vec::new();
+    for _ in 0..4 {
+        let (r, good) = (r.clone(), good.clone());
+        hs.push(std::thread::spawn(move || {
+            for _ in 0..200 {
+                assert!(r.get(b"zbad", u64::MAX, 0).is_err());
+                let (v, _, found, _) = r.get(b"good", u64::MAX, 0).unwrap();
+                assert!(found && v.as_deref() == Some(good.as_slice()));
+            }
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+}
+
+/// Repeat reads of vlog values must return identical bytes whether or not the
+/// frame's checksum is recomputed — including the compressed frame layout,
+/// where skipping the CRC must not skip the decompression length checks.
+#[test]
+fn vlog_values_stable_across_repeat_reads() {
+    for alg in [Compression::None, Compression::Snappy, Compression::Zstd] {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("vs.klog");
+        let klog = klog.to_str().unwrap();
+        let mut w = Writer::new(klog, opts(alg, 8, 64, 1024)).unwrap();
+        let vals: Vec<Vec<u8>> = (0..8u8)
+            .map(|i| (0..9000u32).map(|j| (j as u8) ^ i).collect())
+            .collect();
+        for (i, v) in vals.iter().enumerate() {
+            w.add(
+                format!("k{i}").as_bytes(),
+                v,
+                (i + 1) as u64,
+                0,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+        let r = Reader::open(
+            klog,
+            LocalStorage::new(Arc::new(FileCache::new(16)), cfg!(feature = "mmap-reads")),
+            Arc::new(BlockCache::new(1 << 20)),
+            44,
+            default_comparator(),
+        )
+        .unwrap();
+        for round in 0..4 {
+            for (i, want) in vals.iter().enumerate() {
+                let (v, _, found, _) = r.get(format!("k{i}").as_bytes(), u64::MAX, 0).unwrap();
+                assert!(found, "{alg:?} round {round} key k{i} missing");
+                assert_eq!(v.as_ref(), Some(want), "{alg:?} round {round} key k{i}");
+            }
+        }
+    }
+}
+
 #[test]
 fn tombstone_and_mvcc() {
     let dir = tempfile::tempdir().unwrap();

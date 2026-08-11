@@ -15,7 +15,7 @@ use crate::comparator::ComparatorRef;
 use crate::compress::compress as do_compress;
 use crate::config::{compression_for_key, Compression, CompressionRule};
 use crate::encoding::{append_uvarint, checksum, put_u32, put_u64};
-use crate::error::Result;
+use crate::error::{OndaError, Result};
 
 /// Configuration for SSTable construction.
 #[derive(Clone)]
@@ -40,6 +40,28 @@ pub struct WriterOptions {
 
 /// Fan-out (entries per node) for the B+tree index.
 const BTREE_FANOUT: usize = 256;
+
+/// The stored (post-compression) payload length as it goes into a vlog frame
+/// header, or [`OndaError::TooLarge`] when it does not fit.
+///
+/// The header field is a `u32` (see [`VLOG_V2_HDR_LEN`] and `docs/formats.md`),
+/// so a 4 GiB payload written with an `as u32` cast would wrap to a small
+/// length: the frame's CRC would then cover bytes the reader never reads, the
+/// next frame's offset would point into this one's payload, and the table would
+/// be silently corrupt from the moment it was written. Refusing the write is
+/// the only outcome that keeps "every stored byte is checksummed" true.
+///
+/// The limit is on the *stored* bytes, not the caller's value: a value larger
+/// than 4 GiB that compresses below the limit is representable and accepted.
+fn vlog_stored_len(stored_len: usize) -> Result<u32> {
+    u32::try_from(stored_len).map_err(|_| {
+        OndaError::TooLarge(format!(
+            "vlog frame payload is {stored_len} bytes; the frame header stores \
+             it in a u32, so {} is the maximum",
+            u32::MAX
+        ))
+    })
+}
 
 impl std::fmt::Debug for WriterOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -292,11 +314,14 @@ impl Writer {
             }
         };
         let stored: &[u8] = payload.as_deref().unwrap_or(value);
+        // Refuse before writing anything: a truncated length field would
+        // corrupt this frame and every frame after it (see `vlog_stored_len`).
+        let stored_len = vlog_stored_len(stored.len())?;
         let off = self.vlog_off;
         let mut hdr = [0u8; VLOG_V2_HDR_LEN];
         put_u32(&mut hdr[0..4], checksum(stored));
         hdr[4] = used_alg as u8;
-        put_u32(&mut hdr[5..9], stored.len() as u32);
+        put_u32(&mut hdr[5..9], stored_len);
         let w = self.vlog.as_mut().unwrap();
         w.write_all(&hdr)?;
         w.write_all(stored)?;
@@ -577,6 +602,25 @@ mod tests {
     use crate::sst::Reader;
     use crate::storage::LocalStorage;
     use std::sync::Arc;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")] // a 32-bit usize cannot exceed the field
+    fn vlog_stored_len_refuses_above_u32() {
+        // Exercised through the length check rather than a 4 GiB value: the
+        // guard is factored out precisely so this costs nothing to test.
+        assert_eq!(vlog_stored_len(0).unwrap(), 0);
+        assert_eq!(
+            vlog_stored_len(u32::MAX as usize).unwrap(),
+            u32::MAX,
+            "a payload of exactly u32::MAX still fits the header field"
+        );
+        let e = vlog_stored_len(u32::MAX as usize + 1).expect_err("must refuse");
+        assert_eq!(e.kind(), "too_large", "got {e:?}");
+        assert!(
+            e.to_string().contains("4294967295"),
+            "the error should name the limit: {e}"
+        );
+    }
 
     #[test]
     fn separator_properties() {

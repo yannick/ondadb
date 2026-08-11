@@ -88,14 +88,31 @@ block's **last** `(user_key, seq)`.
 
 ### vlog layout
 
-Concatenated per-value frames, addressed by `vlog_off` (frame start):
+Concatenated per-value frames, addressed by `vlog_off` (frame start). Two frame
+layouts exist; which one a table uses is a footer flag (`FOOTER_VLOG_V2`), not a
+per-frame tag:
 
 ```
-[crc32c(value) u32][value bytes]        (VLOG_CRC_LEN = 4)
+v1: [crc32c(value) u32][value bytes]                        (VLOG_CRC_LEN = 4)
+v2: [crc32c(stored) u32][alg u8][stored_len u32][stored]    (VLOG_V2_HDR_LEN = 9)
 ```
 
-The CRC is verified on every read (`Reader::read_vlog_into`), both file and
-mmap paths. Older builds wrote unframed vlogs — no migration exists.
+In v2 the payload is the value compressed with `alg`, or the raw value with
+`alg = None` when compression would not shrink it — so **the stored length never
+exceeds the logical value length** (`val_len` in the klog entry), and a frame
+claiming otherwise is corrupt. `stored_len` is a `u32`: the writer refuses a
+value whose stored form reaches 4 GiB (`OndaError::TooLarge`) rather than
+truncate the field, which would leave the CRC covering bytes no reader reads and
+the next frame's offset pointing inside this one.
+
+The CRC covers the stored bytes and is verified **once per frame per open
+reader** (`Reader::verify_vlog_frame`), on both the file and mmap paths — the
+same "immutable file, check it once" rule the klog's per-block `verified` bitmap
+uses, and the same limit: a frame is re-verified when the table is re-opened, not
+when it is re-read. A frame that fails is never marked, so corruption keeps being
+reported on every subsequent read.
+
+Older builds wrote unframed vlogs — no migration exists.
 
 ### Index
 

@@ -63,8 +63,10 @@ ratios between engines, not absolute numbers across sessions. See
 3. **WAL batch atomicity**: one frame per committed batch. Replay must never
    surface a partial batch (frame CRC covers the whole payload).
 4. **Every stored byte is checksummed**: WAL frames (CRC32-C), SSTable blocks
-   (CRC32-C, verified at least once per open reader), vlog values (per-value
-   CRC32-C prefix), manifest (whole-file CRC32-C). Adding a new persisted
+   (CRC32-C), vlog values (per-value CRC32-C prefix), manifest (whole-file
+   CRC32-C). Blocks and vlog frames are verified **at least once per open
+   reader** — never fewer (the first read always checks, and a frame that fails
+   is never marked verified), and re-verified on re-open. Adding a new persisted
    structure without a checksum is a regression.
 5. **Sequence visibility is gap-free**: readers only see `visible_seq()`;
    `publish_range` advances it only when every lower range has completed. Never

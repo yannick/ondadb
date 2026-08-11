@@ -1,6 +1,7 @@
 //! SSTable reader: point lookups and ordered iteration over a finished SSTable.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+use std::sync::{Arc, OnceLock};
 
 use super::{
     cmp_internal, decode_entry, vlog_path_for, Block, BlockHandle, IndexEntry, SstIterator,
@@ -39,6 +40,32 @@ pub struct Reader {
     /// ([`FOOTER_VLOG_V2`]).
     vlog_v2: bool,
 
+    /// Vlog frames whose CRC this reader has already verified, as a bounded
+    /// direct-mapped set of frame offsets ([`VLOG_SLOT_EMPTY`] = free slot).
+    /// Same reasoning as the klog `verified` bitmap below — the file is
+    /// immutable, so a frame only needs checking on its first read — but it
+    /// cannot use the same representation: a data block has a dense small id
+    /// (its index position), whereas a vlog frame is addressed only by byte
+    /// offset and frames are variable-length (a value just over
+    /// `klog_value_threshold` is tens of bytes; a document is megabytes), so
+    /// there is no frame count to size a bitmap from and no byte granule
+    /// smaller than every frame. Storing the offsets bounds it instead: a
+    /// collision costs a re-verification, never a false "verified", because a
+    /// slot holds the offset it verified and only an exact match skips the
+    /// checksum.
+    ///
+    /// Unlike the klog bitmap this covers the buffered `pread` path too: that
+    /// path re-reads and re-verifies on every get, while the non-mmap klog path
+    /// caches the decompressed block and so never re-verifies anyway.
+    ///
+    /// Allocated on the first vlog read, so tables without large values — and
+    /// tables whose large values are never touched — pay nothing. Per-reader
+    /// resident bytes are the dominant memory term at scale (see
+    /// [`resident_bytes`](Self::resident_bytes)); the 8 KiB this costs a reader
+    /// that does touch its vlog is *not* counted there, which reports what is
+    /// loaded eagerly at open.
+    vlog_verified: OnceLock<Box<[AtomicU64]>>,
+
     #[cfg(feature = "mmap-reads")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
     #[cfg(feature = "mmap-reads")]
@@ -63,6 +90,17 @@ impl std::fmt::Debug for Reader {
 fn corrupt() -> OndaError {
     OndaError::Corruption("sst: corruption detected".into())
 }
+
+/// Slots in a reader's vlog CRC-verified set (see `Reader::vlog_verified`).
+/// Power of two so the index is a mask. 1024 slots is 8 KiB per reader that
+/// touches its vlog, and covers every frame of a default-target (64 MiB)
+/// table whose values are 64 KiB or larger; smaller values collide sooner,
+/// which only means re-verifying a cheaper checksum.
+const VLOG_VERIFIED_SLOTS: usize = 1024;
+
+/// Sentinel for a slot that has verified nothing. No frame can start at
+/// `u64::MAX` — the offset is a position in a file.
+const VLOG_SLOT_EMPTY: u64 = u64::MAX;
 
 /// A data block borrowed for the duration of one point read: either an owned
 /// (cached/decompressed) block or, under `mmap-reads`, a plain slice into
@@ -142,6 +180,7 @@ impl Reader {
             bloom: None,
             has_restarts: false,
             vlog_v2: false,
+            vlog_verified: OnceLock::new(),
             #[cfg(feature = "mmap-reads")]
             klog_mmap: None,
             #[cfg(feature = "mmap-reads")]
@@ -358,7 +397,6 @@ impl Reader {
 
         #[cfg(feature = "mmap-reads")]
         if let Some(mmap) = &self.klog_mmap {
-            use std::sync::atomic::Ordering as AtOrd;
             let start = h.offset as usize;
             let end = start + h.length as usize;
             // Verify each block's CRC exactly once per open reader (the file is
@@ -410,7 +448,6 @@ impl Reader {
     pub(crate) fn read_data_block_local(&self, i: usize) -> Result<BlockRef<'_>> {
         #[cfg(feature = "mmap-reads")]
         if let Some(mmap) = &self.klog_mmap {
-            use std::sync::atomic::Ordering as AtOrd;
             let h = self.index[i].handle;
             let start = h.offset as usize;
             let end = start + h.length as usize;
@@ -564,6 +601,42 @@ impl Reader {
         Ok((None, 0, false, false))
     }
 
+    /// The slot that can hold "the frame at `off` is verified", allocating the
+    /// set on first use.
+    fn vlog_verified_slot(&self, off: u64) -> &AtomicU64 {
+        let table = self.vlog_verified.get_or_init(|| {
+            (0..VLOG_VERIFIED_SLOTS)
+                .map(|_| AtomicU64::new(VLOG_SLOT_EMPTY))
+                .collect()
+        });
+        // Fibonacci hash: consecutive frames are strided by the value size, so
+        // the low bits alone would cluster for any regular value size.
+        let i =
+            (off.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (VLOG_VERIFIED_SLOTS - 1);
+        &table[i]
+    }
+
+    /// Check the frame at `off` against its stored CRC, at most once per frame
+    /// per open reader.
+    ///
+    /// The mark is published only after a checksum *passes*, so a frame that
+    /// fails is never recorded as verified and every later read re-checks it
+    /// (and fails again). A racing pair of readers either both verify — the
+    /// stores are identical — or one sees the other's mark; a `u64` store
+    /// cannot tear, so no reader ever observes a half-written offset.
+    #[inline]
+    fn verify_vlog_frame(&self, off: u64, payload: &[u8], want: u32) -> Result<()> {
+        let slot = self.vlog_verified_slot(off);
+        if slot.load(AtOrd::Acquire) == off {
+            return Ok(());
+        }
+        if checksum(payload) != want {
+            return Err(corrupt());
+        }
+        slot.store(off, AtOrd::Release);
+        Ok(())
+    }
+
     pub(crate) fn read_vlog(&self, off: u64, length: u64) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(length as usize);
         self.read_vlog_into(off, length, &mut buf)?;
@@ -587,9 +660,7 @@ impl Reader {
                     let e = s + VLOG_V2_HDR_LEN + comp_len;
                     if e <= mmap.len() {
                         let payload = &mmap[s + VLOG_V2_HDR_LEN..e];
-                        if checksum(payload) != want {
-                            return Err(corrupt());
-                        }
+                        self.verify_vlog_frame(off, payload, want)?;
                         if alg == Compression::None {
                             // Raw payload: zero extra work beyond the copy out.
                             if payload.len() != len {
@@ -611,9 +682,7 @@ impl Reader {
                 if e <= mmap.len() {
                     let want = read_u32(&mmap[s..s + VLOG_CRC_LEN]);
                     let val = &mmap[s + VLOG_CRC_LEN..e];
-                    if checksum(val) != want {
-                        return Err(corrupt());
-                    }
+                    self.verify_vlog_frame(off, val, want)?;
                     out.extend_from_slice(val);
                     return Ok(());
                 }
@@ -626,11 +695,20 @@ impl Reader {
             let want = read_u32(&hdr[0..4]);
             let alg = Compression::from_u8(hdr[4]).ok_or_else(corrupt)?;
             let comp_len = read_u32(&hdr[5..9]) as usize;
-            let mut payload = vec![0u8; comp_len];
-            f.read_exact_at(&mut payload, off + VLOG_V2_HDR_LEN as u64)?;
-            if checksum(&payload) != want {
+            // Bound the allocation before making it. A corrupt header can name
+            // any length up to 4 GiB, and `read_exact_at` would only discover
+            // that after the buffer was allocated and zeroed. The stored
+            // payload is never larger than the logical value: the writer keeps
+            // a compressed payload only when it is strictly smaller, and stores
+            // the value raw otherwise — so `comp_len > len` is corruption, and
+            // checking it costs nothing (a `size()` call would be a network
+            // round trip on a remote tier).
+            if comp_len > len {
                 return Err(corrupt());
             }
+            let mut payload = vec![0u8; comp_len];
+            f.read_exact_at(&mut payload, off + VLOG_V2_HDR_LEN as u64)?;
+            self.verify_vlog_frame(off, &payload, want)?;
             if alg == Compression::None {
                 if payload.len() != len {
                     return Err(corrupt());
@@ -651,9 +729,9 @@ impl Reader {
         let start = out.len();
         out.resize(start + len, 0);
         f.read_exact_at(&mut out[start..], off + VLOG_CRC_LEN as u64)?;
-        if checksum(&out[start..]) != want {
+        if let Err(e) = self.verify_vlog_frame(off, &out[start..], want) {
             out.truncate(start);
-            return Err(corrupt());
+            return Err(e);
         }
         Ok(())
     }

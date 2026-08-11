@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.7.7
+
+**Large values were re-checksummed on every read, and a 4 GiB one was written
+corrupt.** Two vlog defects, one performance and one silent-corruption.
+
+- **A vlog frame's CRC is now verified once per open reader, not once per
+  read.** A klog data block has had CRC-once semantics for a while; a vlog frame
+  never did, so every read of a large value re-checksummed the entire stored
+  payload. That checksum is most of the read: CRC32-C runs at ~6.3 GB/s on the
+  baseline machine, so a 5 MB value spent ~800 µs per read re-verifying bytes it
+  had already verified. Measured repeat-read throughput (median of 3, same
+  build, `tests/vlog_read_bench.rs`): with mmap reads **6.97 → 45.1 GB/s** at
+  400 KiB and **6.52 → 47.3 GB/s** at 5 MiB; on the buffered `pread` path
+  **4.85 → 9.29** and **3.87 → 6.47 GB/s**. Unlike the klog bitmap this covers
+  both paths.
+
+  Semantics are unchanged in the direction that matters: the first read of every
+  frame verifies, a frame that fails verification is never marked, and re-opening
+  the table re-verifies. The mark is a bounded direct-mapped set of frame offsets
+  (8 KiB, allocated on a reader's first vlog read), not a bitmap — a vlog frame
+  has no dense index to number bits by, and a collision costs a re-verification
+  rather than a skipped one.
+
+- **Vlog values are still not cached in the block cache**, now on purpose and on
+  evidence: caching them measured a **32% regression** on the mmap path (the
+  value gets memcpy'd out of an `Arc` instead of straight from the mapping) and a
+  3.1× win on the buffered path that is paid for by evicting ~256 klog blocks per
+  MiB of value to avoid re-reading what the OS page cache already holds. The full
+  table and the one case that would change the answer (remote `s3` tiers, where a
+  miss is an HTTP GET) are in `docs/performance.md`.
+
+- **A value whose stored form reached 4 GiB was silently truncated.** The frame
+  header stores the payload length in a `u32` and the writer cast to it, so a
+  ≥4 GiB stored payload wrapped to a small length: the CRC then covered bytes no
+  reader would read, and the following frame's offset pointed inside this one's
+  payload — a table corrupt from the moment it was written, with no error
+  anywhere. `Writer` now refuses such a value with `OndaError::TooLarge`. The
+  limit is on the stored (post-compression) bytes, so a larger value that
+  compresses under the limit is still accepted.
+
+- **The v2 frame layout is now documented** (`docs/formats.md` described only
+  v1), including the stored-length invariant. The reader enforces it: a v2 frame
+  whose header claims more stored bytes than the value's logical length is
+  rejected as corrupt instead of driving a blind allocation of up to 4 GiB.
+
 ## 0.7.5
 
 **The open-reader cache is now bounded in bytes, and bounded by default.**
