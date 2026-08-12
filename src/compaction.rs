@@ -67,7 +67,7 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
-        while let Some(level) = pick_level(cf) {
+        while let Some(level) = pick_level(db, cf) {
             compact_level(db, cf, level)?;
             cf.compaction_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -105,18 +105,57 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     res
 }
 
+/// A table mounted from another database's publication
+/// (`attach_part_by_ref`): its shared-tier object name carries a FOREIGN
+/// instance nonce. Such tables are read-only mounts — the sharer must never
+/// rewrite bytes it did not publish (`SPADINO-A2.md`'s safety argument; the
+/// original "and cannot" claim missed local re-materialization by
+/// background compaction, which silently rebuilt whole mounted parts as
+/// local tables). They are excluded from compaction triggers and inputs.
+fn is_foreign_mount(db: &DbInner, meta: &crate::manifest::SstMeta) -> bool {
+    let Some(object) = &meta.object else {
+        return false;
+    };
+    // Object names are `cf-{cf}/{nonce:016x}-{id}.klog`; the nonce is the
+    // 16-hex prefix of the final path component.
+    let stem = object.rsplit('/').next().unwrap_or(object);
+    let Some((hex, _)) = stem.split_once('-') else {
+        return true; // unparseable foreign-shaped name: treat as mounted
+    };
+    let Ok(nonce) = u64::from_str_radix(hex, 16) else {
+        return true;
+    };
+    match *db.instance_nonce.lock() {
+        Some(own) => nonce != own,
+        // No nonce minted: this database never published to a shared tier,
+        // so ANY object-named table was mounted from elsewhere.
+        None => true,
+    }
+}
+
 /// Choose a level to compact, or `None` if nothing is triggered.
-fn pick_level(cf: &Arc<ColumnFamily>) -> Option<usize> {
+///
+/// Foreign mounts are invisible to the triggers: a level full of mounted
+/// tables must not re-trigger a compaction that would then exclude them all
+/// (a busy loop), and their bytes are another publisher's, not this
+/// database's write debt.
+fn pick_level(db: &DbInner, cf: &Arc<ColumnFamily>) -> Option<usize> {
     let trigger = cf.opts.l1_file_count_trigger as usize;
     let ratio = cf.opts.level_size_ratio.max(2);
     let wbs = cf.opts.write_buffer_size as u64;
     cf.with_levels(|levels| {
-        if levels[0].len() >= trigger {
+        if levels[0]
+            .iter()
+            .filter(|t| !is_foreign_mount(db, &t.meta))
+            .count()
+            >= trigger
+        {
             return Some(0);
         }
         for (i, lvl) in levels.iter().enumerate().skip(1) {
             let bytes: u64 = lvl
                 .iter()
+                .filter(|t| !is_foreign_mount(db, &t.meta))
                 .map(|t| t.meta.klog_size + t.meta.vlog_size)
                 .sum();
             let cap = wbs.saturating_mul(ratio.saturating_pow(i as u32 - 1));
@@ -155,11 +194,25 @@ fn compact_into(
     // live state inside `update_levels` below, as `levels[target]` minus the
     // inputs — which is the same set, plus concurrent arrivals.
     let (inputs, num_levels): (Vec<Arc<SstHandle>>, usize) = cf.with_levels(|levels| {
-        let mut inputs: Vec<Arc<SstHandle>> = levels[level].clone();
+        // Foreign mounts (attach_part_by_ref) never compact: not as the
+        // level's own inputs, and a push-down that would overlap one in the
+        // target is skipped whole — merging around a read-only mount would
+        // leave overlapping tables in one level.
+        let mut inputs: Vec<Arc<SstHandle>> = levels[level]
+            .iter()
+            .filter(|t| !is_foreign_mount(db, &t.meta))
+            .cloned()
+            .collect();
+        if inputs.is_empty() {
+            return (Vec::new(), levels.len());
+        }
         let (min_key, max_key) = key_span(&inputs, &cmp);
         if target != level && target < levels.len() {
             for th in &levels[target] {
                 if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, &min_key, &max_key) {
+                    if is_foreign_mount(db, &th.meta) {
+                        return (Vec::new(), levels.len());
+                    }
                     inputs.push(th.clone());
                 }
             }

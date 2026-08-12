@@ -334,3 +334,71 @@ fn attach_by_ref_mounts_from_s3() {
         "S3 mount must copy nothing local"
     );
 }
+
+/// The sharer must never rewrite mounted bytes: background/manual compaction
+/// skips foreign mounts entirely (the `SPADINO-A2.md` safety argument made
+/// executable — before this guard, four attached tables tripped the L0
+/// file-count trigger and compaction silently re-materialized the whole part
+/// as a local table).
+#[test]
+fn a_sharer_never_compacts_mounted_parts() {
+    let shared = tempfile::tempdir().unwrap();
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+    let root = shared.path().to_str().unwrap();
+
+    // Publisher: four parts, each published separately so the sharer mounts
+    // four distinct table sets (enough to trip l1_file_count_trigger = 1).
+    let db1 = open_with_shared(d1.path().to_str().unwrap(), root);
+    let mut cfg = shared_cfg();
+    cfg.partition_rules = (0..4)
+        .map(|p| PartitionRule {
+            prefix: format!("p{p}/").into_bytes(),
+            name: format!("p{p}"),
+        })
+        .collect();
+    let cf1 = db1.create_column_family("default", cfg.clone()).unwrap();
+    let mut parts = Vec::new();
+    for p in 0..4 {
+        for i in 0..8u32 {
+            db1.put(
+                &cf1,
+                format!("p{p}/{i:03}").as_bytes(),
+                b"VAL",
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
+        db1.flush_memtable(&cf1).unwrap();
+        db1.compact(&cf1).unwrap();
+        db1.move_part_to_tier(&cf1, &format!("p{p}"), "cas")
+            .unwrap();
+        parts.push(db1.export_part(&cf1, &format!("p{p}")).unwrap());
+    }
+
+    // Sharer mounts all four, then compacts explicitly.
+    let db2 = open_with_shared(d2.path().to_str().unwrap(), root);
+    let cf2 = db2.create_column_family("default", cfg).unwrap();
+    for part in &parts {
+        db2.attach_part_by_ref(&cf2, part, "cas").unwrap();
+    }
+    let shared_before = sst_files_under(shared.path());
+    db2.compact(&cf2).unwrap();
+
+    assert!(
+        sst_files_under(d2.path()).is_empty(),
+        "compaction must not re-materialize mounted parts locally"
+    );
+    assert_eq!(
+        sst_files_under(shared.path()),
+        shared_before,
+        "mounted objects untouched"
+    );
+    for p in 0..4 {
+        assert_eq!(
+            db2.get(&cf2, format!("p{p}/000").as_bytes()).unwrap(),
+            b"VAL",
+            "mounted reads survive the compaction pass"
+        );
+    }
+}
