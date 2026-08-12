@@ -49,7 +49,12 @@ flate2 = "1.0"
 rust-ini = "0.21"
 sha2 = "0.10"
 hmac = "0.12"
-rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tokio-rustls-tls"] }
+# tokio-native-tls, NOT tokio-rustls-tls: rustls' native-roots loader panics
+# (`InvalidCertificate(BadEncoding)`) when the host trust store holds a cert
+# it cannot parse — hit live on a macOS build host with a plain-HTTP MinIO
+# endpoint, where TLS should not even be needed. The platform TLS stack
+# tolerates its own store.
+rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tags", "use-tokio-native-tls", "fail-on-err"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 memmap2 = { version = "0.9", optional = true }
 smallvec = "1.15.2"
