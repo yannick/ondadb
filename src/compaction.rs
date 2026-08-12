@@ -453,9 +453,7 @@ fn compact_into(
                     levels.iter().flatten().map(|t| t.meta.id).collect();
                 let after: std::collections::HashSet<u64> =
                     out.iter().flatten().map(|t| t.meta.id).collect();
-                before
-                    .difference(&after)
-                    .all(|id| input_ids.contains(id))
+                before.difference(&after).all(|id| input_ids.contains(id))
             },
             "compaction dropped a table that was not one of its inputs — that \
              is committed data becoming unreachable (level={level} target={target})"

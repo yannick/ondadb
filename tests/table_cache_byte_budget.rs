@@ -168,7 +168,10 @@ fn the_count_bound_binds_independently_of_the_byte_budget() {
         "{open} readers open with max_open_readers = {MAX_OPEN} and no byte \
          bound — adding the byte budget must not have weakened the count bound"
     );
-    assert!(closes > 0, "no reader was ever closed; the bound never engaged");
+    assert!(
+        closes > 0,
+        "no reader was ever closed; the bound never engaged"
+    );
     db.close().expect("close");
 }
 
@@ -229,7 +232,10 @@ fn the_byte_occupancy_is_visible_and_agrees_with_the_breakdown() {
          breakdown ({resident}) — index={index} bloom={bloom} \
          readers={readers} entries={entries}"
     );
-    assert!(bytes > 0, "no resident bytes reported for {readers} readers");
+    assert!(
+        bytes > 0,
+        "no resident bytes reported for {readers} readers"
+    );
 
     // And it must fall when readers are evicted, not merely exist.
     db.set_max_open_readers(3);

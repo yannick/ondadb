@@ -442,6 +442,53 @@ the object durable (it runs *before* the manifest flip that publishes it);
 `delete` of a missing object must succeed; implementations must be
 `Send + Sync` — engine threads call concurrently.
 
+## Shared tiers & attach-by-reference (A2, 0.8.0)
+
+`TierDef::shared()` declares a tier's root shared between databases, enabling
+the one-writer / many-read-only-sharers topology (`SPADINO-A2.md`):
+
+```rust,no_run
+# use ondadb::{ColumnFamilyConfig, Options, TierDef, DB};
+// Publisher and sharers all declare the SAME root, shared:
+let mut opts = Options::new("/data/onda-node2");
+opts.tiers = vec![TierDef::new("cas", "/mnt/shared/onda").shared()];
+let db2 = DB::open(opts)?;
+let cf2 = db2.create_column_family("default", ColumnFamilyConfig::default())?;
+
+// The publisher exported this after moving the part onto the shared tier:
+// let part = db1.export_part(&cf1, "img")?;   (tables now carry object names)
+# let part: ondadb::PartManifest = unimplemented!();
+db2.attach_part_by_ref(&cf2, &part, "cas")?;   // zero bytes copied
+# Ok::<(), ondadb::OndaError>(())
+```
+
+What `shared()` changes, precisely:
+
+- **Object naming.** A part move onto a shared tier names each file
+  `cf-{cf}/{instance:016x}-{id}.klog` relative to the tier root, where
+  `instance` is a per-database nonce minted once (persisted in the manifest).
+  Two databases sharing a root cannot collide. Moves onto non-shared tiers
+  keep the legacy `cf-{cf}/{id}.klog` path exactly.
+- **`attach_part_by_ref`** registers an exported part's tables under fresh
+  local ids that resolve to the shared objects. Footers/indexes/blooms are
+  CRC-verified through the tier's backend (bounded reads); the target adopts
+  the part's sequence lineage (fresh databases can mount anything). The block
+  cache stays collision-free: it keys on the per-process local id.
+- **Shared tiers are delete-free.** The mover will not move a part OFF a
+  shared tier, detach/freeze refuse shared publications, the startup orphan
+  sweep skips shared roots, and compaction's obsolete-input deletion never
+  touches them. Reclaiming shared objects belongs to the layer above (the
+  consumer's GC) — one sharer's hygiene must not be another's data loss.
+
+The safety argument is immutability: a shared part is produced by exactly one
+compaction in exactly one database and never appended. **Mutable sharing is
+unsupported.** A sharer that wants the data writable copies it in with the
+classic `attach_part` instead.
+
+Downgrade caveat: a manifest carrying object names (or the instance nonce) is
+refused by pre-A2 binaries (checksummed unknown tail → corruption error, fail
+stop). A database that never declares a shared tier never writes either tag.
+
 ## Operational notes
 
 **Durability model.** The commit point for every part/tier operation is the

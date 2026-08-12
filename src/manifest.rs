@@ -20,6 +20,8 @@ use crate::error::{OndaError, Result};
 const MAGIC: u32 = 0x5756_4D46; // "WVMF"
 const VERSION: u32 = 1;
 const WAL_LAYOUT_TAG: &[u8; 8] = b"ONDAWAL1";
+const OBJECT_TAG: &[u8; 8] = b"ONDAOBJ1";
+const INSTANCE_TAG: &[u8; 8] = b"ONDAINS1";
 
 /// WAL/memtable layout persisted for the whole database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,6 +66,14 @@ pub struct SstMeta {
     /// the age is unknown (a legacy manifest, or a table whose lineage never
     /// carried a timestamp); the mover treats an unknown age as ineligible.
     pub max_entry_time: Option<i64>,
+    /// Tier-root-relative path stem of this table's files on a **shared** tier
+    /// (A2): the klog lives at `{tier_root}/{object}.klog`. `None` for every
+    /// table on the default or a non-shared tier, and for all pre-A2 manifests
+    /// — those resolve by the legacy id-derived path. Set by a part move onto
+    /// a shared tier (`cf-{cf}/{instance:016x}-{id}`) or adopted verbatim by
+    /// [`attach_part_by_ref`](crate::DB::attach_part_by_ref), so the name a
+    /// table was published under never changes, whichever database reads it.
+    pub object: Option<String>,
 }
 
 /// Persisted state of one column family.
@@ -81,6 +91,13 @@ pub struct Manifest {
     pub global_seq: u64,
     pub cfs: Vec<CfManifest>,
     pub wal_layout: WalLayout,
+    /// Per-database nonce naming this instance's objects on shared tiers
+    /// (A2). Minted once, the first time a shared tier is configured, and
+    /// never changed afterwards: object names embed it, so a new nonce would
+    /// orphan every object the old one named. `None` until minted — a
+    /// database with no shared tier never mints one, keeping its manifest
+    /// readable by pre-A2 binaries.
+    pub instance_nonce: Option<u64>,
 }
 
 impl Default for Manifest {
@@ -90,6 +107,7 @@ impl Default for Manifest {
             global_seq: 0,
             cfs: Vec::new(),
             wal_layout: WalLayout::PerColumnFamily,
+            instance_nonce: None,
         }
     }
 }
@@ -190,14 +208,36 @@ impl Manifest {
             .iter()
             .any(|cf| cf.sstables.iter().any(|s| s.max_entry_time.is_some()));
         let has_layout = self.wal_layout == WalLayout::Unified;
-        if has_part || has_tier || has_time || has_layout {
+        let has_tagged = self
+            .cfs
+            .iter()
+            .any(|cf| cf.sstables.iter().any(|s| s.object.is_some()))
+            || self.instance_nonce.is_some();
+        if has_part || has_tier || has_time || has_layout || has_tagged {
             encode_name_section(&mut b, &self.cfs, |s| s.partition.as_deref());
         }
-        if has_tier || has_time || has_layout {
+        if has_tier || has_time || has_layout || has_tagged {
             encode_name_section(&mut b, &self.cfs, |s| s.tier.as_deref());
         }
-        if has_time || has_layout {
+        if has_time || has_layout || has_tagged {
             encode_u64_section(&mut b, &self.cfs, |s| s.max_entry_time.map(|t| t as u64));
+        }
+        // Tagged tail sections (fixed order, each self-identifying): objects,
+        // instance nonce, WAL layout. Tagged rather than positional so a
+        // manifest carrying none of them stays byte-identical to the legacy
+        // layout, and a pre-A2 binary meeting one fails the decode closed
+        // instead of misreading it.
+        let has_object = self
+            .cfs
+            .iter()
+            .any(|cf| cf.sstables.iter().any(|s| s.object.is_some()));
+        if has_object {
+            b.extend_from_slice(OBJECT_TAG);
+            encode_name_section(&mut b, &self.cfs, |s| s.object.as_deref());
+        }
+        if let Some(nonce) = self.instance_nonce {
+            b.extend_from_slice(INSTANCE_TAG);
+            append_u64(&mut b, nonce);
         }
         if has_layout {
             b.extend_from_slice(WAL_LAYOUT_TAG);
@@ -272,6 +312,7 @@ impl Manifest {
                     partition: None,
                     tier: None,
                     max_entry_time: None,
+                    object: None,
                 });
             }
             cfs.push(CfManifest {
@@ -286,6 +327,11 @@ impl Manifest {
         // section is only ever present when all earlier ones precede it, so this
         // fixed order is unambiguous. Older manifests stop short and leave the
         // corresponding fields `None`.
+        // The encoder emits ALL THREE positional sections whenever any tagged
+        // section follows (see `encode`), so the positional walk below can
+        // never mistake a tag for a section: tags only ever begin after the
+        // three positional sections were consumed, or in a manifest whose
+        // tail is empty.
         if !p.is_empty() {
             p = decode_name_section(p, &mut cfs, |sst, name| sst.partition = Some(name))?;
         }
@@ -294,6 +340,14 @@ impl Manifest {
         }
         if !p.is_empty() {
             p = decode_u64_section(p, &mut cfs, |sst, v| sst.max_entry_time = Some(v as i64))?;
+        }
+        if p.len() >= 8 && &p[..8] == OBJECT_TAG {
+            p = decode_name_section(&p[8..], &mut cfs, |sst, name| sst.object = Some(name))?;
+        }
+        let mut instance_nonce = None;
+        if p.len() >= 16 && &p[..8] == INSTANCE_TAG {
+            instance_nonce = Some(read_u64(&p[8..]));
+            p = &p[16..];
         }
         let wal_layout = if p.is_empty() {
             WalLayout::PerColumnFamily
@@ -310,6 +364,7 @@ impl Manifest {
             global_seq,
             cfs,
             wal_layout,
+            instance_nonce,
         })
     }
 }
@@ -426,6 +481,7 @@ mod tests {
             next_file_id: 42,
             global_seq: 99,
             wal_layout: WalLayout::PerColumnFamily,
+            instance_nonce: None,
             cfs: vec![CfManifest {
                 name: "default".into(),
                 config: vec![1, 2, 3, 4],
@@ -443,6 +499,7 @@ mod tests {
                         partition: None,
                         tier: None,
                         max_entry_time: None,
+                        object: None,
                     },
                     SstMeta {
                         id: 2,
@@ -457,6 +514,7 @@ mod tests {
                         partition: Some("img".into()),
                         tier: None,
                         max_entry_time: None,
+                        object: None,
                     },
                 ],
             }],
@@ -672,6 +730,54 @@ mod tests {
     /// incremental (edit-log) manifest; the test exists so the number is
     /// measured rather than estimated, and regressions are visible.
     #[test]
+    fn object_and_nonce_survive_round_trip() {
+        let mut m = sample();
+        m.instance_nonce = Some(0xdead_beef_cafe_f00d);
+        m.cfs[0].sstables[1].tier = Some("cas".into());
+        m.cfs[0].sstables[1].object = Some("cf-default/00c0ffee-7".into());
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(d.instance_nonce, Some(0xdead_beef_cafe_f00d));
+        assert_eq!(d.cfs[0].sstables[0].object, None);
+        assert_eq!(
+            d.cfs[0].sstables[1].object.as_deref(),
+            Some("cf-default/00c0ffee-7")
+        );
+        // the positional sections still round-trip beside the tags
+        assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
+        assert_eq!(d.cfs[0].sstables[1].tier.as_deref(), Some("cas"));
+    }
+
+    #[test]
+    fn manifest_without_objects_or_nonce_stays_pre_a2_byte_identical() {
+        // The A2 tags must not appear unless used: a database that never
+        // declares a shared tier keeps writing manifests a pre-A2 binary
+        // reads. Byte-level check: no tag magic anywhere in the encoding.
+        let enc = sample().encode();
+        for tag in [&b"ONDAOBJ1"[..], &b"ONDAINS1"[..]] {
+            assert!(
+                !enc.windows(tag.len()).any(|w| w == tag),
+                "unused A2 tag leaked into the manifest encoding"
+            );
+        }
+    }
+
+    #[test]
+    fn nonce_alone_round_trips_with_empty_positional_sections() {
+        // A nonce can be minted before anything is partitioned or tiered; the
+        // encoder then emits all-empty positional sections ahead of the tag
+        // (the invariant the positional decoder relies on).
+        let mut m = sample();
+        for s in &mut m.cfs[0].sstables {
+            s.partition = None;
+        }
+        m.instance_nonce = Some(7);
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(d.instance_nonce, Some(7));
+        assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+        assert!(d.cfs[0].sstables.iter().all(|s| s.object.is_none()));
+    }
+
+    #[test]
     #[ignore = "sizing probe, not a gate — run with --ignored --nocapture"]
     fn manifest_encoded_size_at_scale() {
         for n in [1_000usize, 10_000, 100_000] {
@@ -690,12 +796,14 @@ mod tests {
                     partition: Some(format!("tenant-{i:06}/2026-07")),
                     tier: Some("s3".to_string()),
                     max_entry_time: Some(1_700_000_000_000_000),
+                    object: None,
                 })
                 .collect();
             let m = Manifest {
                 next_file_id: n as u64,
                 global_seq: 1,
                 wal_layout: WalLayout::PerColumnFamily,
+                instance_nonce: None,
                 cfs: vec![CfManifest {
                     name: "t_post".into(),
                     config: Vec::new(),
