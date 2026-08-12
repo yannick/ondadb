@@ -1,6 +1,6 @@
 [package]
 name = "ondadb"
-version = "0.7.7"
+version = "0.7.8"
 edition = "2021"
 rust-version = "1.89" # std::fs::File advisory locking (DB LOCK file)
 license = "MPL-2.0"
@@ -49,16 +49,31 @@ flate2 = "1.0"
 rust-ini = "0.21"
 sha2 = "0.10"
 hmac = "0.12"
-# tokio-native-tls, NOT tokio-rustls-tls: rustls' native-roots loader panics
-# (`InvalidCertificate(BadEncoding)`) when the host trust store holds a cert
-# it cannot parse — hit live on a macOS build host with a plain-HTTP MinIO
-# endpoint, where TLS should not even be needed. The platform TLS stack
-# tolerates its own store.
-rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tags", "use-tokio-native-tls", "fail-on-err"] }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 memmap2 = { version = "0.9", optional = true }
 smallvec = "1.15.2"
 libc = "0.2.189"
+
+# rust-s3's TLS backend is TARGET-CONDITIONAL:
+#
+#   * macOS: native-tls (Security.framework). rustls' native-roots loader
+#     panics (`InvalidCertificate(BadEncoding)`) when the keychain holds a
+#     cert it cannot parse — hit live on a macOS build host against a
+#     plain-HTTP MinIO endpoint, where TLS should not even engage. The
+#     platform stack tolerates its own store.
+#   * everything else (Linux incl. musl): rustls. No system TLS library, so
+#     static FROM-scratch container binaries link clean — the flavor spada's
+#     musl CI images shipped all along. /etc/ssl/certs/ca-certificates.crt
+#     must be present in the image for httpS endpoints (the CI packaging
+#     copies it in).
+#
+# Same optional flag on both tables, so `s3 = ["dep:rust-s3", ...]` activates
+# whichever table matches the target.
+[target.'cfg(target_os = "macos")'.dependencies]
+rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tags", "use-tokio-native-tls", "fail-on-err"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rust-s3 = { version = "0.35", optional = true, default-features = false, features = ["tags", "tokio-rustls-tls", "fail-on-err"] }
 
 [dev-dependencies]
 tempfile = "3"
