@@ -10,9 +10,9 @@
 //! conflict with itself, surfacing as a fail-stop ~40 minutes into real
 //! ingest. `begin` now waits out the transient publication gap.
 
-use ondadb::{ColumnFamilyConfig, DB, IsolationLevel, Options};
-use std::sync::Arc;
+use ondadb::{ColumnFamilyConfig, IsolationLevel, Options, DB};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[test]
 fn serial_snapshot_rewrites_survive_a_slow_concurrent_committer() {

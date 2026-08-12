@@ -77,6 +77,11 @@ pub struct DbInner {
     manifest_mu: Mutex<()>,
     /// Durable database-wide WAL layout written by `persist_manifest`.
     wal_layout: Mutex<WalLayout>,
+    /// Per-database nonce naming this instance's objects on shared tiers
+    /// (A2, `SPADINO-A2.md`). Minted at open when a shared tier is configured
+    /// and no nonce is recorded yet; `None` otherwise. Never re-minted:
+    /// object names embed it.
+    pub(crate) instance_nonce: Mutex<Option<u64>>,
 
     /// Count of successful manifest persists over this DB's lifetime. Cheap
     /// (a single relaxed increment on an already fsync-bound path); exists so
@@ -199,9 +204,7 @@ impl DbInner {
             return;
         }
         let start = std::time::Instant::now();
-        while self.visible_seq() < floor
-            && start.elapsed() < std::time::Duration::from_secs(1)
-        {
+        while self.visible_seq() < floor && start.elapsed() < std::time::Duration::from_secs(1) {
             std::thread::yield_now();
         }
     }
@@ -255,7 +258,7 @@ impl DbInner {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn observe_seq(&self, seq: u64) {
+    pub(crate) fn observe_seq(&self, seq: u64) {
         if seq == 0 {
             return;
         }
@@ -294,6 +297,7 @@ impl DbInner {
             global_seq: self.visible_seq(),
             cfs: Vec::new(),
             wal_layout: *self.wal_layout.lock(),
+            instance_nonce: self.instance_nonce.lock().to_owned(),
         };
         for cf in cfs.values() {
             m.cfs.push(CfManifest {
@@ -512,6 +516,7 @@ impl DB {
             pending_flush,
             manifest_mu: Mutex::new(()),
             wal_layout: Mutex::new(requested_layout),
+            instance_nonce: Mutex::new(manifest.instance_nonce),
             manifest_persists: AtomicU64::new(0),
             file_deletion: Mutex::new(FileDeletionState::default()),
             workers: Mutex::new(Vec::new()),
@@ -565,11 +570,24 @@ impl DB {
         }
 
         if !opts.read_only {
+            // Mint the instance nonce the first time a shared tier is
+            // configured (A2). Persisted immediately so a crash between the
+            // first shared-tier move and the next manifest write cannot mint
+            // a second nonce and orphan the first name. A database with no
+            // shared tier never mints one, keeping its manifest readable by
+            // pre-A2 binaries.
+            let has_shared = inner.opts.tiers.iter().any(|t| t.shared);
+            if has_shared && inner.instance_nonce.lock().is_none() {
+                *inner.instance_nonce.lock() = Some(mint_instance_nonce(&inner.dir));
+                inner.persist_manifest()?;
+            }
             // Sweep tier-move orphans left by a crash mid-move (a copy on the
             // target before the manifest flip, or a source after it). The
             // manifest — now recovered — is the single source of truth for where
             // each table lives; anything else is deleted. Runs before workers so
-            // no background move races the sweep.
+            // no background move races the sweep. Shared tiers are exempt: their
+            // objects may be referenced by other databases, and this engine
+            // never deletes on a shared tier (SPADINO-A2.md).
             sweep_move_orphans(&inner, &manifest);
             spawn_workers(&inner, flush_rx, compact_rx);
         }
@@ -930,12 +948,34 @@ impl DB {
 /// delete exactly those. Files whose id the manifest does not know (in-flight
 /// flush/compaction output, WALs) are left untouched; correctly-placed files
 /// match and are kept.
+/// Mint the per-database instance nonce (A2): 8 bytes of SHA-256 over the
+/// database path, the wall clock, and the pid. Not a cryptographic identity —
+/// a collision needs two databases minting in the same nanosecond with the
+/// same path and pid — but unique enough that object names never collide
+/// under a shared tier root, which is all it exists for.
+fn mint_instance_nonce(dir: &str) -> u64 {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(dir.as_bytes());
+    h.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_be_bytes())
+            .unwrap_or([0u8; 16]),
+    );
+    h.update(std::process::id().to_be_bytes());
+    let out = h.finalize();
+    u64::from_be_bytes(out[..8].try_into().expect("sha256 yields 32 bytes"))
+}
+
 fn sweep_move_orphans(inner: &Arc<DbInner>, manifest: &Manifest) {
     // Candidate tier locations: the default tier (`None`) plus every configured
     // named tier (the reserved "ssd" name aliases the default).
     let mut locations: Vec<Option<String>> = vec![None];
     for t in &inner.opts.tiers {
-        if t.name != "ssd" {
+        // Never sweep a shared tier: its objects may belong to another
+        // database whose ids coincide with ours (SPADINO-A2.md).
+        if t.name != "ssd" && !t.shared {
             locations.push(Some(t.name.clone()));
         }
     }

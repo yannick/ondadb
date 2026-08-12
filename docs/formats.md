@@ -264,3 +264,20 @@ Same WAL format; file names `unified-wal-<gen>.log[.sN]`; record keys carry an
 8-byte big-endian CF-id prefix (`cf_id = fnv64(cf_name)`). Split flush strips
 the prefix and re-sorts each CF's slice with that CF's comparator. The manifest
 tag above prevents reopening a non-empty database under a different WAL layout.
+
+## A2 tail tags (0.8.0)
+
+Two tagged manifest-tail sections follow the positional
+(partition/tier/max-entry-time) sections, in fixed order, each self-identifying
+by an 8-byte magic (the `ONDAWAL1` precedent):
+
+- `ONDAOBJ1` — per-CF `(count, (table_index, object)...)` name section: the
+  tier-root-relative object path of each shared-tier table
+  (`SstMeta::object`). Emitted only when some table carries one.
+- `ONDAINS1` — 8-byte per-database instance nonce naming this database's
+  objects on shared tiers. Emitted once minted.
+
+When any tagged section is present the encoder emits ALL positional sections
+first (possibly all-empty), which is what lets the positional decoder consume
+greedily without misreading a tag. Manifests carrying neither tag are
+byte-identical to pre-A2 encodings.

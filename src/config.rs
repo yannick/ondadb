@@ -252,6 +252,15 @@ pub struct TierDef {
     /// `pread` path plus the block cache (which matters more there). Defaults to
     /// `true` via [`TierDef::new`]. An S3 tier is always `false`.
     pub supports_mmap: bool,
+    /// Whether this tier's root is SHARED between databases (A2,
+    /// `SPADINO-A2.md`). On a shared tier: part moves name their objects
+    /// `cf-{cf}/{instance:016x}-{id}` (collision-free across databases),
+    /// [`attach_part_by_ref`](crate::DB::attach_part_by_ref) may mount other
+    /// databases' immutable parts without copying, and this engine NEVER
+    /// deletes an object (reclaim belongs to the layer above — one sharer's
+    /// hygiene must not be another's data loss). Defaults to `false`: a
+    /// non-shared tier behaves exactly as before A2 existed, byte-for-byte.
+    pub shared: bool,
     /// The storage backend for this tier. Defaults to [`TierBackend::Local`]; an
     /// S3-backed tier is built with [`TierDef::s3`] (requires the `s3` feature).
     pub backend: TierBackend,
@@ -321,6 +330,7 @@ impl TierDef {
             name: name.into(),
             root: root.into(),
             supports_mmap: true,
+            shared: false,
             backend: TierBackend::Local,
         }
     }
@@ -332,6 +342,15 @@ impl TierDef {
         self
     }
 
+    /// Declare this tier's root SHARED between databases (A2): part moves get
+    /// collision-free object names, `attach_part_by_ref` may mount other
+    /// databases' parts, and this engine never deletes an object on the tier.
+    /// See [`TierDef::shared`](Self::shared) (the field) for the contract.
+    pub fn shared(mut self) -> Self {
+        self.shared = true;
+        self
+    }
+
     /// An S3-backed tier: objects live under the in-bucket prefix `root` and are
     /// read via HTTP range GETs (never mmap'd). See [`S3Config`].
     #[cfg(feature = "s3")]
@@ -340,6 +359,7 @@ impl TierDef {
             name: name.into(),
             root: root.into(),
             supports_mmap: false,
+            shared: false,
             backend: TierBackend::S3(config),
         }
     }
@@ -358,6 +378,7 @@ impl TierDef {
             name: name.into(),
             root: root.into(),
             supports_mmap: false,
+            shared: false,
             backend: TierBackend::Custom(storage),
         }
     }

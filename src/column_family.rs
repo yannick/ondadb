@@ -246,9 +246,15 @@ impl ColumnFamily {
     /// `<db_dir>/cf-<name>/<id>.klog` as [`klog_path`](Self::klog_path); a tiered
     /// bottom part resolves under that tier's root.
     pub(crate) fn klog_path_for(&self, meta: &SstMeta) -> String {
-        match meta.tier.as_deref() {
-            None => self.klog_path(meta.id),
-            Some(t) => format!(
+        match (meta.tier.as_deref(), meta.object.as_deref()) {
+            (None, _) => self.klog_path(meta.id),
+            // A2: an object-named table resolves relative to the TIER ROOT —
+            // the name was chosen at publish time and never changes, whichever
+            // database reads it (the cf-{name}/ component is inside `object`).
+            (Some(t), Some(o)) => {
+                format!("{}/{o}.klog", self.ctx.tiers.root_for(Some(t)))
+            }
+            (Some(t), None) => format!(
                 "{}/{}.klog",
                 self.ctx.tiers.cf_dir(Some(t), &self.name),
                 meta.id
@@ -365,9 +371,16 @@ impl ColumnFamily {
             // NOT opened here. Opening every table in the manifest at startup
             // is what made resident memory track total stored bytes; the reader
             // is fetched on first use through the bounded table cache.
-            let klog = match s.tier.as_deref() {
-                None => format!("{dir}/{}.klog", s.id),
-                Some(t) => format!("{}/{}.klog", ctx.tiers.cf_dir(Some(t), &name), s.id),
+            // Mirrors `klog_path_for` (which needs a built CF): an
+            // object-named table (A2) resolves relative to the tier ROOT.
+            let klog = match (s.tier.as_deref(), s.object.as_deref()) {
+                (None, _) => format!("{dir}/{}.klog", s.id),
+                (Some(t), Some(o)) => {
+                    format!("{}/{o}.klog", ctx.tiers.root_for(Some(t)))
+                }
+                (Some(t), None) => {
+                    format!("{}/{}.klog", ctx.tiers.cf_dir(Some(t), &name), s.id)
+                }
             };
             let tref = crate::table_cache::TableRef {
                 klog,

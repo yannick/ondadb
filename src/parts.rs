@@ -62,6 +62,12 @@ pub struct PartTable {
     pub vlog_size: u64,
     /// Tier the bytes currently live on, or `None` for the default tier.
     pub tier: Option<String>,
+    /// Tier-root-relative object path on a SHARED tier (A2), the name
+    /// [`attach_part_by_ref`](crate::DB::attach_part_by_ref) mounts. `None`
+    /// for default-tier and non-shared-tier tables — those are not mountable
+    /// by reference. Deliberately excluded from the part digest: the digest
+    /// identifies bytes, and a rename is not a rewrite.
+    pub object: Option<String>,
     /// SHA-256 over the klog bytes followed by the vlog bytes — the table's
     /// content identity.
     pub content: [u8; 32],
@@ -237,6 +243,25 @@ impl DB {
         if handles.is_empty() {
             return Err(OndaError::NotFound);
         }
+        // A shared-tier table is an immutable publication other databases may
+        // reference; unlinking or hard-linking it locally is either data loss
+        // for a sharer or nonsense for a remote object (A2 — shared tiers are
+        // delete-free and fs-free).
+        if let Some(h) = handles.iter().find(|h| {
+            h.meta.tier.as_deref().is_some_and(|t| {
+                self.inner
+                    .opts
+                    .tiers
+                    .iter()
+                    .any(|d| d.name == t && d.shared)
+            })
+        }) {
+            return Err(OndaError::InvalidArgs(format!(
+                "part {partition:?} has table id {} on a shared tier — \
+                 shared publications cannot be detached or frozen",
+                h.meta.id
+            )));
+        }
         let ids: Vec<u64> = handles.iter().map(|h| h.meta.id).collect();
 
         // 1. Drop the tables from the in-memory level set (new reads stop seeing
@@ -394,6 +419,139 @@ impl DB {
         Ok(())
     }
 
+    /// Mount another database's part from a SHARED tier — by reference, zero
+    /// bytes copied (A2, `SPADINO-A2.md`).
+    ///
+    /// Every table of `part` must carry an [`object`](PartTable::object) name
+    /// (i.e. the part was published onto a shared tier); `tier` must name a
+    /// tier declared [`shared`](crate::TierDef::shared) on THIS database whose
+    /// root is the same location the exporter's tier pointed at. Each table is
+    /// registered in the catalog under a fresh local id whose paths resolve to
+    /// the shared objects; the block cache stays collision-free because it is
+    /// keyed by the per-process local id, which is never reused.
+    ///
+    /// # Lineage
+    ///
+    /// Unlike [`attach_part`](Self::attach_part), a foreign sequence lineage
+    /// is ACCEPTED: the database adopts a sequence floor past the tables'
+    /// `max_seq` (the recovery path's own mechanism), making the mounted
+    /// entries visible to every snapshot taken after the attach. This is
+    /// sound for the intended topology — immutable, single-writer parts,
+    /// read-only sharers — and that topology is a CONTRACT: mounting a part
+    /// whose writer still appends to it is unsupported.
+    ///
+    /// # Validation
+    ///
+    /// Each table's footer, index and bloom are opened and CRC-verified
+    /// through the tier's backend (bounded reads — for an S3 tier a handful
+    /// of range GETs, never a download), and the reader's own
+    /// `num_entries`/`max_seq`/key range are cross-checked against the
+    /// manifest's claims; any mismatch rejects the whole part with nothing
+    /// installed. Byte-level identity is NOT re-verified here — that is
+    /// [`export_part`](Self::export_part)'s job, priced honestly.
+    pub fn attach_part_by_ref(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        part: &PartManifest,
+        tier: &str,
+    ) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.inner.poison.check()?;
+        let is_shared = self
+            .inner
+            .opts
+            .tiers
+            .iter()
+            .any(|t| t.name == tier && t.shared);
+        if !is_shared {
+            return Err(OndaError::InvalidArgs(format!(
+                "attach_part_by_ref: tier {tier:?} is not declared shared \
+                 (TierDef::shared) on this database"
+            )));
+        }
+        if part.tables.is_empty() {
+            return Err(OndaError::InvalidArgs("empty part manifest".into()));
+        }
+        if let Some(t) = part.tables.iter().find(|t| t.object.is_none()) {
+            return Err(OndaError::InvalidArgs(format!(
+                "attach_part_by_ref: table id {} carries no object name — the \
+                 part was not published onto a shared tier",
+                t.id
+            )));
+        }
+        let _mu = cf.compact_mu.lock();
+
+        // Stage and validate every table before installing anything.
+        let mut staged: Vec<(Arc<SstHandle>, bool)> = Vec::new();
+        for t in &part.tables {
+            let new_id = self.inner.next_file_id();
+            let mut meta = SstMeta {
+                id: new_id,
+                tier: Some(tier.to_string()),
+                object: t.object.clone(),
+                ..Default::default()
+            };
+            // Opens through the tier's backend and CRC-verifies footer,
+            // index and bloom — the same validation every reader open does.
+            let reader = cf.open_reader_for(&meta)?;
+            if reader.num_entries() != t.num_entries
+                || reader.max_seq() != t.max_seq
+                || reader.min_key() != t.min_key.as_slice()
+                || reader.max_key() != t.max_key.as_slice()
+            {
+                return Err(OndaError::InvalidArgs(format!(
+                    "attach_part_by_ref: object {:?} disagrees with the part \
+                     manifest (entries {} vs {}, max_seq {} vs {}) — wrong or \
+                     stale manifest",
+                    t.object.as_deref().unwrap_or(""),
+                    reader.num_entries(),
+                    t.num_entries,
+                    reader.max_seq(),
+                    t.max_seq,
+                )));
+            }
+            let at_bottom = !cf.bottom_overlaps(&t.min_key, &t.max_key);
+            meta.level = if at_bottom {
+                cf.bottom_level_index() as u32
+            } else {
+                0
+            };
+            meta.num_entries = t.num_entries;
+            meta.max_seq = t.max_seq;
+            meta.klog_size = t.klog_size;
+            meta.vlog_size = t.vlog_size;
+            meta.min_key = t.min_key.clone();
+            meta.max_key = t.max_key.clone();
+            meta.partition = if at_bottom {
+                cf.partition_resolver_snapshot()?.name_of(&meta.min_key)
+            } else {
+                None
+            };
+            // Freshly mounted: the mover must not immediately re-move it, and
+            // a shared-tier part is never moved by a sharer anyway (the mover
+            // skips off-default parts by the tier filter).
+            meta.max_entry_time = Some(crate::util::now_nanos());
+            staged.push((cf.handle_for(meta), at_bottom));
+        }
+
+        // Adopt the foreign lineage BEFORE the tables become visible, so no
+        // read can see an entry above the visible sequence.
+        let max_seq = part.tables.iter().map(|t| t.max_seq).max().unwrap_or(0);
+        self.inner.observe_seq(max_seq);
+
+        for (handle, at_bottom) in staged {
+            if at_bottom {
+                cf.insert_bottom_sorted(handle);
+            } else {
+                cf.install_handles_l0(vec![handle]);
+            }
+        }
+        self.inner.persist_manifest()?;
+        Ok(())
+    }
+
     /// Describe the bottom-level part for `partition` as a
     /// [`PartManifest`] — its tables, their key ranges, and a digest over
     /// their bytes.
@@ -452,6 +610,7 @@ impl DB {
                 klog_size: h.meta.klog_size,
                 vlog_size: h.meta.vlog_size,
                 tier: h.meta.tier.clone(),
+                object: h.meta.object.clone(),
                 content,
             });
         }
@@ -484,6 +643,25 @@ impl DB {
         if handles.is_empty() {
             return Err(OndaError::NotFound);
         }
+        // A shared-tier table is an immutable publication other databases may
+        // reference; unlinking or hard-linking it locally is either data loss
+        // for a sharer or nonsense for a remote object (A2 — shared tiers are
+        // delete-free and fs-free).
+        if let Some(h) = handles.iter().find(|h| {
+            h.meta.tier.as_deref().is_some_and(|t| {
+                self.inner
+                    .opts
+                    .tiers
+                    .iter()
+                    .any(|d| d.name == t && d.shared)
+            })
+        }) {
+            return Err(OndaError::InvalidArgs(format!(
+                "part {partition:?} has table id {} on a shared tier — \
+                 shared publications cannot be detached or frozen",
+                h.meta.id
+            )));
+        }
         let dir = dir.as_ref();
         let cf_dir = dir.join(format!("cf-{}", cf.name()));
         std::fs::create_dir_all(&cf_dir)?;
@@ -512,6 +690,9 @@ impl DB {
         let manifest = Manifest {
             next_file_id: max_id + 1,
             global_seq: self.inner.visible_seq(),
+            // A frozen slice is a standalone database with no shared tiers;
+            // it mints its own nonce if it ever configures one.
+            instance_nonce: None,
             wal_layout: if self.inner.opts.unified_memtable {
                 WalLayout::Unified
             } else {
@@ -615,9 +796,27 @@ impl crate::db::DbInner {
         // identical, so passing them through `Storage::create` would truncate
         // live data. Moving only the remaining handles also heals a mixed-tier
         // part produced by a disjoint attach or partial bottom compaction.
+        let shared_tier_names: Vec<String> = self
+            .opts
+            .tiers
+            .iter()
+            .filter(|t| t.shared)
+            .map(|t| t.name.clone())
+            .collect();
         let handles: Vec<_> = handles
             .into_iter()
             .filter(|handle| handle.meta.tier.as_deref() != Some(tier))
+            // A table on a SHARED tier is an immutable publication: moving it
+            // would delete a source object another database may reference
+            // (A2 — shared tiers are delete-free). Re-placement is the layer
+            // above's job, by publishing anew.
+            .filter(|handle| {
+                handle
+                    .meta
+                    .tier
+                    .as_deref()
+                    .is_none_or(|t| !shared_tier_names.iter().any(|s| s == t))
+            })
             .collect();
         if handles.is_empty() {
             return Ok(());
@@ -629,6 +828,19 @@ impl crate::db::DbInner {
         let dest_storage = cf.tiers().storage_for(Some(tier));
         let dest_cf_dir = cf.tiers().cf_dir(Some(tier), cf.name());
         dest_storage.ensure_dir(&dest_cf_dir)?;
+        // A2: on a SHARED tier, objects are named by the per-database instance
+        // nonce so two databases pointed at one root cannot collide. On a
+        // non-shared tier the legacy id-derived path is kept byte-for-byte.
+        let shared = self.opts.tiers.iter().any(|t| t.name == tier && t.shared);
+        let nonce = if shared {
+            let n = *self.instance_nonce.lock();
+            Some(n.expect("a shared tier always mints the instance nonce at open"))
+        } else {
+            None
+        };
+        let object_for = |id: u64| -> Option<String> {
+            nonce.map(|n| format!("cf-{}/{n:016x}-{id}", cf.name()))
+        };
 
         // Copy every file to the target tier and open new handles there, before
         // touching the manifest — the part stays fully live on its current tier
@@ -645,8 +857,17 @@ impl crate::db::DbInner {
         for h in &handles {
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
-            let dst_klog = format!("{dest_cf_dir}/{}.klog", h.meta.id);
-            let dst_vlog = format!("{dest_cf_dir}/{}.vlog", h.meta.id);
+            let object = object_for(h.meta.id);
+            let (dst_klog, dst_vlog) = match &object {
+                Some(o) => {
+                    let root = cf.tiers().root_for(Some(tier));
+                    (format!("{root}/{o}.klog"), format!("{root}/{o}.vlog"))
+                }
+                None => (
+                    format!("{dest_cf_dir}/{}.klog", h.meta.id),
+                    format!("{dest_cf_dir}/{}.vlog", h.meta.id),
+                ),
+            };
             object_index += 1;
             copy_to_storage(&src_klog, &dst_klog, &dest_storage, || {
                 observe_move(
@@ -677,6 +898,7 @@ impl crate::db::DbInner {
             }
             let mut meta = h.meta.clone();
             meta.tier = Some(tier.to_string());
+            meta.object = object;
             new_handles.push(cf.handle_for(meta.clone()));
         }
         observe_move(
