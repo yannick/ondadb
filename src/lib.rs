@@ -10,13 +10,22 @@
 //! The crate is built bottom-up; modules are added phase by phase. See the
 //! implementation plan for the full roadmap.
 
-// The default build is 100% safe Rust.  The optional `mmap-reads` and
+// The default build is safe Rust.  The optional `mmap-reads` and
 // `arena-memtable` features each lift this to allow the localized `unsafe` in,
 // respectively, the mmap zero-copy reader and the arena-backed memtable;
 // everything else stays safe.  `unsafe-fastpath` enables both.
+//
+// `deny`, not `forbid`, because `forbid` cannot be lifted anywhere in the
+// crate — not even by an audited `#[allow(unsafe_code)]` on a single function.
+// That made the default build **fail to compile on Linux**, where
+// `util::coarse_now_nanos` calls `clock_gettime(CLOCK_REALTIME_COARSE)`
+// (E0453: `allow(unsafe_code)` incompatible with previous forbid). `deny`
+// still hard-errors on every `unsafe` that is not individually annotated, so
+// new unsafe cannot appear by accident; the exceptions are greppable via
+// `#[allow(unsafe_code)]`.
 #![cfg_attr(
     not(any(feature = "mmap-reads", feature = "arena-memtable")),
-    forbid(unsafe_code)
+    deny(unsafe_code)
 )]
 #![warn(missing_debug_implementations)]
 

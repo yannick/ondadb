@@ -24,6 +24,7 @@ pub fn now_nanos() -> i64 {
 /// this is `CLOCK_REALTIME_COARSE` (vDSO, tick resolution); elsewhere it
 /// falls back to the precise clock.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // the crate's single audited exception; see lib.rs
 pub fn coarse_now_nanos() -> i64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
