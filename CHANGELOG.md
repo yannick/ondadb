@@ -75,7 +75,7 @@ which is the rate at which records actually become durable SSTables:
 |---|---|---|---|---|---|
 | 5M  | 2 702 ms  | 1 086 ms | 1.36M ops/s | 2.15M ops/s | 1.6x |
 | 10M | 10 916 ms | 428 ms   | 0.77M ops/s | 3.45M ops/s | 4.5x |
-| 20M | 36 666 ms | 1 185 ms | 0.49M ops/s | 3.46M ops/s | 7.1x |
+| 20M | 36 666 ms | 1 195 ms | 0.49M ops/s | 3.45M ops/s | 7.0x |
 
 The ratio is not the point — the **shape** is. 0.7.8 halved its settled rate
 each time the data doubled (1.36M → 0.77M → 0.49M); 0.8.0 holds it flat past
