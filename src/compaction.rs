@@ -27,8 +27,12 @@
 //! becomes measurable ([`pending_compaction_bytes`]), which is what the write
 //! pacing in `ColumnFamily::apply_commit` throttles against.
 //!
-//! L0 remains whole-level by necessity: its files overlap each other, so a
-//! subset cannot be merged without reordering versions of the same key.
+//! L0 is bounded differently. Its files overlap each other, so an *arbitrary*
+//! subset cannot be merged without reordering versions of a key — but the
+//! **oldest** files can be, because `levels[0]` is newest-first and the read
+//! path walks it in that order, so a version left behind in a newer L0 file
+//! still shadows the copy pushed down to L1. A job therefore takes the oldest
+//! `l1_file_count_trigger` files.
 
 use std::sync::Arc;
 
@@ -84,7 +88,6 @@ pub(crate) fn run_manual(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()
     res
 }
 
-/// Run compaction on `cf` until no level is over its trigger.
 /// Background compaction: run bounded jobs until nothing is triggered.
 ///
 /// Unlike [`run_manual`] this takes no CF-wide lock. Each job holds only the

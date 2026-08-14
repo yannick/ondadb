@@ -85,6 +85,37 @@ work in one job grew with the dataset" costs you.
 Peak Put barely moves (~4.6M → ~4.0-4.4M ops/s): the ingest path was never the
 problem, and pacing only engages once debt is real.
 
+### Reads, and the trade-off this makes
+
+On a settled tree the new geometry costs nothing. Cold `Get` over 5M records is
+**1.41M ops/s against 0.7.8's 1.40M** (3 runs each), and scans are equal or
+better — smaller SSTables did not hurt point reads, because levels below L0 are
+disjoint and binary-searched, so one file is probed per level regardless of how
+many it holds.
+
+What *does* change is the state a database is in immediately after opening. A
+close that abandons compaction leaves L0 deeper, and L0 files overlap, so a
+point read probes **every** one of them — read cost is linear in L0 depth.
+Reading straight after such a close, with compaction still catching up:
+
+| | L0 files when reads begin | cold Get |
+|---|---|---|
+| default (close abandons compaction) | 6 | ~0.78M ops/s |
+| `finish_compactions_on_close = true` | 2 | ~1.41M ops/s |
+
+This is the deferred work becoming visible somewhere, and the choice is which
+somewhere. If your workload loads a dataset, closes, reopens and immediately
+serves point reads, set `finish_compactions_on_close = true` — that restores
+0.7.8's behaviour exactly, at the cost of a ~3.2 s close (0.7.8: 2.5 s; the
+difference is the extra write amplification partial merges incur, since
+overlapping target files are re-merged more often). For a long-running database
+compaction keeps up and the distinction does not arise.
+
+An earlier attempt to fix this by ranking L0 above equally-overfull deeper
+levels in the picker was **reverted**: it changed nothing, because the L0 depth
+in question is what `close()` left behind and reads begin before any compaction
+has had a chance to run. Measured identical at 6 files with and without it.
+
 ### Compatibility
 
 The new geometry rides in a tagged manifest tail (`ONDACMP1`) emitted only when

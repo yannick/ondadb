@@ -95,6 +95,11 @@ Full release history is in [`CHANGELOG.md`](CHANGELOG.md).
   compaction bytes past `soft_pending_compaction_bytes` and block at
   `hard_pending_compaction_bytes`, so sustained ingest reports a rate the engine
   can actually hold. Read the backlog back with `CfStats::compaction_debt`.
+- **`finish_compactions_on_close`** (default `false`) — close abandons queued
+  compaction, leaving debt the next open resumes from. Set it `true` if you
+  load a dataset, close, and reopen to serve point reads immediately: an
+  abandoned backlog leaves L0 deeper, and since L0 files overlap, every point
+  read probes all of them until compaction catches up.
 - **Compaction filters** — `cf.set_compaction_filter(|key, value| ...)` drops (or
   tombstones) entries during compaction for custom GC/expiry.
 - **FIFO compaction style** — `compaction_style: Fifo` with `fifo_max_bytes` /
