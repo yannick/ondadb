@@ -246,18 +246,29 @@ fn build_job(
     let target = level + 1;
 
     if level == 0 {
-        // L0 files overlap each other, so a subset cannot be compacted without
-        // reordering versions: L0 goes down whole.
+        // L0 files overlap each other, so an arbitrary subset cannot be
+        // compacted — it would reorder versions of the same key. The OLDEST
+        // files can be, though: `levels[0]` is newest-first and the read path
+        // walks it in that order, so a version left behind in a newer L0 file
+        // still shadows the copy this pushes down to L1.
+        //
+        // Taking the oldest `l1_file_count_trigger` bounds the job. Taking all
+        // of L0 bounded it only by `l0_queue_stall_threshold` — 20 memtables,
+        // over a gigabyte — and an ingest that happened to stop on a full L0
+        // then paid for that whole merge inside `close()`, which is how an
+        // otherwise ~200 ms close occasionally became 18 s.
+        let take = cf.opts.l1_file_count_trigger.max(1) as usize;
         let inputs: Vec<Arc<SstHandle>> = cf.with_levels(|levels| {
-            levels
-                .first()
-                .map(|l| {
-                    l.iter()
-                        .filter(|t| !is_foreign_mount(db, &t.meta))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default()
+            let Some(l0) = levels.first() else {
+                return Vec::new();
+            };
+            let live: Vec<Arc<SstHandle>> = l0
+                .iter()
+                .filter(|t| !is_foreign_mount(db, &t.meta))
+                .cloned()
+                .collect();
+            // Oldest-first, then the oldest `take` of them.
+            live.into_iter().rev().take(take).collect()
         });
         if inputs.is_empty() {
             return None;
