@@ -1,14 +1,36 @@
 # ondaDB
 
 A safe, performance-focused **Rust** key/value LSM storage engine.
-Single crate, no async runtime, `#![forbid(unsafe_code)]` by default.
+Single crate, synchronous API, std threads + crossbeam (no async runtime),
+`#![forbid(unsafe_code)]` by default.
 
-- **100% safe Rust by default** (`#![forbid(unsafe_code)]`). Two opt-in fast-path
-  features (`mmap-reads`, `arena-memtable`) each lift that forbid for one module
-  only, in small, documented `unsafe` regions — see [Builds](#builds).
-- **Durable by construction** — every stored byte is checksummed, flushes fsync
-  in a fixed order, and any fsync/manifest failure fail-stops the database rather
-  than silently continuing. See the invariants in
+## Highlights
+
+- **100% safe Rust by default** (`#![forbid(unsafe_code)]`); two opt-in fast-path
+  features add small, documented `unsafe` regions for mmap reads and an arena
+  memtable — see [Builds](#builds).
+- **Column families** — isolated, independently configured key/value stores, each
+  with its own memtable, WAL and LSM levels.
+- **MVCC transactions** — five isolation levels, savepoints, post-commit hooks,
+  and bidirectional snapshot-consistent iterators, with write-conflict detection
+  on Snapshot/Serializable.
+- **Tiered storage, including S3** — hot data lives on local SSD; aged bottom
+  parts are pushed to a second disk, an NFS-style mount, or an S3-compatible
+  object store (cargo feature `s3`) and read back through bounded HTTP range GETs
+  fronted by the block cache (a cold block is one GET, a warm one none). N
+  disposable reader databases can mount the same object-store parts with **zero
+  bytes copied** (attach-by-reference). The engine API stays synchronous
+  throughout — the S3 backend's own runtime never surfaces. See
+  [Storage tiers & S3](#storage-tiers--s3).
+- **Classic LSM core** — leveled compaction (plus a FIFO style), WiscKey value
+  separation, bloom filters, six comparators, and six compression codecs
+  (optionally per level).
+- **Bounded, predictable memory** — a byte-budgeted, sharded table cache caps
+  resident index + bloom memory (the `max_open_files` equivalent), so opening a
+  large store never loads all of it at once.
+- **Durable by construction** — every stored byte is checksummed, flush fsync
+  ordering is fixed, and any fsync/manifest failure fail-stops the database
+  rather than silently continuing. See
   [`docs/concurrency-and-safety.md`](docs/concurrency-and-safety.md).
 
 Full release history is in [`CHANGELOG.md`](CHANGELOG.md).
@@ -104,21 +126,15 @@ concepts, worked examples, S3 setup and operational notes.
 - **Storage tiers + part mover** — named tiers (`Options::tiers`): a second disk,
   a no-mmap NFS-style mount, S3, or a caller-built `Storage` backend
   (`TierDef::custom`). Per-CF `tier_rules` (prefix + `min_age`) drive a background
-  mover that relocates aged bottom parts crash-safely
-  (copy → fsync → atomic manifest flip → delete source).
-- **S3 tier** (cargo feature `s3`, MinIO-tested) — cold parts live in an
-  S3-compatible object store: block reads become bounded HTTP range GETs fronted
-  by the block cache (cold block = 1 GET, warm = 0), writes are single-shot PUTs,
-  and no async runtime bleeds into the engine. Every request carries a bounded
-  retry (4 attempts, 25/50/100 ms backoff) on transport-level errors only — sound
-  because every operation the backend issues is idempotent.
-- **Attach-by-reference over shared tiers** — `TierDef::shared()` plus
-  `attach_part_by_ref` let N reader databases **mount the same object-store parts
-  with zero bytes copied**. Objects on a shared tier are named by a per-database
-  instance nonce so writers sharing a root never collide, each attached table is
-  CRC-verified through the tier backend on attach, and shared tiers are delete-free
-  (reclamation is the coordinating layer's job). This expresses the
-  one-writer / many-disposable-reader topology directly.
+  mover that relocates aged bottom parts crash-safely.
+- **S3 tier** (cargo feature `s3`) — cold parts live in an S3-compatible object
+  store, read through bounded range GETs fronted by the block cache.
+- **Attach-by-reference over shared tiers** — `TierDef::shared()` +
+  `attach_part_by_ref` let N reader databases mount the same object-store parts
+  with zero bytes copied.
+
+  See [Storage tiers & S3](#storage-tiers--s3) for the tier model, an S3 setup
+  example and attach-by-reference.
 
 ### Operations & observability
 
@@ -148,7 +164,8 @@ phantom protection (point-read validation only). See the non-goals in
 
 ## Builds
 
-ondaDB ships a safe default build and two opt-in fast-path features:
+ondaDB ships a safe default build, two opt-in fast-path features, and an
+independent object-store feature:
 
 | Feature | `unsafe` | What it adds |
 |---------|----------|--------------|
@@ -156,15 +173,19 @@ ondaDB ships a safe default build and two opt-in fast-path features:
 | **`mmap-reads`** | one contained region | `mmap` zero-copy SSTable/vlog reads (helps point reads and SST-resident scans) |
 | **`arena-memtable`** | one contained region | arena-backed skip-list memtable (chunked arena, one writer per shard, lock-free readers) |
 | **`unsafe-fastpath`** | both regions | back-compat alias enabling `mmap-reads` + `arena-memtable` together |
+| **`s3`** | none | S3-compatible object-store tier (range-GET reads, single-PUT writes); adds a tokio runtime used **only inside** the S3 backend |
 
 ```sh
 cargo build                              # safe build (default)
 cargo build --features unsafe-fastpath   # both fast paths
+cargo build --features s3                # object-store tier support
 cargo test                               # full suite, safe build
 cargo test --features unsafe-fastpath    # same suite over the fast paths
 ```
 
-Both configurations must stay green — the two builds compile different
+The `s3` feature is orthogonal to the fast-path features and composes with any
+build; it stays behind a flag so the core build pulls in no network dependencies.
+Both fast-path configurations must stay green — the two builds compile different
 memtable/reader code. See [`AGENTS.md`](AGENTS.md) for the CI-equivalent gate.
 
 ## Documentation
@@ -295,6 +316,70 @@ when flush falls behind.
 Point reads work under any per-CF comparator (exact prefixed-key lookup); ordered
 iteration and flush re-sort a CF's slice with that CF's comparator. Implemented in
 [`src/unified.rs`](src/unified.rs).
+
+## Storage tiers & S3
+
+A **tier** is a named storage backend (`Options::tiers`). By default all data
+lives in the database directory; a tier lets a column family's **aged bottom
+parts** live somewhere else — a second disk, a no-mmap NFS-style mount, an
+S3-compatible object store, or a caller-built `Storage` backend
+(`TierDef::custom`). Per-CF `tier_rules` (a key prefix + a `min_age`) drive a
+background **part mover** that relocates a part crash-safely once its newest
+entry is old enough: copy → fsync → atomic manifest flip → delete source. WAL and
+upper levels always stay local; only bottom-level parts move. Reads are
+transparent — a moved part is served through its tier backend, and the manifest
+remains the source of truth. Full guide, worked examples and operational notes:
+[`docs/parts-and-tiers.md`](docs/parts-and-tiers.md).
+
+**S3 tier** (cargo feature `s3`, MinIO-tested). Cold parts become objects in an
+S3-compatible bucket. Block reads are bounded HTTP range GETs fronted by the
+block cache (a cold data block is one GET, a warm one none); writes are
+single-shot PUTs of whole, never-appended objects; every request carries a
+bounded transport-level retry. No async runtime bleeds into the engine — the S3
+backend owns a contained tokio runtime and the public API stays synchronous.
+Because the block cache fully fronts a remote tier, size it up for S3 workloads.
+
+```rust
+use std::time::Duration;
+use ondadb::{ColumnFamilyConfig, Options, S3Config, TierDef, TierRule, DB};
+
+let s3 = S3Config {
+    bucket: "archive".into(),
+    region: "us-east-1".into(),
+    endpoint: "https://s3.example.com".into(),   // e.g. a MinIO endpoint
+    access_key: "…".into(),
+    secret_key: "…".into(),
+    path_style: true,                            // required by MinIO
+};
+
+let mut opts = Options::new("/data/onda");
+// The tier root is an in-bucket KEY PREFIX, not a filesystem path.
+opts.tiers = vec![TierDef::s3("s3", "onda-prod", s3)];
+opts.block_cache_size = 512 << 20;               // S3 tiers lean on the cache
+
+let db = DB::open(opts)?;
+let cf = db.create_column_family("default", ColumnFamilyConfig {
+    // Once an img/ part's newest entry is 30 days old, the mover puts its files
+    // to the bucket; db.get(&cf, b"img/…") keeps working via range GETs.
+    tier_rules: vec![TierRule {
+        prefix: b"img/".to_vec(),
+        tier: "s3".into(),
+        min_age: Duration::from_secs(30 * 24 * 3600),
+    }],
+    ..ColumnFamilyConfig::default()
+})?;
+# let _ = cf;
+# Ok::<(), ondadb::OndaError>(())
+```
+
+**Attach-by-reference over shared tiers.** Declaring a tier
+`TierDef::s3(…).shared()` lets N reader databases mount the *same* object-store
+parts with **zero bytes copied** (`DB::attach_part_by_ref`), for a
+one-writer / many-disposable-reader topology (e.g. a search index over immutable
+segments). Objects on a shared tier are named by a persisted per-database nonce
+so writers sharing a root never collide, each attached table is CRC-verified on
+attach, and shared tiers are delete-free — reclaiming objects is the coordinating
+layer's job. See [`docs/parts-and-tiers.md`](docs/parts-and-tiers.md).
 
 ## Architecture / module map
 
