@@ -189,7 +189,27 @@ pub struct ColumnFamily {
     /// unlinked. Background workers and `DB::compact` can otherwise overlap
     /// (the compact queue may hold the same CF twice across two worker
     /// threads).
+    ///
+    /// Since 0.8.0 this guards only whole-CF operations — the manual
+    /// `DB::compact` sweep. Ordinary compaction and the parts/tiers operations
+    /// exclude each other through [`range_locks`](Self::range_locks) instead,
+    /// so two jobs on disjoint key ranges run concurrently.
     pub(crate) compact_mu: Mutex<()>,
+    /// Key ranges currently being rewritten in this CF. The single exclusion
+    /// mechanism shared by compaction (non-blocking) and the parts/tiers
+    /// operations (blocking) — see [`crate::range_lock`].
+    pub(crate) range_locks: Arc<crate::range_lock::RangeLocks>,
+    /// Per-level sweep position: the key a level's next compaction starts
+    /// looking from, so successive jobs advance across the keyspace instead of
+    /// re-picking the same file. Wraps to the start when it runs off the end.
+    pub(crate) compact_cursor: Mutex<std::collections::HashMap<usize, Vec<u8>>>,
+    /// Cached compaction debt in bytes — how far the levels sit past their
+    /// capacities. Read on every commit to decide pacing, so it is a gauge
+    /// rather than a computation: recomputing it would walk every level's file
+    /// list per write. Refreshed by whatever changes level sizes (a flush
+    /// landing in L0, a compaction completing) via
+    /// [`crate::compaction::refresh_compaction_debt`].
+    pub(crate) compaction_debt: AtomicU64,
     commit_hook: Mutex<Option<CommitHookFn>>,
     compaction_filter: Mutex<Option<CompactionFilterFn>>,
     /// Mirrors `commit_hook.is_some()`; lets the commit path skip building hook
@@ -319,7 +339,7 @@ impl ColumnFamily {
             dir,
             opts,
             live_partition_rules,
-            cmp,
+            cmp: cmp.clone(),
             state: RwLock::new(CfState {
                 mem,
                 wal,
@@ -336,6 +356,9 @@ impl ColumnFamily {
             flushing: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             compact_mu: Mutex::new(()),
+            range_locks: crate::range_lock::RangeLocks::new(cmp.clone()),
+            compact_cursor: Mutex::new(std::collections::HashMap::new()),
+            compaction_debt: AtomicU64::new(0),
             commit_hook: Mutex::new(None),
             compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
@@ -436,7 +459,7 @@ impl ColumnFamily {
             dir,
             opts,
             live_partition_rules,
-            cmp,
+            cmp: cmp.clone(),
             state: RwLock::new(CfState {
                 mem,
                 wal,
@@ -453,6 +476,9 @@ impl ColumnFamily {
             flushing: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             compact_mu: Mutex::new(()),
+            range_locks: crate::range_lock::RangeLocks::new(cmp.clone()),
+            compact_cursor: Mutex::new(std::collections::HashMap::new()),
+            compaction_debt: AtomicU64::new(0),
             commit_hook: Mutex::new(None),
             compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
@@ -502,17 +528,68 @@ impl ColumnFamily {
         }
     }
 
+    /// Is compaction debt at or above the hard ceiling, where commits block?
+    pub(crate) fn over_hard_compaction_limit(&self) -> bool {
+        let hard = self.opts.hard_pending_compaction_bytes;
+        hard != 0 && self.compaction_debt.load(Ordering::Relaxed) >= hard
+    }
+
+    /// Wake writers parked on the hard compaction limit. Taking `rot` is what
+    /// makes the wake-up race-free against a writer that has just evaluated the
+    /// predicate but not yet waited.
+    pub(crate) fn notify_debt_waiters(&self) {
+        let _g = self.rot.lock();
+        self.cond.notify_all();
+    }
+
+    /// Delay this commit in proportion to how far compaction debt sits past the
+    /// soft threshold.
+    ///
+    /// Without this, ingest runs at memtable speed no matter how far behind
+    /// compaction is: writes return fast, debt grows unbounded, and the
+    /// throughput a benchmark reports is a rate the engine cannot sustain. The
+    /// delay is deliberately small and per-commit — it shapes the ingest rate
+    /// rather than stopping it, leaving the hard ceiling to do the stopping.
+    fn pace_for_compaction_debt(&self) {
+        let soft = self.opts.soft_pending_compaction_bytes;
+        if soft == 0 || self.ctx.closing.load(Ordering::Relaxed) {
+            return;
+        }
+        let debt = self.compaction_debt.load(Ordering::Relaxed);
+        if debt <= soft {
+            return;
+        }
+        let hard = self.opts.hard_pending_compaction_bytes;
+        // Fraction of the way from soft to hard, in [0, 1]. With no hard
+        // ceiling configured there is no span to interpolate over, so pace at
+        // the floor and let debt be bounded by whatever the operator intended.
+        let frac = if hard > soft {
+            ((debt - soft) as f64 / (hard - soft) as f64).min(1.0)
+        } else {
+            0.1
+        };
+        const MAX_DELAY_US: f64 = 1000.0;
+        let delay_us = (frac * MAX_DELAY_US) as u64;
+        if delay_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(delay_us));
+        }
+    }
+
     /// Apply a committed batch: append to the WAL and insert into the memtable,
     /// then rotate if the memtable is full. Records borrow the transaction's
     /// buffer; both the WAL and the memtable copy what they need.
     pub(crate) fn apply_commit(self: &Arc<Self>, recs: &[wal::RecordRef<'_>]) -> Result<()> {
         self.ctx.poison.check()?;
+        // Soft pacing happens before the lock is taken: the point is to slow
+        // this writer down, not to hold anyone else up while it waits.
+        self.pace_for_compaction_debt();
         let threshold = self.opts.l0_queue_stall_threshold as usize;
         {
             let mut g = self.rot.lock();
             loop {
                 let stalled = g.rotating
-                    || (self.state.read().imm.len() >= threshold
+                    || ((self.state.read().imm.len() >= threshold
+                        || self.over_hard_compaction_limit())
                         && !self.ctx.closing.load(Ordering::Relaxed));
                 if stalled {
                     self.cond.wait(&mut g);

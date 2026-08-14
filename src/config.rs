@@ -189,6 +189,17 @@ pub struct Options {
     pub max_open_sstables: usize,
     pub max_memory_usage: u64,
     pub read_only: bool,
+    /// Whether [`DB::close`](crate::DB::close) drains queued compaction work
+    /// before returning.
+    ///
+    /// Default `false`: close abandons whatever is still queued. Leftover debt
+    /// is legal LSM state that the next open resumes from, so the only cost is
+    /// that the reopened database starts with more to compact.
+    ///
+    /// Declared since the option existed but read by nothing until 0.8.0 — the
+    /// compaction worker only tested its stop flag when its queue ran dry, so
+    /// close drained the queue regardless of this setting. On a database that
+    /// had just ingested 20M records that made `close()` take 35 seconds.
     pub finish_compactions_on_close: bool,
     pub max_concurrent_flushes: usize,
     pub unified_memtable: bool,
@@ -514,6 +525,48 @@ pub struct ColumnFamilyConfig {
     /// FIFO only: evict tables whose klog file is older than this
     /// (zero = no age limit).
     pub fifo_ttl: Duration,
+    /// Size at which compaction cuts an output SSTable.
+    ///
+    /// This is what makes a compaction's work *bounded*. Compaction picks one
+    /// input file and merges it with the target-level files its key range
+    /// overlaps, so the cost of a single job is roughly
+    /// `target_file_size * (1 + level_size_ratio)` — independent of how large
+    /// the level has grown. Before 0.8.0 output was cut at
+    /// [`write_buffer_size`](Self::write_buffer_size) and the L1 cap was the
+    /// same value, so L1 held exactly one file spanning the whole keyspace and
+    /// every push-down rewrote the entire level below: work per compaction grew
+    /// with the dataset, and sustained ingest accumulated unbounded debt.
+    ///
+    /// Smaller values make compaction finer-grained (and more parallelizable)
+    /// at the cost of more files, each holding a block index and bloom filter
+    /// while open — see [`Options::max_open_reader_bytes`].
+    pub target_file_size: usize,
+    /// Byte capacity of L1; deeper levels are this times
+    /// [`level_size_ratio`](Self::level_size_ratio) per level.
+    ///
+    /// Held separately from [`write_buffer_size`](Self::write_buffer_size) so
+    /// the number of files per level (`l1_base_bytes / target_file_size`) can be
+    /// chosen independently of memtable size. A level that holds only one file
+    /// cannot be compacted partially, because that file's range covers
+    /// everything below it.
+    pub l1_base_bytes: u64,
+    /// Estimated pending-compaction bytes above which each commit is delayed in
+    /// proportion to the excess, slowing writers smoothly as compaction falls
+    /// behind. `0` disables pacing.
+    ///
+    /// Without this, ingest runs at memtable speed no matter how far compaction
+    /// lags: the write returns quickly, the debt is paid later at close or by
+    /// whoever reads next, and reported throughput is a rate the engine cannot
+    /// actually sustain.
+    pub soft_pending_compaction_bytes: u64,
+    /// Estimated pending-compaction bytes above which commits block until a
+    /// compaction completes. `0` disables the hard stop.
+    ///
+    /// This is the ceiling that bounds debt (and therefore disk footprint and
+    /// read amplification) when ingest simply outruns compaction. Must be >=
+    /// [`soft_pending_compaction_bytes`](Self::soft_pending_compaction_bytes);
+    /// [`validate`](Self::validate) rejects the inversion.
+    pub hard_pending_compaction_bytes: u64,
 }
 
 impl Default for ColumnFamilyConfig {
@@ -551,6 +604,10 @@ impl Default for ColumnFamilyConfig {
             compaction_style: CompactionStyle::Leveled,
             fifo_max_bytes: 0,
             fifo_ttl: Duration::ZERO,
+            target_file_size: 16 << 20,      // 16 MiB
+            l1_base_bytes: 256 << 20,        // 256 MiB => ~16 files in L1
+            soft_pending_compaction_bytes: 2 << 30, // 2 GiB
+            hard_pending_compaction_bytes: 8 << 30, // 8 GiB
         }
     }
 }
@@ -855,6 +912,24 @@ impl ColumnFamilyConfig {
                 }
             }
         }
+        if self.target_file_size == 0 {
+            return Err("target_file_size must be non-zero".to_string());
+        }
+        if self.l1_base_bytes == 0 {
+            return Err("l1_base_bytes must be non-zero".to_string());
+        }
+        // Pacing that starts after the hard stop can never run, and the
+        // inversion reads as a tuning success until debt is already unbounded.
+        if self.soft_pending_compaction_bytes != 0
+            && self.hard_pending_compaction_bytes != 0
+            && self.soft_pending_compaction_bytes > self.hard_pending_compaction_bytes
+        {
+            return Err(format!(
+                "soft_pending_compaction_bytes ({}) exceeds \
+                 hard_pending_compaction_bytes ({})",
+                self.soft_pending_compaction_bytes, self.hard_pending_compaction_bytes
+            ));
+        }
         Ok(())
     }
 
@@ -980,6 +1055,24 @@ impl ColumnFamilyConfig {
             append_uvarint(&mut b, name.len() as u64);
             b.extend_from_slice(name.as_bytes());
         }
+
+        // 0.8.0 compaction geometry, in its own tagged tail for the same reason
+        // as the tails above: a reader that predates it stops at the magic it
+        // does not know and keeps the struct defaults. Emitted only when it
+        // differs from the defaults, so a config that never touched these
+        // fields still encodes byte-for-byte as earlier releases wrote it.
+        let d = ColumnFamilyConfig::default();
+        if self.target_file_size != d.target_file_size
+            || self.l1_base_bytes != d.l1_base_bytes
+            || self.soft_pending_compaction_bytes != d.soft_pending_compaction_bytes
+            || self.hard_pending_compaction_bytes != d.hard_pending_compaction_bytes
+        {
+            b.extend_from_slice(CONFIG_COMPACTION_MAGIC);
+            append_u64(&mut b, self.target_file_size as u64);
+            append_u64(&mut b, self.l1_base_bytes);
+            append_u64(&mut b, self.soft_pending_compaction_bytes);
+            append_u64(&mut b, self.hard_pending_compaction_bytes);
+        }
         b
     }
 
@@ -1009,6 +1102,8 @@ impl ColumnFamilyConfig {
 const CONFIG_OVERFLOW_MAGIC: &[u8; 8] = b"ONDAOVF1";
 /// Tag introducing the derived-partitioner tail (scheme name only).
 const CONFIG_PARTITION_FN_MAGIC: &[u8; 8] = b"ONDAPFN1";
+/// Tag introducing the 0.8.0 compaction-geometry tail.
+const CONFIG_COMPACTION_MAGIC: &[u8; 8] = b"ONDACMP1";
 
 fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     use crate::encoding::{read_u32, read_u64, uvarint};
@@ -1149,7 +1244,8 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
 
     let Some(rest) = p.strip_prefix(CONFIG_OVERFLOW_MAGIC) else {
         // No overflow section; the derived-partitioner tail may still follow.
-        read_partition_fn_tail(p, cfg);
+        let p = read_partition_fn_tail(p, cfg);
+        read_compaction_tail(p, cfg);
         return Some(());
     };
     p = rest;
@@ -1230,7 +1326,8 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
             min_age,
         });
     }
-    read_partition_fn_tail(p, cfg);
+    let p = read_partition_fn_tail(p, cfg);
+    read_compaction_tail(p, cfg);
     Some(())
 }
 
@@ -1243,21 +1340,51 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
 /// blob; the consequence is a column family that opens as rule-partitioned,
 /// and `DB::open` cannot then mis-resolve it because there is no name to
 /// resolve.
-fn read_partition_fn_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+/// Consume the derived-partitioner tail if present, returning what follows it
+/// so later tails can be read in turn.
+fn read_partition_fn_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     use crate::encoding::uvarint;
     let Some(rest) = p.strip_prefix(CONFIG_PARTITION_FN_MAGIC) else {
-        return;
+        return p;
     };
     let Some((len, n)) = uvarint(rest) else {
-        return;
+        return p;
     };
     let rest = &rest[n..];
     let len = len as usize;
     if rest.len() < len {
-        return;
+        return p;
     }
     cfg.partition_scheme =
         PartitionScheme::Unresolved(String::from_utf8_lossy(&rest[..len]).into_owned());
+    &rest[len..]
+}
+
+/// Consume the 0.8.0 compaction-geometry tail if present. Absent (every
+/// manifest written before 0.8.0, and any config left at the defaults), the
+/// struct defaults stand.
+fn read_compaction_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    use crate::encoding::read_u64;
+    let Some(mut rest) = p.strip_prefix(CONFIG_COMPACTION_MAGIC) else {
+        return;
+    };
+    let mut next = || -> Option<u64> {
+        if rest.len() < 8 {
+            return None;
+        }
+        let v = read_u64(rest);
+        rest = &rest[8..];
+        Some(v)
+    };
+    // All four or none: a truncated tail leaves every field at its default
+    // rather than applying a half-read geometry.
+    let (Some(tfs), Some(l1), Some(soft), Some(hard)) = (next(), next(), next(), next()) else {
+        return;
+    };
+    cfg.target_file_size = tfs as usize;
+    cfg.l1_base_bytes = l1;
+    cfg.soft_pending_compaction_bytes = soft;
+    cfg.hard_pending_compaction_bytes = hard;
 }
 
 #[cfg(test)]
@@ -1743,5 +1870,74 @@ mod per_level_tests {
 
         let decoded = ColumnFamilyConfig::decode(&legacy);
         assert_eq!(decoded.compression_per_level, vec![Compression::Zstd; 128]);
+    }
+
+    /// The 0.8.0 geometry survives a manifest round-trip, and a config left at
+    /// the defaults still encodes exactly as earlier releases wrote it.
+    #[test]
+    fn compaction_geometry_roundtrip_and_default_is_byte_identical() {
+        let tuned = ColumnFamilyConfig {
+            target_file_size: 4 << 20,
+            l1_base_bytes: 1 << 30,
+            soft_pending_compaction_bytes: 7 << 30,
+            hard_pending_compaction_bytes: 9 << 30,
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&tuned.encode());
+        assert_eq!(d.target_file_size, 4 << 20);
+        assert_eq!(d.l1_base_bytes, 1 << 30);
+        assert_eq!(d.soft_pending_compaction_bytes, 7 << 30);
+        assert_eq!(d.hard_pending_compaction_bytes, 9 << 30);
+
+        // Defaults carry no tail at all.
+        let base = ColumnFamilyConfig::default().encode();
+        assert!(
+            !base
+                .windows(CONFIG_COMPACTION_MAGIC.len())
+                .any(|w| w == CONFIG_COMPACTION_MAGIC),
+            "a default config must not emit the compaction tail"
+        );
+    }
+
+    /// A pre-0.8.0 manifest (no compaction tail) decodes to the new defaults
+    /// rather than to zeroes, which would divide by zero when sizing levels.
+    #[test]
+    fn pre_080_manifest_decodes_to_compaction_defaults() {
+        let legacy = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            ..ColumnFamilyConfig::default()
+        }
+        .encode();
+        let d = ColumnFamilyConfig::decode(&legacy);
+        let def = ColumnFamilyConfig::default();
+        assert_eq!(d.target_file_size, def.target_file_size);
+        assert_eq!(d.l1_base_bytes, def.l1_base_bytes);
+        assert_eq!(d.hard_pending_compaction_bytes, def.hard_pending_compaction_bytes);
+    }
+
+    /// The geometry tail must survive alongside the tails that precede it.
+    #[test]
+    fn compaction_tail_coexists_with_partition_fn_tail() {
+        let cfg = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Unresolved("byhash".into()),
+            target_file_size: 2 << 20,
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&cfg.encode());
+        assert_eq!(d.target_file_size, 2 << 20);
+        match d.partition_scheme {
+            PartitionScheme::Unresolved(n) => assert_eq!(n, "byhash"),
+            other => panic!("partition scheme lost: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_inverted_compaction_thresholds() {
+        let bad = ColumnFamilyConfig {
+            soft_pending_compaction_bytes: 9 << 30,
+            hard_pending_compaction_bytes: 1 << 30,
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(bad.validate().is_err());
     }
 }

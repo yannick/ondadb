@@ -49,6 +49,7 @@ pub mod memtable;
 #[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;
 pub mod parts;
+pub(crate) mod range_lock;
 pub mod sst;
 pub mod storage;
 #[cfg(feature = "s3")]

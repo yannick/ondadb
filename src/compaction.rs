@@ -2,13 +2,33 @@
 //!
 //! L0 is compacted into L1 when its file count reaches `l1_file_count_trigger`;
 //! a level `i >= 1` is compacted into `i+1` when its byte size exceeds the
-//! level's capacity (`write_buffer_size * level_size_ratio^(i-1)`).  Inputs are
+//! level's capacity (`l1_base_bytes * level_size_ratio^(i-1)`).  Inputs are
 //! merge-iterated in internal order; for each user key the newest version is
 //! kept, plus every version newer than the oldest live snapshot, and tombstones
 //! are dropped once they reach the bottom level.
 //!
-//! This is standard leveled compaction; the C
-//! engine's three-mode "Spooky" merge is a future refinement.
+//! # Bounded jobs (0.8.0)
+//!
+//! Compaction picks **one** file from the source level and merges it with only
+//! the target-level files its key range overlaps, so a job costs about
+//! `target_file_size * (1 + level_size_ratio)` regardless of how large the
+//! level has grown. Before 0.8.0 a job took the *whole* source level plus every
+//! target file it overlapped; since L0 files span nearly the entire keyspace
+//! under random keys, that rewrote all of L1 every time, and all of L2 below
+//! that. Work per compaction therefore grew with the dataset, and sustained
+//! ingest built debt faster than it could be paid: measured on a 24-core M2
+//! Ultra, draining that backlog at close took 2.5 s after 5M inserts and 35 s
+//! after 20M — while the reported write rate stayed flat at ~4.6M ops/s,
+//! because nothing in the write path was aware of the debt at all.
+//!
+//! Two things follow from bounded jobs. Compactions on disjoint key ranges no
+//! longer share inputs, so they run concurrently — see [`crate::range_lock`],
+//! which is also what excludes them from the parts/tiers operations. And debt
+//! becomes measurable ([`pending_compaction_bytes`]), which is what the write
+//! pacing in `ColumnFamily::apply_commit` throttles against.
+//!
+//! L0 remains whole-level by necessity: its files overlap each other, so a
+//! subset cannot be merged without reordering versions of the same key.
 
 use std::sync::Arc;
 
@@ -33,6 +53,12 @@ pub(crate) fn run_manual(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()
         return Ok(()); // FIFO never merges; eviction already ran above
     }
     let _mu = cf.compact_mu.lock();
+    // The sweep rewrites every level, so it takes the whole keyspace: this is
+    // what excludes it from background jobs and from the parts/tiers
+    // operations, which hold ranges rather than this mutex.
+    let _range = cf
+        .range_locks
+        .acquire_blocking(crate::range_lock::KeyRange::all());
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
@@ -59,24 +85,289 @@ pub(crate) fn run_manual(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()
 }
 
 /// Run compaction on `cf` until no level is over its trigger.
+/// Background compaction: run bounded jobs until nothing is triggered.
+///
+/// Unlike [`run_manual`] this takes no CF-wide lock. Each job holds only the
+/// key range it rewrites, so several workers compact one column family at once
+/// as long as their ranges are disjoint — and a tier move or `detach_part`
+/// blocks only the range it touches.
+///
+/// `stop` lets a closing database abandon queued work between jobs instead of
+/// draining it (see `Options::finish_compactions_on_close`).
 pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
         return run_fifo(db, cf);
     }
-    let _mu = cf.compact_mu.lock();
-    cf.compacting
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    let res = (|| {
-        while let Some(level) = pick_level(db, cf) {
-            compact_level(db, cf, level)?;
-            cf.compaction_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    while let Some((job, guard)) = pick_compaction(db, cf) {
+        cf.compacting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let res = compact_inputs(db, cf, job.level, job.target, job.inputs);
+        cf.compacting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(guard);
+        res?;
+        cf.compaction_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        refresh_compaction_debt(db, cf);
+        // A closing DB stops between jobs; the debt it leaves is legal LSM
+        // state that the next open recovers from.
+        if db.closing.load(std::sync::atomic::Ordering::Relaxed)
+            && !db.opts.finish_compactions_on_close
+        {
+            break;
         }
-        Ok(())
-    })();
-    cf.compacting
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    res
+    }
+    Ok(())
+}
+
+/// One unit of compaction work: a bounded input set and the span it covers.
+pub(crate) struct CompactionJob {
+    pub(crate) level: usize,
+    pub(crate) target: usize,
+    pub(crate) inputs: Vec<Arc<SstHandle>>,
+}
+
+/// Byte capacity of `level` (>= 1). Held apart from `write_buffer_size` since
+/// 0.8.0: a level sized to one file cannot be compacted a piece at a time,
+/// because that file's range spans everything below it.
+fn level_capacity(cf: &Arc<ColumnFamily>, level: usize) -> u64 {
+    let ratio = cf.opts.level_size_ratio.max(2);
+    cf.opts
+        .l1_base_bytes
+        .saturating_mul(ratio.saturating_pow(level.saturating_sub(1) as u32))
+}
+
+/// Non-mounted bytes held in `level`.
+fn level_bytes(db: &DbInner, cf: &Arc<ColumnFamily>, level: usize) -> u64 {
+    cf.with_levels(|levels| {
+        levels
+            .get(level)
+            .map(|l| {
+                l.iter()
+                    .filter(|t| !is_foreign_mount(db, &t.meta))
+                    .map(|t| t.meta.klog_size + t.meta.vlog_size)
+                    .sum()
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// How far past its capacity each level sits, summed — the engine's compaction
+/// debt. Drives write pacing (`ColumnFamilyConfig::soft_pending_compaction_bytes`).
+pub(crate) fn pending_compaction_bytes(db: &DbInner, cf: &Arc<ColumnFamily>) -> u64 {
+    let n = cf.with_levels(|levels| levels.len());
+    let mut debt: u64 = 0;
+    // L0 is counted by file count, not capacity: every file there must be
+    // rewritten into L1 regardless of size.
+    let trigger = cf.opts.l1_file_count_trigger.max(1) as u64;
+    let l0_files = cf.with_levels(|levels| {
+        levels
+            .first()
+            .map(|l| l.iter().filter(|t| !is_foreign_mount(db, &t.meta)).count())
+            .unwrap_or(0)
+    }) as u64;
+    if l0_files > trigger {
+        debt = debt.saturating_add(level_bytes(db, cf, 0));
+    }
+    for i in 1..n {
+        let bytes = level_bytes(db, cf, i);
+        debt = debt.saturating_add(bytes.saturating_sub(level_capacity(cf, i)));
+    }
+    debt
+}
+
+/// Recompute the cached debt gauge writers pace against.
+///
+/// Called by whatever changes level sizes — a flush landing in L0, a compaction
+/// completing. Doing it here rather than on the write path keeps `apply_commit`
+/// an atomic load instead of a walk over every level's file list.
+pub(crate) fn refresh_compaction_debt(db: &DbInner, cf: &Arc<ColumnFamily>) {
+    let debt = pending_compaction_bytes(db, cf);
+    cf.compaction_debt
+        .store(debt, std::sync::atomic::Ordering::Relaxed);
+    // A writer parked on the hard limit is waiting for exactly this number to
+    // come down; nothing else will wake it.
+    cf.notify_debt_waiters();
+}
+
+/// Choose the next bounded compaction job and lock its key range, or `None`
+/// when nothing is triggered or every triggered candidate is already held.
+///
+/// Levels are considered most-overfull first (`bytes / capacity`, or
+/// `files / trigger` for L0) so the worst backlog is worked down first.
+fn pick_compaction(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    let n = cf.with_levels(|levels| levels.len());
+    let mut scored: Vec<(f64, usize)> = Vec::new();
+
+    let trigger = cf.opts.l1_file_count_trigger.max(1) as f64;
+    let l0_files = cf.with_levels(|levels| {
+        levels
+            .first()
+            .map(|l| l.iter().filter(|t| !is_foreign_mount(db, &t.meta)).count())
+            .unwrap_or(0)
+    }) as f64;
+    if l0_files >= trigger {
+        scored.push((l0_files / trigger, 0));
+    }
+    for i in 1..n {
+        let cap = level_capacity(cf, i).max(1) as f64;
+        let bytes = level_bytes(db, cf, i) as f64;
+        if bytes > cap {
+            scored.push((bytes / cap, i));
+        }
+    }
+    // Highest score first; ties by shallower level, which unblocks the levels
+    // above it soonest.
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+
+    for (_, level) in scored {
+        if let Some(job) = build_job(db, cf, level) {
+            return Some(job);
+        }
+    }
+    None
+}
+
+/// Assemble a job for `level`, or `None` if every candidate there is blocked
+/// (range already held, or a foreign mount in the way).
+fn build_job(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    let cmp = cf.cmp();
+    let target = level + 1;
+
+    if level == 0 {
+        // L0 files overlap each other, so a subset cannot be compacted without
+        // reordering versions: L0 goes down whole.
+        let inputs: Vec<Arc<SstHandle>> = cf.with_levels(|levels| {
+            levels
+                .first()
+                .map(|l| {
+                    l.iter()
+                        .filter(|t| !is_foreign_mount(db, &t.meta))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if inputs.is_empty() {
+            return None;
+        }
+        let (min_key, max_key) = key_span(&inputs, &cmp);
+        let with_target = gather_target(db, cf, target, &min_key, &max_key, inputs)?;
+        return lock_job(cf, level, target, with_target);
+    }
+
+    // Levels >= 1 are sorted by key and disjoint, so one file can be taken on
+    // its own. Sweep from the cursor so successive jobs advance across the
+    // keyspace rather than re-picking the head of the level.
+    let candidates: Vec<Arc<SstHandle>> = cf.with_levels(|levels| {
+        levels
+            .get(level)
+            .map(|l| {
+                l.iter()
+                    .filter(|t| !is_foreign_mount(db, &t.meta))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if candidates.is_empty() {
+        return None;
+    }
+    let cursor = cf.compact_cursor.lock().get(&level).cloned();
+    let start = match &cursor {
+        Some(c) => candidates
+            .iter()
+            .position(|t| cmp.compare(&t.meta.min_key, c).is_ge())
+            .unwrap_or(0),
+        None => 0,
+    };
+
+    // One full sweep from the cursor, wrapping once, so a blocked candidate
+    // never wedges the level.
+    for k in 0..candidates.len() {
+        let idx = (start + k) % candidates.len();
+        let pick = candidates[idx].clone();
+        let (min_key, max_key) = key_span(std::slice::from_ref(&pick), &cmp);
+        let Some(inputs) = gather_target(db, cf, target, &min_key, &max_key, vec![pick.clone()])
+        else {
+            continue; // a foreign mount overlaps: try the next file
+        };
+        if let Some(job) = lock_job(cf, level, target, inputs) {
+            // Next job starts after this file.
+            cf.compact_cursor
+                .lock()
+                .insert(level, pick.meta.max_key.clone());
+            return Some(job);
+        }
+    }
+    None
+}
+
+/// Add the tables in `target` overlapping `[min_key, max_key]` to `inputs`.
+/// `None` if any of them is a foreign mount — merging around a read-only mount
+/// would leave overlapping tables in one level.
+fn gather_target(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    target: usize,
+    min_key: &[u8],
+    max_key: &[u8],
+    mut inputs: Vec<Arc<SstHandle>>,
+) -> Option<Vec<Arc<SstHandle>>> {
+    let cmp = cf.cmp();
+    let blocked = cf.with_levels(|levels| {
+        let Some(lvl) = levels.get(target) else {
+            return false;
+        };
+        for th in lvl {
+            if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, min_key, max_key) {
+                if is_foreign_mount(db, &th.meta) {
+                    return true;
+                }
+                inputs.push(th.clone());
+            }
+        }
+        false
+    });
+    if blocked {
+        return None;
+    }
+    Some(inputs)
+}
+
+/// Take the range lock covering every input, or `None` if it is already held.
+fn lock_job(
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    target: usize,
+    inputs: Vec<Arc<SstHandle>>,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    let cmp = cf.cmp();
+    let spans: Vec<(&[u8], &[u8])> = inputs
+        .iter()
+        .map(|t| (t.meta.min_key.as_slice(), t.meta.max_key.as_slice()))
+        .collect();
+    let range = crate::range_lock::KeyRange::union(spans, &cmp)?;
+    let guard = cf.range_locks.try_acquire(range)?;
+    Some((
+        CompactionJob {
+            level,
+            target,
+            inputs,
+        },
+        guard,
+    ))
 }
 
 /// FIFO "compaction": never merges — evicts the oldest L0 tables past the
@@ -84,6 +375,12 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
 /// (the same ordering the merge path uses).
 fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     let _mu = cf.compact_mu.lock();
+    // Eviction unlinks whole tables, so it takes the same exclusion the merge
+    // path does — otherwise a concurrent parts/tiers operation could be holding
+    // a table this is about to delete.
+    let _range = cf
+        .range_locks
+        .acquire_blocking(crate::range_lock::KeyRange::all());
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
@@ -133,40 +430,6 @@ fn is_foreign_mount(db: &DbInner, meta: &crate::manifest::SstMeta) -> bool {
     }
 }
 
-/// Choose a level to compact, or `None` if nothing is triggered.
-///
-/// Foreign mounts are invisible to the triggers: a level full of mounted
-/// tables must not re-trigger a compaction that would then exclude them all
-/// (a busy loop), and their bytes are another publisher's, not this
-/// database's write debt.
-fn pick_level(db: &DbInner, cf: &Arc<ColumnFamily>) -> Option<usize> {
-    let trigger = cf.opts.l1_file_count_trigger as usize;
-    let ratio = cf.opts.level_size_ratio.max(2);
-    let wbs = cf.opts.write_buffer_size as u64;
-    cf.with_levels(|levels| {
-        if levels[0]
-            .iter()
-            .filter(|t| !is_foreign_mount(db, &t.meta))
-            .count()
-            >= trigger
-        {
-            return Some(0);
-        }
-        for (i, lvl) in levels.iter().enumerate().skip(1) {
-            let bytes: u64 = lvl
-                .iter()
-                .filter(|t| !is_foreign_mount(db, &t.meta))
-                .map(|t| t.meta.klog_size + t.meta.vlog_size)
-                .sum();
-            let cap = wbs.saturating_mul(ratio.saturating_pow(i as u32 - 1));
-            if bytes > cap {
-                return Some(i);
-            }
-        }
-        None
-    })
-}
-
 /// Compact every table in `level` plus overlapping tables in `level+1` into
 /// `level+1`.
 fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Result<()> {
@@ -177,6 +440,10 @@ fn compact_level(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, level: usize) -> Res
 /// the in-place bottom rewrite manual compaction does — the only way tables
 /// in the last level that overlap no incoming data ever see the compaction
 /// filter or drop their tombstones again).
+/// Whole-level compaction, used by the manual [`run_manual`] sweep. Background
+/// compaction goes through [`pick_compaction`] instead, which selects a bounded
+/// subset; taking a whole level here is deliberate, since the sweep's job is to
+/// push every populated level down once.
 fn compact_into(
     db: &Arc<DbInner>,
     cf: &Arc<ColumnFamily>,
@@ -193,7 +460,7 @@ fn compact_into(
     // afterwards would drop any table added meanwhile. It is re-derived from
     // live state inside `update_levels` below, as `levels[target]` minus the
     // inputs — which is the same set, plus concurrent arrivals.
-    let (inputs, num_levels): (Vec<Arc<SstHandle>>, usize) = cf.with_levels(|levels| {
+    let inputs: Vec<Arc<SstHandle>> = cf.with_levels(|levels| {
         // Foreign mounts (attach_part_by_ref) never compact: not as the
         // level's own inputs, and a push-down that would overlap one in the
         // target is skipped whole — merging around a read-only mount would
@@ -204,25 +471,45 @@ fn compact_into(
             .cloned()
             .collect();
         if inputs.is_empty() {
-            return (Vec::new(), levels.len());
+            return Vec::new();
         }
         let (min_key, max_key) = key_span(&inputs, &cmp);
         if target != level && target < levels.len() {
             for th in &levels[target] {
                 if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, &min_key, &max_key) {
                     if is_foreign_mount(db, &th.meta) {
-                        return (Vec::new(), levels.len());
+                        return Vec::new();
                     }
                     inputs.push(th.clone());
                 }
             }
         }
-        (inputs, levels.len())
+        inputs
     });
 
     if inputs.is_empty() {
         return Ok(());
     }
+    compact_inputs(db, cf, level, target, inputs)
+}
+
+/// Merge `inputs` from `level` into `target` and install the result.
+///
+/// The caller owns input selection *and* the range lock covering every input —
+/// this function assumes exclusive ownership of that span and does not check.
+pub(crate) fn compact_inputs(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    target: usize,
+    inputs: Vec<Arc<SstHandle>>,
+) -> Result<()> {
+    let cmp = cf.cmp();
+    debug_assert!(target == level || target == level + 1);
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let num_levels = cf.with_levels(|levels| levels.len()).max(target + 1);
 
     let bottom = target >= num_levels - 1 && {
         // bottom only if no level beyond target holds data
@@ -252,7 +539,10 @@ fn compact_into(
         it.seek_to_first();
     }
 
-    let target_bytes = (cf.opts.write_buffer_size as u64).max(1);
+    // Output is cut at `target_file_size`, held apart from `write_buffer_size`
+    // since 0.8.0 — it sets how many files a level holds, and therefore how
+    // finely the level below can be compacted.
+    let target_bytes = (cf.opts.target_file_size as u64).max(1);
     let mut outputs: Vec<SstMeta> = Vec::new();
     // (writer, klog, id, bytes, partition). `partition` is the partition every
     // key in the current output file belongs to — only meaningful at the bottom

@@ -70,6 +70,9 @@ pub struct DbInner {
     pub(crate) handles: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<AtomicBool>,
     pub(crate) pending_flush: Arc<AtomicUsize>,
+    /// Guards the scheduled part-mover pass so only one compaction worker runs
+    /// it at a time.
+    pub(crate) mover_running: AtomicBool,
 
     /// Serializes manifest rebuild+write. Multiple flush workers, the compaction
     /// worker, and CF create/drop all call `persist_manifest` concurrently; without
@@ -514,6 +517,7 @@ impl DB {
             closing,
             stop,
             pending_flush,
+            mover_running: AtomicBool::new(false),
             manifest_mu: Mutex::new(()),
             wal_layout: Mutex::new(requested_layout),
             instance_nonce: Mutex::new(manifest.instance_nonce),
@@ -1112,6 +1116,9 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                                 crate::wal::remove_wal_files(p);
                             }
                         }
+                        // A flush changes L0, so it changes the debt writers
+                        // pace against.
+                        crate::compaction::refresh_compaction_debt(&db, &cf);
                         // FIFO CFs enforce their size/age limit after every
                         // flush; leveled CFs wait for the L0 file trigger.
                         let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
@@ -1151,6 +1158,7 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
                         // FIFO CFs enforce their size/age limit after every
                         // flush; leveled CFs wait for the L0 file trigger.
                         let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
+                        crate::compaction::refresh_compaction_debt(&db, &cf);
                         if !db.closing.load(Ordering::Relaxed)
                             && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
                         {
@@ -1188,6 +1196,15 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
     loop {
         match rx.recv_timeout(WORKER_TICK) {
             Ok(cf) => {
+                // Check `stop` before starting, not only when the queue runs
+                // dry. Testing it on timeout alone meant a closing database
+                // drained every queued job first, which is what made
+                // `finish_compactions_on_close` unobservable and turned close
+                // into a 35-second wait after a large ingest. Leftover debt is
+                // legal LSM state; the next open picks it up.
+                if stop.load(Ordering::SeqCst) && !db.opts.finish_compactions_on_close {
+                    break;
+                }
                 let _ = compaction::run(&db, &cf);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1197,12 +1214,19 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
+        // One mover pass at a time. With several compaction workers, two could
+        // otherwise scan concurrently and pick the same partition to relocate.
         if !mover_interval.is_zero()
             && !db.closing.load(Ordering::Relaxed)
             && last_mover.elapsed() >= mover_interval
+            && db
+                .mover_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
         {
             last_mover = std::time::Instant::now();
             let _ = db.run_part_mover();
+            db.mover_running.store(false, Ordering::SeqCst);
         }
     }
 }

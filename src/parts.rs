@@ -35,7 +35,60 @@ use crate::column_family::{ColumnFamily, SstHandle};
 use crate::db::DB;
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
+use crate::range_lock::{KeyRange, RangeGuard};
 use crate::sst::vlog_path_for;
+
+/// Lock the key span covering `partition`'s bottom-level tables, so compaction
+/// cannot rewrite them between the caller's snapshot and its removal.
+///
+/// Before 0.8.0 that exclusion came from `cf.compact_mu`, which compaction held
+/// for a whole run. Compaction now holds only the range it rewrites, so these
+/// operations have to name a range too, or they lose the guarantee entirely —
+/// the failure being a tier move and a compaction rewriting the same bottom
+/// tables, one of them installing tables whose inputs the other has unlinked.
+///
+/// The span is re-read under the lock: a compaction that finished between the
+/// first read and the acquire may have widened the partition's extent. If it
+/// did, widen and retry. Falls back to locking the whole keyspace, which is
+/// always correct and is what the old `compact_mu` effectively did.
+fn lock_partition_span(cf: &Arc<ColumnFamily>, partition: &str) -> RangeGuard {
+    let cmp = cf.cmp();
+    let span_of = |handles: &[Arc<SstHandle>]| -> Option<KeyRange> {
+        let spans: Vec<(&[u8], &[u8])> = handles
+            .iter()
+            .map(|h| (h.meta.min_key.as_slice(), h.meta.max_key.as_slice()))
+            .collect();
+        KeyRange::union(spans, &cmp)
+    };
+    let within = |handles: &[Arc<SstHandle>], r: &KeyRange| -> bool {
+        handles.iter().all(|h| {
+            let lo_ok = r
+                .min
+                .as_ref()
+                .is_none_or(|m| cmp.compare(&h.meta.min_key, m).is_ge());
+            let hi_ok = r
+                .max
+                .as_ref()
+                .is_none_or(|m| cmp.compare(&h.meta.max_key, m).is_le());
+            lo_ok && hi_ok
+        })
+    };
+
+    for _ in 0..4 {
+        let Some(range) = span_of(&cf.bottom_partition_handles(partition)) else {
+            // Nothing materialized: the caller will report NotFound, but it
+            // must still do so under a lock, or a compaction could materialize
+            // the part underneath the check.
+            return cf.range_locks.acquire_blocking(KeyRange::all());
+        };
+        let guard = cf.range_locks.acquire_blocking(range.clone());
+        if within(&cf.bottom_partition_handles(partition), &range) {
+            return guard;
+        }
+        drop(guard); // extent grew under us; re-derive and try again
+    }
+    cf.range_locks.acquire_blocking(KeyRange::all())
+}
 
 /// One SSTable of an exported part, described independently of this database.
 ///
@@ -236,8 +289,9 @@ impl DB {
         }
         self.inner.poison.check()?;
         // Serialize against compaction so the bottom level cannot be rewritten
-        // out from under us between snapshot and removal.
-        let _mu = cf.compact_mu.lock();
+        // out from under us between snapshot and removal. Scoped to this
+        // partition's span, so compaction elsewhere in the CF continues.
+        let _range = lock_partition_span(cf, partition);
 
         let handles = cf.bottom_partition_handles(partition);
         if handles.is_empty() {
@@ -317,7 +371,12 @@ impl DB {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.inner.poison.check()?;
-        let _mu = cf.compact_mu.lock();
+        // Whole keyspace: the incoming tables' extent is not known until the
+        // directory has been read and validated, and the `bottom_overlaps`
+        // placement decision below has to be stable against compaction. An
+        // attach is a rare administrative operation, so this costs no steady-
+        // state concurrency — and it is what `compact_mu` already did here.
+        let _range = cf.range_locks.acquire_blocking(KeyRange::all());
 
         let dir = dir.as_ref();
         let mut klogs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
@@ -481,7 +540,8 @@ impl DB {
                 t.id
             )));
         }
-        let _mu = cf.compact_mu.lock();
+        // Whole keyspace, for the same reason as `attach_part`.
+        let _range = cf.range_locks.acquire_blocking(KeyRange::all());
 
         // Stage and validate every table before installing anything.
         let mut staged: Vec<(Arc<SstHandle>, bool)> = Vec::new();
@@ -785,7 +845,9 @@ impl crate::db::DbInner {
         if !cf.tiers().is_known(Some(tier)) {
             return Err(OndaError::InvalidArgs(format!("unknown tier {tier:?}")));
         }
-        let _mu = cf.compact_mu.lock();
+        // Scoped to this partition, so the background mover no longer stops
+        // compaction across the whole column family while it copies.
+        let _range = lock_partition_span(cf, partition);
 
         let handles = cf.bottom_partition_handles(partition);
         if handles.is_empty() {

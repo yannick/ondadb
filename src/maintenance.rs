@@ -30,6 +30,12 @@ pub struct CfStats {
     pub bloom_skips: u64,
     /// SSTable probes actually issued.
     pub sst_probes: u64,
+    /// Bytes by which the levels exceed their capacities — the backlog
+    /// compaction still owes. Writers pace against this once it passes
+    /// `soft_pending_compaction_bytes` and block at
+    /// `hard_pending_compaction_bytes`, so a value pinned near the hard limit
+    /// means ingest is outrunning compaction.
+    pub compaction_debt: u64,
 }
 
 /// Database-wide statistics.
@@ -61,6 +67,9 @@ impl ColumnFamily {
             point_reads: self.point_reads.load(std::sync::atomic::Ordering::Relaxed),
             bloom_skips: self.bloom_skips.load(std::sync::atomic::Ordering::Relaxed),
             sst_probes: self.sst_probes.load(std::sync::atomic::Ordering::Relaxed),
+            compaction_debt: self
+                .compaction_debt
+                .load(std::sync::atomic::Ordering::Relaxed),
             levels,
         }
     }
