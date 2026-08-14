@@ -265,7 +265,7 @@ Same WAL format; file names `unified-wal-<gen>.log[.sN]`; record keys carry an
 the prefix and re-sorts each CF's slice with that CF's comparator. The manifest
 tag above prevents reopening a non-empty database under a different WAL layout.
 
-## A2 tail tags (0.8.0)
+## A2 tail tags (0.7.8)
 
 Two tagged manifest-tail sections follow the positional
 (partition/tier/max-entry-time) sections, in fixed order, each self-identifying

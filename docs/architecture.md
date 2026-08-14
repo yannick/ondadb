@@ -16,6 +16,7 @@ type/function names — grep for them; line numbers rot.
 | `memtable_arena.rs` | *(unsafe-fastpath only)* arena skip-list shard: single-allocation nodes with inline key prefix + seq; `ShardCursor` for zero-copy flush |
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
+| `table_cache.rs` | `TableCache`: sharded (CLOCK) LRU of open SSTable readers, bounding resident index+bloom memory by reader count (`max_open_readers`) and byte budget (`max_open_reader_bytes`); the `max_open_files` equivalent |
 | `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse and pinned-block borrowed keys/values |
 | `compaction.rs` | Leveled compaction: pick level, k-way merge, version collapse, tombstone/TTL GC, compaction filters; bottom-level output cut at partition boundaries; FIFO style (oldest-table eviction) |
 | `ingest.rs` | Bulk ingestion: pre-sorted stream → L0 SSTables directly (no WAL/memtable); atomic install at `finish()` |
@@ -89,7 +90,20 @@ unified store (if enabled) → active memtable → immutable memtables (newest
 first) → L0 tables whose [min,max] covers the key (all of them; L0 overlaps) →
 one binary-searched table per level ≥ 1. SSTable get: bloom filter →
 `find_block` binary search on the in-memory index → linear entry scan inside
-the 4 KiB block → inline value or vlog read (CRC-verified).
+the data block → inline value or vlog read (CRC-verified).
+
+Every SSTable touched by a read or scan resolves its reader through the shared
+`TableCache` (`table_cache.rs`), not by opening the file directly: `SstHandle`
+holds only the information to re-open a reader and asks the cache for one. A
+reader carries the table's whole block index and bloom filter resident, so the
+cache bounds that memory by **both** an open-reader count (`max_open_readers`,
+default 512) **and** a byte budget (`max_open_reader_bytes`, default 1 GiB),
+evicting least-recently-used readers past either bound — the `max_open_files`
+equivalent. Closing a reader is sound because it is a pure, re-derivable view of
+an immutable file (an eviction only drops the cache's `Arc`; a caller mid-read
+keeps its own until done). The cache is sharded with second-chance (CLOCK)
+replacement, so a hit takes a shard read lock rather than a process-global
+mutex, and point reads scale across cores.
 
 Iterator (`ColumnFamily::new_iterator`): builds `ChildIter`s over the txn
 overlay (optional), unified slice (optional), the active memtable, the imms, and

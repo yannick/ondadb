@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.7.8
+
+**Attach-by-reference over shared tiers (A2)**, plus a target-conditional S3 TLS
+backend. Non-shared tiers are byte-for-byte unchanged from 0.7.7 in every
+persisted structure and every path; a database that never declares a shared tier
+is indistinguishable from before.
+
+- **Shared tiers and zero-copy attach — `TierDef::shared()` +
+  `DB::attach_part_by_ref`.** This expresses a one-writer / many-disposable-reader
+  topology directly: one database seals immutable parts onto an object store and N
+  query databases mount them without copying a byte. Three things made it
+  impossible before, each addressed here:
+
+  - **Object naming no longer collides.** A move onto a *shared* tier names each
+    file `cf-{cf}/{instance:016x}-{id}` relative to the tier root, where
+    `instance` is a per-database nonce minted once and persisted. Two databases
+    pointed at one root can no longer overwrite each other's objects (before, tier
+    paths derived from the per-database file id, so both eventually moved *their*
+    id 7). Moves onto non-shared tiers keep the legacy id-derived path exactly.
+  - **`attach_part_by_ref` copies nothing.** It registers an exported
+    `PartManifest`'s tables in the catalog under fresh local ids that resolve to
+    the shared objects. Each table's footer/index/bloom is opened and CRC-verified
+    through the tier backend (the same validation `Reader::open` always does), and
+    the manifest's `num_entries`/`max_seq` claims are cross-checked against the
+    footer — a mismatch rejects the whole part, nothing installed. The target
+    adopts the part's sequence lineage via the recovery path's `observe_seq`, so a
+    fresh (empty) database can attach foreign-lineage parts that `attach_part`
+    would refuse.
+  - **Shared tiers are delete-free.** The engine never deletes an object on a
+    shared tier: the mover will not move a part *off* one, `detach`/`freeze` refuse
+    shared publications, the startup orphan sweep skips shared roots, and
+    compaction's obsolete-input deletion resolves default-tier paths only.
+    Reclaiming shared objects is the coordinating layer's job (as with the
+    "no internal object CAS" rule) — without this, one sharer's hygiene would be
+    another's data loss.
+
+  **A sharer never compacts mounted parts.** A2's read-only-sharer safety argument
+  held for the mover but not for local compaction: the LSM could pick mounted
+  (foreign-nonce) tables as compaction triggers or inputs and silently rebuild
+  shared bytes as local tables. `is_foreign_mount` now excludes them from both,
+  and a push-down that would overlap a mounted table in the target level aborts.
+  Pinned by `a_sharer_never_compacts_mounted_parts`.
+
+  **Persistence.** Two new tagged manifest-tail sections following the `ONDAWAL1`
+  precedent: `ONDAOBJ1` (per-CF table→object names, emitted only when some table
+  carries an object) and `ONDAINS1` (the 8-byte instance nonce, emitted once
+  minted). `PartTable.object` carries the name through `export_part` but is
+  excluded from the part digest — a rename is not a rewrite. A manifest carrying
+  neither tag is byte-identical to a pre-A2 encoding; a pre-A2 binary refuses a
+  tagged manifest fail-stop (checksummed unknown tail → corruption error), the
+  same downgrade posture as the 0.3.0 tier tail. New public surface:
+  `TierDef::shared`, `DB::attach_part_by_ref`, `SstMeta::object`,
+  `PartTable::object`. Full guide in `docs/parts-and-tiers.md`; the design
+  rationale is `SPADINO-A2.md`. Mutable sharing remains documented as unsupported
+  — the safety argument is that a shared part is immutable and single-writer.
+
+- **The S3 TLS backend is target-conditional (feature `s3`).** macOS links
+  native-tls (Security.framework): rustls' native-roots loader panics
+  (`InvalidCertificate(BadEncoding)`) on a keychain holding an unparseable
+  trust-store cert — and it hit live on a macOS host talking *plain HTTP* to a
+  MinIO endpoint, where TLS should not even engage. Every other target — including
+  musl, which the static from-scratch CI images and spada's builds link against —
+  returns to tokio-rustls-tls. The `s3` feature activates whichever backend
+  matches the target; no API or format change.
+
 ## 0.7.7
 
 **Large values were re-checksummed on every read, and a 4 GiB one was written
@@ -44,6 +109,26 @@ corrupt.** Two vlog defects, one performance and one silent-corruption.
   v1), including the stored-length invariant. The reader enforces it: a v2 frame
   whose header claims more stored bytes than the value's logical length is
   rejected as corrupt instead of driving a blind allocation of up to 4 GiB.
+
+## 0.7.6
+
+**A read-back of just-ingested rows could come up short — read-your-own-ingest.**
+This completes the fix started in 0.7.4.
+
+- **A fixed snapshot begun right after `Ingestion::finish` could pin below the
+  ingestion's sequence.** The 0.7.4 fix made a fixed-snapshot begin wait for the
+  thread's *own* commit floor, but only `Txn::commit` recorded that floor; the
+  ingestion path (reserve + publish at `start_ingestion`) never did. So a fixed
+  snapshot opened immediately after an ingestion finished could pin *below* the
+  ingestion's seq whenever another thread's earlier-reserved commit was holding
+  the gap-free watermark down — and a read of the just-ingested rows through that
+  snapshot came back short.
+
+  The ingestion path now notes its thread's commit floor the same way
+  `Txn::commit` does. This was a live-only, intermittent failure: spada's seal
+  verification read it as segment corruption ("materialized key count differs from
+  the prepared lane") for two days, surviving three fixes on its own side. The
+  stress test reproduces 9–15% short reads per run before the fix and zero after.
 
 ## 0.7.5
 

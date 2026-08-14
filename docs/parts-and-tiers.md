@@ -442,7 +442,7 @@ the object durable (it runs *before* the manifest flip that publishes it);
 `delete` of a missing object must succeed; implementations must be
 `Send + Sync` — engine threads call concurrently.
 
-## Shared tiers & attach-by-reference (A2, 0.8.0)
+## Shared tiers & attach-by-reference (A2, 0.7.8)
 
 `TierDef::shared()` declares a tier's root shared between databases, enabling
 the one-writer / many-read-only-sharers topology (`SPADINO-A2.md`):
@@ -514,7 +514,7 @@ whose id the current manifest does not place on that tier (the startup
 sweep's rule, applied externally). Do not run the audit against a manifest
 older than the bucket listing.
 
-**Transient network failures (0.4.1).** Every S3 request carries a bounded
+**Transient network failures (0.5.0).** Every S3 request carries a bounded
 in-backend retry — 4 attempts, 25/50/100 ms backoff, transport-level errors
 only (`Hyper`/`Io`; an HTTP 4xx/5xx is never retried). This absorbs the
 hyper keep-alive reuse race, whose signature is an *intermittent*
