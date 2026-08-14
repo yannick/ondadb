@@ -181,11 +181,11 @@ Flush worker (`db.rs::flush_worker`):
 ## Compaction (`compaction.rs`)
 
 Classic leveled: L0→L1 on file count, Li→Li+1 when level bytes exceed
-`write_buffer_size * level_size_ratio^(i-1)`. Merge-iterates inputs plus
+`l1_base_bytes * level_size_ratio^(i-1)`. Merge-iterates inputs plus
 overlapping next-level tables; keeps the newest version per key plus every
 version newer than `DbInner::oldest_snapshot()`; drops tombstones and expired
 TTL entries only at the bottom level. Output SSTs are split at
-`write_buffer_size` and, at the bottom level, additionally **cut at partition
+`target_file_size` and, at the bottom level, additionally **cut at partition
 boundaries** (see § Partitions). Every output carries
 `max_entry_time = max` over its inputs' stamps, so re-compacting cold data
 does not reset its age for the part mover. Ordering: new levels installed →
@@ -193,6 +193,44 @@ does not reset its age for the part mover. Ordering: new levels installed →
 (defer-aware). Input deletion resolves **default-tier paths only** — a
 compacted input that lived on a named tier is not unlinked there (a storage
 leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
+
+### Bounded jobs and backpressure (0.8.0)
+
+A job takes **one** file from the source level plus only the target-level files
+its range overlaps, so it costs about
+`target_file_size * (1 + level_size_ratio)` however large the level is. A
+per-level cursor sweeps the keyspace so successive jobs advance rather than
+re-picking the head of the level. L0 is the exception twice over: its files
+overlap each other, so a job takes the **oldest** `l1_file_count_trigger` of
+them — safe because `levels[0]` is newest-first and reads walk it in that
+order, so a version left in a newer L0 file still shadows the copy pushed down.
+
+Before 0.8.0 a job took the whole source level plus every overlapping target
+file. Under random keys an L0 file spans nearly the entire keyspace, so each
+push-down rewrote all of the level below, and the work in one job grew with the
+dataset. `target_file_size` and `l1_base_bytes` did not exist: both were
+`write_buffer_size`, which meant L1 held exactly one file whose range covered
+everything beneath it — partial compaction was not merely unimplemented, the
+geometry made it impossible.
+
+Two consequences. Jobs on disjoint ranges share no inputs, so they run
+concurrently (§ Range locks). And debt is measurable —
+`compaction::pending_compaction_bytes`, cached on the CF and refreshed by flush
+and compaction — which is what `ColumnFamily::apply_commit` paces against:
+proportional delay past `soft_pending_compaction_bytes`, blocking at
+`hard_pending_compaction_bytes`. Without that, ingest ran at memtable speed no
+matter how far compaction lagged, since `l0_queue_stall_threshold` gates on
+sealed memtables awaiting *flush* and flush was never the bottleneck.
+
+### Range locks (`range_lock.rs`)
+
+Compaction and the parts/tiers operations exclude each other by **key range**
+rather than by a CF-wide mutex. Compaction `try_acquire`s and picks different
+work when a range is held; `detach_part`, `attach_part`, `attach_part_by_ref`
+and `relocate_part` `acquire_blocking` because they are user-initiated and must
+not fail spuriously. `cf.compact_mu` now guards only whole-CF operations (the
+manual `DB::compact` sweep and FIFO eviction), both of which additionally take
+the whole keyspace. Lock order is always `compact_mu` → range lock.
 
 ## Partitions (`ColumnFamilyConfig::partition_rules`)
 
@@ -284,8 +322,14 @@ ClickHouse's parts, it is the unit of backup, retention and tiering:
   discipline) so compaction cannot unlink a file mid-freeze. The live part
   is untouched.
 
-All three serialize against compaction via `cf.compact_mu` (freeze uses the
-deletion pause instead); every catalog change is one crash-atomic manifest
+All three serialize against compaction by taking a **range lock** over the span
+they touch (freeze uses the deletion pause instead) — `detach` and `relocate`
+over their partition's span, `attach` over the whole keyspace since the incoming
+extent is not known until the files are validated. Before 0.8.0 this was
+`cf.compact_mu`; when compaction stopped taking that mutex, these operations had
+to name a range or lose the guarantee entirely, the failure being a tier move
+and a compaction rewriting the same bottom tables with one unlinking the other's
+inputs. Every catalog change is one crash-atomic manifest
 rewrite, so a crash can only leave orphan files, never route a reader to a
 file that is not durably in place. Detach/attach/freeze move files with
 `std::fs`, so they operate on **default-tier (local) parts**; move a part

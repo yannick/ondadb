@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.8.0
+
+**Sustained writes.** Compaction jobs are bounded, writers pace against
+compaction debt, and `close()` no longer pays off a backlog it never reported.
+No format migration: a 0.7.8 database opens unchanged.
+
+### What was wrong
+
+Compaction took the **whole** source level plus every target-level file it
+overlapped. Under random keys an L0 file spans nearly the entire keyspace, so
+each L0→L1 push-down rewrote all of L1, and each L1→L2 all of L2 — the work in
+one job grew with the dataset.
+
+Nothing in the write path knew. `l0_queue_stall_threshold` gates on sealed
+memtables awaiting **flush**, and flush was never the bottleneck: isolating the
+phases showed the flush queue draining in ~130 ms whether 5M or 20M records had
+been written. So ingest ran at memtable speed however far compaction had fallen
+behind, and the debt surfaced at close.
+
+Measured on a 24-core M2 Ultra (16 B keys, 100 B values, 8 threads), the
+reported Put rate sat flat at ~4.6M ops/s from 5M through 20M records while the
+close that followed it went **2.5 s → 10.8 s → 35 s**. The rate an application
+measured was one the engine could not sustain, and the gap widened with the
+dataset.
+
+### What changed
+
+- **Bounded jobs.** A compaction takes one file from the source level plus only
+  the target files its range overlaps — about
+  `target_file_size * (1 + level_size_ratio)` regardless of level size. A
+  per-level cursor sweeps the keyspace so successive jobs advance instead of
+  re-picking the head. L0 takes the **oldest** `l1_file_count_trigger` files,
+  which is safe because `levels[0]` is newest-first and reads walk it in that
+  order, so a version left in a newer L0 file still shadows the copy pushed
+  down.
+- **`target_file_size` and `l1_base_bytes`** are new `ColumnFamilyConfig`
+  fields, held apart from `write_buffer_size`. They had all been the same value,
+  so L1 held exactly **one** file whose range covered everything beneath it:
+  partial compaction was not merely unimplemented, the geometry made it
+  impossible. Defaults 16 MiB and 256 MiB, giving ~16 files in L1.
+- **Write pacing.** `soft_pending_compaction_bytes` (default 2 GiB) delays each
+  commit in proportion to the excess; `hard_pending_compaction_bytes` (8 GiB)
+  blocks until a compaction completes. Debt is a gauge cached on the column
+  family and refreshed by flush and compaction, so the write path reads one
+  atomic rather than walking every level. Readable via
+  `CfStats::compaction_debt`.
+- **Range locks (`range_lock.rs`)** replace `cf.compact_mu` as the exclusion
+  mechanism. Compaction `try_acquire`s and picks other work when a range is
+  held; `detach_part`, `attach_part`, `attach_part_by_ref` and `relocate_part`
+  `acquire_blocking` over their span. **This part is load-bearing for
+  correctness:** those four relied on `compact_mu` so the bottom level could not
+  be rewritten between their snapshot and their removal, and when compaction
+  stopped taking that mutex they had to name a range or lose the guarantee — the
+  failure being a tier move and a compaction rewriting the same bottom tables,
+  one unlinking the other's inputs. `compact_mu` now guards only whole-CF
+  operations (the `DB::compact` sweep, FIFO eviction), which additionally take
+  the whole keyspace. Lock order is always `compact_mu` → range lock.
+- **The background part mover** blocks only its own partition instead of the
+  whole column family, and runs one pass at a time now that several compaction
+  workers exist. A foreign mount (`attach_part_by_ref`) no longer blocks its
+  entire level — only the ranges that actually overlap it.
+- **`finish_compactions_on_close` works.** It was declared in `Options` and read
+  by nothing: the compaction worker tested its stop flag only when its queue ran
+  dry, so close drained the backlog whatever the setting said. Default stays
+  `false`; leftover debt is legal LSM state the next open resumes from.
+
+### Results
+
+Same machine and workload. "Settled" counts the close that follows the ingest,
+which is the rate at which records actually become durable SSTables:
+
+| Records | 0.7.8 close | 0.8.0 close | 0.7.8 settled | 0.8.0 settled | |
+|---|---|---|---|---|---|
+| 5M  | 2 702 ms  | 1 086 ms | 1.36M ops/s | 2.15M ops/s | 1.6x |
+| 10M | 10 916 ms | 428 ms   | 0.77M ops/s | 3.45M ops/s | 4.5x |
+| 20M | 36 666 ms | 1 185 ms | 0.49M ops/s | 3.46M ops/s | 7.1x |
+
+The ratio is not the point — the **shape** is. 0.7.8 halved its settled rate
+each time the data doubled (1.36M → 0.77M → 0.49M); 0.8.0 holds it flat past
+10M. The gain therefore keeps growing with dataset size, which is what "the
+work in one job grew with the dataset" costs you.
+
+Peak Put barely moves (~4.6M → ~4.0-4.4M ops/s): the ingest path was never the
+problem, and pacing only engages once debt is real.
+
+### Compatibility
+
+The new geometry rides in a tagged manifest tail (`ONDACMP1`) emitted only when
+it differs from the defaults, so a config left alone still encodes byte-for-byte
+as earlier releases wrote it and a pre-0.8.0 manifest decodes to the new
+defaults. Verified end to end: a database written by the released 0.7.8 binary
+opens under 0.8.0 with all records readable, and recompacting it under the new
+picker loses nothing. Existing SSTables keep their old sizes until compaction
+re-cuts them.
+
+310 tests green, including `tests/sustained_writes.rs`.
+
 ## 0.7.8
 
 **Attach-by-reference over shared tiers (A2)**, plus a target-conditional S3 TLS

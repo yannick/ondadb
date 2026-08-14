@@ -87,6 +87,14 @@ Full release history is in [`CHANGELOG.md`](CHANGELOG.md).
 
 - **Leveled compaction** (L0→L1 by file count, Li→Li+1 by size), snapshot-aware
   version collapse and tombstone GC.
+- **Bounded compaction jobs** — a job takes one file from the source level plus
+  only the target files it overlaps, so its cost is
+  `target_file_size * (1 + level_size_ratio)` no matter how large the level is.
+  Jobs on disjoint key ranges compact concurrently.
+- **Debt-aware write pacing** — writers are delayed in proportion to pending
+  compaction bytes past `soft_pending_compaction_bytes` and block at
+  `hard_pending_compaction_bytes`, so sustained ingest reports a rate the engine
+  can actually hold. Read the backlog back with `CfStats::compaction_debt`.
 - **Compaction filters** — `cf.set_compaction_filter(|key, value| ...)` drops (or
   tombstones) entries during compaction for custom GC/expiry.
 - **FIFO compaction style** — `compaction_style: Fifo` with `fifo_max_bytes` /
