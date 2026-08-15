@@ -1,3 +1,5 @@
 /target
 .worktrees/
 /target-040
+__pycache__/
+*.py[cod]
