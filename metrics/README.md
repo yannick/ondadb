@@ -67,6 +67,14 @@ regression disappear. Current reports are replaceable scratch output; history
 snapshots are the committed comparison record when a maintainer chooses to add
 them.
 
+Unsafe collection copies the current checkout into a fresh temporary project
+mirror before running Geiger. The copy includes current tracked, modified, and
+untracked project source, but excludes repository-root administration and
+generated trees such as `.git`, `.worktrees`, `.superpowers`, and `target*` so a
+nested checkout cannot be counted as unused source. Geiger uses the mirror's
+explicit `Cargo.toml`; its reusable Cargo target remains outside the mirror, and
+the mirror is removed after both successful and failed producer runs.
+
 ## Benchmark operations and interpretation
 
 The standalone runner defaults to five runs. Run the complete standalone suite

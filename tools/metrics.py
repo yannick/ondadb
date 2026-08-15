@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import math
@@ -30,6 +31,16 @@ CURRENT_PATH = METRICS_DIR / "current.json"
 BASELINE_PATH = ROOT / "metrics" / "baseline.json"
 HISTORY_DIR = ROOT / "metrics" / "history"
 BCA_BASELINE_PATH = ROOT / ".bca-baseline.toml"
+GEIGER_TARGET_DIR = ROOT / "target/metrics/cargo-geiger-target"
+
+GEIGER_MIRROR_EXCLUDED_DIRECTORIES = {
+    ".claude",
+    ".git",
+    ".superpowers",
+    ".worktrees",
+    "__pycache__",
+    "target",
+}
 
 UNSAFE_CATEGORIES = {
     "functions": "functions",
@@ -233,7 +244,13 @@ def _run_text(command: Sequence[str], output_path: Path | None = None) -> str:
     return completed.stdout
 
 
-def normalize_geiger(document: dict[str, object], package: str = "ondadb") -> dict[str, int]:
+def normalize_geiger(
+    document: dict[str, object],
+    package: str = "ondadb",
+    *,
+    repository_root: Path | None = None,
+    allowed_unscanned_roots: Sequence[Path] | None = None,
+) -> dict[str, int]:
     """Extract total project-owned unsafe items from cargo-geiger JSON."""
     packages_without_metrics = _array(
         _required(document, "packages_without_metrics"),
@@ -259,7 +276,15 @@ def normalize_geiger(document: dict[str, object], package: str = "ondadb") -> di
         _required(document, "used_but_not_scanned_files"),
         "cargo-geiger used_but_not_scanned_files",
     )
-    repository_root = ROOT.resolve()
+    resolved_repository_root = (repository_root or ROOT).resolve()
+    resolved_allowed_roots = tuple(
+        path.resolve()
+        for path in (
+            allowed_unscanned_roots
+            if allowed_unscanned_roots is not None
+            else (GEIGER_TARGET_DIR,)
+        )
+    )
     for raw_path in unscanned_files:
         path_text = _string(
             raw_path,
@@ -267,9 +292,16 @@ def normalize_geiger(document: dict[str, object], package: str = "ondadb") -> di
         )
         path = Path(path_text)
         if not path.is_absolute():
-            path = ROOT / path
+            path = resolved_repository_root / path
+        resolved_path = path.resolve()
+        if any(
+            resolved_path == allowed_root
+            or resolved_path.is_relative_to(allowed_root)
+            for allowed_root in resolved_allowed_roots
+        ):
+            continue
         try:
-            project_path = path.resolve().relative_to(repository_root)
+            project_path = resolved_path.relative_to(resolved_repository_root)
         except ValueError:
             continue
         raise MetricsError(
@@ -327,6 +359,120 @@ def geiger_environment(
     environment = dict(base)
     environment["CARGO_TARGET_DIR"] = str(target_dir)
     return environment
+
+
+def _geiger_mirror_ignore(source_root: Path):
+    resolved_source_root = source_root.resolve()
+
+    def ignored(directory: str, names: list[str]) -> set[str]:
+        excluded = {name for name in names if name == "__pycache__"}
+        if Path(directory).resolve() != resolved_source_root:
+            return excluded
+        excluded.update(
+            name
+            for name in names
+            if name in GEIGER_MIRROR_EXCLUDED_DIRECTORIES
+            or name.startswith("target")
+        )
+        return excluded
+
+    return ignored
+
+
+@contextmanager
+def geiger_project_mirror(
+    source_root: Path,
+    *,
+    temporary_parent: Path | None = None,
+):
+    """Yield a fresh project mirror without repository administration trees."""
+    temporary_root: Path | None = None
+    try:
+        temporary_root = Path(
+            tempfile.mkdtemp(
+                prefix="ondadb-cargo-geiger-",
+                dir=temporary_parent,
+            )
+        )
+        mirror = temporary_root / "project"
+        shutil.copytree(
+            source_root,
+            mirror,
+            symlinks=True,
+            ignore=_geiger_mirror_ignore(source_root),
+        )
+    except OSError as error:
+        cleanup_error: OSError | None = None
+        if temporary_root is not None:
+            try:
+                shutil.rmtree(temporary_root)
+            except OSError as remove_error:
+                cleanup_error = remove_error
+        cleanup_detail = (
+            f"; cleanup also failed for {temporary_root}: {cleanup_error}"
+            if cleanup_error is not None
+            else ""
+        )
+        raise ToolError(
+            f"could not create isolated cargo-geiger project mirror: "
+            f"{error}{cleanup_detail}"
+        ) from error
+
+    producer_error: BaseException | None = None
+    try:
+        yield mirror
+    except BaseException as error:
+        producer_error = error
+        raise
+    finally:
+        try:
+            shutil.rmtree(temporary_root)
+        except OSError as error:
+            if producer_error is not None:
+                raise ToolError(
+                    f"cargo-geiger producer failed: {producer_error}; cleanup "
+                    f"also failed for {temporary_root}: {error}"
+                ) from error
+            raise ToolError(
+                f"could not remove isolated cargo-geiger project mirror "
+                f"{temporary_root}: {error}"
+            ) from error
+
+
+def geiger_command(project_mirror: Path) -> tuple[str, ...]:
+    """Build the pinned Geiger invocation against an explicit mirror manifest."""
+    return (
+        "cargo-geiger",
+        "--manifest-path",
+        str(project_mirror / "Cargo.toml"),
+        "--features",
+        "unsafe-fastpath",
+        "--output-format",
+        "Json",
+        "--quiet",
+    )
+
+
+def collect_geiger_document(
+    *,
+    source_root: Path,
+    output_path: Path,
+    target_dir: Path,
+) -> dict[str, object]:
+    """Run Geiger against a temporary mirror and validate it before cleanup."""
+    with geiger_project_mirror(source_root) as project_mirror:
+        geiger_raw = run_json(
+            geiger_command(project_mirror),
+            output_path,
+            environment=geiger_environment(dict(os.environ), target_dir),
+        )
+        geiger = _mapping(geiger_raw, "cargo-geiger document")
+        normalize_geiger(
+            geiger,
+            repository_root=project_mirror,
+            allowed_unscanned_roots=(target_dir,),
+        )
+        return geiger
 
 
 def unsafe_regressions(
@@ -822,17 +968,11 @@ def _producer_documents() -> tuple[object, object, dict[str, object]]:
         RAW_DIR / "bca-tests.json",
         tests=True,
     )
-    geiger_raw = run_json(
-        (
-            "cargo-geiger", "--features", "unsafe-fastpath",
-            "--output-format", "Json", "--quiet",
-        ),
-        RAW_DIR / "geiger.json",
-        environment=geiger_environment(
-            dict(os.environ), Path("target/metrics/cargo-geiger-target")
-        ),
+    geiger = collect_geiger_document(
+        source_root=ROOT,
+        output_path=RAW_DIR / "geiger.json",
+        target_dir=GEIGER_TARGET_DIR.resolve(),
     )
-    geiger = _mapping(geiger_raw, "cargo-geiger document")
     return production, tests, geiger
 
 

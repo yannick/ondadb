@@ -132,6 +132,175 @@ SNAPSHOT = {
 
 
 class GeigerTests(unittest.TestCase):
+    def _write_mirror_fixture(self, root):
+        files = {
+            "Cargo.toml": "[package]\nname = \"ondadb\"\nversion = \"0.0.0\"\n",
+            "Cargo.lock": "# current lock\n",
+            "src/lib.rs": "pub fn current_uncommitted_source() {}\n",
+            "src/target/project_owned.rs": "pub fn nested_target_module() {}\n",
+            "examples/project_owned.rs": "pub fn project_owned_example() {}\n",
+            ".git/admin.rs": "unsafe { duplicate() }\n",
+            ".worktrees/nested/src/lib.rs": "unsafe { duplicate() }\n",
+            "target/generated.rs": "unsafe { duplicate() }\n",
+            "target-debug/generated.rs": "unsafe { duplicate() }\n",
+            "target_debug/generated.rs": "unsafe { duplicate() }\n",
+            ".superpowers/scratch.rs": "unsafe { duplicate() }\n",
+        }
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    def test_isolated_mirror_preserves_current_project_files_and_excludes_admin_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            self._write_mirror_fixture(root)
+
+            with metrics.geiger_project_mirror(
+                root, temporary_parent=Path(directory)
+            ) as mirror:
+                mirror_path = mirror
+                self.assertEqual(
+                    (mirror / "src/lib.rs").read_text(encoding="utf-8"),
+                    "pub fn current_uncommitted_source() {}\n",
+                )
+                self.assertTrue((mirror / "examples/project_owned.rs").is_file())
+                self.assertTrue((mirror / "src/target/project_owned.rs").is_file())
+                for excluded in (
+                    ".git",
+                    ".worktrees",
+                    "target",
+                    "target-debug",
+                    "target_debug",
+                    ".superpowers",
+                ):
+                    self.assertFalse((mirror / excluded).exists())
+
+            self.assertFalse(mirror_path.exists())
+
+    def test_isolated_mirror_cleans_up_after_producer_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            self._write_mirror_fixture(root)
+            mirror_path = None
+
+            with self.assertRaisesRegex(RuntimeError, "producer failed"):
+                with metrics.geiger_project_mirror(
+                    root, temporary_parent=Path(directory)
+                ) as mirror:
+                    mirror_path = mirror
+                    raise RuntimeError("producer failed")
+
+            self.assertIsNotNone(mirror_path)
+            self.assertFalse(mirror_path.exists())
+
+    def test_isolated_mirror_creation_failure_is_actionable_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "tools.metrics.shutil.copytree",
+            side_effect=PermissionError("denied"),
+        ):
+            temporary_parent = Path(directory)
+            with self.assertRaisesRegex(
+                metrics.ToolError,
+                "create isolated cargo-geiger project mirror.*denied",
+            ):
+                with metrics.geiger_project_mirror(
+                    temporary_parent / "source",
+                    temporary_parent=temporary_parent,
+                ):
+                    self.fail("mirror creation unexpectedly succeeded")
+            self.assertEqual(list(temporary_parent.iterdir()), [])
+
+    def test_mirror_creation_reports_primary_and_cleanup_failures(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "tools.metrics.shutil.copytree",
+            side_effect=PermissionError("copy denied"),
+        ), mock.patch(
+            "tools.metrics.shutil.rmtree",
+            side_effect=PermissionError("cleanup denied"),
+        ):
+            with self.assertRaisesRegex(
+                metrics.ToolError,
+                "create isolated.*copy denied.*cleanup also failed.*cleanup denied",
+            ):
+                with metrics.geiger_project_mirror(
+                    Path(directory) / "source",
+                    temporary_parent=Path(directory),
+                ):
+                    self.fail("mirror creation unexpectedly succeeded")
+
+    def test_producer_and_cleanup_failures_are_both_actionable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            self._write_mirror_fixture(root)
+
+            with mock.patch(
+                "tools.metrics.shutil.rmtree",
+                side_effect=PermissionError("cleanup denied"),
+            ), self.assertRaisesRegex(
+                metrics.ToolError,
+                "producer failed.*cleanup also failed.*cleanup denied",
+            ):
+                with metrics.geiger_project_mirror(
+                    root,
+                    temporary_parent=Path(directory),
+                ):
+                    raise RuntimeError("producer failed")
+
+    def test_geiger_command_uses_explicit_mirror_manifest(self):
+        mirror = Path("/tmp/ondadb-geiger-mirror/project")
+
+        self.assertEqual(
+            metrics.geiger_command(mirror),
+            (
+                "cargo-geiger",
+                "--manifest-path",
+                "/tmp/ondadb-geiger-mirror/project/Cargo.toml",
+                "--features",
+                "unsafe-fastpath",
+                "--output-format",
+                "Json",
+                "--quiet",
+            ),
+        )
+
+    def test_geiger_collection_rejects_mirror_owned_scan_gap_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            self._write_mirror_fixture(root)
+            output_path = root / "raw/geiger.json"
+            target_dir = root / "target/metrics/cargo-geiger-target"
+            observed = {}
+
+            def partial_scan(command, output_path, *, environment):
+                mirror = Path(command[2]).parent
+                observed["mirror"] = mirror
+                observed["target"] = environment["CARGO_TARGET_DIR"]
+                document = json.loads(json.dumps(GEIGER))
+                document["used_but_not_scanned_files"] = [
+                    str(mirror / "src/unscanned.rs")
+                ]
+                return document
+
+            with mock.patch(
+                "tools.metrics.run_json", side_effect=partial_scan
+            ), self.assertRaisesRegex(
+                metrics.MetricsError,
+                "src/unscanned.rs.*not scanned",
+            ):
+                metrics.collect_geiger_document(
+                    source_root=root,
+                    output_path=output_path,
+                    target_dir=target_dir,
+                )
+
+            self.assertEqual(observed["target"], str(target_dir))
+            self.assertFalse(observed["mirror"].exists())
+
     def test_uses_repository_local_target_instead_of_shared_cargo_artifacts(self):
         environment = metrics.geiger_environment(
             {"PATH": "/bin", "CARGO_TARGET_DIR": "/shared/target"},
@@ -219,6 +388,26 @@ class GeigerTests(unittest.TestCase):
                 "methods": 3,
             },
         )
+
+    def test_permits_generated_files_from_configured_geiger_target_only(self):
+        generated_gap = json.loads(json.dumps(GEIGER))
+        generated_gap["used_but_not_scanned_files"] = [
+            str(
+                metrics.ROOT
+                / "target/metrics/cargo-geiger-target/debug/build/crate/out/generated.rs"
+            )
+        ]
+
+        self.assertEqual(
+            metrics.normalize_geiger(generated_gap)["expressions"],
+            5,
+        )
+
+        generated_gap["used_but_not_scanned_files"] = [
+            str(metrics.ROOT / "target/other/project-owned.rs")
+        ]
+        with self.assertRaisesRegex(metrics.MetricsError, "project-owned.rs"):
+            metrics.normalize_geiger(generated_gap)
 
 
 class SnapshotSchemaTests(unittest.TestCase):
