@@ -34,6 +34,9 @@ RESULT_RE = re.compile(
     r"(\d+) ops\s+([0-9]+(?:\.[0-9]+)?) ms\s+"
     r"([0-9]+(?:\.[0-9]+)?) ops/sec\s*$"
 )
+PHASE_PREFIX_RE = re.compile(
+    r"^(Put|Get \(cold\)|Forward Scan|Backward Scan|Delete)(?:\s|$)"
+)
 
 
 @dataclass(frozen=True)
@@ -61,9 +64,12 @@ def parse_output(text: str) -> dict[str, PhaseResult]:
     """Parse the stable phase lines emitted by ``onda_bench``."""
     parsed: dict[str, PhaseResult] = {}
     for line in text.splitlines():
+        phase_match = PHASE_PREFIX_RE.match(line)
+        if phase_match is None:
+            continue
         match = RESULT_RE.match(line)
         if match is None:
-            continue
+            raise ValueError(f"missing or malformed benchmark measurement: {line}")
         label, ops_text, milliseconds_text, rate_text = match.groups()
         phase = PHASE_NAMES[label]
         if phase in parsed:
@@ -73,6 +79,10 @@ def parse_output(text: str) -> dict[str, PhaseResult]:
             milliseconds=float(milliseconds_text),
             ops_per_second=float(rate_text),
         )
+        if not math.isfinite(result.milliseconds) or not math.isfinite(
+            result.ops_per_second
+        ):
+            raise ValueError(f"benchmark measurements must be finite: {line}")
         if (
             result.ops <= 0
             or result.milliseconds <= 0
@@ -170,6 +180,10 @@ def write_reports(document: dict[str, object], output_dir: Path) -> tuple[Path, 
         if not isinstance(run, dict) or not isinstance(run.get("phases"), dict):
             raise ValueError("benchmark run has an invalid phase map")
         run_number = run.get("run")
+        stdout = run.get("stdout")
+        stderr = run.get("stderr")
+        if not isinstance(stdout, str) or not isinstance(stderr, str):
+            raise ValueError("benchmark run is missing captured output")
         for phase, measurement in run["phases"].items():
             if not isinstance(measurement, dict):
                 raise ValueError("benchmark phase measurement must be an object")
@@ -180,6 +194,8 @@ def write_reports(document: dict[str, object], output_dir: Path) -> tuple[Path, 
                     measurement.get("ops"),
                     measurement.get("milliseconds"),
                     measurement.get("ops_per_second"),
+                    stdout,
+                    stderr,
                 ]
             )
 
@@ -187,7 +203,17 @@ def write_reports(document: dict[str, object], output_dir: Path) -> tuple[Path, 
         mode="w", encoding="utf-8", newline="", dir=output_dir, delete=False
     ) as temporary:
         writer = csv.writer(temporary, lineterminator="\n")
-        writer.writerow(["phase", "run", "ops", "milliseconds", "ops_per_second"])
+        writer.writerow(
+            [
+                "phase",
+                "run",
+                "ops",
+                "milliseconds",
+                "ops_per_second",
+                "stdout",
+                "stderr",
+            ]
+        )
         writer.writerows(rows)
         temporary.flush()
         os.fsync(temporary.fileno())
@@ -234,6 +260,8 @@ def execute_runs(binary: Path, workload: Workload, db_root: Path) -> list[dict[s
         runs.append(
             {
                 "run": run_number,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
                 "phases": {phase: asdict(parsed[phase]) for phase in workload.phases},
             }
         )

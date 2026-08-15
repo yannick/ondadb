@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr, redirect_stdout
+import csv
 import io
 import math
 from pathlib import Path
@@ -31,6 +32,18 @@ class ParseOutputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             benchmark.parse_output(
                 "Put                          0 ops    2.00 ms    0 ops/sec\n"
+            )
+
+    def test_rejects_recognized_phase_without_throughput(self):
+        with self.assertRaisesRegex(ValueError, "missing or malformed"):
+            benchmark.parse_output("Put                          100 ops    2.00 ms\n")
+
+    def test_rejects_non_finite_throughput(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            benchmark.parse_output(
+                "Put                          100 ops    2.00 ms    "
+                + "9" * 400
+                + " ops/sec\n"
             )
 
 
@@ -106,6 +119,8 @@ class ReportTests(unittest.TestCase):
             "runs": [
                 {
                     "run": 1,
+                    "stdout": "Get (cold)                   100 ops    1.00 ms    100000 ops/sec\n",
+                    "stderr": "cache warmed\n",
                     "phases": {
                         "get": {
                             "ops": 100,
@@ -129,12 +144,32 @@ class ReportTests(unittest.TestCase):
 
             self.assertEqual(json_path.name, "onda-latest.json")
             self.assertIn('"schema": "ondadb.benchmark.v1"', json_path.read_text())
-            rows = csv_path.read_text().splitlines()
+            with csv_path.open(newline="") as report:
+                rows = list(csv.reader(report))
             self.assertEqual(
                 rows[0],
-                "phase,run,ops,milliseconds,ops_per_second",
+                [
+                    "phase",
+                    "run",
+                    "ops",
+                    "milliseconds",
+                    "ops_per_second",
+                    "stdout",
+                    "stderr",
+                ],
             )
-            self.assertEqual(rows[1], "get,1,100,1.0,100000.0")
+            self.assertEqual(
+                rows[1],
+                [
+                    "get",
+                    "1",
+                    "100",
+                    "1.0",
+                    "100000.0",
+                    "Get (cold)                   100 ops    1.00 ms    100000 ops/sec\n",
+                    "cache warmed\n",
+                ],
+            )
 
 
 class ExecutionTests(unittest.TestCase):
@@ -159,6 +194,7 @@ class ExecutionTests(unittest.TestCase):
             executable.write_text(
                 "#!/bin/sh\n"
                 "printf '%s\\n' 'Get (cold)                   100 ops    1.00 ms    100000 ops/sec'\n"
+                "printf '%s\\n' 'cache warmed' >&2\n"
             )
             executable.chmod(0o755)
 
@@ -167,6 +203,11 @@ class ExecutionTests(unittest.TestCase):
 
             self.assertEqual(len(runs), 2)
             self.assertEqual(runs[0]["phases"]["get"]["ops_per_second"], 100000.0)
+            self.assertEqual(
+                runs[0]["stdout"],
+                "Get (cold)                   100 ops    1.00 ms    100000 ops/sec\n",
+            )
+            self.assertEqual(runs[0]["stderr"], "cache warmed\n")
 
     def test_propagates_nonzero_benchmark_exit(self):
         with tempfile.TemporaryDirectory() as directory:
