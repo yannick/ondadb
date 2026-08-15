@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ondadb::{ColumnFamilyConfig, Compression, IsolationLevel, Options, DB};
+use ondadb::{ColumnFamily, ColumnFamilyConfig, Compression, IsolationLevel, Options, DB};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -231,6 +231,23 @@ fn report(phase: &str, ops: usize, elapsed: Duration) {
     );
 }
 
+fn populate(db: &DB, cf: &Arc<ColumnFamily>, keys: &[Vec<u8>], value: &[u8], a: &Args) -> Duration {
+    let start = Instant::now();
+    run_threaded(keys.len(), a.threads, |lo, hi| {
+        let mut i = lo;
+        while i < hi {
+            let be = (i + a.batch).min(hi);
+            let mut txn = db.begin_with_isolation(IsolationLevel::ReadCommitted);
+            for key in &keys[i..be] {
+                txn.put(cf, key, value, Duration::ZERO).unwrap();
+            }
+            txn.commit().unwrap();
+            i = be;
+        }
+    });
+    start.elapsed()
+}
+
 fn main() {
     let a = match parse_args_from(std::env::args()) {
         Ok(args) => args,
@@ -239,7 +256,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-    debug_assert!(a.phases.needs_population());
     let db_path = if a.db_path.is_empty() {
         "ondadb_bench_data".to_string()
     } else {
@@ -265,26 +281,11 @@ fn main() {
     let initial_cf = initial_db
         .create_column_family("bench", cfg.clone())
         .expect("create cf");
-    let start = Instant::now();
-    {
-        let db = &initial_db;
-        let cf = &initial_cf;
-        let keys = &keys;
-        let value = &value;
-        run_threaded(a.ops, a.threads, |lo, hi| {
-            let mut i = lo;
-            while i < hi {
-                let be = (i + a.batch).min(hi);
-                let mut txn = db.begin_with_isolation(IsolationLevel::ReadCommitted);
-                for key in &keys[i..be] {
-                    txn.put(cf, key, value, Duration::ZERO).unwrap();
-                }
-                txn.commit().unwrap();
-                i = be;
-            }
-        });
-    }
-    let put_elapsed = start.elapsed();
+    let put_elapsed = if a.phases.needs_population() {
+        populate(&initial_db, &initial_cf, &keys, &value, &a)
+    } else {
+        Duration::ZERO
+    };
     if a.phases.contains(Phase::Put) {
         report("Put", a.ops, put_elapsed);
     }
@@ -440,6 +441,39 @@ mod tests {
         let phases = PhaseSet::parse_list("put").unwrap();
         assert!(phases.needs_population());
         assert!(!phases.needs_reopen());
+    }
+
+    #[test]
+    fn populate_writes_every_key() {
+        let db_path =
+            std::env::temp_dir().join(format!("ondadb-onda-bench-populate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&db_path);
+        let db = DB::open(Options::new(db_path.to_string_lossy())).unwrap();
+        let cf = db
+            .create_column_family("bench", ColumnFamilyConfig::default())
+            .unwrap();
+        let keys = vec![b"first".to_vec(), b"second".to_vec()];
+        let value = b"value";
+        let args = Args {
+            ops: keys.len(),
+            key_size: 5,
+            value_size: value.len(),
+            threads: 1,
+            pattern: "sequential".into(),
+            compression: "none".into(),
+            batch: 1,
+            db_path: String::new(),
+            keep: false,
+            phases: PhaseSet::all(),
+        };
+
+        let _ = populate(&db, &cf, &keys, value, &args);
+
+        for key in &keys {
+            assert_eq!(db.get(&cf, key).unwrap(), value);
+        }
+        db.close().unwrap();
+        std::fs::remove_dir_all(db_path).unwrap();
     }
 
     #[test]
