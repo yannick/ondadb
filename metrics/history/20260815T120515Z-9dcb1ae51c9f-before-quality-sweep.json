@@ -1,0 +1,85 @@
+{
+  "binary": {
+    "safe": {
+      "file_bytes": 1813544,
+      "text_bytes": 1338204
+    },
+    "unsafe_fastpath": {
+      "file_bytes": 1794248,
+      "text_bytes": 1332868
+    }
+  },
+  "collected_at": "2026-08-15T11:54:52Z",
+  "complexity": {
+    "baseline_exceptions": 26,
+    "cognitive": {
+      "max": 107,
+      "median": 0.0,
+      "p90": 5.0
+    },
+    "cyclomatic": {
+      "max": 46,
+      "median": 1.0,
+      "p90": 5.0
+    },
+    "function_lloc": {
+      "max": 321,
+      "median": 5.0,
+      "p90": 23.0
+    }
+  },
+  "coverage": {
+    "functions": {
+      "count": 1268,
+      "covered": 1146,
+      "percent": 90.37854889589906
+    },
+    "lines": {
+      "count": 11862,
+      "covered": 10706,
+      "percent": 90.25459450345642
+    },
+    "regions": {
+      "count": 20136,
+      "covered": 17970,
+      "percent": 89.24314660309892
+    }
+  },
+  "dependencies": {
+    "direct": 18,
+    "duplicate_versions": 2,
+    "transitive": 62
+  },
+  "git": {
+    "dirty": false,
+    "revision": "9dcb1ae51c9ffa4ea767d6fa980661dba48c838a"
+  },
+  "host": {
+    "architecture": "arm64",
+    "cpu_count": 12,
+    "os": "Darwin"
+  },
+  "long_functions": {
+    "src/compaction.rs::compact_inputs": 321,
+    "src/config.rs::decode_into": 225,
+    "src/db.rs::DB::open_impl": 202
+  },
+  "schema": "ondadb.metrics.v1",
+  "source": {
+    "production_lines": 16748,
+    "test_lines": 8219
+  },
+  "tools": {
+    "bca": "2.1.0",
+    "cargo-bloat": "0.12.1",
+    "cargo-geiger": "0.13.0",
+    "cargo-llvm-cov": "0.8.7"
+  },
+  "unsafe": {
+    "expressions": 63,
+    "functions": 0,
+    "impls": 3,
+    "methods": 0,
+    "traits": 0
+  }
+}
