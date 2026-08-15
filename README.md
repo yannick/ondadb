@@ -432,6 +432,11 @@ src/
 
 ## Testing & quality
 
+`just` is the discoverable command index for the quality, metrics, benchmark,
+and setup recipes (`just --list`). The explicit Cargo commands below remain the
+authoritative CI-equivalent reference. See [`metrics/README.md`](metrics/README.md)
+for metric definitions, ratchets, baseline and history policy, and report paths.
+
 ```sh
 cargo test                                  # default (safe) build
 cargo test --features unsafe-fastpath       # fast path
@@ -448,6 +453,10 @@ covering batch atomicity, recovery loops, snapshot isolation, prefix scans,
 large-value WAL replay and DB locking.
 
 ## Benchmarks
+
+Use `just --list` to discover standalone and sibling-harness benchmark recipes;
+[`metrics/README.md`](metrics/README.md) documents their parameters, report
+paths, and interpretation.
 
 ondaDB's standalone benchmark binary lives at
 [`src/bin/onda_bench.rs`](src/bin/onda_bench.rs) and is driven by the shared
