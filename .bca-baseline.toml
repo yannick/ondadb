@@ -11,30 +11,6 @@ version = 6
 tier = "hard"
 
 [[entry]]
-path = "src/column_family.rs"
-qualified = "ColumnFamily::get"
-metric = "cognitive"
-value = 38.0
-
-[[entry]]
-path = "src/column_family.rs"
-qualified = "ColumnFamily::get"
-metric = "cyclomatic"
-value = 24.0
-
-[[entry]]
-path = "src/column_family.rs"
-qualified = "ColumnFamily::new_iterator"
-metric = "cognitive"
-value = 28.0
-
-[[entry]]
-path = "src/column_family.rs"
-qualified = "ColumnFamily::new_iterator"
-metric = "cyclomatic"
-value = 21.0
-
-[[entry]]
 path = "src/compaction.rs"
 qualified = "compact_inputs"
 metric = "cognitive"

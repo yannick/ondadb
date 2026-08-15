@@ -160,6 +160,48 @@ struct RotState {
     rotating: bool,
 }
 
+#[derive(Default)]
+struct PointReadCandidate {
+    value: Option<Vec<u8>>,
+    seq: u64,
+    found: bool,
+    deleted: bool,
+}
+
+impl PointReadCandidate {
+    fn consider(&mut self, value: Option<Vec<u8>>, seq: u64, found: bool, deleted: bool) {
+        if found && (!self.found || seq > self.seq) {
+            self.value = value;
+            self.seq = seq;
+            self.found = true;
+            self.deleted = deleted;
+        }
+    }
+
+    fn consider_memtable(&mut self, lookup: crate::memtable::Lookup) {
+        let value = if lookup.deleted {
+            None
+        } else {
+            Some(lookup.value)
+        };
+        self.consider(value, lookup.seq, lookup.found, lookup.deleted);
+    }
+
+    fn finish(self) -> Result<Vec<u8>> {
+        if self.found && !self.deleted {
+            Ok(self.value.unwrap_or_default())
+        } else {
+            Err(OndaError::NotFound)
+        }
+    }
+}
+
+struct PointReadSources {
+    mem: Arc<Memtable>,
+    imms: Vec<Arc<ImmMemtable>>,
+    tables: SmallVec<[Arc<SstHandle>; 4]>,
+}
+
 /// An isolated key-value store within a [`crate::DB`].
 pub struct ColumnFamily {
     pub(crate) ctx: Arc<CfCtx>,
@@ -897,60 +939,35 @@ impl ColumnFamily {
         }
     }
 
-    /// Resolve `user_key` as of `read_seq`. Returns the value, or `NotFound`.
-    pub(crate) fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
-        self.point_reads.fetch_add(1, Ordering::Relaxed);
-        let now = coarse_now_nanos();
-        let (mem, imms, tables) = {
-            let s = self.state.read();
-            let mem = s.mem.clone();
-            let imms: Vec<Arc<ImmMemtable>> = s.imm.clone();
-            let mut tables: SmallVec<[Arc<SstHandle>; 4]> = SmallVec::new();
-            for th in &s.levels[0] {
-                if Self::key_in_range(th, &self.cmp, user_key) {
-                    tables.push(th.clone());
-                }
+    fn point_read_sources(&self, user_key: &[u8]) -> PointReadSources {
+        let s = self.state.read();
+        let mut tables = SmallVec::new();
+        for th in &s.levels[0] {
+            if Self::key_in_range(th, &self.cmp, user_key) {
+                tables.push(th.clone());
             }
-            for lvl in s.levels.iter().skip(1) {
-                if let Some(i) = Self::find_overlapping(lvl, &self.cmp, user_key) {
-                    tables.push(lvl[i].clone());
-                }
+        }
+        for lvl in s.levels.iter().skip(1) {
+            if let Some(i) = Self::find_overlapping(lvl, &self.cmp, user_key) {
+                tables.push(lvl[i].clone());
             }
-            (mem, imms, tables)
-        };
+        }
+        PointReadSources {
+            mem: s.mem.clone(),
+            imms: s.imm.clone(),
+            tables,
+        }
+    }
 
-        let mut best_val: Option<Vec<u8>> = None;
-        let mut best_seq = 0u64;
-        let mut best_found = false;
-        let mut best_deleted = false;
-
-        // Unified-memtable mode: the shared store holds this CF's hot data.
-        if let Some(u) = &self.ctx.unified {
-            let r = u.get(self.id, user_key, read_seq, now);
-            if r.found {
-                best_found = true;
-                best_seq = r.seq;
-                best_deleted = r.deleted;
-                best_val = if r.deleted { None } else { Some(r.value) };
-            }
-        }
-        let r = mem.get(user_key, read_seq, now);
-        if r.found && (!best_found || r.seq > best_seq) {
-            best_found = true;
-            best_seq = r.seq;
-            best_deleted = r.deleted;
-            best_val = if r.deleted { None } else { Some(r.value) };
-        }
-        for imm in imms.iter().rev() {
-            let r = imm.mem.get(user_key, read_seq, now);
-            if r.found && (!best_found || r.seq > best_seq) {
-                best_found = true;
-                best_seq = r.seq;
-                best_deleted = r.deleted;
-                best_val = if r.deleted { None } else { Some(r.value) };
-            }
-        }
-        for th in &tables {
+    fn consider_sstables(
+        &self,
+        candidate: &mut PointReadCandidate,
+        tables: &[Arc<SstHandle>],
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) -> Result<()> {
+        for th in tables {
             // One bloom hash + one check per table; the probe below skips the
             // filter (it was just consulted).
             let rd = th.reader()?;
@@ -960,20 +977,29 @@ impl ColumnFamily {
                 continue;
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
-            let (v, seq, found, deleted) = rd.get_unfiltered(user_key, read_seq, now)?;
-            if found && (!best_found || seq > best_seq) {
-                best_found = true;
-                best_seq = seq;
-                best_deleted = deleted;
-                best_val = v;
-            }
+            let (value, seq, found, deleted) = rd.get_unfiltered(user_key, read_seq, now)?;
+            candidate.consider(value, seq, found, deleted);
         }
+        Ok(())
+    }
 
-        if best_found && !best_deleted {
-            Ok(best_val.unwrap_or_default())
-        } else {
-            Err(OndaError::NotFound)
+    /// Resolve `user_key` as of `read_seq`. Returns the value, or `NotFound`.
+    pub(crate) fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
+        self.point_reads.fetch_add(1, Ordering::Relaxed);
+        let now = coarse_now_nanos();
+        let sources = self.point_read_sources(user_key);
+        let mut candidate = PointReadCandidate::default();
+
+        // Unified-memtable mode: the shared store holds this CF's hot data.
+        if let Some(u) = &self.ctx.unified {
+            candidate.consider_memtable(u.get(self.id, user_key, read_seq, now));
         }
+        candidate.consider_memtable(sources.mem.get(user_key, read_seq, now));
+        for imm in sources.imms.iter().rev() {
+            candidate.consider_memtable(imm.mem.get(user_key, read_seq, now));
+        }
+        self.consider_sstables(&mut candidate, &sources.tables, user_key, read_seq, now)?;
+        candidate.finish()
     }
 
     /// Newest committed sequence for `user_key` across all sources (ignoring
@@ -1041,19 +1067,12 @@ impl ColumnFamily {
         above_lower && below_upper
     }
 
-    /// Build a snapshot iterator. `extra` is an optional transaction overlay
-    /// memtable consulted as the newest source. `bounds` are the caller's
-    /// declared key bounds: SSTables whose `[min_key, max_key]` lies entirely
-    /// outside them are skipped (memtables are hash-sharded and cannot be
-    /// pruned), and the returned iterator terminates at the bounds.
-    pub(crate) fn new_iterator(
+    fn append_memtable_children(
         &self,
-        read_seq: u64,
+        children: &mut Vec<ChildIter>,
+        state: &CfState,
         extra: Option<Arc<Memtable>>,
-        bounds: (Bound<&[u8]>, Bound<&[u8]>),
-    ) -> Iterator {
-        let mut children: Vec<ChildIter> = Vec::new();
-        let s = self.state.read();
+    ) {
         if let Some(extra) = extra {
             children.push(ChildIter::Mem(extra.iter()));
         }
@@ -1075,51 +1094,91 @@ impl ColumnFamily {
                 children.push(ChildIter::Mem(overlay.iter()));
             }
         }
-        children.push(ChildIter::Mem(s.mem.iter()));
-        for imm in s.imm.iter().rev() {
+        children.push(ChildIter::Mem(state.mem.iter()));
+        for imm in state.imm.iter().rev() {
             children.push(ChildIter::Mem(imm.mem.iter()));
         }
-        for th in &s.levels[0] {
-            if Self::sst_in_bounds(th, &self.cmp, &bounds) {
-                match th.reader() {
-                    Ok(r) => children.push(ChildIter::Sst(r.iter())),
-                    // Omitting the table would return a short answer that
-                    // looks complete. Fail the iterator instead.
-                    Err(e) => return Iterator::failed(self.cmp.clone(), e),
-                }
+    }
+
+    fn append_l0_children(
+        &self,
+        children: &mut Vec<ChildIter>,
+        level: &[Arc<SstHandle>],
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> Result<()> {
+        for th in level {
+            if Self::sst_in_bounds(th, &self.cmp, bounds) {
+                children.push(ChildIter::Sst(th.reader()?.iter()));
             }
         }
+        Ok(())
+    }
+
+    fn sorted_level_start(&self, level: &[Arc<SstHandle>], lower: Bound<&[u8]>) -> usize {
+        match lower {
+            Bound::Unbounded => 0,
+            Bound::Included(key) => {
+                level.partition_point(|th| self.cmp.compare(&th.meta.max_key, key).is_lt())
+            }
+            Bound::Excluded(key) => {
+                level.partition_point(|th| self.cmp.compare(&th.meta.max_key, key).is_le())
+            }
+        }
+    }
+
+    fn append_sorted_level_children(
+        &self,
+        children: &mut Vec<ChildIter>,
+        level: &[Arc<SstHandle>],
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> Result<()> {
+        let start = self.sorted_level_start(level, bounds.0);
+        for th in &level[start..] {
+            if !key_is_below_upper(&self.cmp, &th.meta.min_key, bounds.1) {
+                break;
+            }
+            children.push(ChildIter::Sst(th.reader()?.iter()));
+        }
+        Ok(())
+    }
+
+    fn iterator_children(
+        &self,
+        state: &CfState,
+        extra: Option<Arc<Memtable>>,
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> Result<Vec<ChildIter>> {
+        let mut children = Vec::new();
+        self.append_memtable_children(&mut children, state, extra);
+        self.append_l0_children(&mut children, &state.levels[0], bounds)?;
         // Levels >= 1 are sorted by key and disjoint, so the overlapping
-        // tables form one contiguous run: binary-search its start, walk
-        // until the upper bound. Iterator construction used to walk EVERY
-        // table in the CF (two comparator calls each), which made even an
-        // empty bounded scan O(total tables) — ~40 ns per resident table,
-        // and a reader-open for each when the table cache had evicted it.
-        for lvl in s.levels.iter().skip(1) {
-            let start = match bounds.0 {
-                Bound::Unbounded => 0,
-                Bound::Included(l) => {
-                    lvl.partition_point(|th| self.cmp.compare(&th.meta.max_key, l).is_lt())
-                }
-                Bound::Excluded(l) => {
-                    lvl.partition_point(|th| self.cmp.compare(&th.meta.max_key, l).is_le())
-                }
-            };
-            for th in &lvl[start..] {
-                let below_upper = match bounds.1 {
-                    Bound::Unbounded => true,
-                    Bound::Included(u) => self.cmp.compare(&th.meta.min_key, u).is_le(),
-                    Bound::Excluded(u) => self.cmp.compare(&th.meta.min_key, u).is_lt(),
-                };
-                if !below_upper {
-                    break;
-                }
-                match th.reader() {
-                    Ok(r) => children.push(ChildIter::Sst(r.iter())),
-                    Err(e) => return Iterator::failed(self.cmp.clone(), e),
-                }
-            }
+        // tables form one contiguous run: binary-search its start, then walk
+        // until the upper bound. Walking every table made an empty bounded scan
+        // O(total tables), including reader opens after cache eviction.
+        for level in state.levels.iter().skip(1) {
+            self.append_sorted_level_children(&mut children, level, bounds)?;
         }
+        Ok(children)
+    }
+
+    /// Build a snapshot iterator. `extra` is an optional transaction overlay
+    /// memtable consulted as the newest source. `bounds` are the caller's
+    /// declared key bounds: SSTables whose `[min_key, max_key]` lies entirely
+    /// outside them are skipped (memtables are hash-sharded and cannot be
+    /// pruned), and the returned iterator terminates at the bounds.
+    pub(crate) fn new_iterator(
+        &self,
+        read_seq: u64,
+        extra: Option<Arc<Memtable>>,
+        bounds: (Bound<&[u8]>, Bound<&[u8]>),
+    ) -> Iterator {
+        let s = self.state.read();
+        let children = match self.iterator_children(&s, extra, &bounds) {
+            Ok(children) => children,
+            // Omitting a table would return a short answer that looks
+            // complete. Fail the iterator instead.
+            Err(error) => return Iterator::failed(self.cmp.clone(), error),
+        };
         drop(s);
         let owned = (bound_to_owned(bounds.0), bound_to_owned(bounds.1));
         Iterator::new(
@@ -1592,5 +1651,56 @@ fn bound_to_owned(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(k) => Bound::Included(k.to_vec()),
         Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
+    }
+}
+
+fn key_is_below_upper(cmp: &ComparatorRef, key: &[u8], upper: Bound<&[u8]>) -> bool {
+    match upper {
+        Bound::Unbounded => true,
+        Bound::Included(limit) => cmp.compare(key, limit).is_le(),
+        Bound::Excluded(limit) => cmp.compare(key, limit).is_lt(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Bound;
+    use std::sync::Arc;
+
+    use super::{key_is_below_upper, PointReadCandidate};
+    use crate::comparator::{Bytewise, CaseInsensitive, ComparatorRef};
+    use crate::error::OndaError;
+
+    #[test]
+    fn point_read_candidate_keeps_the_newest_visible_result() {
+        let mut candidate = PointReadCandidate::default();
+
+        candidate.consider(Some(b"new".to_vec()), 9, true, false);
+        candidate.consider(Some(b"old".to_vec()), 3, true, false);
+        candidate.consider(Some(b"same-sequence".to_vec()), 9, true, false);
+        candidate.consider(Some(b"absent".to_vec()), 12, false, false);
+
+        assert_eq!(candidate.finish().unwrap(), b"new");
+    }
+
+    #[test]
+    fn point_read_candidate_newer_tombstone_hides_older_value() {
+        let mut candidate = PointReadCandidate::default();
+
+        candidate.consider(Some(b"value".to_vec()), 4, true, false);
+        candidate.consider(None, 5, true, true);
+
+        assert!(matches!(candidate.finish(), Err(OndaError::NotFound)));
+    }
+
+    #[test]
+    fn sorted_level_upper_bound_uses_the_column_family_comparator() {
+        let bytewise: ComparatorRef = Arc::new(Bytewise);
+        let folded: ComparatorRef = Arc::new(CaseInsensitive);
+
+        assert!(key_is_below_upper(&bytewise, b"B", Bound::Included(b"a")));
+        assert!(!key_is_below_upper(&folded, b"B", Bound::Included(b"a")));
+        assert!(key_is_below_upper(&folded, b"A", Bound::Included(b"a")));
+        assert!(!key_is_below_upper(&folded, b"A", Bound::Excluded(b"a")));
     }
 }
