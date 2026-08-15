@@ -115,7 +115,18 @@ class ReportTests(unittest.TestCase):
             "git": {"revision": "abc123", "dirty": False},
             "host": {"os": "Darwin", "architecture": "arm64", "cpu_count": 24},
             "rustc": "rustc 1.97.1",
-            "workload": {"runs": 1, "ops": 100, "phases": ["get"]},
+            "workload": {
+                "runs": 1,
+                "ops": 100,
+                "threads": 2,
+                "key_size": 16,
+                "value_size": 100,
+                "pattern": "random",
+                "compression": "none",
+                "batch": 25,
+                "features": "unsafe-fastpath",
+                "phases": ["get"],
+            },
             "runs": [
                 {
                     "run": 1,
@@ -149,6 +160,24 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(
                 rows[0],
                 [
+                    "schema",
+                    "collected_at",
+                    "git_revision",
+                    "git_dirty",
+                    "host_os",
+                    "host_architecture",
+                    "host_cpu_count",
+                    "rustc",
+                    "workload_runs",
+                    "workload_ops",
+                    "workload_threads",
+                    "workload_key_size",
+                    "workload_value_size",
+                    "workload_pattern",
+                    "workload_compression",
+                    "workload_batch",
+                    "workload_features",
+                    "workload_phases",
                     "phase",
                     "run",
                     "ops",
@@ -161,6 +190,24 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(
                 rows[1],
                 [
+                    "ondadb.benchmark.v1",
+                    "2026-08-15T12:00:00Z",
+                    "abc123",
+                    "False",
+                    "Darwin",
+                    "arm64",
+                    "24",
+                    "rustc 1.97.1",
+                    "1",
+                    "100",
+                    "2",
+                    "16",
+                    "100",
+                    "random",
+                    "none",
+                    "25",
+                    "unsafe-fastpath",
+                    "get",
                     "get",
                     "1",
                     "100",
@@ -221,6 +268,7 @@ class ExecutionTests(unittest.TestCase):
                     benchmark.execute_runs(executable, self.workload(), root / "db")
 
             self.assertEqual(raised.exception.returncode, 2)
+            self.assertFalse((root / "db" / "run-1").exists())
 
     def test_positive_integer_argument_rejects_zero(self):
         with self.assertRaisesRegex(ValueError, "positive integer"):

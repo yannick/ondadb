@@ -170,7 +170,59 @@ def write_reports(document: dict[str, object], output_dir: Path) -> tuple[Path, 
     """Atomically write the latest benchmark JSON and flat per-run CSV."""
     json_path = output_dir / "onda-latest.json"
     csv_path = output_dir / "onda-latest.csv"
-    _atomic_text(json_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+    def required(mapping: dict[str, object], key: str, expected, label: str):
+        value = mapping.get(key)
+        if not isinstance(value, expected) or isinstance(value, bool) and expected is int:
+            raise ValueError(f"benchmark report is missing or invalid {label}.{key}")
+        return value
+
+    schema = required(document, "schema", str, "report")
+    collected_at = required(document, "collected_at", str, "report")
+    git = required(document, "git", dict, "report")
+    git_revision = required(git, "revision", str, "git")
+    git_dirty = required(git, "dirty", bool, "git")
+    host = required(document, "host", dict, "report")
+    host_os = required(host, "os", str, "host")
+    host_architecture = required(host, "architecture", str, "host")
+    host_cpu_count = required(host, "cpu_count", int, "host")
+    rustc = required(document, "rustc", str, "report")
+    workload = required(document, "workload", dict, "report")
+    workload_runs = required(workload, "runs", int, "workload")
+    workload_ops = required(workload, "ops", int, "workload")
+    workload_threads = required(workload, "threads", int, "workload")
+    workload_key_size = required(workload, "key_size", int, "workload")
+    workload_value_size = required(workload, "value_size", int, "workload")
+    workload_pattern = required(workload, "pattern", str, "workload")
+    workload_compression = required(workload, "compression", str, "workload")
+    workload_batch = required(workload, "batch", int, "workload")
+    workload_features = required(workload, "features", str, "workload")
+    workload_phase_values = required(workload, "phases", list, "workload")
+    if not workload_phase_values or any(
+        not isinstance(phase, str) or not phase for phase in workload_phase_values
+    ):
+        raise ValueError("benchmark report has invalid workload.phases")
+    workload_phases = ",".join(workload_phase_values)
+    provenance = [
+        schema,
+        collected_at,
+        git_revision,
+        git_dirty,
+        host_os,
+        host_architecture,
+        host_cpu_count,
+        rustc,
+        workload_runs,
+        workload_ops,
+        workload_threads,
+        workload_key_size,
+        workload_value_size,
+        workload_pattern,
+        workload_compression,
+        workload_batch,
+        workload_features,
+        workload_phases,
+    ]
 
     rows: list[list[object]] = []
     runs = document.get("runs")
@@ -180,31 +232,65 @@ def write_reports(document: dict[str, object], output_dir: Path) -> tuple[Path, 
         if not isinstance(run, dict) or not isinstance(run.get("phases"), dict):
             raise ValueError("benchmark run has an invalid phase map")
         run_number = run.get("run")
+        if not isinstance(run_number, int) or isinstance(run_number, bool):
+            raise ValueError("benchmark run is missing its run number")
         stdout = run.get("stdout")
         stderr = run.get("stderr")
         if not isinstance(stdout, str) or not isinstance(stderr, str):
             raise ValueError("benchmark run is missing captured output")
         for phase, measurement in run["phases"].items():
-            if not isinstance(measurement, dict):
+            if not isinstance(phase, str) or not phase or not isinstance(measurement, dict):
                 raise ValueError("benchmark phase measurement must be an object")
+            measurement_ops = measurement.get("ops")
+            milliseconds = measurement.get("milliseconds")
+            ops_per_second = measurement.get("ops_per_second")
+            if (
+                not isinstance(measurement_ops, int)
+                or isinstance(measurement_ops, bool)
+                or not isinstance(milliseconds, (int, float))
+                or isinstance(milliseconds, bool)
+                or not isinstance(ops_per_second, (int, float))
+                or isinstance(ops_per_second, bool)
+            ):
+                raise ValueError("benchmark phase measurement is incomplete")
             rows.append(
-                [
+                provenance
+                + [
                     phase,
                     run_number,
-                    measurement.get("ops"),
-                    measurement.get("milliseconds"),
-                    measurement.get("ops_per_second"),
+                    measurement_ops,
+                    milliseconds,
+                    ops_per_second,
                     stdout,
                     stderr,
                 ]
             )
 
+    _atomic_text(json_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", newline="", dir=output_dir, delete=False
     ) as temporary:
         writer = csv.writer(temporary, lineterminator="\n")
         writer.writerow(
             [
+                "schema",
+                "collected_at",
+                "git_revision",
+                "git_dirty",
+                "host_os",
+                "host_architecture",
+                "host_cpu_count",
+                "rustc",
+                "workload_runs",
+                "workload_ops",
+                "workload_threads",
+                "workload_key_size",
+                "workload_value_size",
+                "workload_pattern",
+                "workload_compression",
+                "workload_batch",
+                "workload_features",
+                "workload_phases",
                 "phase",
                 "run",
                 "ops",

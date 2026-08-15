@@ -235,6 +235,47 @@ def _run_text(command: Sequence[str], output_path: Path | None = None) -> str:
 
 def normalize_geiger(document: dict[str, object], package: str = "ondadb") -> dict[str, int]:
     """Extract total project-owned unsafe items from cargo-geiger JSON."""
+    packages_without_metrics = _array(
+        _required(document, "packages_without_metrics"),
+        "cargo-geiger packages_without_metrics",
+    )
+    for raw_package_id in packages_without_metrics:
+        package_id = _mapping(
+            raw_package_id,
+            "cargo-geiger packages_without_metrics entry",
+        )
+        name = _string(
+            _required(
+                package_id,
+                "name",
+                "cargo-geiger packages_without_metrics entry",
+            ),
+            "cargo-geiger packages_without_metrics entry.name",
+        )
+        if name == package:
+            raise MetricsError(f"cargo-geiger reports {package} without metrics")
+
+    unscanned_files = _array(
+        _required(document, "used_but_not_scanned_files"),
+        "cargo-geiger used_but_not_scanned_files",
+    )
+    repository_root = ROOT.resolve()
+    for raw_path in unscanned_files:
+        path_text = _string(
+            raw_path,
+            "cargo-geiger used_but_not_scanned_files entry",
+        )
+        path = Path(path_text)
+        if not path.is_absolute():
+            path = ROOT / path
+        try:
+            project_path = path.resolve().relative_to(repository_root)
+        except ValueError:
+            continue
+        raise MetricsError(
+            f"cargo-geiger repository file {project_path} was used but not scanned"
+        )
+
     packages = _array(_required(document, "packages"), "cargo-geiger packages")
     for entry_value in packages:
         entry = _mapping(entry_value, "cargo-geiger package entry")
@@ -810,8 +851,8 @@ def _deterministic_values(
     }
 
 
-def collect_snapshot() -> dict[str, object]:
-    """Collect all trend metrics and atomically publish the normalized snapshot."""
+def collect_snapshot(*, publish: bool = True) -> dict[str, object]:
+    """Collect trend metrics and optionally atomically publish the snapshot."""
     versions = _ensure_tools(("bca", "cargo-geiger", "cargo-bloat"))
     production, tests, geiger = _producer_documents()
     metadata_raw = run_json(
@@ -861,7 +902,8 @@ def collect_snapshot() -> dict[str, object]:
         "coverage": None,
     }
     validate_snapshot(snapshot)
-    atomic_write_json(CURRENT_PATH, snapshot)
+    if publish:
+        atomic_write_json(CURRENT_PATH, snapshot)
     return snapshot
 
 
@@ -885,16 +927,21 @@ def _print_snapshot(snapshot: dict[str, object]) -> None:
     print(f"snapshot: {CURRENT_PATH.relative_to(ROOT)}")
 
 
+def bca_check_command(arguments: Sequence[str]) -> tuple[str, ...]:
+    """Build an auditable BCA gate command that cannot honor inline suppressions."""
+    return ("bca", "check", "--no-suppress", *arguments)
+
+
 def _run_bca_check(arguments: Sequence[str]) -> None:
-    command = ("bca", "check", *arguments)
+    command = bca_check_command(arguments)
     try:
         completed = subprocess.run(command, cwd=ROOT, check=False)
     except OSError as error:
         raise ToolError(f"could not run {' '.join(command)}: {error}") from error
-    if completed.returncode == 1:
-        raise ToolError("bca check failed with a tool error")
-    if completed.returncode != 0:
+    if completed.returncode == 2:
         raise GateError(f"bca complexity ratchet failed (exit {completed.returncode})")
+    if completed.returncode != 0:
+        raise ToolError(f"bca check failed with a tool error (exit {completed.returncode})")
 
 
 def check_ratchets() -> None:
@@ -985,6 +1032,7 @@ def publish_baseline_pair(
 def write_baselines() -> None:
     """Explicitly refresh both deterministic metric baselines."""
     versions = _ensure_tools(("bca", "cargo-geiger"))
+    git = _git_info()
     with tempfile.NamedTemporaryFile(
         dir=BCA_BASELINE_PATH.parent,
         prefix=f".{BCA_BASELINE_PATH.name}.",
@@ -1000,7 +1048,7 @@ def write_baselines() -> None:
         baseline = {
             "schema": BASELINE_SCHEMA,
             "updated_at": _utc_timestamp(),
-            "git": _git_info(),
+            "git": git,
             "tools": versions,
             **values,
         }
@@ -1083,8 +1131,7 @@ def attach_coverage(
 def collect_coverage(open_report: bool = False) -> None:
     """Run the exact two-configuration merged coverage workflow."""
     versions = _ensure_tools(("cargo-llvm-cov",))
-    if not CURRENT_PATH.exists():
-        raise MetricsError("current metrics snapshot is missing; run collect first")
+    snapshot = collect_snapshot(publish=False)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     environment = coverage_environment(
         dict(os.environ), Path("target/metrics/llvm-cov-target")
@@ -1097,8 +1144,6 @@ def collect_coverage(open_report: bool = False) -> None:
             raise ToolError(f"coverage command failed: {' '.join(command)}: {error}") from error
     coverage_raw = load_json(RAW_DIR / "coverage.json")
     coverage_document = _mapping(coverage_raw, "coverage document")
-    snapshot_raw = load_json(CURRENT_PATH)
-    snapshot = _mapping(snapshot_raw, "current snapshot")
     attach_coverage(snapshot, coverage_document, versions["cargo-llvm-cov"])
     atomic_write_json(CURRENT_PATH, snapshot)
     index = METRICS_DIR / "coverage" / "html" / "index.html"
@@ -1126,7 +1171,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("baseline", help="explicitly refresh deterministic baselines")
     coverage = subparsers.add_parser("coverage", help="collect merged safe/fast coverage")
     coverage.add_argument("--open", action="store_true", dest="open_report")
-    subparsers.add_parser("tools-check", help="diagnose required pinned tools")
+    tools_check = subparsers.add_parser(
+        "tools-check", help="diagnose required pinned tools"
+    )
+    tools_check.add_argument("tools", nargs="*", choices=tuple(TOOLS))
     subparsers.add_parser("tools-install-command", help="print pinned installation commands")
     return parser
 
@@ -1144,7 +1192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(install)
             return 0
         if args.command == "tools-check":
-            results = inspect_tools()
+            results = inspect_tools(args.tools or None)
             for result in results:
                 print(result["message"])
             return 0 if all(result["state"] == "ok" for result in results) else 1

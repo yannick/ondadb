@@ -72,7 +72,18 @@ class JustfileHelpTests(unittest.TestCase):
 
         self.assertIn(b"metrics-record label", completed.stdout)
         self.assertIn(b"bench-phase phase", completed.stdout)
+        self.assertNotIn(b"_default", completed.stdout)
         self.assertNotIn(b"_require-bench-harness", completed.stdout)
+
+    def test_hotspots_checks_the_pinned_bca_before_running_vcs(self):
+        completed = run_just("--dry-run", "hotspots")
+        output = completed.stdout + completed.stderr
+
+        prerequisite = b"python3 tools/metrics.py tools-check bca"
+        hotspot = b"bca vcs --format html"
+        self.assertIn(prerequisite, output)
+        self.assertIn(hotspot, output)
+        self.assertLess(output.index(prerequisite), output.index(hotspot))
 
     def test_summary_includes_each_public_recipe(self):
         completed = run_just("--summary")

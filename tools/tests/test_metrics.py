@@ -158,7 +158,13 @@ class GeigerTests(unittest.TestCase):
 
     def test_rejects_missing_project_package(self):
         with self.assertRaisesRegex(metrics.MetricsError, "ondadb package"):
-            metrics.normalize_geiger({"packages": []})
+            metrics.normalize_geiger(
+                {
+                    "packages": [],
+                    "packages_without_metrics": [],
+                    "used_but_not_scanned_files": [],
+                }
+            )
 
     def test_rejects_missing_unsafety_category_instead_of_using_zero(self):
         malformed = json.loads(json.dumps(GEIGER))
@@ -166,6 +172,53 @@ class GeigerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(metrics.MetricsError, "used.methods"):
             metrics.normalize_geiger(malformed)
+
+    def test_rejects_missing_scan_completeness_fields(self):
+        for field in ("packages_without_metrics", "used_but_not_scanned_files"):
+            with self.subTest(field=field):
+                malformed = json.loads(json.dumps(GEIGER))
+                del malformed[field]
+
+                with self.assertRaisesRegex(metrics.MetricsError, field):
+                    metrics.normalize_geiger(malformed)
+
+    def test_rejects_project_package_without_metrics(self):
+        incomplete = json.loads(json.dumps(GEIGER))
+        incomplete["packages_without_metrics"] = [
+            {"name": "ondadb", "version": "0.8.0", "source": {"Path": "file:///repo"}}
+        ]
+
+        with self.assertRaisesRegex(metrics.MetricsError, "ondadb.*without metrics"):
+            metrics.normalize_geiger(incomplete)
+
+    def test_rejects_repository_file_that_was_used_but_not_scanned(self):
+        partial = json.loads(json.dumps(GEIGER))
+        partial["used_but_not_scanned_files"] = [
+            str(metrics.ROOT / "src" / "lib.rs"),
+        ]
+
+        with self.assertRaisesRegex(metrics.MetricsError, "src/lib.rs.*not scanned"):
+            metrics.normalize_geiger(partial)
+
+    def test_permits_dependency_owned_scan_gaps(self):
+        dependency_gap = json.loads(json.dumps(GEIGER))
+        dependency_gap["packages_without_metrics"] = [
+            {"name": "dependency", "version": "1.0.0", "source": {"Registry": {}}}
+        ]
+        dependency_gap["used_but_not_scanned_files"] = [
+            "/cargo/registry/src/dependency/build-helper.c",
+        ]
+
+        self.assertEqual(
+            metrics.normalize_geiger(dependency_gap),
+            {
+                "functions": 2,
+                "expressions": 5,
+                "impls": 1,
+                "traits": 0,
+                "methods": 3,
+            },
+        )
 
 
 class SnapshotSchemaTests(unittest.TestCase):
@@ -297,6 +350,45 @@ class DistributionTests(unittest.TestCase):
 
 
 class BcaTests(unittest.TestCase):
+    def test_check_command_disables_inline_suppressions_in_effective_config(self):
+        command = metrics.bca_check_command(("--print-effective-config=json",))
+
+        self.assertEqual(
+            command,
+            (
+                "bca",
+                "check",
+                "--no-suppress",
+                "--print-effective-config=json",
+            ),
+        )
+        completed = subprocess.run(
+            command,
+            cwd=metrics.ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        effective = json.loads(completed.stdout)
+        self.assertIs(effective["check"]["no_suppress"], True)
+
+    def test_only_documented_bca_violation_status_is_a_gate_failure(self):
+        for returncode, expected_error in (
+            (1, metrics.ToolError),
+            (2, metrics.GateError),
+            (3, metrics.ToolError),
+            (7, metrics.ToolError),
+        ):
+            with self.subTest(returncode=returncode), mock.patch(
+                "tools.metrics.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=("bca", "check"),
+                    returncode=returncode,
+                ),
+            ):
+                with self.assertRaises(expected_error):
+                    metrics._run_bca_check(())
+
     def test_bca_uses_aggregate_output_files_for_production_and_tests(self):
         output = Path("target/metrics/raw/bca.json")
         self.assertEqual(
@@ -575,6 +667,64 @@ class FileOperationTests(unittest.TestCase):
             self.assertEqual(bca.read_text(encoding="utf-8"), "version = 6\nentry = []\n")
             self.assertEqual(json.loads(json_path.read_text()), {"old": True})
 
+    def test_baseline_captures_git_provenance_before_candidate_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bca = root / ".bca-baseline.toml"
+            json_path = root / "baseline.json"
+            events = []
+
+            def git_info():
+                self.assertEqual(list(root.glob("*.candidate")), [])
+                events.append("git")
+                return {
+                    "revision": "0123456789abcdef0123456789abcdef01234567",
+                    "dirty": False,
+                }
+
+            def write_candidate(arguments):
+                events.append("bca")
+                Path(arguments[1]).write_text(
+                    "version = 6\nentry = []\n",
+                    encoding="utf-8",
+                )
+
+            published = {}
+
+            def publish_candidate(candidate, document):
+                published.update(document)
+                candidate.unlink()
+
+            with mock.patch.object(metrics, "ROOT", root), mock.patch.object(
+                metrics, "BCA_BASELINE_PATH", bca
+            ), mock.patch.object(
+                metrics, "BASELINE_PATH", json_path
+            ), mock.patch(
+                "tools.metrics._ensure_tools", return_value={"bca": "2.1.0"}
+            ), mock.patch(
+                "tools.metrics._git_info", side_effect=git_info
+            ), mock.patch(
+                "tools.metrics._run_bca_check", side_effect=write_candidate
+            ), mock.patch(
+                "tools.metrics._deterministic_values",
+                return_value={
+                    "unsafe": {
+                        "functions": 0,
+                        "expressions": 0,
+                        "impls": 0,
+                        "traits": 0,
+                        "methods": 0,
+                    },
+                    "long_functions": {},
+                },
+            ), mock.patch(
+                "tools.metrics.publish_baseline_pair", side_effect=publish_candidate
+            ):
+                metrics.write_baselines()
+
+            self.assertEqual(events, ["git", "bca"])
+            self.assertIs(published["git"]["dirty"], False)
+
 
 class HistoryTests(unittest.TestCase):
     def test_record_sanitizes_label_and_creates_expected_file(self):
@@ -649,6 +799,63 @@ class CoverageCommandTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def _collect_with_current(self, current_document):
+        temporary = tempfile.TemporaryDirectory(dir=metrics.ROOT / "target")
+        self.addCleanup(temporary.cleanup)
+        metrics_dir = Path(temporary.name)
+        current_path = metrics_dir / "current.json"
+        raw_dir = metrics_dir / "raw"
+        if current_document is not None:
+            metrics.atomic_write_json(current_path, current_document)
+
+        fresh = json.loads(json.dumps(SNAPSHOT))
+        fresh["collected_at"] = "2026-08-15T13:00:00Z"
+        fresh["git"]["revision"] = "fedcba9876543210fedcba9876543210fedcba98"
+        coverage_document = {
+            "data": [{"totals": {
+                "lines": {"count": 10, "covered": 9, "percent": 90.0},
+                "functions": {"count": 4, "covered": 3, "percent": 75.0},
+                "regions": {"count": 20, "covered": 15, "percent": 75.0},
+            }}]
+        }
+
+        with mock.patch.object(metrics, "METRICS_DIR", metrics_dir), mock.patch.object(
+            metrics, "RAW_DIR", raw_dir
+        ), mock.patch.object(
+            metrics, "CURRENT_PATH", current_path
+        ), mock.patch(
+            "tools.metrics._ensure_tools",
+            return_value={"cargo-llvm-cov": "0.8.7"},
+        ), mock.patch(
+            "tools.metrics.collect_snapshot", return_value=fresh
+        ) as collect, mock.patch(
+            "tools.metrics.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=(), returncode=0),
+        ), mock.patch(
+            "tools.metrics.load_json", return_value=coverage_document
+        ):
+            metrics.collect_coverage()
+
+        collect.assert_called_once_with(publish=False)
+        return metrics.load_json(current_path)
+
+    def test_coverage_creates_current_snapshot_when_it_is_missing(self):
+        published = self._collect_with_current(None)
+
+        self.assertEqual(
+            published["git"]["revision"],
+            "fedcba9876543210fedcba9876543210fedcba98",
+        )
+        self.assertEqual(published["coverage"]["lines"]["covered"], 9)
+
+    def test_coverage_replaces_stale_snapshot_with_fresh_provenance(self):
+        stale = json.loads(json.dumps(SNAPSHOT))
+        stale["collected_at"] = "2026-08-15T11:00:00Z"
+        published = self._collect_with_current(stale)
+
+        self.assertEqual(published["collected_at"], "2026-08-15T13:00:00Z")
+        self.assertNotEqual(published["git"], stale["git"])
 
 
 if __name__ == "__main__":

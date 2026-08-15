@@ -29,7 +29,7 @@ tools-install` installs all four:
 | `just metrics` | Collect the normalized current report; it is informational, not a gate | `target/metrics/current.json` and `target/metrics/raw/` |
 | `just metrics-record LABEL` | Append one observed current report to history | `metrics/history/YYYYMMDDTHHMMSSZ-<short-sha>-<sanitized-label>.json` |
 | `just metrics-baseline` | Deliberately refresh accepted deterministic debt | `metrics/baseline.json` and `.bca-baseline.toml` |
-| `just coverage` | Merge coverage from both feature configurations into the current report | `target/metrics/raw/coverage.json`, `target/metrics/coverage/html/`, and `target/metrics/current.json` |
+| `just coverage` | Freshly collect normalized metrics, merge coverage from both feature configurations into that same-provenance report, and atomically replace the current snapshot | `target/metrics/raw/coverage.json`, `target/metrics/coverage/html/`, and `target/metrics/current.json` |
 | `just coverage-open` | Run `coverage`, then open its HTML index when the platform has an opener | the same coverage paths |
 | `just hotspots` | Render a version-control churn/complexity report | `target/metrics/hotspots.html` |
 
@@ -53,7 +53,7 @@ dirty state, host details, and producer versions alongside these values.
 | Complexity baseline exceptions | Number of entries accepted by BCA's baseline | Lower | Report, with BCA enforcing the underlying baseline | `bca 2.1.0`; `target/metrics/current.json` | `.bca-baseline.toml`; remove exceptions by addressing the rule violation, and add one only through reviewed acceptance. |
 | Unsafe surface | Counts of unsafe functions, expressions, impls, traits, and methods, collected with `unsafe-fastpath` | Lower | Ratcheted | `cargo-geiger 0.13.0`; current report and `target/metrics/raw/geiger.json` | `metrics/baseline.json`; any increase requires explicit, reviewed debt acceptance. Prefer eliminating unsafe code or shrinking its audited boundary. |
 | Long functions | Fully qualified production functions whose source-span length exceeds 200, with their lengths | Lower | Ratcheted | `bca 2.1.0`; current report and BCA raw paths | `metrics/baseline.json`; each newly long function fails the gate. Reduce genuine responsibility, preserving clear control flow. |
-| Source lines | Production and test source-line totals | Context only | Report | `bca 2.1.0`; `target/metrics/current.json` | No baseline; use it to interpret other trends, never as a target by itself. |
+| Source lines | Production Rust source lines under `src/`, plus integration-test Rust source lines directly collected below `tests/` (inline `#[cfg(test)]` modules under `src/` are not included in the test total) | Context only | Report | `bca 2.1.0`; `target/metrics/current.json` | No baseline; use it to interpret other trends, never as a target by itself. |
 | Dependencies | Active direct and transitive Cargo packages, plus extra versions of duplicate package names | Lower | Report | Cargo metadata/tree; current report, `target/metrics/raw/cargo-metadata.json`, and `target/metrics/raw/cargo-tree-duplicates.txt` | No baseline; remove a dependency or duplicate only when it preserves required behavior and maintenance clarity. |
 | Benchmark binary size | Whole-file and `.text` bytes for release `onda_bench`, in safe and `unsafe-fastpath` builds | Lower, subject to performance and functionality | Report | `cargo-bloat 0.12.1`; current report and `target/metrics/raw/cargo-bloat-*.json` | No baseline; investigate material growth rather than optimizing bytes at the cost of correctness or speed. |
 | Coverage | Merged line, function, and region `count`, `covered`, and percentage for safe plus `unsafe-fastpath` | Higher | Report | `cargo-llvm-cov 0.8.7`; `target/metrics/raw/coverage.json`, `target/metrics/coverage/html/index.html`, and updated current report | No baseline. Run the long coverage task when coverage itself is being assessed; it is intentionally outside the fast gate. |
@@ -108,8 +108,11 @@ database for every repetition, and writes `ondadb.benchmark.v1` to
 `target/benchmarks/onda-latest.json` plus flat per-run rows to
 `target/benchmarks/onda-latest.csv`. The JSON preserves workload, host, Git,
 Rust compiler provenance, captured output, samples, and each phase's median,
-minimum, maximum, and relative spread. The median is the headline number; use
-the spread to decide whether a difference is credible.
+minimum, maximum, and relative spread. Every CSV row repeats its schema,
+collection time, Git, host, Rust compiler, complete workload, feature set, and
+requested phases alongside the raw run measurement, so the CSV remains
+self-describing when detached from the JSON. The median is the headline number;
+use the spread to decide whether a difference is credible.
 
 For cross-engine work, use the explicitly delegated legacy sibling harness:
 

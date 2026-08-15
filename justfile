@@ -70,6 +70,7 @@ coverage-open:
 [group('Metrics')]
 hotspots:
     mkdir -p target/metrics
+    python3 tools/metrics.py tools-check bca
     bca vcs --format html --output target/metrics/hotspots.html
 
 # Run the standalone ondaDB benchmark.
