@@ -1,0 +1,81 @@
+{
+  "binary": {
+    "safe": {
+      "file_bytes": 1796216,
+      "text_bytes": 1331720
+    },
+    "unsafe_fastpath": {
+      "file_bytes": 1793368,
+      "text_bytes": 1325720
+    }
+  },
+  "collected_at": "2026-08-15T13:52:02Z",
+  "complexity": {
+    "baseline_exceptions": 3,
+    "cognitive": {
+      "max": 20,
+      "median": 0.0,
+      "p90": 5.0
+    },
+    "cyclomatic": {
+      "max": 16,
+      "median": 1.0,
+      "p90": 5.0
+    },
+    "function_lloc": {
+      "max": 182,
+      "median": 5.0,
+      "p90": 23.0
+    }
+  },
+  "coverage": {
+    "functions": {
+      "count": 1396,
+      "covered": 1274,
+      "percent": 91.26074498567334
+    },
+    "lines": {
+      "count": 12478,
+      "covered": 11346,
+      "percent": 90.92803333867607
+    },
+    "regions": {
+      "count": 21015,
+      "covered": 18898,
+      "percent": 89.92624315964787
+    }
+  },
+  "dependencies": {
+    "direct": 18,
+    "duplicate_versions": 2,
+    "transitive": 62
+  },
+  "git": {
+    "dirty": false,
+    "revision": "6836364369aa55240963cffadb9ed495eeefbc71"
+  },
+  "host": {
+    "architecture": "arm64",
+    "cpu_count": 12,
+    "os": "Darwin"
+  },
+  "long_functions": {},
+  "schema": "ondadb.metrics.v1",
+  "source": {
+    "production_lines": 17269,
+    "test_lines": 8219
+  },
+  "tools": {
+    "bca": "2.1.0",
+    "cargo-bloat": "0.12.1",
+    "cargo-geiger": "0.13.0",
+    "cargo-llvm-cov": "0.8.7"
+  },
+  "unsafe": {
+    "expressions": 63,
+    "functions": 0,
+    "impls": 3,
+    "methods": 0,
+    "traits": 0
+  }
+}
