@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileCache};
@@ -371,6 +371,286 @@ impl DbInner {
     }
 }
 
+struct OpenResources {
+    tiers: Arc<crate::storage::TierRegistry>,
+    block_cache: Arc<BlockCache>,
+    flush_tx: Sender<FlushJob>,
+    flush_rx: Receiver<FlushJob>,
+    compact_tx: Sender<Arc<ColumnFamily>>,
+    compact_rx: Receiver<Arc<ColumnFamily>>,
+    poison: Arc<crate::util::Poison>,
+    wal_syncs: Arc<AtomicU64>,
+    closing: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    pending_flush: Arc<AtomicUsize>,
+}
+
+impl OpenResources {
+    fn new(opts: &Options, dir: &str) -> Result<Self> {
+        let file_cache = Arc::new(FileCache::new(opts.max_open_sstables.max(1)));
+        let tiers = build_tier_registry(opts, dir, file_cache)?;
+        let (flush_tx, flush_rx) = unbounded::<FlushJob>();
+        let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
+        Ok(Self {
+            tiers,
+            block_cache: Arc::new(BlockCache::new(opts.block_cache_size as i64)),
+            flush_tx,
+            flush_rx,
+            compact_tx,
+            compact_rx,
+            poison: Arc::new(crate::util::Poison::new()),
+            wal_syncs: Arc::new(AtomicU64::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            pending_flush: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+struct WorkerReceivers {
+    flush: Receiver<FlushJob>,
+    compact: Receiver<Arc<ColumnFamily>>,
+}
+
+fn build_tier_registry(
+    opts: &Options,
+    dir: &str,
+    file_cache: Arc<FileCache>,
+) -> Result<Arc<crate::storage::TierRegistry>> {
+    // The default tier permits mmap when built; named local tiers honor their
+    // flag so a slow mount can force positioned reads. "ssd" aliases default.
+    let default = crate::storage::LocalStorage::new(file_cache.clone(), true);
+    let mut extra: Vec<(String, String, Arc<dyn crate::storage::Storage>)> = Vec::new();
+    for tier in &opts.tiers {
+        if tier.name == "ssd" {
+            continue;
+        }
+        let storage: Arc<dyn crate::storage::Storage> = match &tier.backend {
+            crate::config::TierBackend::Local => {
+                crate::storage::LocalStorage::new(file_cache.clone(), tier.supports_mmap)
+            }
+            #[cfg(feature = "s3")]
+            crate::config::TierBackend::S3(config) => crate::storage_s3::S3Storage::new(config)?,
+            // The embedder owns the construction and wrapping of custom stores.
+            crate::config::TierBackend::Custom(storage) => storage.clone(),
+        };
+        extra.push((tier.name.clone(), tier.root.clone(), storage));
+    }
+    Ok(Arc::new(crate::storage::TierRegistry::new(
+        dir.to_owned(),
+        default,
+        extra,
+    )?))
+}
+
+fn requested_wal_layout(opts: &Options) -> WalLayout {
+    if opts.unified_memtable {
+        WalLayout::Unified
+    } else {
+        WalLayout::PerColumnFamily
+    }
+}
+
+fn validate_wal_layout(manifest: &Manifest, requested: WalLayout) -> Result<()> {
+    if manifest.cfs.is_empty() || manifest.wal_layout == requested {
+        return Ok(());
+    }
+    Err(OndaError::InvalidArgs(format!(
+        "WAL layout mismatch: database is {:?}, requested {:?}",
+        manifest.wal_layout, requested
+    )))
+}
+
+fn build_db_inner(
+    opts: &Options,
+    dir: String,
+    manifest: &Manifest,
+    requested_layout: WalLayout,
+    lock_file: std::fs::File,
+    resources: OpenResources,
+) -> Result<(Arc<DbInner>, WorkerReceivers)> {
+    let OpenResources {
+        tiers,
+        block_cache,
+        flush_tx,
+        flush_rx,
+        compact_tx,
+        compact_rx,
+        poison,
+        wal_syncs,
+        closing,
+        stop,
+        pending_flush,
+    } = resources;
+    let (unified, unified_max_seq) = open_unified_store(
+        opts,
+        &dir,
+        &flush_tx,
+        &pending_flush,
+        &closing,
+        &poison,
+        &wal_syncs,
+    )?;
+    let tables = Arc::new(crate::table_cache::TableCache::with_byte_budget(
+        opts.max_open_readers,
+        opts.max_open_reader_bytes,
+    ));
+    let ctx = Arc::new(CfCtx {
+        tiers,
+        bc: block_cache,
+        tables,
+        flush_tx,
+        compact_tx,
+        closing: closing.clone(),
+        read_only: opts.read_only,
+        pending_flush: pending_flush.clone(),
+        unified: unified.clone(),
+        poison: poison.clone(),
+        wal_syncs: wal_syncs.clone(),
+    });
+    let inner = Arc::new(DbInner {
+        opts: opts.clone(),
+        dir,
+        cfs: RwLock::new(HashMap::new()),
+        cf_by_id: RwLock::new(HashMap::new()),
+        ctx,
+        unified,
+        next_seq: AtomicU64::new(manifest.global_seq + 1),
+        visible: AtomicU64::new(manifest.global_seq),
+        publish: Mutex::new(PublishState {
+            cursor: manifest.global_seq + 1,
+            completed: HashMap::new(),
+        }),
+        snapshots: Mutex::new(BTreeMap::new()),
+        commit_mu: Mutex::new(()),
+        next_file_id: AtomicU64::new(manifest.next_file_id.max(1)),
+        closing,
+        stop,
+        pending_flush,
+        mover_running: AtomicBool::new(false),
+        manifest_mu: Mutex::new(()),
+        wal_layout: Mutex::new(requested_layout),
+        instance_nonce: Mutex::new(manifest.instance_nonce),
+        manifest_persists: AtomicU64::new(0),
+        file_deletion: Mutex::new(FileDeletionState::default()),
+        workers: Mutex::new(Vec::new()),
+        lock_file: Mutex::new(Some(lock_file)),
+        handles: Arc::new(AtomicUsize::new(1)),
+        poison,
+        wal_syncs,
+    });
+    inner.observe_seq(unified_max_seq);
+    Ok((
+        inner,
+        WorkerReceivers {
+            flush: flush_rx,
+            compact: compact_rx,
+        },
+    ))
+}
+
+fn open_unified_store(
+    opts: &Options,
+    dir: &str,
+    flush_tx: &Sender<FlushJob>,
+    pending_flush: &Arc<AtomicUsize>,
+    closing: &Arc<AtomicBool>,
+    poison: &Arc<crate::util::Poison>,
+    wal_syncs: &Arc<AtomicU64>,
+) -> Result<(Option<Arc<crate::unified::UnifiedStore>>, u64)> {
+    if !opts.unified_memtable {
+        return Ok((None, 0));
+    }
+    let (store, max_seq) = crate::unified::UnifiedStore::open(
+        dir,
+        opts,
+        flush_tx.clone(),
+        pending_flush.clone(),
+        closing.clone(),
+        poison.clone(),
+        wal_syncs.clone(),
+    )?;
+    Ok((Some(store), max_seq))
+}
+
+fn recover_column_families(
+    inner: &Arc<DbInner>,
+    manifest: &Manifest,
+    opts: &Options,
+) -> Result<()> {
+    for persisted in &manifest.cfs {
+        let mut config = ColumnFamilyConfig::decode(&persisted.config);
+        let comparator = comparator_by_name(&config.comparator_name).ok_or_else(|| {
+            OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
+        })?;
+        resolve_partition_scheme(&mut config, opts, &persisted.name)?;
+        let (cf, max_seq) = ColumnFamily::load(
+            inner.ctx.clone(),
+            persisted.name.clone(),
+            inner.cf_dir(&persisted.name),
+            config,
+            comparator,
+            &persisted.sstables,
+        )?;
+        inner.observe_seq(max_seq);
+        inner.cf_by_id.write().insert(cf.id(), cf.clone());
+        inner.cfs.write().insert(persisted.name.clone(), cf);
+    }
+    Ok(())
+}
+
+fn resolve_partition_scheme(
+    config: &mut ColumnFamilyConfig,
+    opts: &Options,
+    cf_name: &str,
+) -> Result<()> {
+    let crate::config::PartitionScheme::Unresolved(name) = &config.partition_scheme else {
+        return Ok(());
+    };
+    // Silently reverting to rules would cut all future parts on different
+    // boundaries, with corruption surfacing only much later during movement.
+    let found = opts
+        .partition_fns
+        .iter()
+        .find(|partitioner| partitioner.scheme_name() == name)
+        .cloned()
+        .ok_or_else(|| {
+            OndaError::InvalidArgs(format!(
+                "column family {cf_name:?} was written with derived partition scheme {name:?}, \
+                 which is not registered in Options::partition_fns"
+            ))
+        })?;
+    config.partition_scheme = crate::config::PartitionScheme::Derived(found);
+    Ok(())
+}
+
+fn finish_open(
+    inner: &Arc<DbInner>,
+    manifest: &Manifest,
+    receivers: WorkerReceivers,
+) -> Result<()> {
+    if inner.opts.read_only {
+        return Ok(());
+    }
+    ensure_instance_nonce(inner)?;
+    // The sweep must run after recovery and before workers, so no move races
+    // the manifest-as-source-of-truth cleanup.
+    sweep_move_orphans(inner, manifest);
+    spawn_workers(inner, receivers.flush, receivers.compact);
+    Ok(())
+}
+
+fn ensure_instance_nonce(inner: &Arc<DbInner>) -> Result<()> {
+    let has_shared = inner.opts.tiers.iter().any(|tier| tier.shared);
+    if !has_shared || inner.instance_nonce.lock().is_some() {
+        return Ok(());
+    }
+    *inner.instance_nonce.lock() = Some(mint_instance_nonce(&inner.dir));
+    // Persist immediately: object names embed the nonce, so a crash before a
+    // later manifest write must not allow a different nonce to be minted.
+    inner.persist_manifest()
+}
+
 impl DB {
     /// Open (creating if needed) the database at `opts.path`.
     pub fn open(opts: Options) -> Result<DB> {
@@ -405,196 +685,24 @@ impl DB {
         // excluded. The lock dies with the fd, so a crashed process never
         // leaves a stale lock behind.
         let lock_file = acquire_dir_lock(&dir, opts.read_only)?;
-
-        let fc = Arc::new(FileCache::new(opts.max_open_sstables.max(1)));
-        let bc = Arc::new(BlockCache::new(opts.block_cache_size as i64));
-
-        // Storage-tier registry: the default tier is the DB directory; every
-        // configured tier gets its own LocalStorage over the shared file cache.
-        // The default tier permits mmap (when the feature is built); a named tier
-        // honors its `supports_mmap` flag so a slow/remote-style mount can force
-        // the buffered pread path. The name "ssd" is reserved for the default.
-        let default_storage = crate::storage::LocalStorage::new(fc.clone(), true);
-        let mut extra_tiers: Vec<(String, String, Arc<dyn crate::storage::Storage>)> = Vec::new();
-        for t in &opts.tiers {
-            if t.name == "ssd" {
-                continue;
-            }
-            let storage: Arc<dyn crate::storage::Storage> = match &t.backend {
-                crate::config::TierBackend::Local => {
-                    crate::storage::LocalStorage::new(fc.clone(), t.supports_mmap)
-                }
-                #[cfg(feature = "s3")]
-                crate::config::TierBackend::S3(cfg) => crate::storage_s3::S3Storage::new(cfg)?,
-                // A caller-provided backend is used verbatim (P8): the embedder
-                // already built (and wrapped) it.
-                crate::config::TierBackend::Custom(s) => s.clone(),
-            };
-            extra_tiers.push((t.name.clone(), t.root.clone(), storage));
-        }
-        let tiers = Arc::new(crate::storage::TierRegistry::new(
-            dir.clone(),
-            default_storage,
-            extra_tiers,
-        )?);
-
-        let (flush_tx, flush_rx) = unbounded::<FlushJob>();
-        let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
-        let poison = Arc::new(crate::util::Poison::new());
-        let wal_syncs = Arc::new(AtomicU64::new(0));
-        let closing = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let pending_flush = Arc::new(AtomicUsize::new(0));
+        let resources = OpenResources::new(&opts, &dir)?;
 
         // The WAL layout is a durable database-wide choice once the catalog
         // contains a column family. Opening under the other layout would make
         // recovery consult one set of WALs while new commits write another.
         let manifest = Manifest::load(manifest_path(&dir))?;
-        let requested_layout = if opts.unified_memtable {
-            WalLayout::Unified
-        } else {
-            WalLayout::PerColumnFamily
-        };
-        if !manifest.cfs.is_empty() && manifest.wal_layout != requested_layout {
-            return Err(OndaError::InvalidArgs(format!(
-                "WAL layout mismatch: database is {:?}, requested {:?}",
-                manifest.wal_layout, requested_layout
-            )));
-        }
-
-        // Unified memtable (shared across CFs), if enabled.
-        let mut unified_max_seq = 0u64;
-        let unified = if opts.unified_memtable {
-            let (store, max_seq) = crate::unified::UnifiedStore::open(
-                &dir,
-                &opts,
-                flush_tx.clone(),
-                pending_flush.clone(),
-                closing.clone(),
-                poison.clone(),
-                wal_syncs.clone(),
-            )?;
-            unified_max_seq = max_seq;
-            Some(store)
-        } else {
-            None
-        };
-
-        let tables = Arc::new(crate::table_cache::TableCache::with_byte_budget(
-            opts.max_open_readers,
-            opts.max_open_reader_bytes,
-        ));
-        let ctx = Arc::new(CfCtx {
-            tiers,
-            bc,
-            tables,
-            flush_tx,
-            compact_tx,
-            closing: closing.clone(),
-            read_only: opts.read_only,
-            pending_flush: pending_flush.clone(),
-            unified: unified.clone(),
-            poison: poison.clone(),
-            wal_syncs: wal_syncs.clone(),
-        });
-
-        let inner = Arc::new(DbInner {
-            opts: opts.clone(),
+        let requested_layout = requested_wal_layout(&opts);
+        validate_wal_layout(&manifest, requested_layout)?;
+        let (inner, receivers) = build_db_inner(
+            &opts,
             dir,
-            cfs: RwLock::new(HashMap::new()),
-            cf_by_id: RwLock::new(HashMap::new()),
-            ctx,
-            unified,
-            next_seq: AtomicU64::new(manifest.global_seq + 1),
-            visible: AtomicU64::new(manifest.global_seq),
-            publish: Mutex::new(PublishState {
-                cursor: manifest.global_seq + 1,
-                completed: HashMap::new(),
-            }),
-            snapshots: Mutex::new(BTreeMap::new()),
-            commit_mu: Mutex::new(()),
-            next_file_id: AtomicU64::new(manifest.next_file_id.max(1)),
-            closing,
-            stop,
-            pending_flush,
-            mover_running: AtomicBool::new(false),
-            manifest_mu: Mutex::new(()),
-            wal_layout: Mutex::new(requested_layout),
-            instance_nonce: Mutex::new(manifest.instance_nonce),
-            manifest_persists: AtomicU64::new(0),
-            file_deletion: Mutex::new(FileDeletionState::default()),
-            workers: Mutex::new(Vec::new()),
-            lock_file: Mutex::new(Some(lock_file)),
-            handles: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            poison,
-            wal_syncs,
-        });
-        inner.observe_seq(unified_max_seq);
-
-        // Recover column families from the manifest.
-        for cfm in &manifest.cfs {
-            let mut cfg = ColumnFamilyConfig::decode(&cfm.config);
-            let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
-                OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
-            })?;
-            // A derived partitioner is persisted by name only; exchange it for
-            // the registered implementation, exactly as the comparator above is
-            // resolved. Failing here — rather than proceeding with rule-based
-            // partitioning — is deliberate: the CF's existing parts were cut on
-            // derived boundaries, and silently reverting would cut every part
-            // written afterwards differently while every operation appeared to
-            // succeed. The damage would surface much later, as parts that
-            // detach, freeze and tier incorrectly.
-            if let crate::config::PartitionScheme::Unresolved(name) = &cfg.partition_scheme {
-                let found = opts
-                    .partition_fns
-                    .iter()
-                    .find(|f| f.scheme_name() == name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        OndaError::InvalidArgs(format!(
-                            "column family {:?} was written with derived partition scheme {name:?}, \
-                             which is not registered in Options::partition_fns",
-                            cfm.name
-                        ))
-                    })?;
-                cfg.partition_scheme = crate::config::PartitionScheme::Derived(found);
-            }
-            let (cf, max_seq) = ColumnFamily::load(
-                inner.ctx.clone(),
-                cfm.name.clone(),
-                inner.cf_dir(&cfm.name),
-                cfg,
-                cmp,
-                &cfm.sstables,
-            )?;
-            inner.observe_seq(max_seq);
-            inner.cf_by_id.write().insert(cf.id(), cf.clone());
-            inner.cfs.write().insert(cfm.name.clone(), cf);
-        }
-
-        if !opts.read_only {
-            // Mint the instance nonce the first time a shared tier is
-            // configured (A2). Persisted immediately so a crash between the
-            // first shared-tier move and the next manifest write cannot mint
-            // a second nonce and orphan the first name. A database with no
-            // shared tier never mints one, keeping its manifest readable by
-            // pre-A2 binaries.
-            let has_shared = inner.opts.tiers.iter().any(|t| t.shared);
-            if has_shared && inner.instance_nonce.lock().is_none() {
-                *inner.instance_nonce.lock() = Some(mint_instance_nonce(&inner.dir));
-                inner.persist_manifest()?;
-            }
-            // Sweep tier-move orphans left by a crash mid-move (a copy on the
-            // target before the manifest flip, or a source after it). The
-            // manifest — now recovered — is the single source of truth for where
-            // each table lives; anything else is deleted. Runs before workers so
-            // no background move races the sweep. Shared tiers are exempt: their
-            // objects may be referenced by other databases, and this engine
-            // never deletes on a shared tier (SPADINO-A2.md).
-            sweep_move_orphans(&inner, &manifest);
-            spawn_workers(&inner, flush_rx, compact_rx);
-        }
+            &manifest,
+            requested_layout,
+            lock_file,
+            resources,
+        )?;
+        recover_column_families(&inner, &manifest, &opts)?;
+        finish_open(&inner, &manifest, receivers)?;
         Ok(DB { inner })
     }
 
@@ -973,43 +1081,67 @@ fn mint_instance_nonce(dir: &str) -> u64 {
 }
 
 fn sweep_move_orphans(inner: &Arc<DbInner>, manifest: &Manifest) {
-    // Candidate tier locations: the default tier (`None`) plus every configured
-    // named tier (the reserved "ssd" name aliases the default).
-    let mut locations: Vec<Option<String>> = vec![None];
-    for t in &inner.opts.tiers {
-        // Never sweep a shared tier: its objects may belong to another
-        // database whose ids coincide with ours (SPADINO-A2.md).
-        if t.name != "ssd" && !t.shared {
-            locations.push(Some(t.name.clone()));
-        }
-    }
+    let locations = orphan_sweep_locations(&inner.opts);
     for cfm in &manifest.cfs {
-        let mut tier_of: HashMap<u64, Option<String>> = HashMap::new();
-        for s in &cfm.sstables {
-            tier_of.insert(s.id, s.tier.clone());
-        }
+        let tier_of = manifest_table_locations(cfm);
         for loc in &locations {
-            let dir = inner.ctx.tiers.cf_dir(loc.as_deref(), &cfm.name);
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue, // tier dir may not exist yet — nothing to sweep
-            };
-            for entry in entries.flatten() {
-                let fname = entry.file_name();
-                let fname = fname.to_string_lossy();
-                let Some(id) = parse_sst_file_id(&fname) else {
-                    continue; // not an <id>.klog/.vlog (e.g. a WAL or subdir)
-                };
-                // Delete only when the manifest knows this id but places it on a
-                // different tier than the directory we found it in.
-                if let Some(manifest_tier) = tier_of.get(&id) {
-                    if manifest_tier.as_deref() != loc.as_deref() {
-                        let _ = std::fs::remove_file(format!("{dir}/{fname}"));
-                    }
-                }
-            }
+            sweep_cf_location(inner, &cfm.name, &tier_of, loc.as_deref());
         }
     }
+}
+
+fn orphan_sweep_locations(opts: &Options) -> Vec<Option<String>> {
+    let mut locations = vec![None];
+    for tier in &opts.tiers {
+        // Never sweep a shared tier: its objects may belong to another database
+        // whose table ids happen to coincide with ours (SPADINO-A2.md).
+        if tier.name != "ssd" && !tier.shared {
+            locations.push(Some(tier.name.clone()));
+        }
+    }
+    locations
+}
+
+fn manifest_table_locations(cfm: &CfManifest) -> HashMap<u64, Option<String>> {
+    cfm.sstables
+        .iter()
+        .map(|sst| (sst.id, sst.tier.clone()))
+        .collect()
+}
+
+fn sweep_cf_location(
+    inner: &Arc<DbInner>,
+    cf_name: &str,
+    manifest_tiers: &HashMap<u64, Option<String>>,
+    location: Option<&str>,
+) {
+    let dir = inner.ctx.tiers.cf_dir(location, cf_name);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        sweep_sst_entry(&dir, &entry, manifest_tiers, location);
+    }
+}
+
+fn sweep_sst_entry(
+    dir: &str,
+    entry: &std::fs::DirEntry,
+    manifest_tiers: &HashMap<u64, Option<String>>,
+    location: Option<&str>,
+) {
+    let file_name = entry.file_name();
+    let file_name = file_name.to_string_lossy();
+    let Some(id) = parse_sst_file_id(&file_name) else {
+        return;
+    };
+    if sst_is_misplaced(manifest_tiers.get(&id), location) {
+        let _ = std::fs::remove_file(format!("{dir}/{file_name}"));
+    }
+}
+
+fn sst_is_misplaced(manifest_tier: Option<&Option<String>>, location: Option<&str>) -> bool {
+    manifest_tier.is_some_and(|tier| tier.as_deref() != location)
 }
 
 /// Parse the table id from an SSTable file name (`<id>.klog` or `<id>.vlog`),
@@ -1234,6 +1366,44 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_layout_validation_allows_empty_catalogs_and_matching_catalogs() {
+        let empty = Manifest::default();
+        assert!(validate_wal_layout(&empty, WalLayout::Unified).is_ok());
+
+        let populated = Manifest {
+            cfs: vec![CfManifest::default()],
+            wal_layout: WalLayout::Unified,
+            ..Manifest::default()
+        };
+        assert!(validate_wal_layout(&populated, WalLayout::Unified).is_ok());
+    }
+
+    #[test]
+    fn wal_layout_validation_rejects_a_populated_mismatch() {
+        let manifest = Manifest {
+            cfs: vec![CfManifest::default()],
+            wal_layout: WalLayout::PerColumnFamily,
+            ..Manifest::default()
+        };
+
+        let err = validate_wal_layout(&manifest, WalLayout::Unified).unwrap_err();
+        assert!(matches!(err, OndaError::InvalidArgs(message) if
+            message == "WAL layout mismatch: database is PerColumnFamily, requested Unified"));
+    }
+
+    #[test]
+    fn orphan_sweep_removes_only_known_tables_in_the_wrong_location() {
+        let default = None;
+        let cold = Some("cold".to_owned());
+
+        assert!(!sst_is_misplaced(None, None));
+        assert!(!sst_is_misplaced(Some(&default), None));
+        assert!(sst_is_misplaced(Some(&default), Some("cold")));
+        assert!(!sst_is_misplaced(Some(&cold), Some("cold")));
+        assert!(sst_is_misplaced(Some(&cold), None));
+    }
 
     /// The two durability-inspection hooks: `column_family_config` reports the
     /// effective (reopen-faithful) config, and `wal_sync_count` counts only

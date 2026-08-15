@@ -935,144 +935,12 @@ impl ColumnFamilyConfig {
 
     /// Serialize the durable subset of the config for the manifest blob.
     pub fn encode(&self) -> Vec<u8> {
-        use crate::encoding::{append_u32, append_u64, append_uvarint};
         let mut b = Vec::new();
-        append_uvarint(&mut b, self.comparator_name.len() as u64);
-        b.extend_from_slice(self.comparator_name.as_bytes());
-        b.push(self.compression as u8);
-        append_u64(&mut b, self.write_buffer_size as u64);
-        append_u64(&mut b, self.level_size_ratio);
-        append_u64(&mut b, self.klog_value_threshold as u64);
-        b.push(u8::from(self.enable_bloom_filter));
-        append_u64(&mut b, self.bloom_fpr.to_bits());
-        append_u32(&mut b, self.l1_file_count_trigger);
-        append_u32(&mut b, self.l0_queue_stall_threshold);
-        b.push(u8::from(self.use_btree));
-        // Appended after the original durable subset: manifests written by older
-        // versions lack these trailing bytes, so `decode_into` (which stops early
-        // on a short blob via `?`) reconstructs them as the struct defaults —
-        // backward compatible in both directions.
-        b.push(self.sync_mode as u8);
-        append_u64(&mut b, self.sync_interval.as_micros() as u64);
-        let n_levels = self.compression_per_level.len().min(u8::MAX as usize);
-        b.push(n_levels as u8);
-        for c in self.compression_per_level.iter().take(n_levels) {
-            b.push(*c as u8);
-        }
-        b.push(self.compaction_style as u8);
-        append_u64(&mut b, self.fifo_max_bytes);
-        append_u64(&mut b, self.fifo_ttl.as_micros() as u64);
-        let n_rules = self.compression_rules.len().min(u8::MAX as usize);
-        b.push(n_rules as u8);
-        for r in self.compression_rules.iter().take(n_rules) {
-            append_uvarint(&mut b, r.prefix.len() as u64);
-            b.extend_from_slice(&r.prefix);
-            b.push(r.compression as u8);
-        }
-        // Appended tail (same backward/forward-compatible scheme as above): an
-        // older manifest ends before this count, so `decode_into` returns via
-        // `?` and leaves `partition_rules` empty.
-        let n_parts = self.partition_rules.len().min(u8::MAX as usize);
-        b.push(n_parts as u8);
-        for r in self.partition_rules.iter().take(n_parts) {
-            append_uvarint(&mut b, r.prefix.len() as u64);
-            b.extend_from_slice(&r.prefix);
-            append_uvarint(&mut b, r.name.len() as u64);
-            b.extend_from_slice(r.name.as_bytes());
-        }
-        // Appended tail (same backward/forward-compatible scheme): storage-tier
-        // rules. An older manifest ends before this count byte, so `decode_into`
-        // returns via `?` and leaves `tier_rules` empty.
-        let n_tiers = self.tier_rules.len().min(u8::MAX as usize);
-        b.push(n_tiers as u8);
-        for r in self.tier_rules.iter().take(n_tiers) {
-            append_uvarint(&mut b, r.prefix.len() as u64);
-            b.extend_from_slice(&r.prefix);
-            append_uvarint(&mut b, r.tier.len() as u64);
-            b.extend_from_slice(r.tier.as_bytes());
-            append_u64(&mut b, r.min_age.as_micros() as u64);
-        }
-
-        // Preserve the released 0.3.0 representation above byte-for-byte for
-        // every count it could represent. Extra entries live in a tagged tail:
-        // old readers ignore it, while new readers append it to the first 255.
-        // This avoids the ambiguity between a legacy u8 count >= 128 and the
-        // first byte of a LEB128 count.
-        if self.compression_per_level.len() > u8::MAX as usize
-            || self.compression_rules.len() > u8::MAX as usize
-            || self.partition_rules.len() > u8::MAX as usize
-            || self.tier_rules.len() > u8::MAX as usize
-        {
-            b.extend_from_slice(CONFIG_OVERFLOW_MAGIC);
-
-            append_uvarint(
-                &mut b,
-                self.compression_per_level.len().saturating_sub(n_levels) as u64,
-            );
-            for c in self.compression_per_level.iter().skip(n_levels) {
-                b.push(*c as u8);
-            }
-
-            append_uvarint(
-                &mut b,
-                self.compression_rules.len().saturating_sub(n_rules) as u64,
-            );
-            for r in self.compression_rules.iter().skip(n_rules) {
-                append_uvarint(&mut b, r.prefix.len() as u64);
-                b.extend_from_slice(&r.prefix);
-                b.push(r.compression as u8);
-            }
-
-            append_uvarint(
-                &mut b,
-                self.partition_rules.len().saturating_sub(n_parts) as u64,
-            );
-            for r in self.partition_rules.iter().skip(n_parts) {
-                append_uvarint(&mut b, r.prefix.len() as u64);
-                b.extend_from_slice(&r.prefix);
-                append_uvarint(&mut b, r.name.len() as u64);
-                b.extend_from_slice(r.name.as_bytes());
-            }
-
-            append_uvarint(&mut b, self.tier_rules.len().saturating_sub(n_tiers) as u64);
-            for r in self.tier_rules.iter().skip(n_tiers) {
-                append_uvarint(&mut b, r.prefix.len() as u64);
-                b.extend_from_slice(&r.prefix);
-                append_uvarint(&mut b, r.tier.len() as u64);
-                b.extend_from_slice(r.tier.as_bytes());
-                append_u64(&mut b, r.min_age.as_micros() as u64);
-            }
-        }
-
-        // Derived-partitioner marker, in its own tagged tail for the same
-        // reason the overflow tail has one: a reader that predates it stops at
-        // the end of the section it knows and reconstructs the rest as
-        // defaults, so a config with no derived scheme is byte-for-byte what
-        // earlier releases wrote. Only the scheme *name* is durable — the
-        // implementation is re-supplied through `Options::partition_fns`.
-        if let Some(name) = self.derived_scheme_name() {
-            b.extend_from_slice(CONFIG_PARTITION_FN_MAGIC);
-            append_uvarint(&mut b, name.len() as u64);
-            b.extend_from_slice(name.as_bytes());
-        }
-
-        // 0.8.0 compaction geometry, in its own tagged tail for the same reason
-        // as the tails above: a reader that predates it stops at the magic it
-        // does not know and keeps the struct defaults. Emitted only when it
-        // differs from the defaults, so a config that never touched these
-        // fields still encodes byte-for-byte as earlier releases wrote it.
-        let d = ColumnFamilyConfig::default();
-        if self.target_file_size != d.target_file_size
-            || self.l1_base_bytes != d.l1_base_bytes
-            || self.soft_pending_compaction_bytes != d.soft_pending_compaction_bytes
-            || self.hard_pending_compaction_bytes != d.hard_pending_compaction_bytes
-        {
-            b.extend_from_slice(CONFIG_COMPACTION_MAGIC);
-            append_u64(&mut b, self.target_file_size as u64);
-            append_u64(&mut b, self.l1_base_bytes);
-            append_u64(&mut b, self.soft_pending_compaction_bytes);
-            append_u64(&mut b, self.hard_pending_compaction_bytes);
-        }
+        encode_base_config(&mut b, self);
+        let counts = encode_legacy_policies(&mut b, self);
+        encode_overflow_policies(&mut b, self, counts);
+        encode_partition_scheme(&mut b, self);
+        encode_compaction_geometry(&mut b, self);
         b
     }
 
@@ -1105,229 +973,386 @@ const CONFIG_PARTITION_FN_MAGIC: &[u8; 8] = b"ONDAPFN1";
 /// Tag introducing the 0.8.0 compaction-geometry tail.
 const CONFIG_COMPACTION_MAGIC: &[u8; 8] = b"ONDACMP1";
 
-fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
-    use crate::encoding::{read_u32, read_u64, uvarint};
-    let (nlen, n) = uvarint(p)?;
-    p = &p[n..];
-    let nlen = nlen as usize;
-    if p.len() < nlen {
-        return None;
-    }
-    cfg.comparator_name = String::from_utf8_lossy(&p[..nlen]).into_owned();
-    p = &p[nlen..];
+#[derive(Clone, Copy)]
+struct LegacyPolicyCounts {
+    levels: usize,
+    compression: usize,
+    partitions: usize,
+    tiers: usize,
+}
 
-    let byte = |p: &mut &[u8]| -> Option<u8> {
-        let b = *p.first()?;
-        *p = &p[1..];
-        Some(b)
+fn encode_base_config(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::{append_u32, append_u64, append_uvarint};
+
+    append_uvarint(b, cfg.comparator_name.len() as u64);
+    b.extend_from_slice(cfg.comparator_name.as_bytes());
+    b.push(cfg.compression as u8);
+    append_u64(b, cfg.write_buffer_size as u64);
+    append_u64(b, cfg.level_size_ratio);
+    append_u64(b, cfg.klog_value_threshold as u64);
+    b.push(u8::from(cfg.enable_bloom_filter));
+    append_u64(b, cfg.bloom_fpr.to_bits());
+    append_u32(b, cfg.l1_file_count_trigger);
+    append_u32(b, cfg.l0_queue_stall_threshold);
+    b.push(u8::from(cfg.use_btree));
+
+    // This is the first append-tolerant tail. A legacy blob ending above keeps
+    // the defaults because decoding stops before assigning these fields.
+    b.push(cfg.sync_mode as u8);
+    append_u64(b, cfg.sync_interval.as_micros() as u64);
+}
+
+fn encode_legacy_policies(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) -> LegacyPolicyCounts {
+    use crate::encoding::{append_u64, append_uvarint};
+
+    let counts = LegacyPolicyCounts {
+        levels: cfg.compression_per_level.len().min(u8::MAX as usize),
+        compression: cfg.compression_rules.len().min(u8::MAX as usize),
+        partitions: cfg.partition_rules.len().min(u8::MAX as usize),
+        tiers: cfg.tier_rules.len().min(u8::MAX as usize),
     };
-    let uvar = |p: &mut &[u8]| -> Option<u64> {
-        let (v, n) = uvarint(p)?;
-        *p = &p[n..];
-        Some(v)
+    b.push(counts.levels as u8);
+    b.extend(
+        cfg.compression_per_level
+            .iter()
+            .take(counts.levels)
+            .map(|c| *c as u8),
+    );
+    b.push(cfg.compaction_style as u8);
+    append_u64(b, cfg.fifo_max_bytes);
+    append_u64(b, cfg.fifo_ttl.as_micros() as u64);
+
+    b.push(counts.compression as u8);
+    for rule in cfg.compression_rules.iter().take(counts.compression) {
+        append_uvarint(b, rule.prefix.len() as u64);
+        b.extend_from_slice(&rule.prefix);
+        b.push(rule.compression as u8);
+    }
+    b.push(counts.partitions as u8);
+    for rule in cfg.partition_rules.iter().take(counts.partitions) {
+        append_uvarint(b, rule.prefix.len() as u64);
+        b.extend_from_slice(&rule.prefix);
+        append_uvarint(b, rule.name.len() as u64);
+        b.extend_from_slice(rule.name.as_bytes());
+    }
+    b.push(counts.tiers as u8);
+    for rule in cfg.tier_rules.iter().take(counts.tiers) {
+        append_uvarint(b, rule.prefix.len() as u64);
+        b.extend_from_slice(&rule.prefix);
+        append_uvarint(b, rule.tier.len() as u64);
+        b.extend_from_slice(rule.tier.as_bytes());
+        append_u64(b, rule.min_age.as_micros() as u64);
+    }
+    counts
+}
+
+fn has_overflow_policies(cfg: &ColumnFamilyConfig) -> bool {
+    cfg.compression_per_level.len() > u8::MAX as usize
+        || cfg.compression_rules.len() > u8::MAX as usize
+        || cfg.partition_rules.len() > u8::MAX as usize
+        || cfg.tier_rules.len() > u8::MAX as usize
+}
+
+fn encode_overflow_policies(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig, counts: LegacyPolicyCounts) {
+    use crate::encoding::{append_u64, append_uvarint};
+
+    if !has_overflow_policies(cfg) {
+        return;
+    }
+    b.extend_from_slice(CONFIG_OVERFLOW_MAGIC);
+    append_uvarint(
+        b,
+        cfg.compression_per_level
+            .len()
+            .saturating_sub(counts.levels) as u64,
+    );
+    b.extend(
+        cfg.compression_per_level
+            .iter()
+            .skip(counts.levels)
+            .map(|c| *c as u8),
+    );
+
+    append_uvarint(
+        b,
+        cfg.compression_rules
+            .len()
+            .saturating_sub(counts.compression) as u64,
+    );
+    for rule in cfg.compression_rules.iter().skip(counts.compression) {
+        append_uvarint(b, rule.prefix.len() as u64);
+        b.extend_from_slice(&rule.prefix);
+        b.push(rule.compression as u8);
+    }
+    append_uvarint(
+        b,
+        cfg.partition_rules.len().saturating_sub(counts.partitions) as u64,
+    );
+    for rule in cfg.partition_rules.iter().skip(counts.partitions) {
+        append_uvarint(b, rule.prefix.len() as u64);
+        b.extend_from_slice(&rule.prefix);
+        append_uvarint(b, rule.name.len() as u64);
+        b.extend_from_slice(rule.name.as_bytes());
+    }
+    append_uvarint(b, cfg.tier_rules.len().saturating_sub(counts.tiers) as u64);
+    for rule in cfg.tier_rules.iter().skip(counts.tiers) {
+        append_uvarint(b, rule.prefix.len() as u64);
+        b.extend_from_slice(&rule.prefix);
+        append_uvarint(b, rule.tier.len() as u64);
+        b.extend_from_slice(rule.tier.as_bytes());
+        append_u64(b, rule.min_age.as_micros() as u64);
+    }
+}
+
+fn encode_partition_scheme(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_uvarint;
+
+    let Some(name) = cfg.derived_scheme_name() else {
+        return;
     };
-    let u64v = |p: &mut &[u8]| -> Option<u64> {
-        if p.len() < 8 {
+    b.extend_from_slice(CONFIG_PARTITION_FN_MAGIC);
+    append_uvarint(b, name.len() as u64);
+    b.extend_from_slice(name.as_bytes());
+}
+
+fn encode_compaction_geometry(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_u64;
+
+    let defaults = ColumnFamilyConfig::default();
+    if cfg.target_file_size == defaults.target_file_size
+        && cfg.l1_base_bytes == defaults.l1_base_bytes
+        && cfg.soft_pending_compaction_bytes == defaults.soft_pending_compaction_bytes
+        && cfg.hard_pending_compaction_bytes == defaults.hard_pending_compaction_bytes
+    {
+        return;
+    }
+    b.extend_from_slice(CONFIG_COMPACTION_MAGIC);
+    append_u64(b, cfg.target_file_size as u64);
+    append_u64(b, cfg.l1_base_bytes);
+    append_u64(b, cfg.soft_pending_compaction_bytes);
+    append_u64(b, cfg.hard_pending_compaction_bytes);
+}
+
+#[derive(Clone, Copy)]
+struct ConfigCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> ConfigCursor<'a> {
+    fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        Some(self.bytes(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(crate::encoding::read_u32(self.bytes(4)?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(crate::encoding::read_u64(self.bytes(8)?))
+    }
+
+    fn uvar(&mut self) -> Option<u64> {
+        let (value, used) = crate::encoding::uvarint(self.remaining)?;
+        self.remaining = &self.remaining[used..];
+        Some(value)
+    }
+
+    fn bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+        if self.remaining.len() < len {
             return None;
         }
-        let v = read_u64(p);
-        *p = &p[8..];
-        Some(v)
-    };
-    let u32v = |p: &mut &[u8]| -> Option<u32> {
-        if p.len() < 4 {
-            return None;
-        }
-        let v = read_u32(p);
-        *p = &p[4..];
-        Some(v)
-    };
+        let (value, remaining) = self.remaining.split_at(len);
+        self.remaining = remaining;
+        Some(value)
+    }
 
-    if let Some(c) = Compression::from_u8(byte(&mut p)?) {
-        cfg.compression = c;
+    fn consume_prefix(&mut self, prefix: &[u8]) -> bool {
+        let Some(remaining) = self.remaining.strip_prefix(prefix) else {
+            return false;
+        };
+        self.remaining = remaining;
+        true
     }
-    cfg.write_buffer_size = u64v(&mut p)? as usize;
-    cfg.level_size_ratio = u64v(&mut p)?;
-    cfg.klog_value_threshold = u64v(&mut p)? as usize;
-    cfg.enable_bloom_filter = byte(&mut p)? != 0;
-    cfg.bloom_fpr = f64::from_bits(u64v(&mut p)?);
-    cfg.l1_file_count_trigger = u32v(&mut p)?;
-    cfg.l0_queue_stall_threshold = u32v(&mut p)?;
-    cfg.use_btree = byte(&mut p)? != 0;
-    // Trailing fields added later; an older manifest ends here and keeps the
-    // struct defaults for these (the `?` returns before overwriting them).
-    if let Some(sm) = SyncMode::from_u8(byte(&mut p)?) {
-        cfg.sync_mode = sm;
+
+    fn remaining_len(&self) -> usize {
+        self.remaining.len()
     }
-    cfg.sync_interval = std::time::Duration::from_micros(u64v(&mut p)?);
-    let n_levels = byte(&mut p)?;
-    let mut per_level = Vec::with_capacity(n_levels as usize);
-    for _ in 0..n_levels {
-        per_level.push(Compression::from_u8(byte(&mut p)?)?);
+
+    fn into_remaining(self) -> &'a [u8] {
+        self.remaining
     }
-    cfg.compression_per_level = per_level;
-    if let Some(style) = CompactionStyle::from_u8(byte(&mut p)?) {
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
+}
+
+fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
+    let mut cursor = ConfigCursor::new(p);
+    decode_base_config(&mut cursor, cfg)?;
+    decode_legacy_policies(&mut cursor, cfg)?;
+    if cursor.consume_prefix(CONFIG_OVERFLOW_MAGIC) {
+        decode_overflow_policies(&mut cursor, cfg)?;
+    }
+    let p = read_partition_fn_tail(cursor.into_remaining(), cfg);
+    read_compaction_tail(p, cfg);
+    Some(())
+}
+
+fn decode_base_config(cursor: &mut ConfigCursor<'_>, cfg: &mut ColumnFamilyConfig) -> Option<()> {
+    let name_len = cursor.uvar()? as usize;
+    cfg.comparator_name = String::from_utf8_lossy(cursor.bytes(name_len)?).into_owned();
+    if let Some(compression) = Compression::from_u8(cursor.byte()?) {
+        cfg.compression = compression;
+    }
+    cfg.write_buffer_size = cursor.u64()? as usize;
+    cfg.level_size_ratio = cursor.u64()?;
+    cfg.klog_value_threshold = cursor.u64()? as usize;
+    cfg.enable_bloom_filter = cursor.byte()? != 0;
+    cfg.bloom_fpr = f64::from_bits(cursor.u64()?);
+    cfg.l1_file_count_trigger = cursor.u32()?;
+    cfg.l0_queue_stall_threshold = cursor.u32()?;
+    cfg.use_btree = cursor.byte()? != 0;
+
+    // All remaining fields were appended after the original durable subset.
+    // A short legacy blob returns here and leaves their defaults in place.
+    if let Some(sync_mode) = SyncMode::from_u8(cursor.byte()?) {
+        cfg.sync_mode = sync_mode;
+    }
+    cfg.sync_interval = std::time::Duration::from_micros(cursor.u64()?);
+    Some(())
+}
+
+fn decode_legacy_policies(
+    cursor: &mut ConfigCursor<'_>,
+    cfg: &mut ColumnFamilyConfig,
+) -> Option<()> {
+    let level_count = cursor.byte()? as usize;
+    cfg.compression_per_level = decode_compression_levels(cursor, level_count)?;
+    if let Some(style) = CompactionStyle::from_u8(cursor.byte()?) {
         cfg.compaction_style = style;
     }
-    cfg.fifo_max_bytes = u64v(&mut p)?;
-    cfg.fifo_ttl = std::time::Duration::from_micros(u64v(&mut p)?);
-    let n_rules = byte(&mut p)?;
-    let mut rules = Vec::with_capacity(n_rules as usize);
-    for _ in 0..n_rules {
-        let (plen, n) = uvarint(p)?;
-        p = &p[n..];
-        let plen = plen as usize;
-        if p.len() < plen {
-            return None;
-        }
-        let prefix = p[..plen].to_vec();
-        p = &p[plen..];
-        rules.push(CompressionRule {
-            prefix,
-            compression: Compression::from_u8(byte(&mut p)?)?,
-        });
-    }
-    cfg.compression_rules = rules;
-    // Appended-tail partition rules; an older manifest ends above and keeps the
-    // default (empty) list.
-    let n_parts = byte(&mut p)?;
-    let mut parts = Vec::with_capacity(n_parts as usize);
-    for _ in 0..n_parts {
-        let (plen, n) = uvarint(p)?;
-        p = &p[n..];
-        let plen = plen as usize;
-        if p.len() < plen {
-            return None;
-        }
-        let prefix = p[..plen].to_vec();
-        p = &p[plen..];
-        let (nlen, n) = uvarint(p)?;
-        p = &p[n..];
-        let nlen = nlen as usize;
-        if p.len() < nlen {
-            return None;
-        }
-        let name = String::from_utf8_lossy(&p[..nlen]).into_owned();
-        p = &p[nlen..];
-        parts.push(PartitionRule { prefix, name });
-    }
-    cfg.partition_rules = parts;
-    // Appended-tail tier rules; an older manifest ends above and keeps the
-    // default (empty) list.
-    let n_tiers = byte(&mut p)?;
-    let mut tiers = Vec::with_capacity(n_tiers as usize);
-    for _ in 0..n_tiers {
-        let (plen, n) = uvarint(p)?;
-        p = &p[n..];
-        let plen = plen as usize;
-        if p.len() < plen {
-            return None;
-        }
-        let prefix = p[..plen].to_vec();
-        p = &p[plen..];
-        let (tlen, n) = uvarint(p)?;
-        p = &p[n..];
-        let tlen = tlen as usize;
-        if p.len() < tlen {
-            return None;
-        }
-        let tier = String::from_utf8_lossy(&p[..tlen]).into_owned();
-        p = &p[tlen..];
-        let min_age = std::time::Duration::from_micros(u64v(&mut p)?);
-        tiers.push(TierRule {
-            prefix,
-            tier,
-            min_age,
-        });
-    }
-    cfg.tier_rules = tiers;
+    cfg.fifo_max_bytes = cursor.u64()?;
+    cfg.fifo_ttl = std::time::Duration::from_micros(cursor.u64()?);
 
-    let Some(rest) = p.strip_prefix(CONFIG_OVERFLOW_MAGIC) else {
-        // No overflow section; the derived-partitioner tail may still follow.
-        let p = read_partition_fn_tail(p, cfg);
-        read_compaction_tail(p, cfg);
-        return Some(());
-    };
-    p = rest;
+    let compression_count = cursor.byte()? as usize;
+    cfg.compression_rules = decode_compression_rules(cursor, compression_count)?;
+    let partition_count = cursor.byte()? as usize;
+    cfg.partition_rules = decode_partition_rules(cursor, partition_count)?;
+    let tier_count = cursor.byte()? as usize;
+    cfg.tier_rules = decode_tier_rules(cursor, tier_count)?;
+    Some(())
+}
 
-    let extra_levels = uvar(&mut p)?;
+fn decode_compression_levels(
+    cursor: &mut ConfigCursor<'_>,
+    count: usize,
+) -> Option<Vec<Compression>> {
+    let mut levels = Vec::with_capacity(count);
+    for _ in 0..count {
+        levels.push(Compression::from_u8(cursor.byte()?)?);
+    }
+    Some(levels)
+}
+
+fn decode_compression_rules(
+    cursor: &mut ConfigCursor<'_>,
+    count: usize,
+) -> Option<Vec<CompressionRule>> {
+    let mut rules = Vec::with_capacity(count);
+    for _ in 0..count {
+        rules.push(decode_compression_rule(cursor)?);
+    }
+    Some(rules)
+}
+
+fn decode_compression_rule(cursor: &mut ConfigCursor<'_>) -> Option<CompressionRule> {
+    let prefix_len = cursor.uvar()? as usize;
+    let prefix = cursor.bytes(prefix_len)?.to_vec();
+    let compression = Compression::from_u8(cursor.byte()?)?;
+    Some(CompressionRule {
+        prefix,
+        compression,
+    })
+}
+
+fn decode_partition_rules(
+    cursor: &mut ConfigCursor<'_>,
+    count: usize,
+) -> Option<Vec<PartitionRule>> {
+    let mut rules = Vec::with_capacity(count);
+    for _ in 0..count {
+        rules.push(decode_partition_rule(cursor)?);
+    }
+    Some(rules)
+}
+
+fn decode_partition_rule(cursor: &mut ConfigCursor<'_>) -> Option<PartitionRule> {
+    let prefix_len = cursor.uvar()? as usize;
+    let prefix = cursor.bytes(prefix_len)?.to_vec();
+    let name_len = cursor.uvar()? as usize;
+    let name = String::from_utf8_lossy(cursor.bytes(name_len)?).into_owned();
+    Some(PartitionRule { prefix, name })
+}
+
+fn decode_tier_rules(cursor: &mut ConfigCursor<'_>, count: usize) -> Option<Vec<TierRule>> {
+    let mut rules = Vec::with_capacity(count);
+    for _ in 0..count {
+        rules.push(decode_tier_rule(cursor)?);
+    }
+    Some(rules)
+}
+
+fn decode_tier_rule(cursor: &mut ConfigCursor<'_>) -> Option<TierRule> {
+    let prefix_len = cursor.uvar()? as usize;
+    let prefix = cursor.bytes(prefix_len)?.to_vec();
+    let tier_len = cursor.uvar()? as usize;
+    let tier = String::from_utf8_lossy(cursor.bytes(tier_len)?).into_owned();
+    let min_age = std::time::Duration::from_micros(cursor.u64()?);
+    Some(TierRule {
+        prefix,
+        tier,
+        min_age,
+    })
+}
+
+fn decode_overflow_policies(
+    cursor: &mut ConfigCursor<'_>,
+    cfg: &mut ColumnFamilyConfig,
+) -> Option<()> {
+    let extra_levels = cursor.uvar()? as usize;
     cfg.compression_per_level
-        .reserve(extra_levels.min(p.len() as u64) as usize);
+        .reserve(extra_levels.min(cursor.remaining_len()));
     for _ in 0..extra_levels {
         cfg.compression_per_level
-            .push(Compression::from_u8(byte(&mut p)?)?);
+            .push(Compression::from_u8(cursor.byte()?)?);
     }
 
-    let extra_rules = uvar(&mut p)?;
+    let extra_compression = cursor.uvar()? as usize;
     cfg.compression_rules
-        .reserve(extra_rules.min(p.len() as u64) as usize);
-    for _ in 0..extra_rules {
-        let (plen, n) = uvarint(p)?;
-        p = &p[n..];
-        let plen = plen as usize;
-        if p.len() < plen {
-            return None;
-        }
-        let prefix = p[..plen].to_vec();
-        p = &p[plen..];
-        cfg.compression_rules.push(CompressionRule {
-            prefix,
-            compression: Compression::from_u8(byte(&mut p)?)?,
-        });
+        .reserve(extra_compression.min(cursor.remaining_len()));
+    for _ in 0..extra_compression {
+        cfg.compression_rules.push(decode_compression_rule(cursor)?);
     }
 
-    let extra_parts = uvar(&mut p)?;
+    let extra_partitions = cursor.uvar()? as usize;
     cfg.partition_rules
-        .reserve(extra_parts.min(p.len() as u64) as usize);
-    for _ in 0..extra_parts {
-        let (plen, n) = uvarint(p)?;
-        p = &p[n..];
-        let plen = plen as usize;
-        if p.len() < plen {
-            return None;
-        }
-        let prefix = p[..plen].to_vec();
-        p = &p[plen..];
-        let (nlen, n) = uvarint(p)?;
-        p = &p[n..];
-        let nlen = nlen as usize;
-        if p.len() < nlen {
-            return None;
-        }
-        let name = String::from_utf8_lossy(&p[..nlen]).into_owned();
-        p = &p[nlen..];
-        cfg.partition_rules.push(PartitionRule { prefix, name });
+        .reserve(extra_partitions.min(cursor.remaining_len()));
+    for _ in 0..extra_partitions {
+        cfg.partition_rules.push(decode_partition_rule(cursor)?);
     }
 
-    let extra_tiers = uvar(&mut p)?;
+    let extra_tiers = cursor.uvar()? as usize;
     cfg.tier_rules
-        .reserve(extra_tiers.min(p.len() as u64) as usize);
+        .reserve(extra_tiers.min(cursor.remaining_len()));
     for _ in 0..extra_tiers {
-        let (plen, n) = uvarint(p)?;
-        p = &p[n..];
-        let plen = plen as usize;
-        if p.len() < plen {
-            return None;
-        }
-        let prefix = p[..plen].to_vec();
-        p = &p[plen..];
-        let (tlen, n) = uvarint(p)?;
-        p = &p[n..];
-        let tlen = tlen as usize;
-        if p.len() < tlen {
-            return None;
-        }
-        let tier = String::from_utf8_lossy(&p[..tlen]).into_owned();
-        p = &p[tlen..];
-        let min_age = std::time::Duration::from_micros(u64v(&mut p)?);
-        cfg.tier_rules.push(TierRule {
-            prefix,
-            tier,
-            min_age,
-        });
+        cfg.tier_rules.push(decode_tier_rule(cursor)?);
     }
-    let p = read_partition_fn_tail(p, cfg);
-    read_compaction_tail(p, cfg);
     Some(())
 }
 
@@ -1390,6 +1415,31 @@ fn read_compaction_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_cursor_reads_checked_little_endian_values() {
+        let bytes = [
+            0x7f, 0x78, 0x56, 0x34, 0x12, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0xac,
+            0x02, b'o', b'k',
+        ];
+        let mut cursor = ConfigCursor::new(&bytes);
+
+        assert_eq!(cursor.byte(), Some(0x7f));
+        assert_eq!(cursor.u32(), Some(0x1234_5678));
+        assert_eq!(cursor.u64(), Some(0x0102_0304_0506_0708));
+        assert_eq!(cursor.uvar(), Some(300));
+        assert_eq!(cursor.bytes(2), Some(&b"ok"[..]));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn config_cursor_does_not_advance_after_a_short_fixed_width_read() {
+        let mut cursor = ConfigCursor::new(&[1, 2, 3]);
+
+        assert_eq!(cursor.u64(), None);
+        assert_eq!(cursor.bytes(3), Some(&[1, 2, 3][..]));
+        assert!(cursor.is_empty());
+    }
 
     #[test]
     fn cf_config_encode_decode() {

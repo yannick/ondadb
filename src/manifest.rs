@@ -154,211 +154,24 @@ impl Manifest {
 
     fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        append_u32(&mut b, MAGIC);
-        append_u32(&mut b, VERSION);
-        append_u64(&mut b, self.next_file_id);
-        append_u64(&mut b, self.global_seq);
-        append_uvarint(&mut b, self.cfs.len() as u64);
-        for cf in &self.cfs {
-            append_bytes(&mut b, cf.name.as_bytes());
-            append_bytes(&mut b, &cf.config);
-            append_uvarint(&mut b, cf.sstables.len() as u64);
-            for s in &cf.sstables {
-                append_uvarint(&mut b, s.id);
-                append_uvarint(&mut b, u64::from(s.level));
-                append_uvarint(&mut b, s.num_entries);
-                append_uvarint(&mut b, s.num_tombstones);
-                append_uvarint(&mut b, s.max_seq);
-                append_uvarint(&mut b, s.klog_size);
-                append_uvarint(&mut b, s.vlog_size);
-                append_bytes(&mut b, &s.min_key);
-                append_bytes(&mut b, &s.max_key);
-            }
-        }
-        // Append-tolerant tail: per-SSTable `partition` and `tier` names. The
-        // per-record encoding above is a flat sequential list with no framing,
-        // so optional per-record fields can't be tucked in there without
-        // breaking older readers; instead they live here at the end of the body
-        // (still inside the CRC).
-        //
-        // The tail holds up to three positional sections, each a per-CF `(count,
-        // (table_index uvarint, payload)...)` list mirroring the nested CF→table
-        // shape of the body:
-        //   1. the partition section  (name payload),
-        //   2. the tier section       (name payload; added after partitions), and
-        //   3. the max-entry-time section (uvarint payload; added after tiers).
-        //
-        // Emission rules keep every earlier on-disk format byte-identical and let
-        // `decode` read the sections positionally (a later section is emitted only
-        // when all earlier ones precede it, even if those are all-empty):
-        //   - nothing set                 -> no tail at all (legacy layout).
-        //   - only partitions             -> partition section only (P1 layout).
-        //   - tiers, no times             -> partition + tier sections (P3 layout).
-        //   - any max_entry_time          -> partition + tier + time sections.
-        let has_part = self
-            .cfs
-            .iter()
-            .any(|cf| cf.sstables.iter().any(|s| s.partition.is_some()));
-        let has_tier = self
-            .cfs
-            .iter()
-            .any(|cf| cf.sstables.iter().any(|s| s.tier.is_some()));
-        let has_time = self
-            .cfs
-            .iter()
-            .any(|cf| cf.sstables.iter().any(|s| s.max_entry_time.is_some()));
-        let has_layout = self.wal_layout == WalLayout::Unified;
-        let has_tagged = self
-            .cfs
-            .iter()
-            .any(|cf| cf.sstables.iter().any(|s| s.object.is_some()))
-            || self.instance_nonce.is_some();
-        if has_part || has_tier || has_time || has_layout || has_tagged {
-            encode_name_section(&mut b, &self.cfs, |s| s.partition.as_deref());
-        }
-        if has_tier || has_time || has_layout || has_tagged {
-            encode_name_section(&mut b, &self.cfs, |s| s.tier.as_deref());
-        }
-        if has_time || has_layout || has_tagged {
-            encode_u64_section(&mut b, &self.cfs, |s| s.max_entry_time.map(|t| t as u64));
-        }
-        // Tagged tail sections (fixed order, each self-identifying): objects,
-        // instance nonce, WAL layout. Tagged rather than positional so a
-        // manifest carrying none of them stays byte-identical to the legacy
-        // layout, and a pre-A2 binary meeting one fails the decode closed
-        // instead of misreading it.
-        let has_object = self
-            .cfs
-            .iter()
-            .any(|cf| cf.sstables.iter().any(|s| s.object.is_some()));
-        if has_object {
-            b.extend_from_slice(OBJECT_TAG);
-            encode_name_section(&mut b, &self.cfs, |s| s.object.as_deref());
-        }
-        if let Some(nonce) = self.instance_nonce {
-            b.extend_from_slice(INSTANCE_TAG);
-            append_u64(&mut b, nonce);
-        }
-        if has_layout {
-            b.extend_from_slice(WAL_LAYOUT_TAG);
-            b.push(1);
-        }
+        encode_manifest_header(&mut b, self);
+        encode_manifest_column_families(&mut b, &self.cfs);
+        let tails = ManifestTailPresence::detect(self);
+        encode_positional_tails(&mut b, &self.cfs, tails);
+        encode_tagged_tails(&mut b, self, tails);
         let crc = checksum(&b);
         append_u32(&mut b, crc);
         b
     }
 
     fn decode(data: &[u8]) -> Result<Manifest> {
-        let bad = || OndaError::Corruption("manifest: corrupt or invalid".into());
-        if data.len() < 8 {
-            return Err(bad());
-        }
-        let body = &data[..data.len() - 4];
-        if read_u32(&data[data.len() - 4..]) != checksum(body) {
-            return Err(bad());
-        }
-        let mut p = body;
-        if read_u32(p) != MAGIC {
-            return Err(bad());
-        }
-        p = &p[4..];
-        if read_u32(p) != VERSION {
-            return Err(bad());
-        }
-        p = &p[4..];
-        let next_file_id = read_u64(p);
-        p = &p[8..];
-        let global_seq = read_u64(p);
-        p = &p[8..];
-        let (ncf, n) = uvarint(p).ok_or_else(bad)?;
-        p = &p[n..];
-        let mut cfs = Vec::with_capacity(ncf as usize);
-        for _ in 0..ncf {
-            let (name, rest) = take_bytes(p).ok_or_else(bad)?;
-            p = rest;
-            let (config, rest) = take_bytes(p).ok_or_else(bad)?;
-            p = rest;
-            let (nsst, n) = uvarint(p).ok_or_else(bad)?;
-            p = &p[n..];
-            let mut sstables = Vec::with_capacity(nsst as usize);
-            for _ in 0..nsst {
-                let take = |p: &mut &[u8]| -> Result<u64> {
-                    let (v, n) = uvarint(p).ok_or_else(bad)?;
-                    *p = &p[n..];
-                    Ok(v)
-                };
-                let id = take(&mut p)?;
-                let level = take(&mut p)? as u32;
-                let num_entries = take(&mut p)?;
-                let num_tombstones = take(&mut p)?;
-                let max_seq = take(&mut p)?;
-                let klog_size = take(&mut p)?;
-                let vlog_size = take(&mut p)?;
-                let (min_key, rest) = take_bytes(p).ok_or_else(bad)?;
-                p = rest;
-                let (max_key, rest) = take_bytes(p).ok_or_else(bad)?;
-                p = rest;
-                sstables.push(SstMeta {
-                    id,
-                    level,
-                    num_entries,
-                    num_tombstones,
-                    max_seq,
-                    klog_size,
-                    vlog_size,
-                    min_key,
-                    max_key,
-                    // Filled from the append-tolerant tail after the CF loop.
-                    partition: None,
-                    tier: None,
-                    max_entry_time: None,
-                    object: None,
-                });
-            }
-            cfs.push(CfManifest {
-                name: String::from_utf8(name).map_err(|_| bad())?,
-                config,
-                sstables,
-            });
-        }
-        // Append-tolerant tail (see `encode`), read positionally: the first
-        // section is always the partition section, the second (if present) the
-        // tier section, the third (if present) the max-entry-time section. A
-        // section is only ever present when all earlier ones precede it, so this
-        // fixed order is unambiguous. Older manifests stop short and leave the
-        // corresponding fields `None`.
-        // The encoder emits ALL THREE positional sections whenever any tagged
-        // section follows (see `encode`), so the positional walk below can
-        // never mistake a tag for a section: tags only ever begin after the
-        // three positional sections were consumed, or in a manifest whose
-        // tail is empty.
-        if !p.is_empty() {
-            p = decode_name_section(p, &mut cfs, |sst, name| sst.partition = Some(name))?;
-        }
-        if !p.is_empty() {
-            p = decode_name_section(p, &mut cfs, |sst, name| sst.tier = Some(name))?;
-        }
-        if !p.is_empty() {
-            p = decode_u64_section(p, &mut cfs, |sst, v| sst.max_entry_time = Some(v as i64))?;
-        }
-        if p.len() >= 8 && &p[..8] == OBJECT_TAG {
-            p = decode_name_section(&p[8..], &mut cfs, |sst, name| sst.object = Some(name))?;
-        }
-        let mut instance_nonce = None;
-        if p.len() >= 16 && &p[..8] == INSTANCE_TAG {
-            instance_nonce = Some(read_u64(&p[8..]));
-            p = &p[16..];
-        }
-        let wal_layout = if p.is_empty() {
-            WalLayout::PerColumnFamily
-        } else if p.len() == WAL_LAYOUT_TAG.len() + 1
-            && &p[..WAL_LAYOUT_TAG.len()] == WAL_LAYOUT_TAG
-            && p[WAL_LAYOUT_TAG.len()] == 1
-        {
-            WalLayout::Unified
-        } else {
-            return Err(bad());
-        };
+        let body = verified_manifest_body(data)?;
+        let mut cursor = ManifestCursor::new(body);
+        let (next_file_id, global_seq, column_family_count) = decode_manifest_header(&mut cursor)?;
+        let mut cfs = decode_manifest_column_families(&mut cursor, column_family_count)?;
+        let p = decode_positional_tails(cursor.into_remaining(), &mut cfs)?;
+        let (p, instance_nonce) = decode_tagged_tails(p, &mut cfs)?;
+        let wal_layout = decode_wal_layout(p)?;
         Ok(Manifest {
             next_file_id,
             global_seq,
@@ -367,6 +180,240 @@ impl Manifest {
             instance_nonce,
         })
     }
+}
+
+fn corrupt_manifest() -> OndaError {
+    OndaError::Corruption("manifest: corrupt or invalid".into())
+}
+
+#[derive(Clone, Copy)]
+struct ManifestTailPresence {
+    partition: bool,
+    tier: bool,
+    time: bool,
+    object: bool,
+    nonce: bool,
+    layout: bool,
+}
+
+impl ManifestTailPresence {
+    fn detect(manifest: &Manifest) -> Self {
+        let has =
+            |pick: fn(&SstMeta) -> bool| manifest.cfs.iter().any(|cf| cf.sstables.iter().any(pick));
+        Self {
+            partition: has(|sst| sst.partition.is_some()),
+            tier: has(|sst| sst.tier.is_some()),
+            time: has(|sst| sst.max_entry_time.is_some()),
+            object: has(|sst| sst.object.is_some()),
+            nonce: manifest.instance_nonce.is_some(),
+            layout: manifest.wal_layout == WalLayout::Unified,
+        }
+    }
+
+    fn tagged(self) -> bool {
+        self.object || self.nonce
+    }
+}
+
+fn encode_manifest_header(b: &mut Vec<u8>, manifest: &Manifest) {
+    append_u32(b, MAGIC);
+    append_u32(b, VERSION);
+    append_u64(b, manifest.next_file_id);
+    append_u64(b, manifest.global_seq);
+    append_uvarint(b, manifest.cfs.len() as u64);
+}
+
+fn encode_manifest_column_families(b: &mut Vec<u8>, cfs: &[CfManifest]) {
+    for cf in cfs {
+        append_bytes(b, cf.name.as_bytes());
+        append_bytes(b, &cf.config);
+        append_uvarint(b, cf.sstables.len() as u64);
+        for sst in &cf.sstables {
+            append_uvarint(b, sst.id);
+            append_uvarint(b, u64::from(sst.level));
+            append_uvarint(b, sst.num_entries);
+            append_uvarint(b, sst.num_tombstones);
+            append_uvarint(b, sst.max_seq);
+            append_uvarint(b, sst.klog_size);
+            append_uvarint(b, sst.vlog_size);
+            append_bytes(b, &sst.min_key);
+            append_bytes(b, &sst.max_key);
+        }
+    }
+}
+
+fn encode_positional_tails(b: &mut Vec<u8>, cfs: &[CfManifest], presence: ManifestTailPresence) {
+    // Later positional sections imply all earlier sections. Tagged tails also
+    // imply all three so an old positional reader never mistakes a tag for data.
+    if presence.partition || presence.tier || presence.time || presence.layout || presence.tagged()
+    {
+        encode_name_section(b, cfs, |sst| sst.partition.as_deref());
+    }
+    if presence.tier || presence.time || presence.layout || presence.tagged() {
+        encode_name_section(b, cfs, |sst| sst.tier.as_deref());
+    }
+    if presence.time || presence.layout || presence.tagged() {
+        encode_u64_section(b, cfs, |sst| sst.max_entry_time.map(|time| time as u64));
+    }
+}
+
+fn encode_tagged_tails(b: &mut Vec<u8>, manifest: &Manifest, presence: ManifestTailPresence) {
+    if presence.object {
+        b.extend_from_slice(OBJECT_TAG);
+        encode_name_section(b, &manifest.cfs, |sst| sst.object.as_deref());
+    }
+    if let Some(nonce) = manifest.instance_nonce {
+        b.extend_from_slice(INSTANCE_TAG);
+        append_u64(b, nonce);
+    }
+    if presence.layout {
+        b.extend_from_slice(WAL_LAYOUT_TAG);
+        b.push(1);
+    }
+}
+
+struct ManifestCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> ManifestCursor<'a> {
+    fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(read_u32(self.bytes(4)?))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(read_u64(self.bytes(8)?))
+    }
+
+    fn uvar(&mut self) -> Result<u64> {
+        let (value, used) = uvarint(self.remaining).ok_or_else(corrupt_manifest)?;
+        self.remaining = &self.remaining[used..];
+        Ok(value)
+    }
+
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        if self.remaining.len() < len {
+            return Err(corrupt_manifest());
+        }
+        let (value, remaining) = self.remaining.split_at(len);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn byte_vec(&mut self) -> Result<Vec<u8>> {
+        let len = self.uvar()? as usize;
+        Ok(self.bytes(len)?.to_vec())
+    }
+
+    fn into_remaining(self) -> &'a [u8] {
+        self.remaining
+    }
+}
+
+fn verified_manifest_body(data: &[u8]) -> Result<&[u8]> {
+    if data.len() < 4 {
+        return Err(corrupt_manifest());
+    }
+    let (body, stored_crc) = data.split_at(data.len() - 4);
+    if read_u32(stored_crc) != checksum(body) {
+        return Err(corrupt_manifest());
+    }
+    Ok(body)
+}
+
+fn decode_manifest_header(cursor: &mut ManifestCursor<'_>) -> Result<(u64, u64, usize)> {
+    if cursor.u32()? != MAGIC || cursor.u32()? != VERSION {
+        return Err(corrupt_manifest());
+    }
+    let next_file_id = cursor.u64()?;
+    let global_seq = cursor.u64()?;
+    let column_family_count = cursor.uvar()? as usize;
+    Ok((next_file_id, global_seq, column_family_count))
+}
+
+fn decode_manifest_column_families(
+    cursor: &mut ManifestCursor<'_>,
+    count: usize,
+) -> Result<Vec<CfManifest>> {
+    let mut cfs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = String::from_utf8(cursor.byte_vec()?).map_err(|_| corrupt_manifest())?;
+        let config = cursor.byte_vec()?;
+        let table_count = cursor.uvar()? as usize;
+        let mut sstables = Vec::with_capacity(table_count);
+        for _ in 0..table_count {
+            sstables.push(decode_sstable(cursor)?);
+        }
+        cfs.push(CfManifest {
+            name,
+            config,
+            sstables,
+        });
+    }
+    Ok(cfs)
+}
+
+fn decode_sstable(cursor: &mut ManifestCursor<'_>) -> Result<SstMeta> {
+    Ok(SstMeta {
+        id: cursor.uvar()?,
+        level: cursor.uvar()? as u32,
+        num_entries: cursor.uvar()?,
+        num_tombstones: cursor.uvar()?,
+        max_seq: cursor.uvar()?,
+        klog_size: cursor.uvar()?,
+        vlog_size: cursor.uvar()?,
+        min_key: cursor.byte_vec()?,
+        max_key: cursor.byte_vec()?,
+        partition: None,
+        tier: None,
+        max_entry_time: None,
+        object: None,
+    })
+}
+
+fn decode_positional_tails<'a>(mut p: &'a [u8], cfs: &mut [CfManifest]) -> Result<&'a [u8]> {
+    if !p.is_empty() {
+        p = decode_name_section(p, cfs, |sst, name| sst.partition = Some(name))?;
+    }
+    if !p.is_empty() {
+        p = decode_name_section(p, cfs, |sst, name| sst.tier = Some(name))?;
+    }
+    if !p.is_empty() {
+        p = decode_u64_section(p, cfs, |sst, value| sst.max_entry_time = Some(value as i64))?;
+    }
+    Ok(p)
+}
+
+fn decode_tagged_tails<'a>(
+    mut p: &'a [u8],
+    cfs: &mut [CfManifest],
+) -> Result<(&'a [u8], Option<u64>)> {
+    if let Some(rest) = p.strip_prefix(OBJECT_TAG) {
+        p = decode_name_section(rest, cfs, |sst, name| sst.object = Some(name))?;
+    }
+    let mut instance_nonce = None;
+    if p.len() >= INSTANCE_TAG.len() + 8 && p.starts_with(INSTANCE_TAG) {
+        instance_nonce = Some(read_u64(&p[INSTANCE_TAG.len()..]));
+        p = &p[INSTANCE_TAG.len() + 8..];
+    }
+    Ok((p, instance_nonce))
+}
+
+fn decode_wal_layout(p: &[u8]) -> Result<WalLayout> {
+    if p.is_empty() {
+        return Ok(WalLayout::PerColumnFamily);
+    }
+    if p.len() == WAL_LAYOUT_TAG.len() + 1
+        && p.starts_with(WAL_LAYOUT_TAG)
+        && p[WAL_LAYOUT_TAG.len()] == 1
+    {
+        return Ok(WalLayout::Unified);
+    }
+    Err(corrupt_manifest())
 }
 
 /// Encode one tail section: for each CF in order, a uvarint count of tables
@@ -518,6 +565,20 @@ mod tests {
                     },
                 ],
             }],
+        }
+    }
+
+    #[test]
+    fn every_checksummed_manifest_truncation_is_panic_free() {
+        let encoded = sample().encode();
+        let body_len = encoded.len() - 4;
+
+        for cut in 0..body_len {
+            let mut truncated = encoded[..cut].to_vec();
+            let crc = checksum(&truncated);
+            append_u32(&mut truncated, crc);
+            let decoded = std::panic::catch_unwind(|| Manifest::decode(&truncated));
+            assert!(decoded.is_ok(), "decoder panicked at body length {cut}");
         }
     }
 

@@ -4,9 +4,7 @@
     "revision": "6445ebe09a8e8df477806225121cccdf0d96c73a"
   },
   "long_functions": {
-    "src/compaction.rs::compact_inputs": 321,
-    "src/config.rs::decode_into": 225,
-    "src/db.rs::DB::open_impl": 202
+    "src/compaction.rs::compact_inputs": 321
   },
   "schema": "ondadb.metrics-baseline.v1",
   "tools": {

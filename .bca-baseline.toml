@@ -47,24 +47,6 @@ metric = "cyclomatic"
 value = 46.0
 
 [[entry]]
-path = "src/config.rs"
-qualified = "ColumnFamilyConfig::encode"
-metric = "cyclomatic"
-value = 18.0
-
-[[entry]]
-path = "src/config.rs"
-qualified = "decode_into"
-metric = "cognitive"
-value = 33.0
-
-[[entry]]
-path = "src/config.rs"
-qualified = "decode_into"
-metric = "cyclomatic"
-value = 23.0
-
-[[entry]]
 path = "src/db.rs"
 qualified = "flush_worker"
 metric = "cognitive"
@@ -75,12 +57,6 @@ path = "src/db.rs"
 qualified = "flush_worker"
 metric = "cyclomatic"
 value = 24.0
-
-[[entry]]
-path = "src/db.rs"
-qualified = "sweep_move_orphans"
-metric = "cognitive"
-value = 25.0
 
 [[entry]]
 path = "src/error.rs"
@@ -111,18 +87,6 @@ path = "src/iterator.rs"
 qualified = "Iterator::advance_forward"
 metric = "cognitive"
 value = 23.0
-
-[[entry]]
-path = "src/manifest.rs"
-qualified = "Manifest::decode"
-metric = "cyclomatic"
-value = 18.0
-
-[[entry]]
-path = "src/manifest.rs"
-qualified = "Manifest::encode"
-metric = "cyclomatic"
-value = 19.0
 
 [[entry]]
 path = "src/parts.rs"
