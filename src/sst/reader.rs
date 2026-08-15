@@ -102,6 +102,29 @@ const VLOG_VERIFIED_SLOTS: usize = 1024;
 /// `u64::MAX` — the offset is a position in a file.
 const VLOG_SLOT_EMPTY: u64 = u64::MAX;
 
+type PointResult = (Option<Vec<u8>>, u64, bool, bool);
+
+fn append_vlog_payload(
+    compression: Compression,
+    payload: &[u8],
+    expected_len: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if compression == Compression::None {
+        if payload.len() != expected_len {
+            return Err(corrupt());
+        }
+        out.extend_from_slice(payload);
+        return Ok(());
+    }
+    let raw = crate::compress::decompress(compression, payload, expected_len)?;
+    if raw.len() != expected_len {
+        return Err(corrupt());
+    }
+    out.extend_from_slice(&raw);
+    Ok(())
+}
+
 /// A data block borrowed for the duration of one point read: either an owned
 /// (cached/decompressed) block or, under `mmap-reads`, a plain slice into
 /// the reader's mmap — no refcount traffic per get.
@@ -542,6 +565,71 @@ impl Reader {
         self.get_unfiltered(user_key, read_seq, now)
     }
 
+    fn restart_scan_offset(
+        &self,
+        raw: &[u8],
+        restarts: &[u8],
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<usize> {
+        if restarts.len() < 8 {
+            return Ok(0);
+        }
+        // Find the first restart entry >= target, then scan from its
+        // predecessor so the target cannot lie in a skipped interval.
+        let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
+        let (mut lo, mut hi) = (0usize, restarts.len() / 4);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (entry, _) = decode_entry(raw, restart_off(mid))?;
+            if cmp_internal(
+                &self.cmp,
+                entry.user_key(raw),
+                entry.seq,
+                user_key,
+                read_seq,
+            )
+            .is_lt()
+            {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(if lo > 0 { restart_off(lo - 1) } else { 0 })
+    }
+
+    fn scan_point_entry(
+        &self,
+        raw: &[u8],
+        mut offset: usize,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) -> Result<PointResult> {
+        while offset < raw.len() {
+            let (entry, next) = decode_entry(raw, offset)?;
+            let entry_key = entry.user_key(raw);
+            if cmp_internal(&self.cmp, entry_key, entry.seq, user_key, read_seq).is_lt() {
+                offset = next;
+                continue;
+            }
+            if self.cmp.compare(entry_key, user_key) != std::cmp::Ordering::Equal {
+                break;
+            }
+            if entry.tombstone() || (entry.ttl != 0 && entry.ttl <= now) {
+                return Ok((None, entry.seq, true, true));
+            }
+            let value = if entry.has_vlog() {
+                self.read_vlog(entry.vlog_off, entry.val_len as u64)?
+            } else {
+                entry.inline_value(raw).to_vec()
+            };
+            return Ok((Some(value), entry.seq, true, false));
+        }
+        Ok((None, 0, false, false))
+    }
+
     /// [`get`](Self::get) without the bloom check, for callers that have
     /// already consulted the filter (see `ColumnFamily::get`).
     pub(crate) fn get_unfiltered(
@@ -549,56 +637,15 @@ impl Reader {
         user_key: &[u8],
         read_seq: u64,
         now: i64,
-    ) -> Result<(Option<Vec<u8>>, u64, bool, bool)> {
+    ) -> Result<PointResult> {
         let bi = self.find_block(user_key, read_seq);
         if bi >= self.index.len() {
             return Ok((None, 0, false, false));
         }
         let block = self.read_data_block_local(bi)?;
         let (raw, restarts) = self.split_block(block.bytes())?;
-        let mut off = 0;
-        if restarts.len() >= 8 {
-            // Binary-search the restart points for the first restart entry
-            // >= target, then scan at most one interval from its predecessor.
-            let n = restarts.len() / 4;
-            let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
-            let (mut lo, mut hi) = (0usize, n);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let (e, _) = decode_entry(raw, restart_off(mid))?;
-                if cmp_internal(&self.cmp, e.user_key(raw), e.seq, user_key, read_seq).is_lt() {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if lo > 0 {
-                off = restart_off(lo - 1);
-            }
-        }
-        while off < raw.len() {
-            let (e, next) = decode_entry(raw, off)?;
-            let ek = e.user_key(raw);
-            if cmp_internal(&self.cmp, ek, e.seq, user_key, read_seq).is_lt() {
-                off = next;
-                continue;
-            }
-            if self.cmp.compare(ek, user_key) != std::cmp::Ordering::Equal {
-                return Ok((None, 0, false, false)); // key absent
-            }
-            if e.tombstone() {
-                return Ok((None, e.seq, true, true));
-            }
-            if e.ttl != 0 && e.ttl <= now {
-                return Ok((None, e.seq, true, true));
-            }
-            if e.has_vlog() {
-                let v = self.read_vlog(e.vlog_off, e.val_len as u64)?;
-                return Ok((Some(v), e.seq, true, false));
-            }
-            return Ok((Some(e.inline_value(raw).to_vec()), e.seq, true, false));
-        }
-        Ok((None, 0, false, false))
+        let offset = self.restart_scan_offset(raw, restarts, user_key, read_seq)?;
+        self.scan_point_entry(raw, offset, user_key, read_seq, now)
     }
 
     /// The slot that can hold "the frame at `off` is verified", allocating the
@@ -637,6 +684,86 @@ impl Reader {
         Ok(())
     }
 
+    #[cfg(feature = "mmap-reads")]
+    fn read_vlog_from_mmap(&self, off: u64, len: usize, out: &mut Vec<u8>) -> Result<bool> {
+        if !self.storage.supports_mmap() {
+            return Ok(false);
+        }
+        let mmap = self.vlog_mmap_handle()?;
+        let Ok(start) = usize::try_from(off) else {
+            return Ok(false);
+        };
+        if self.vlog_v2 {
+            let Some(header_end) = start.checked_add(VLOG_V2_HDR_LEN) else {
+                return Ok(false);
+            };
+            let Some(header) = mmap.get(start..header_end) else {
+                return Ok(false);
+            };
+            let want = read_u32(&header[0..4]);
+            let compression = Compression::from_u8(header[4]).ok_or_else(corrupt)?;
+            let payload_len = read_u32(&header[5..9]) as usize;
+            if payload_len > len {
+                return Err(corrupt());
+            }
+            let Some(payload_end) = header_end.checked_add(payload_len) else {
+                return Ok(false);
+            };
+            let Some(payload) = mmap.get(header_end..payload_end) else {
+                return Ok(false);
+            };
+            self.verify_vlog_frame(off, payload, want)?;
+            append_vlog_payload(compression, payload, len, out)?;
+            return Ok(true);
+        }
+        let Some(value_end) = start
+            .checked_add(VLOG_CRC_LEN)
+            .and_then(|value_start| value_start.checked_add(len))
+        else {
+            return Ok(false);
+        };
+        let Some(frame) = mmap.get(start..value_end) else {
+            return Ok(false);
+        };
+        let want = read_u32(&frame[..VLOG_CRC_LEN]);
+        let value = &frame[VLOG_CRC_LEN..];
+        self.verify_vlog_frame(off, value, want)?;
+        out.extend_from_slice(value);
+        Ok(true)
+    }
+
+    fn read_vlog_from_file(&self, off: u64, len: usize, out: &mut Vec<u8>) -> Result<()> {
+        let file = self.storage.open_read(&self.vlog_path)?;
+        if self.vlog_v2 {
+            let mut header = [0u8; VLOG_V2_HDR_LEN];
+            file.read_exact_at(&mut header, off)?;
+            let want = read_u32(&header[0..4]);
+            let compression = Compression::from_u8(header[4]).ok_or_else(corrupt)?;
+            let payload_len = read_u32(&header[5..9]) as usize;
+            // Bound allocation before a corrupt header can request up to 4 GiB.
+            // Writers store compressed bytes only when shorter than the raw
+            // value, so a larger payload cannot be valid.
+            if payload_len > len {
+                return Err(corrupt());
+            }
+            let mut payload = vec![0u8; payload_len];
+            file.read_exact_at(&mut payload, off + VLOG_V2_HDR_LEN as u64)?;
+            self.verify_vlog_frame(off, &payload, want)?;
+            return append_vlog_payload(compression, &payload, len, out);
+        }
+        let mut crc = [0u8; VLOG_CRC_LEN];
+        file.read_exact_at(&mut crc, off)?;
+        let want = read_u32(&crc);
+        let start = out.len();
+        out.resize(start + len, 0);
+        file.read_exact_at(&mut out[start..], off + VLOG_CRC_LEN as u64)?;
+        if let Err(error) = self.verify_vlog_frame(off, &out[start..], want) {
+            out.truncate(start);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_vlog(&self, off: u64, length: u64) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(length as usize);
         self.read_vlog_into(off, length, &mut buf)?;
@@ -647,93 +774,12 @@ impl Reader {
     /// decompressing v2 frames. `off` is the frame start, `length` the
     /// logical (uncompressed) value length.
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
-        let len = length as usize;
+        let len = usize::try_from(length).map_err(|_| corrupt())?;
         #[cfg(feature = "mmap-reads")]
-        if self.storage.supports_mmap() {
-            let mmap = self.vlog_mmap_handle()?;
-            let s = off as usize;
-            if self.vlog_v2 {
-                if s + VLOG_V2_HDR_LEN <= mmap.len() {
-                    let want = read_u32(&mmap[s..s + 4]);
-                    let alg = Compression::from_u8(mmap[s + 4]).ok_or_else(corrupt)?;
-                    let comp_len = read_u32(&mmap[s + 5..s + 9]) as usize;
-                    let e = s + VLOG_V2_HDR_LEN + comp_len;
-                    if e <= mmap.len() {
-                        let payload = &mmap[s + VLOG_V2_HDR_LEN..e];
-                        self.verify_vlog_frame(off, payload, want)?;
-                        if alg == Compression::None {
-                            // Raw payload: zero extra work beyond the copy out.
-                            if payload.len() != len {
-                                return Err(corrupt());
-                            }
-                            out.extend_from_slice(payload);
-                        } else {
-                            let raw = crate::compress::decompress(alg, payload, len)?;
-                            if raw.len() != len {
-                                return Err(corrupt());
-                            }
-                            out.extend_from_slice(&raw);
-                        }
-                        return Ok(());
-                    }
-                }
-            } else {
-                let e = s + VLOG_CRC_LEN + len;
-                if e <= mmap.len() {
-                    let want = read_u32(&mmap[s..s + VLOG_CRC_LEN]);
-                    let val = &mmap[s + VLOG_CRC_LEN..e];
-                    self.verify_vlog_frame(off, val, want)?;
-                    out.extend_from_slice(val);
-                    return Ok(());
-                }
-            }
-        }
-        let f = self.storage.open_read(&self.vlog_path)?;
-        if self.vlog_v2 {
-            let mut hdr = [0u8; VLOG_V2_HDR_LEN];
-            f.read_exact_at(&mut hdr, off)?;
-            let want = read_u32(&hdr[0..4]);
-            let alg = Compression::from_u8(hdr[4]).ok_or_else(corrupt)?;
-            let comp_len = read_u32(&hdr[5..9]) as usize;
-            // Bound the allocation before making it. A corrupt header can name
-            // any length up to 4 GiB, and `read_exact_at` would only discover
-            // that after the buffer was allocated and zeroed. The stored
-            // payload is never larger than the logical value: the writer keeps
-            // a compressed payload only when it is strictly smaller, and stores
-            // the value raw otherwise — so `comp_len > len` is corruption, and
-            // checking it costs nothing (a `size()` call would be a network
-            // round trip on a remote tier).
-            if comp_len > len {
-                return Err(corrupt());
-            }
-            let mut payload = vec![0u8; comp_len];
-            f.read_exact_at(&mut payload, off + VLOG_V2_HDR_LEN as u64)?;
-            self.verify_vlog_frame(off, &payload, want)?;
-            if alg == Compression::None {
-                if payload.len() != len {
-                    return Err(corrupt());
-                }
-                out.extend_from_slice(&payload);
-            } else {
-                let raw = crate::compress::decompress(alg, &payload, len)?;
-                if raw.len() != len {
-                    return Err(corrupt());
-                }
-                out.extend_from_slice(&raw);
-            }
+        if self.read_vlog_from_mmap(off, len, out)? {
             return Ok(());
         }
-        let mut crc_buf = [0u8; VLOG_CRC_LEN];
-        f.read_exact_at(&mut crc_buf, off)?;
-        let want = read_u32(&crc_buf);
-        let start = out.len();
-        out.resize(start + len, 0);
-        f.read_exact_at(&mut out[start..], off + VLOG_CRC_LEN as u64)?;
-        if let Err(e) = self.verify_vlog_frame(off, &out[start..], want) {
-            out.truncate(start);
-            return Err(e);
-        }
-        Ok(())
+        self.read_vlog_from_file(off, len, out)
     }
 
     /// Lazily mmap the vlog file (created only when large values exist).
@@ -920,5 +966,17 @@ mod tests {
             let b = r.get_unfiltered(probe.as_bytes(), u64::MAX, 0).unwrap();
             assert_eq!(a, b, "get vs get_unfiltered diverge for {probe}");
         }
+    }
+
+    #[test]
+    fn vlog_payload_append_is_atomic_on_a_length_mismatch() {
+        let mut out = b"prefix".to_vec();
+
+        append_vlog_payload(Compression::None, b"value", 5, &mut out).unwrap();
+        assert_eq!(out, b"prefixvalue");
+
+        let before = out.clone();
+        assert!(append_vlog_payload(Compression::None, b"short", 7, &mut out).is_err());
+        assert_eq!(out, before, "a corrupt frame must not append partial data");
     }
 }

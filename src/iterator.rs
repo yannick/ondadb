@@ -383,6 +383,42 @@ fn expired(ttl: i64, now: i64) -> bool {
     ttl != 0 && ttl <= now
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionDecision {
+    Ignore,
+    Tombstone,
+    Value,
+}
+
+#[derive(Default)]
+struct VisibleVersion {
+    found: bool,
+    seq: u64,
+    tombstone: bool,
+    ttl: i64,
+}
+
+impl VisibleVersion {
+    fn consider(&mut self, seq: u64, tombstone: bool, ttl: i64, read_seq: u64) -> VersionDecision {
+        if seq > read_seq || (self.found && seq <= self.seq) {
+            return VersionDecision::Ignore;
+        }
+        self.found = true;
+        self.seq = seq;
+        self.tombstone = tombstone;
+        self.ttl = ttl;
+        if tombstone {
+            VersionDecision::Tombstone
+        } else {
+            VersionDecision::Value
+        }
+    }
+
+    fn is_live(&self, now: i64) -> bool {
+        self.found && !self.tombstone && !expired(self.ttl, now)
+    }
+}
+
 impl Iterator {
     pub(crate) fn new(
         cmp: ComparatorRef,
@@ -550,6 +586,24 @@ impl Iterator {
         Ok(())
     }
 
+    fn resolve_current_group(&mut self, forward: bool) -> Result<VisibleVersion> {
+        let mut visible = VisibleVersion::default();
+        self.cur_val = CurVal::Empty;
+        while self.top_in_group() {
+            let decision = {
+                let top = self.m.top();
+                visible.consider(top.seq(), top.tombstone(), top.ttl(), self.read_seq)
+            };
+            match decision {
+                VersionDecision::Ignore => {}
+                VersionDecision::Tombstone => self.cur_val = CurVal::Empty,
+                VersionDecision::Value => self.capture_value()?,
+            }
+            self.m.advance(forward);
+        }
+        Ok(visible)
+    }
+
     pub fn seek_to_first(&mut self) {
         // Start at the lower bound, not the raw heap minimum: SSTables fully
         // outside the bounds were pruned at construction, but memtables and
@@ -606,27 +660,15 @@ impl Iterator {
         while self.m.valid() {
             // Capture the current user key as the group key (borrowed or copied).
             self.capture_group_key();
-            let mut visible = false;
-            let mut deleted = false;
-            let mut ttl = 0i64;
-            self.cur_val = CurVal::Empty;
-            while self.top_in_group() {
-                if !visible && self.m.top().seq() <= self.read_seq {
-                    visible = true;
-                    if self.m.top().tombstone() {
-                        deleted = true;
-                    } else {
-                        if let Err(e) = self.capture_value() {
-                            self.err = Some(e);
-                            self.valid = false;
-                            return;
-                        }
-                        ttl = self.m.top().ttl();
-                    }
+            let visible = match self.resolve_current_group(true) {
+                Ok(visible) => visible,
+                Err(error) => {
+                    self.err = Some(error);
+                    self.valid = false;
+                    return;
                 }
-                self.m.advance(true);
-            }
-            if visible && !deleted && !expired(ttl, self.now) {
+            };
+            if visible.is_live(self.now) {
                 self.valid = true;
                 // Terminate at the first group past the declared upper bound.
                 if self.past_upper() {
@@ -641,32 +683,15 @@ impl Iterator {
     fn advance_backward(&mut self) {
         while self.m.valid() {
             self.capture_group_key();
-            let mut have = false;
-            let mut best_seq = 0u64;
-            let mut best_tomb = false;
-            let mut best_ttl = 0i64;
-            self.cur_val = CurVal::Empty;
-            while self.top_in_group() {
-                let s = self.m.top().seq();
-                if s <= self.read_seq && (!have || s > best_seq) {
-                    have = true;
-                    best_seq = s;
-                    if self.m.top().tombstone() {
-                        best_tomb = true;
-                        self.cur_val = CurVal::Empty;
-                    } else {
-                        best_tomb = false;
-                        if let Err(e) = self.capture_value() {
-                            self.err = Some(e);
-                            self.valid = false;
-                            return;
-                        }
-                        best_ttl = self.m.top().ttl();
-                    }
+            let visible = match self.resolve_current_group(false) {
+                Ok(visible) => visible,
+                Err(error) => {
+                    self.err = Some(error);
+                    self.valid = false;
+                    return;
                 }
-                self.m.advance(false);
-            }
-            if have && !best_tomb && !expired(best_ttl, self.now) {
+            };
+            if visible.is_live(self.now) {
                 self.valid = true;
                 // Terminate at the first group below the declared lower bound.
                 if self.below_lower() {
@@ -676,5 +701,30 @@ impl Iterator {
             }
         }
         self.valid = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VersionDecision, VisibleVersion};
+
+    #[test]
+    fn visible_version_keeps_the_highest_sequence_at_the_snapshot() {
+        let mut visible = VisibleVersion::default();
+
+        assert_eq!(visible.consider(12, false, 0, 10), VersionDecision::Ignore);
+        assert_eq!(visible.consider(3, false, 30, 10), VersionDecision::Value);
+        assert_eq!(visible.consider(8, true, 0, 10), VersionDecision::Tombstone);
+        assert_eq!(visible.consider(7, false, 40, 10), VersionDecision::Ignore);
+        assert!(!visible.is_live(20));
+    }
+
+    #[test]
+    fn visible_version_reports_expiration_without_changing_selection() {
+        let mut visible = VisibleVersion::default();
+
+        assert_eq!(visible.consider(5, false, 25, 5), VersionDecision::Value);
+        assert!(visible.is_live(24));
+        assert!(!visible.is_live(25));
     }
 }

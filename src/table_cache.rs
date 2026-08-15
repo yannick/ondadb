@@ -379,6 +379,37 @@ impl TableCache {
         max_bytes > 0 && open > 1 && self.open_bytes.load(Ordering::Relaxed) > max_bytes
     }
 
+    /// Give one shard a CLOCK visit and evict exactly one reader when it is
+    /// non-empty. Returns whether the global bounds made progress.
+    fn evict_one_shard(&self, shard_index: usize) -> bool {
+        let mut shard = self.shards[shard_index].write();
+        if shard.open.is_empty() {
+            return false;
+        }
+        let mut victim = None;
+        for (id, entry) in &shard.open {
+            if entry.referenced.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            victim = Some(*id);
+            break;
+        }
+        // If every reader used its second chance, evict one anyway so a
+        // lowering of the bound takes effect immediately.
+        let victim = victim.or_else(|| shard.open.keys().next().copied());
+        let Some(victim) = victim else {
+            return false;
+        };
+        // The cache drops its `Arc`; a caller mid-read still holds one. These
+        // counters therefore describe what the cache pins, not process peak.
+        if let Some(entry) = shard.open.remove(&victim) {
+            self.open_bytes.fetch_sub(entry.bytes, Ordering::Relaxed);
+        }
+        self.open_count.fetch_sub(1, Ordering::Relaxed);
+        self.closes.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// Enforce the GLOBAL bounds — count and bytes — rotating across shards
     /// from `start`.
     ///
@@ -397,33 +428,10 @@ impl TableCache {
         while self.over_bound() {
             let mut evicted = false;
             for off in 0..SHARDS {
-                let mut shard = self.shards[(start + off) % SHARDS].write();
-                if shard.open.is_empty() {
-                    continue;
-                }
-                let mut victim: Option<u64> = None;
-                for (id, e) in shard.open.iter() {
-                    if e.referenced.swap(false, Ordering::Relaxed) {
-                        continue;
-                    }
-                    victim = Some(*id);
+                if self.evict_one_shard((start + off) % SHARDS) {
+                    evicted = true;
                     break;
                 }
-                let victim = victim.or_else(|| shard.open.keys().next().copied());
-                if let Some(v) = victim {
-                    // The cache drops its `Arc`; a caller mid-read still holds
-                    // one, so the reader lives until that caller is done. Its
-                    // bytes leave this accounting at that point, which is why
-                    // the budget bounds what the cache pins rather than the
-                    // process's peak.
-                    if let Some(e) = shard.open.remove(&v) {
-                        self.open_bytes.fetch_sub(e.bytes, Ordering::Relaxed);
-                    }
-                    self.open_count.fetch_sub(1, Ordering::Relaxed);
-                    self.closes.fetch_add(1, Ordering::Relaxed);
-                    evicted = true;
-                }
-                break;
             }
             spin += 1;
             // Racing readers can re-insert while we evict; give up after a

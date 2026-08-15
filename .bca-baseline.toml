@@ -53,40 +53,10 @@ metric = "cyclomatic"
 value = 16.0
 
 [[entry]]
-path = "src/iterator.rs"
-qualified = "Iterator::advance_backward"
-metric = "cognitive"
-value = 24.0
-
-[[entry]]
-path = "src/iterator.rs"
-qualified = "Iterator::advance_forward"
-metric = "cognitive"
-value = 23.0
-
-[[entry]]
 path = "src/parts.rs"
 qualified = "crate::db::DbInner::run_part_mover"
 metric = "cognitive"
 value = 22.0
-
-[[entry]]
-path = "src/sst/reader.rs"
-qualified = "Reader::get_unfiltered"
-metric = "cognitive"
-value = 22.0
-
-[[entry]]
-path = "src/sst/reader.rs"
-qualified = "Reader::read_vlog_into"
-metric = "cognitive"
-value = 45.0
-
-[[entry]]
-path = "src/table_cache.rs"
-qualified = "TableCache::evict_to_bound"
-metric = "cognitive"
-value = 23.0
 
 [[entry]]
 path = "src/txn.rs"
