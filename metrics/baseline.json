@@ -1,0 +1,24 @@
+{
+  "git": {
+    "dirty": true,
+    "revision": "b4de0ba364cd178013dee390e40f952f82f73689"
+  },
+  "long_functions": {
+    "src/compaction.rs::compact_inputs": 321,
+    "src/config.rs::decode_into": 225,
+    "src/db.rs::DB::open_impl": 202
+  },
+  "schema": "ondadb.metrics-baseline.v1",
+  "tools": {
+    "bca": "2.1.0",
+    "cargo-geiger": "0.13.0"
+  },
+  "unsafe": {
+    "expressions": 63,
+    "functions": 0,
+    "impls": 3,
+    "methods": 0,
+    "traits": 0
+  },
+  "updated_at": "2026-08-15T07:29:20Z"
+}

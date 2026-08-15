@@ -1,0 +1,11 @@
+paths = ["src"]
+exclude_tests = true
+cyclomatic_count_try = false
+
+[check]
+baseline = ".bca-baseline.toml"
+exclude = ["./src/bin/**"]
+
+[thresholds]
+cyclomatic = 15
+cognitive = 20
