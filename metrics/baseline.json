@@ -1,7 +1,7 @@
 {
   "git": {
-    "dirty": true,
-    "revision": "b4de0ba364cd178013dee390e40f952f82f73689"
+    "dirty": false,
+    "revision": "6445ebe09a8e8df477806225121cccdf0d96c73a"
   },
   "long_functions": {
     "src/compaction.rs::compact_inputs": 321,
@@ -20,5 +20,5 @@
     "methods": 0,
     "traits": 0
   },
-  "updated_at": "2026-08-15T07:29:20Z"
+  "updated_at": "2026-08-15T11:51:24Z"
 }
