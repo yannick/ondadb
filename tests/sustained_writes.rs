@@ -128,25 +128,43 @@ fn all_keys_readable_after_partial_compaction() {
     db.close().unwrap();
 }
 
-/// Debt must stay under the hard ceiling: that is the whole contract of the
-/// pacing. A run that ends far above it means backpressure never engaged.
+/// Pacing must keep compaction debt *bounded* under sustained ingest.
+///
+/// Note what the hard threshold is and is not. It is the point at which
+/// `apply_commit` blocks; it does not cap the gauge. When debt crosses it,
+/// work already in flight still lands — in the worst case every sealed
+/// memtable the flush pipeline is allowed to hold, which is
+/// `l0_queue_stall_threshold * write_buffer_size`. An assertion of
+/// `debt <= hard` is therefore unsound, and was: with a 4 MiB ceiling and a
+/// 5 MiB flush pipeline this test failed roughly one run in three under
+/// full-suite load. The ceiling is sized above that pipeline here, and the
+/// bound allows exactly the overshoot the implementation permits.
 #[test]
-fn sustained_ingest_keeps_debt_under_the_hard_ceiling() {
+fn sustained_ingest_keeps_compaction_debt_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let base = small_geometry();
+    const HARD: u64 = 16 << 20;
     let cfg = ColumnFamilyConfig {
-        soft_pending_compaction_bytes: 256 << 10,
-        hard_pending_compaction_bytes: 4 << 20,
-        ..small_geometry()
+        soft_pending_compaction_bytes: 2 << 20,
+        hard_pending_compaction_bytes: HARD,
+        ..base.clone()
     };
     let cf = db.create_column_family("bench", cfg).unwrap();
 
-    put_range(&db, &cf, 0, 60_000, &[b'v'; 100]);
+    // Sample as we go: the end-of-run value alone could miss an excursion.
+    let mut peak = 0u64;
+    for chunk in 0..12 {
+        put_range(&db, &cf, chunk * 5_000, (chunk + 1) * 5_000, &[b'v'; 100]);
+        peak = peak.max(cf.stats().compaction_debt);
+    }
 
-    let debt = cf.stats().compaction_debt;
+    let in_flight = base.l0_queue_stall_threshold as u64 * base.write_buffer_size as u64;
+    let bound = HARD + in_flight;
     assert!(
-        debt <= 4 << 20,
-        "debt {debt} exceeded the hard ceiling; pacing did not engage"
+        peak <= bound,
+        "peak debt {peak} exceeded {bound} (ceiling {HARD} + {in_flight} in-flight); \
+         pacing is not bounding the backlog"
     );
     db.close().unwrap();
 }

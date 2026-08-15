@@ -85,6 +85,58 @@ Rules learned the hard way:
    background and `sample <pid> 2` (macOS) during the phase you care about.
    Every optimization above targeted a top-of-profile entry; the ones that
    didn't (early lazy-value attempt) regressed.
+4. **Time the close.** See below — this one cost us three releases of a write
+   number that was not real.
+
+## Deferred work is not free work
+
+A benchmark that stops its timer before the engine has finished the work
+measures the buffer, not the system. `onda_bench`, like the Go and C harnesses
+it mirrors, reports Put and then closes the database *outside* the timer. That
+convention is fine only if closing is cheap — and until 0.8.0 it was not.
+
+Measured on a 24-core M2 Ultra, 16 B keys / 100 B values, 8 threads:
+
+| Records | Put as reported | close() | Put counting close |
+|---|---|---|---|
+| 5M  | ~4.6M ops/s | 2.5 s  | 1.36M ops/s |
+| 10M | ~4.6M ops/s | 10.8 s | 0.77M ops/s |
+| 20M | ~4.6M ops/s | 35 s   | 0.49M ops/s |
+
+The reported column is flat. The real one halves every time the data doubles.
+Nothing about the write path was slow; compaction was falling behind and the
+debt was paid at close, where no one was looking.
+
+**How to check.** Split the close into its parts before blaming any of them.
+`DB::flush_memtable` drains the flush queue only, so timing it separately from
+`close()` separates flush backlog from compaction backlog — which is how this
+was diagnosed: flush drained in ~130 ms at every dataset size, and everything
+else was compaction.
+
+```rust
+let t = Instant::now(); db.flush_memtable(&cf)?;  let flush = t.elapsed();
+let t = Instant::now(); db.close()?;              let rest  = t.elapsed();
+```
+
+**Rules that follow:**
+
+- Quote a write rate as `ops / (ingest + close)` unless you are explicitly
+  measuring buffered ingest, and say which you mean.
+- Run at more than one dataset size. A single size cannot show the *shape*, and
+  the shape is where this class of bug lives — a rate that decays with size
+  looks like a healthy rate at any one point.
+- Watch `cf.stats().compaction_debt`. A run that ends with debt near
+  `hard_pending_compaction_bytes` has deferred work its throughput number does
+  not include.
+- Cross-engine comparisons must apply this to *every* engine. RocksDB's close
+  after the same workload is 31–45 ms — it does its flush work inline — so
+  comparing its Put against a competitor's buffered Put is not one measurement.
+
+Also beware the inverse. Moving work *out* of close does not delete it: with
+`finish_compactions_on_close = false` the tree is less merged when reads begin,
+and cold Get right after reopening measures ~0.78M ops/s against ~1.41M on a
+settled tree. Neither number is wrong; they answer different questions. See
+`docs/compaction-and-write-pacing.md` § Closing, and reads right after opening.
 
 
 ## Regression history (why the code looks the way it does)

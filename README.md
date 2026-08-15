@@ -209,6 +209,7 @@ memtable/reader code. See [`AGENTS.md`](AGENTS.md) for the CI-equivalent gate.
 | [`docs/formats.md`](docs/formats.md) | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest (incl. the append-tolerant tail and shared-tier sections), internal keys |
 | [`docs/concurrency-and-safety.md`](docs/concurrency-and-safety.md) | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime contract, every `unsafe` contract |
 | [`docs/parts-and-tiers.md`](docs/parts-and-tiers.md) | User guide to partitions, parts and tiers — worked examples, S3 setup, attach-by-reference, operational notes |
+| [`docs/compaction-and-write-pacing.md`](docs/compaction-and-write-pacing.md) | User guide to compaction geometry, bounded jobs, debt-based write pacing, close semantics, tuning by symptom |
 | [`docs/performance.md`](docs/performance.md) | Fast paths, benchmark methodology, known measurement artifacts |
 
 ## Usage

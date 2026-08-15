@@ -196,6 +196,9 @@ leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
 
 ### Bounded jobs and backpressure (0.8.0)
 
+> User-facing guide with the tuning knobs and worked symptoms:
+> [`compaction-and-write-pacing.md`](compaction-and-write-pacing.md).
+
 A job takes **one** file from the source level plus only the target-level files
 its range overlaps, so it costs about
 `target_file_size * (1 + level_size_ratio)` however large the level is. A
