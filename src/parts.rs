@@ -1095,15 +1095,15 @@ mod mover_policy_tests {
         };
 
         assert_eq!(
-            eligible_part_target(&[cold.clone()], &part(None, Some(80)), 100),
+            eligible_part_target(std::slice::from_ref(&cold), &part(None, Some(80)), 100),
             Some("cold")
         );
         assert_eq!(
-            eligible_part_target(&[cold.clone()], &part(None, Some(90)), 100),
+            eligible_part_target(std::slice::from_ref(&cold), &part(None, Some(90)), 100),
             None
         );
         assert_eq!(
-            eligible_part_target(&[cold.clone()], &part(None, None), 100),
+            eligible_part_target(std::slice::from_ref(&cold), &part(None, None), 100),
             None
         );
         assert_eq!(

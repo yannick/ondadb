@@ -775,58 +775,76 @@ fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Option<usize> {
     best
 }
 
-fn merge_compaction_inputs(
-    db: &Arc<DbInner>,
-    cf: &Arc<ColumnFamily>,
-    cmp: &ComparatorRef,
+struct CompactionMerge<'a> {
+    db: &'a Arc<DbInner>,
+    cf: &'a Arc<ColumnFamily>,
+    cmp: &'a ComparatorRef,
     target: usize,
-    inputs: &[Arc<SstHandle>],
+    inputs: &'a [Arc<SstHandle>],
     bottom: bool,
     oldest_snapshot: u64,
     now: i64,
     filter: Option<crate::column_family::CompactionFilterFn>,
     partitioner: Option<crate::config::PartitionResolver>,
-) -> Result<Vec<SstMeta>> {
-    let mut iterators: Vec<SstIterator> = inputs
-        .iter()
-        .map(|table| table.reader().map(|reader| reader.iter()))
-        .collect::<Result<_>>()?;
-    for iterator in &mut iterators {
-        iterator.seek_to_first();
-    }
-    let mut retention = VersionRetention::new(bottom, oldest_snapshot, now, cmp.clone());
-    let mut outputs = CompactionOutputBuilder::new(db, cf, cmp, target, inputs, partitioner);
-    while let Some(index) = smallest_input(&iterators, cmp) {
-        let (key, seq, tombstone, ttl, single_delete) = {
-            let iterator = &iterators[index];
-            (
-                iterator.user_key().to_vec(),
-                iterator.seq(),
-                iterator.is_tombstone(),
-                iterator.ttl(),
-                iterator.is_single_delete(),
-            )
-        };
-        if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl) {
-            let value = iterators[index].value()?;
-            let filter_removes = filter_eligible
-                && filter.as_ref().is_some_and(|f| {
-                    f(&key, &value) == crate::column_family::FilterDecision::Remove
-                });
-            if !(filter_removes && bottom) {
-                outputs.write(
-                    &key,
-                    &value,
-                    seq,
-                    ttl,
-                    tombstone || filter_removes,
-                    single_delete,
-                )?;
-            }
+}
+
+impl CompactionMerge<'_> {
+    fn run(self) -> Result<Vec<SstMeta>> {
+        let mut iterators: Vec<SstIterator> = self
+            .inputs
+            .iter()
+            .map(|table| table.reader().map(|reader| reader.iter()))
+            .collect::<Result<_>>()?;
+        for iterator in &mut iterators {
+            iterator.seek_to_first();
         }
-        iterators[index].next();
+        let mut retention = VersionRetention::new(
+            self.bottom,
+            self.oldest_snapshot,
+            self.now,
+            self.cmp.clone(),
+        );
+        let mut outputs = CompactionOutputBuilder::new(
+            self.db,
+            self.cf,
+            self.cmp,
+            self.target,
+            self.inputs,
+            self.partitioner,
+        );
+        while let Some(index) = smallest_input(&iterators, self.cmp) {
+            let (key, seq, tombstone, ttl, single_delete) = {
+                let iterator = &iterators[index];
+                (
+                    iterator.user_key().to_vec(),
+                    iterator.seq(),
+                    iterator.is_tombstone(),
+                    iterator.ttl(),
+                    iterator.is_single_delete(),
+                )
+            };
+            if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl)
+            {
+                let value = iterators[index].value()?;
+                let filter_removes = filter_eligible
+                    && self.filter.as_ref().is_some_and(|filter| {
+                        filter(&key, &value) == crate::column_family::FilterDecision::Remove
+                    });
+                if !(filter_removes && self.bottom) {
+                    outputs.write(
+                        &key,
+                        &value,
+                        seq,
+                        ttl,
+                        tombstone || filter_removes,
+                        single_delete,
+                    )?;
+                }
+            }
+            iterators[index].next();
+        }
+        outputs.finish()
     }
-    outputs.finish()
 }
 
 fn install_compaction_outputs(
@@ -920,18 +938,19 @@ pub(crate) fn compact_inputs(
         None
     };
 
-    let outputs = merge_compaction_inputs(
+    let outputs = CompactionMerge {
         db,
         cf,
-        &cmp,
+        cmp: &cmp,
         target,
-        &inputs,
+        inputs: &inputs,
         bottom,
         oldest_snapshot,
         now,
         filter,
         partitioner,
-    )?;
+    }
+    .run()?;
     install_compaction_outputs(cf, &cmp, level, target, &inputs, &outputs);
 
     // Writer::finish has synced every output and its parent directory. Publish
