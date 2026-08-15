@@ -138,12 +138,14 @@ class GeigerTests(unittest.TestCase):
             "Cargo.lock": "# current lock\n",
             "src/lib.rs": "pub fn current_uncommitted_source() {}\n",
             "src/target/project_owned.rs": "pub fn nested_target_module() {}\n",
+            "targeting/unsafe.rs": "unsafe { legitimate_project_source() }\n",
             "examples/project_owned.rs": "pub fn project_owned_example() {}\n",
             ".git/admin.rs": "unsafe { duplicate() }\n",
             ".worktrees/nested/src/lib.rs": "unsafe { duplicate() }\n",
             "target/generated.rs": "unsafe { duplicate() }\n",
-            "target-debug/generated.rs": "unsafe { duplicate() }\n",
-            "target_debug/generated.rs": "unsafe { duplicate() }\n",
+            "target-040/generated.rs": "unsafe { duplicate() }\n",
+            "target-debug/project_owned.rs": "unsafe { legitimate_project_source() }\n",
+            "target_debug/project_owned.rs": "unsafe { legitimate_project_source() }\n",
             ".superpowers/scratch.rs": "unsafe { duplicate() }\n",
         }
         for relative, content in files.items():
@@ -167,12 +169,14 @@ class GeigerTests(unittest.TestCase):
                 )
                 self.assertTrue((mirror / "examples/project_owned.rs").is_file())
                 self.assertTrue((mirror / "src/target/project_owned.rs").is_file())
+                self.assertTrue((mirror / "targeting/unsafe.rs").is_file())
+                self.assertTrue((mirror / "target-debug/project_owned.rs").is_file())
+                self.assertTrue((mirror / "target_debug/project_owned.rs").is_file())
                 for excluded in (
                     ".git",
                     ".worktrees",
                     "target",
-                    "target-debug",
-                    "target_debug",
+                    "target-040",
                     ".superpowers",
                 ):
                     self.assertFalse((mirror / excluded).exists())
@@ -197,20 +201,33 @@ class GeigerTests(unittest.TestCase):
             self.assertFalse(mirror_path.exists())
 
     def test_isolated_mirror_creation_failure_is_actionable_and_cleans_up(self):
+        copy_error = PermissionError("denied")
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "tools.metrics.shutil.copytree",
-            side_effect=PermissionError("denied"),
+            "tools.metrics.shutil.copytree", side_effect=copy_error
         ):
             temporary_parent = Path(directory)
-            with self.assertRaisesRegex(
-                metrics.ToolError,
-                "create isolated cargo-geiger project mirror.*denied",
-            ):
+            with self.assertRaises(PermissionError) as raised:
                 with metrics.geiger_project_mirror(
                     temporary_parent / "source",
                     temporary_parent=temporary_parent,
                 ):
                     self.fail("mirror creation unexpectedly succeeded")
+            self.assertIs(raised.exception, copy_error)
+            self.assertEqual(list(temporary_parent.iterdir()), [])
+
+    def test_mirror_construction_interruption_cleans_up_and_preserves_exception(self):
+        interruption = KeyboardInterrupt("interrupted")
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "tools.metrics.shutil.copytree", side_effect=interruption
+        ):
+            temporary_parent = Path(directory)
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                with metrics.geiger_project_mirror(
+                    temporary_parent / "source",
+                    temporary_parent=temporary_parent,
+                ):
+                    self.fail("mirror creation unexpectedly succeeded")
+            self.assertIs(raised.exception, interruption)
             self.assertEqual(list(temporary_parent.iterdir()), [])
 
     def test_mirror_creation_reports_primary_and_cleanup_failures(self):

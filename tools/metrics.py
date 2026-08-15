@@ -40,6 +40,7 @@ GEIGER_MIRROR_EXCLUDED_DIRECTORIES = {
     ".worktrees",
     "__pycache__",
     "target",
+    "target-040",
 }
 
 UNSAFE_CATEGORIES = {
@@ -372,7 +373,6 @@ def _geiger_mirror_ignore(source_root: Path):
             name
             for name in names
             if name in GEIGER_MIRROR_EXCLUDED_DIRECTORIES
-            or name.startswith("target")
         )
         return excluded
 
@@ -401,22 +401,18 @@ def geiger_project_mirror(
             symlinks=True,
             ignore=_geiger_mirror_ignore(source_root),
         )
-    except OSError as error:
-        cleanup_error: OSError | None = None
+    except BaseException as error:
         if temporary_root is not None:
             try:
                 shutil.rmtree(temporary_root)
-            except OSError as remove_error:
-                cleanup_error = remove_error
-        cleanup_detail = (
-            f"; cleanup also failed for {temporary_root}: {cleanup_error}"
-            if cleanup_error is not None
-            else ""
-        )
-        raise ToolError(
-            f"could not create isolated cargo-geiger project mirror: "
-            f"{error}{cleanup_detail}"
-        ) from error
+            except BaseException as cleanup_error:
+                raise ToolError(
+                    f"could not create isolated cargo-geiger project mirror: "
+                    f"{type(error).__name__}: {error}; cleanup also failed for "
+                    f"{temporary_root}: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                ) from error
+        raise
 
     producer_error: BaseException | None = None
     try:

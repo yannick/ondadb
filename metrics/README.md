@@ -70,10 +70,12 @@ them.
 Unsafe collection copies the current checkout into a fresh temporary project
 mirror before running Geiger. The copy includes current tracked, modified, and
 untracked project source, but excludes repository-root administration and
-generated trees such as `.git`, `.worktrees`, `.superpowers`, and `target*` so a
-nested checkout cannot be counted as unused source. Geiger uses the mirror's
-explicit `Cargo.toml`; its reusable Cargo target remains outside the mirror, and
-the mirror is removed after both successful and failed producer runs.
+generated trees by exact name: `.git`, `.worktrees`, `.superpowers`, `.claude`,
+`target`, and `target-040`. This prevents nested checkouts and known build output
+from being counted as unused source without hiding project-owned paths that
+merely begin with `target`. Geiger uses the mirror's explicit `Cargo.toml`; its
+reusable Cargo target remains outside the mirror, and the mirror is removed
+after both successful and failed producer runs.
 
 ## Benchmark operations and interpretation
 
