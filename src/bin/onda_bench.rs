@@ -14,6 +14,89 @@ use std::time::{Duration, Instant};
 
 use ondadb::{ColumnFamilyConfig, Compression, IsolationLevel, Options, DB};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    Put,
+    Get,
+    Forward,
+    Backward,
+    Delete,
+}
+
+impl Phase {
+    const ALL: [Self; 5] = [
+        Self::Put,
+        Self::Get,
+        Self::Forward,
+        Self::Backward,
+        Self::Delete,
+    ];
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "put" => Some(Self::Put),
+            "get" => Some(Self::Get),
+            "forward" => Some(Self::Forward),
+            "backward" => Some(Self::Backward),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhaseSet(u8);
+
+impl PhaseSet {
+    fn all() -> Self {
+        Self(
+            Phase::ALL
+                .into_iter()
+                .fold(0, |bits, phase| bits | phase.bit()),
+        )
+    }
+
+    fn parse_list(value: &str) -> Result<Self, String> {
+        if value.is_empty() {
+            return Err("-phases requires at least one phase".into());
+        }
+        let mut bits = 0;
+        for name in value.split(',') {
+            let phase =
+                Phase::parse(name).ok_or_else(|| format!("unknown benchmark phase: {name}"))?;
+            bits |= phase.bit();
+        }
+        Ok(Self(bits))
+    }
+
+    const fn contains(self, phase: Phase) -> bool {
+        self.0 & phase.bit() != 0
+    }
+
+    const fn needs_population(self) -> bool {
+        self.0 != 0
+    }
+
+    const fn needs_reopen(self) -> bool {
+        self.contains(Phase::Get)
+            || self.contains(Phase::Forward)
+            || self.contains(Phase::Backward)
+            || self.contains(Phase::Delete)
+    }
+
+    #[cfg(test)]
+    fn selected(self) -> Vec<Phase> {
+        Phase::ALL
+            .into_iter()
+            .filter(|phase| self.contains(*phase))
+            .collect()
+    }
+}
+
 struct Args {
     ops: usize,
     key_size: usize,
@@ -24,9 +107,14 @@ struct Args {
     batch: usize,
     db_path: String,
     keep: bool,
+    phases: PhaseSet,
 }
 
-fn parse_args() -> Args {
+fn parse_args_from<I, S>(args: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut a = Args {
         ops: 1_000_000,
         key_size: 16,
@@ -37,35 +125,49 @@ fn parse_args() -> Args {
         batch: 1000,
         db_path: String::new(),
         keep: false,
+        phases: PhaseSet::all(),
     };
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = args
+        .into_iter()
+        .map(|value| value.as_ref().to_owned())
+        .collect();
     let mut i = 1;
     while i < argv.len() {
-        let flag = argv[i].as_str();
-        let mut val = || {
-            i += 1;
-            argv.get(i).cloned().unwrap_or_default()
+        let flag = argv[i].clone();
+        let val = |i: &mut usize| -> Result<String, String> {
+            *i += 1;
+            argv.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("{flag} requires a value"))
         };
-        match flag {
-            "-ops" => a.ops = val().parse().unwrap_or(a.ops),
-            "-key_size" => a.key_size = val().parse().unwrap_or(a.key_size),
-            "-value_size" => a.value_size = val().parse().unwrap_or(a.value_size),
-            "-threads" => a.threads = val().parse().unwrap_or(a.threads),
-            "-pattern" => a.pattern = val(),
-            "-compression" => a.compression = val(),
-            "-batch" => a.batch = val().parse().unwrap_or(a.batch),
-            "-db" => a.db_path = val(),
+        let positive = |name: &str, value: String| -> Result<usize, String> {
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| format!("{name} must be a positive integer: {value}"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+            Ok(parsed)
+        };
+        match flag.as_str() {
+            "-ops" => a.ops = positive("-ops", val(&mut i)?)?,
+            "-key_size" => a.key_size = positive("-key_size", val(&mut i)?)?,
+            "-value_size" => a.value_size = positive("-value_size", val(&mut i)?)?,
+            "-threads" => a.threads = positive("-threads", val(&mut i)?)?,
+            "-pattern" => a.pattern = val(&mut i)?,
+            "-compression" => a.compression = val(&mut i)?,
+            "-batch" => a.batch = positive("-batch", val(&mut i)?)?,
+            "-db" => a.db_path = val(&mut i)?,
+            "-phases" => a.phases = PhaseSet::parse_list(&val(&mut i)?)?,
             "-keep" => a.keep = true,
             "-engine" => {
-                let _ = val(); // accepted for CLI compatibility
+                let _ = val(&mut i)?; // accepted for CLI compatibility
             }
             _ => {}
         }
         i += 1;
     }
-    a.threads = a.threads.max(1);
-    a.batch = a.batch.max(1);
-    a
+    Ok(a)
 }
 
 fn gen_keys(a: &Args) -> Vec<Vec<u8>> {
@@ -130,7 +232,14 @@ fn report(phase: &str, ops: usize, elapsed: Duration) {
 }
 
 fn main() {
-    let a = parse_args();
+    let a = match parse_args_from(std::env::args()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("onda_bench: {error}");
+            std::process::exit(2);
+        }
+    };
+    debug_assert!(a.phases.needs_population());
     let db_path = if a.db_path.is_empty() {
         "ondadb_bench_data".to_string()
     } else {
@@ -152,14 +261,14 @@ fn main() {
     };
 
     // ---- Put -----------------------------------------------------------------
-    let db = Arc::new(DB::open(Options::new(&db_path)).expect("open"));
-    let cf = db
+    let initial_db = Arc::new(DB::open(Options::new(&db_path)).expect("open"));
+    let initial_cf = initial_db
         .create_column_family("bench", cfg.clone())
         .expect("create cf");
     let start = Instant::now();
     {
-        let db = &db;
-        let cf = &cf;
+        let db = &initial_db;
+        let cf = &initial_cf;
         let keys = &keys;
         let value = &value;
         run_threaded(a.ops, a.threads, |lo, hi| {
@@ -175,33 +284,43 @@ fn main() {
             }
         });
     }
-    report("Put", a.ops, start.elapsed());
+    let put_elapsed = start.elapsed();
+    if a.phases.contains(Phase::Put) {
+        report("Put", a.ops, put_elapsed);
+    }
 
-    // Close and reopen so cold Get reads from SSTables.
-    db.close().expect("close");
-    drop(cf);
-    drop(db);
-
-    let db = Arc::new(DB::open(Options::new(&db_path)).expect("reopen"));
-    let cf = db.get_column_family("bench").expect("cf after reopen");
+    let (db, cf) = if a.phases.needs_reopen() {
+        // Keep every post-put phase comparable with the full workload: its
+        // keys live in SSTables, even when Put itself was only setup.
+        initial_db.close().expect("close before post-put phases");
+        drop(initial_cf);
+        drop(initial_db);
+        let db = Arc::new(DB::open(Options::new(&db_path)).expect("reopen"));
+        let cf = db.get_column_family("bench").expect("cf after reopen");
+        (db, cf)
+    } else {
+        (initial_db, initial_cf)
+    };
 
     // ---- Get (cold) ----------------------------------------------------------
-    let start = Instant::now();
-    {
-        let db = &db;
-        let cf = &cf;
-        let keys = &keys;
-        let vsize = a.value_size;
-        run_threaded(a.ops, a.threads, |lo, hi| {
-            for k in &keys[lo..hi] {
-                match db.get(cf, k) {
-                    Ok(v) if v.len() == vsize => {}
-                    _ => { /* count silently; random keys may collide/miss */ }
+    if a.phases.contains(Phase::Get) {
+        let start = Instant::now();
+        {
+            let db = &db;
+            let cf = &cf;
+            let keys = &keys;
+            let vsize = a.value_size;
+            run_threaded(a.ops, a.threads, |lo, hi| {
+                for k in &keys[lo..hi] {
+                    match db.get(cf, k) {
+                        Ok(v) if v.len() == vsize => {}
+                        _ => { /* count silently; random keys may collide/miss */ }
+                    }
                 }
-            }
-        });
+            });
+        }
+        report("Get (cold)", a.ops, start.elapsed());
     }
-    report("Get (cold)", a.ops, start.elapsed());
 
     // ---- Forward / Backward scan (threads concurrent full iterations) --------
     // Run BEFORE Delete and straight after the reopen, matching the Go/C harness
@@ -239,32 +358,96 @@ fn main() {
         }
         start.elapsed()
     };
-    report("Forward Scan", a.ops, scan(false));
-    report("Backward Scan", a.ops, scan(true));
+    if a.phases.contains(Phase::Forward) {
+        report("Forward Scan", a.ops, scan(false));
+    }
+    if a.phases.contains(Phase::Backward) {
+        report("Backward Scan", a.ops, scan(true));
+    }
 
     // ---- Delete --------------------------------------------------------------
-    let start = Instant::now();
-    {
-        let db = &db;
-        let cf = &cf;
-        let keys = &keys;
-        run_threaded(a.ops, a.threads, |lo, hi| {
-            let mut i = lo;
-            while i < hi {
-                let be = (i + a.batch).min(hi);
-                let mut txn = db.begin_with_isolation(IsolationLevel::ReadCommitted);
-                for key in &keys[i..be] {
-                    txn.delete(cf, key).unwrap();
+    if a.phases.contains(Phase::Delete) {
+        let start = Instant::now();
+        {
+            let db = &db;
+            let cf = &cf;
+            let keys = &keys;
+            run_threaded(a.ops, a.threads, |lo, hi| {
+                let mut i = lo;
+                while i < hi {
+                    let be = (i + a.batch).min(hi);
+                    let mut txn = db.begin_with_isolation(IsolationLevel::ReadCommitted);
+                    for key in &keys[i..be] {
+                        txn.delete(cf, key).unwrap();
+                    }
+                    txn.commit().unwrap();
+                    i = be;
                 }
-                txn.commit().unwrap();
-                i = be;
-            }
-        });
+            });
+        }
+        report("Delete", a.ops, start.elapsed());
     }
-    report("Delete", a.ops, start.elapsed());
 
     db.close().expect("final close");
     if !a.keep {
         let _ = std::fs::remove_dir_all(&db_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phases_default_to_all() {
+        let args = parse_args_from(["onda_bench"]).unwrap();
+        assert!(Phase::ALL
+            .into_iter()
+            .all(|phase| args.phases.contains(phase)));
+    }
+
+    #[test]
+    fn phases_accept_a_comma_separated_subset() {
+        let args = parse_args_from(["onda_bench", "-phases", "get,forward"]).unwrap();
+        assert!(args.phases.contains(Phase::Get));
+        assert!(args.phases.contains(Phase::Forward));
+        assert!(!args.phases.contains(Phase::Put));
+    }
+
+    #[test]
+    fn phases_reject_unknown_and_empty_values() {
+        assert!(parse_args_from(["onda_bench", "-phases", "bogus"]).is_err());
+        assert!(parse_args_from(["onda_bench", "-phases", ""]).is_err());
+    }
+
+    #[test]
+    fn numeric_arguments_reject_invalid_values() {
+        assert!(parse_args_from(["onda_bench", "-ops", "zero"]).is_err());
+        assert!(parse_args_from(["onda_bench", "-threads", "0"]).is_err());
+    }
+
+    #[test]
+    fn post_put_phases_require_population_and_reopen() {
+        for name in ["get", "forward", "backward", "delete"] {
+            let phases = PhaseSet::parse_list(name).unwrap();
+            assert!(phases.needs_population());
+            assert!(phases.needs_reopen());
+        }
+    }
+
+    #[test]
+    fn put_only_does_not_require_reopen() {
+        let phases = PhaseSet::parse_list("put").unwrap();
+        assert!(phases.needs_population());
+        assert!(!phases.needs_reopen());
+    }
+
+    #[test]
+    fn selected_phases_keep_canonical_order() {
+        let phases = PhaseSet::parse_list("delete,get,put").unwrap();
+        assert_eq!(
+            phases.selected(),
+            vec![Phase::Put, Phase::Get, Phase::Delete]
+        );
     }
 }
