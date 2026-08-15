@@ -604,8 +604,8 @@ impl Default for ColumnFamilyConfig {
             compaction_style: CompactionStyle::Leveled,
             fifo_max_bytes: 0,
             fifo_ttl: Duration::ZERO,
-            target_file_size: 16 << 20,      // 16 MiB
-            l1_base_bytes: 256 << 20,        // 256 MiB => ~16 files in L1
+            target_file_size: 16 << 20,             // 16 MiB
+            l1_base_bytes: 256 << 20,               // 256 MiB => ~16 files in L1
             soft_pending_compaction_bytes: 2 << 30, // 2 GiB
             hard_pending_compaction_bytes: 8 << 30, // 8 GiB
         }
@@ -1912,7 +1912,10 @@ mod per_level_tests {
         let def = ColumnFamilyConfig::default();
         assert_eq!(d.target_file_size, def.target_file_size);
         assert_eq!(d.l1_base_bytes, def.l1_base_bytes);
-        assert_eq!(d.hard_pending_compaction_bytes, def.hard_pending_compaction_bytes);
+        assert_eq!(
+            d.hard_pending_compaction_bytes,
+            def.hard_pending_compaction_bytes
+        );
     }
 
     /// The geometry tail must survive alongside the tails that precede it.

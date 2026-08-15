@@ -49,7 +49,7 @@ dirty state, host details, and producer versions alongside these values.
 | --- | --- | --- | --- | --- | --- |
 | Cyclomatic complexity | Function complexity distribution: `max`, `median`, and `p90` | Lower | Report; BCA's committed baseline also gates its configured rules | `bca 2.1.0`; current report and `target/metrics/raw/bca-*.json` | `.bca-baseline.toml` is reviewed debt. Reduce real branching; do not game the metric by splitting one meaningless function into fragments. |
 | Cognitive complexity | Function cognitive-complexity distribution: `max`, `median`, and `p90` | Lower | Report | `bca 2.1.0`; current report and BCA raw paths | Trend it; reduce nested control flow only when it makes code easier to understand. |
-| Function logical lines of code | Per-function LLOC distribution: `max`, `median`, and `p90` | Lower | Report; functions over 200 LLOC are ratcheted | `bca 2.1.0`; current report and BCA raw paths | `metrics/baseline.json` owns accepted over-200-LLOC functions. Refactor coherent units, not artificial wrappers or meaningless function splitting. |
+| Function source-span length | Per-function source span (`end_line - start_line + 1`) distribution: `max`, `median`, and `p90` | Lower | Report; functions over 200 source-span lines are ratcheted | `bca 2.1.0`; current report and BCA raw paths | `metrics/baseline.json` owns accepted over-200-line functions. Refactor coherent units, not artificial wrappers or meaningless function splitting. |
 | Complexity baseline exceptions | Number of entries accepted by BCA's baseline | Lower | Report, with BCA enforcing the underlying baseline | `bca 2.1.0`; `target/metrics/current.json` | `.bca-baseline.toml`; remove exceptions by addressing the rule violation, and add one only through reviewed acceptance. |
 | Unsafe surface | Counts of unsafe functions, expressions, impls, traits, and methods, collected with `unsafe-fastpath` | Lower | Ratcheted | `cargo-geiger 0.13.0`; current report and `target/metrics/raw/geiger.json` | `metrics/baseline.json`; any increase requires explicit, reviewed debt acceptance. Prefer eliminating unsafe code or shrinking its audited boundary. |
 | Long functions | Fully qualified production functions whose LLOC exceeds 200, with their lengths | Lower | Ratcheted | `bca 2.1.0`; current report and BCA raw paths | `metrics/baseline.json`; each newly long function fails the gate. Reduce genuine responsibility, preserving clear control flow. |
@@ -80,6 +80,15 @@ Run a selected phase with `just bench-phase PHASE`, or the phase shortcuts:
 `just bench-put`, `just bench-get`, `just bench-forward`, `just
 bench-backward`, and `just bench-delete`. The valid phases are `put`, `get`,
 `forward`, `backward`, and `delete`.
+
+Every selected phase has its required setup. A phase-only post-Put invocation
+(`get`, `forward`, `backward`, or `delete` without `put`) first populates the
+database untimed, then closes and reopens it before timing the selected phase.
+The selected reads, scans, and deletes therefore operate on SST-resident data,
+not the initial memtable, and that population plus close/reopen work is outside
+the phase timer. A selected `put` phase times the population itself; a
+full-suite run follows the same close/reopen boundary before its post-Put
+phases.
 
 All standalone recipes accept these positional overrides, in this order:
 
