@@ -206,13 +206,16 @@ class GeigerTests(unittest.TestCase):
             "tools.metrics.shutil.copytree", side_effect=copy_error
         ):
             temporary_parent = Path(directory)
-            with self.assertRaises(PermissionError) as raised:
+            with self.assertRaisesRegex(
+                metrics.ToolError,
+                "create isolated cargo-geiger project mirror.*denied",
+            ) as raised:
                 with metrics.geiger_project_mirror(
                     temporary_parent / "source",
                     temporary_parent=temporary_parent,
                 ):
                     self.fail("mirror creation unexpectedly succeeded")
-            self.assertIs(raised.exception, copy_error)
+            self.assertIs(raised.exception.__cause__, copy_error)
             self.assertEqual(list(temporary_parent.iterdir()), [])
 
     def test_mirror_construction_interruption_cleans_up_and_preserves_exception(self):

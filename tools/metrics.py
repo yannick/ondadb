@@ -412,6 +412,10 @@ def geiger_project_mirror(
                     f"{temporary_root}: {type(cleanup_error).__name__}: "
                     f"{cleanup_error}"
                 ) from error
+        if isinstance(error, OSError):
+            raise ToolError(
+                f"could not create isolated cargo-geiger project mirror: {error}"
+            ) from error
         raise
 
     producer_error: BaseException | None = None
