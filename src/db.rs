@@ -16,7 +16,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileCache};
-use crate::column_family::{CfCtx, ColumnFamily, FlushJob};
+use crate::column_family::{CfCtx, ColumnFamily, FlushJob, ImmMemtable};
 use crate::compaction;
 use crate::comparator::comparator_by_name;
 use crate::config::{ColumnFamilyConfig, Options};
@@ -1233,82 +1233,89 @@ fn spawn_workers(
     *inner.workers.lock() = handles;
 }
 
+fn should_schedule_compaction(closing: bool, fifo: bool, l0_len: usize, trigger: usize) -> bool {
+    !closing && (fifo || l0_len >= trigger)
+}
+
+fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
+    crate::compaction::refresh_compaction_debt(db, cf);
+    let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
+    if should_schedule_compaction(
+        db.closing.load(Ordering::Relaxed),
+        fifo,
+        cf.l0_len(),
+        cf.opts.l1_file_count_trigger as usize,
+    ) {
+        let _ = db.ctx.compact_tx.send(cf.clone());
+    }
+}
+
+fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>) {
+    match cf.flush_imm(&imm, db.next_file_id()) {
+        Ok(wal_paths) => {
+            // The SST is already synced by `flush_imm`. Reclaim its WAL only
+            // after the manifest durably references that SST.
+            if db.persist_manifest().is_ok() {
+                for path in wal_paths {
+                    crate::wal::remove_wal_files(path);
+                }
+            }
+            schedule_compaction_after_flush(db, &cf);
+        }
+        Err(error) => {
+            // A dropped/cleared CF may disappear while its queued job runs;
+            // only a failure for the still-live instance fail-stops the DB.
+            let live = db
+                .cfs
+                .read()
+                .get(cf.name())
+                .is_some_and(|current| Arc::ptr_eq(current, &cf));
+            if live {
+                db.poison.set(format!("background flush failed: {error}"));
+            }
+        }
+    }
+}
+
+fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
+    // Each CF slice lands in L0 before the single manifest publication.
+    let mut all_slices_flushed = true;
+    for (cf_id, entries) in crate::unified::split_by_cf(&imm) {
+        let cf = db.cf_by_id.read().get(&cf_id).cloned();
+        let Some(cf) = cf else {
+            continue;
+        };
+        if let Err(error) = cf.ingest_l0(entries, db.next_file_id()) {
+            db.poison.set(format!("unified flush failed: {error}"));
+            all_slices_flushed = false;
+        }
+        schedule_compaction_after_flush(db, &cf);
+    }
+    // A shared WAL covers every CF slice. One failed slice must retain it even
+    // if the manifest could persist the successful slices; recovery needs the
+    // original atomic batch. Only full flush + manifest durability delete it.
+    if all_slices_flushed && db.persist_manifest().is_ok() {
+        for path in &imm.wal_paths {
+            crate::wal::remove_wal_files(path);
+        }
+    }
+    if let Some(unified) = &db.unified {
+        unified.remove_imm(&imm);
+    }
+}
+
+fn process_flush_job(db: &Arc<DbInner>, job: FlushJob) {
+    match job {
+        FlushJob::PerCf { cf, imm } => flush_per_cf(db, cf, imm),
+        FlushJob::Unified { imm } => flush_unified(db, imm),
+    }
+    db.pending_flush.fetch_sub(1, Ordering::SeqCst);
+}
+
 fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>) {
     loop {
         match rx.recv_timeout(WORKER_TICK) {
-            Ok(FlushJob::PerCf { cf, imm }) => {
-                let id = db.next_file_id();
-                match cf.flush_imm(&imm, id) {
-                    Ok(wal_paths) => {
-                        // Only reclaim the WAL once the manifest that references the new
-                        // SSTable is durable. If the manifest write fails, the SSTable is
-                        // orphaned but the data is still in the WAL and recovers on reopen.
-                        if db.persist_manifest().is_ok() {
-                            for p in wal_paths {
-                                crate::wal::remove_wal_files(p);
-                            }
-                        }
-                        // A flush changes L0, so it changes the debt writers
-                        // pace against.
-                        crate::compaction::refresh_compaction_debt(&db, &cf);
-                        // FIFO CFs enforce their size/age limit after every
-                        // flush; leveled CFs wait for the L0 file trigger.
-                        let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
-                        if !db.closing.load(Ordering::Relaxed)
-                            && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
-                        {
-                            let _ = db.ctx.compact_tx.send(cf.clone());
-                        }
-                    }
-                    Err(e) => {
-                        // The data is still in the WAL, but a failed background
-                        // flush (SST write/fsync) means durability can no longer
-                        // be promised for new writes — fail-stop. Exception: if
-                        // the CF was dropped or cleared while this job was in
-                        // flight, the failure is expected (its directory is
-                        // gone) and poisoning would take down a healthy DB.
-                        let live = db
-                            .cfs
-                            .read()
-                            .get(cf.name())
-                            .is_some_and(|c| Arc::ptr_eq(c, &cf));
-                        if live {
-                            db.poison.set(format!("background flush failed: {e}"));
-                        }
-                    }
-                }
-                db.pending_flush.fetch_sub(1, Ordering::SeqCst);
-            }
-            Ok(FlushJob::Unified { imm }) => {
-                // Split the shared memtable by CF and flush each slice to L0.
-                for (cf_id, entries) in crate::unified::split_by_cf(&imm) {
-                    if let Some(cf) = db.cf_by_id.read().get(&cf_id).cloned() {
-                        let file_id = db.next_file_id();
-                        if let Err(e) = cf.ingest_l0(entries, file_id) {
-                            db.poison.set(format!("unified flush failed: {e}"));
-                        }
-                        // FIFO CFs enforce their size/age limit after every
-                        // flush; leveled CFs wait for the L0 file trigger.
-                        let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
-                        crate::compaction::refresh_compaction_debt(&db, &cf);
-                        if !db.closing.load(Ordering::Relaxed)
-                            && (fifo || cf.l0_len() >= cf.opts.l1_file_count_trigger as usize)
-                        {
-                            let _ = db.ctx.compact_tx.send(cf.clone());
-                        }
-                    }
-                }
-                // As above: only drop the WAL once the manifest is durable.
-                if db.persist_manifest().is_ok() {
-                    for p in &imm.wal_paths {
-                        crate::wal::remove_wal_files(p);
-                    }
-                }
-                if let Some(u) = &db.unified {
-                    u.remove_imm(&imm);
-                }
-                db.pending_flush.fetch_sub(1, Ordering::SeqCst);
-            }
+            Ok(job) => process_flush_job(&db, job),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -1366,6 +1373,14 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_compaction_schedule_respects_style_trigger_and_close() {
+        assert!(should_schedule_compaction(false, true, 0, 4));
+        assert!(!should_schedule_compaction(false, false, 3, 4));
+        assert!(should_schedule_compaction(false, false, 4, 4));
+        assert!(!should_schedule_compaction(true, true, 8, 4));
+    }
 
     #[test]
     fn wal_layout_validation_allows_empty_catalogs_and_matching_catalogs() {

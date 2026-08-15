@@ -557,24 +557,30 @@ fn my_stripe(n: usize) -> usize {
     })
 }
 
+fn sync_dirty_files(shared: &Shared) {
+    if !shared.dirty.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    for file in &shared.files {
+        let guard = file.lock();
+        let Some(file) = guard.as_ref() else {
+            continue;
+        };
+        if let Err(error) = file.sync_data() {
+            // Commits acknowledged since the last successful sync may be lost;
+            // fail-stop rather than silently dropping the error.
+            shared.poison(format!("wal interval fsync failed: {error}"));
+        } else {
+            shared.count_sync();
+        }
+    }
+}
+
 fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
     loop {
         match stop.recv_timeout(interval) {
             Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if shared.dirty.swap(false, Ordering::Relaxed) {
-                    for file in &shared.files {
-                        if let Some(f) = file.lock().as_ref() {
-                            if let Err(e) = f.sync_data() {
-                                // Commits acknowledged since the last successful
-                                // sync may be lost — fail-stop the DB rather
-                                // than silently dropping the error.
-                                shared.poison(format!("wal interval fsync failed: {e}"));
-                            }
-                        }
-                    }
-                }
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => sync_dirty_files(&shared),
         }
     }
 }
@@ -797,5 +803,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn interval_sync_flushes_each_dirty_generation_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open(&path, SyncMode::Interval, Duration::from_secs(60)).unwrap();
+        let syncs = Arc::new(AtomicU64::new(0));
+        wal.set_sync_counter(syncs.clone());
+
+        wal.append(rec("a", "1", 1)).unwrap();
+        sync_dirty_files(&wal.shared);
+        assert_eq!(syncs.load(Ordering::Relaxed), WAL_STRIPES as u64);
+
+        sync_dirty_files(&wal.shared);
+        assert_eq!(
+            syncs.load(Ordering::Relaxed),
+            WAL_STRIPES as u64,
+            "an idle interval must not repeat the previous generation's sync"
+        );
     }
 }

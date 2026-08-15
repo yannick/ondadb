@@ -31,7 +31,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::column_family::{ColumnFamily, SstHandle};
+use crate::column_family::{BottomPart, ColumnFamily, SstHandle};
+use crate::config::TierRule;
 use crate::db::DB;
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
@@ -1035,30 +1036,9 @@ impl crate::db::DbInner {
             // move can only make a part vanish (relocate then finds nothing and
             // is a no-op), never move stale data.
             for part in cf.bottom_parts() {
-                let Some(rule) = crate::config::tier_for_key(rules, &part.min_key) else {
+                let Some(target) = eligible_part_target(rules, &part, now) else {
                     continue;
                 };
-                // The reserved name "ssd" denotes the default tier (`None`).
-                let target: Option<&str> = if rule.tier == "ssd" {
-                    None
-                } else {
-                    Some(rule.tier.as_str())
-                };
-                // Already on the target tier → nothing to do (idempotent).
-                if target == part.tier.as_deref() {
-                    continue;
-                }
-                // P4 relocates onto named local tiers only; moving a part back to
-                // the default tier is out of scope (there is no copy target).
-                let Some(target) = target else { continue };
-                // Age gate: only move once the part's newest entry is older than
-                // the rule's min_age. An unknown age (`None`) is never eligible.
-                let Some(newest) = part.max_entry_time else {
-                    continue;
-                };
-                if now.saturating_sub(newest) <= rule.min_age.as_nanos() as i64 {
-                    continue;
-                }
                 match self.relocate_part(cf, &part.partition, target, None) {
                     Ok(()) => moved += 1,
                     // A part that vanished (compacted/detached) between snapshot
@@ -1070,6 +1050,70 @@ impl crate::db::DbInner {
             }
         }
         Ok(moved)
+    }
+}
+
+fn eligible_part_target<'a>(rules: &'a [TierRule], part: &BottomPart, now: i64) -> Option<&'a str> {
+    let rule = crate::config::tier_for_key(rules, &part.min_key)?;
+    // "ssd" denotes the default tier, and moving back to that tier has no copy
+    // target in the P4 mover protocol.
+    let target = (rule.tier != "ssd").then_some(rule.tier.as_str())?;
+    if part.tier.as_deref() == Some(target) {
+        return None;
+    }
+    let newest = part.max_entry_time?;
+    (now.saturating_sub(newest) > rule.min_age.as_nanos() as i64).then_some(target)
+}
+
+#[cfg(test)]
+mod mover_policy_tests {
+    use std::time::Duration;
+
+    use super::eligible_part_target;
+    use crate::column_family::BottomPart;
+    use crate::config::TierRule;
+
+    fn part(tier: Option<&str>, newest: Option<i64>) -> BottomPart {
+        BottomPart {
+            partition: "part".into(),
+            min_key: b"logs/2026".to_vec(),
+            tier: tier.map(str::to_owned),
+            max_entry_time: newest,
+        }
+    }
+
+    #[test]
+    fn mover_policy_requires_a_named_different_and_old_enough_target() {
+        let cold = TierRule {
+            prefix: b"logs/".to_vec(),
+            tier: "cold".into(),
+            min_age: Duration::from_nanos(10),
+        };
+        let default = TierRule {
+            tier: "ssd".into(),
+            ..cold.clone()
+        };
+
+        assert_eq!(
+            eligible_part_target(&[cold.clone()], &part(None, Some(80)), 100),
+            Some("cold")
+        );
+        assert_eq!(
+            eligible_part_target(&[cold.clone()], &part(None, Some(90)), 100),
+            None
+        );
+        assert_eq!(
+            eligible_part_target(&[cold.clone()], &part(None, None), 100),
+            None
+        );
+        assert_eq!(
+            eligible_part_target(&[cold], &part(Some("cold"), Some(0)), 100),
+            None
+        );
+        assert_eq!(
+            eligible_part_target(&[default], &part(Some("cold"), Some(0)), 100),
+            None
+        );
     }
 }
 

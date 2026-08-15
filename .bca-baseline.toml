@@ -23,18 +23,6 @@ metric = "cyclomatic"
 value = 46.0
 
 [[entry]]
-path = "src/db.rs"
-qualified = "flush_worker"
-metric = "cognitive"
-value = 57.0
-
-[[entry]]
-path = "src/db.rs"
-qualified = "flush_worker"
-metric = "cyclomatic"
-value = 24.0
-
-[[entry]]
 path = "src/error.rs"
 qualified = "OndaError::code"
 metric = "cyclomatic"
@@ -51,27 +39,3 @@ path = "src/error.rs"
 qualified = "OndaError::kind"
 metric = "cyclomatic"
 value = 16.0
-
-[[entry]]
-path = "src/parts.rs"
-qualified = "crate::db::DbInner::run_part_mover"
-metric = "cognitive"
-value = 22.0
-
-[[entry]]
-path = "src/txn.rs"
-qualified = "Txn::commit"
-metric = "cognitive"
-value = 53.0
-
-[[entry]]
-path = "src/txn.rs"
-qualified = "Txn::commit"
-metric = "cyclomatic"
-value = 28.0
-
-[[entry]]
-path = "src/wal.rs"
-qualified = "interval_sync"
-metric = "cognitive"
-value = 21.0

@@ -32,6 +32,15 @@ type CfGroup<'a> = (Arc<ColumnFamily>, Vec<RecordRef<'a>>, Vec<CommitOp>, bool);
 /// `(offset, len)` range into the transaction's write buffer.
 type BufRange = (usize, usize);
 
+struct PreparedCommit {
+    order: Vec<usize>,
+}
+
+struct CommitApplication {
+    hooks: Vec<(Arc<ColumnFamily>, Vec<CommitOp>)>,
+    error: Option<OndaError>,
+}
+
 /// Slice `buf` at `r`. A free function (not a method) so callers can hold other
 /// borrows of the transaction at the same time.
 #[inline]
@@ -374,6 +383,147 @@ impl Txn {
         Ok(())
     }
 
+    fn deduplicated_write_order(&self) -> Vec<usize> {
+        if self.writes.len() == 1 {
+            return vec![0];
+        }
+        // Keys borrow the transaction arena: deduplication allocates only the
+        // slot map and order vector, never key/value copies.
+        let mut slot_of: HashMap<(usize, &[u8]), usize, xxhash_rust::xxh3::Xxh3DefaultBuilder> =
+            HashMap::with_capacity_and_hasher(
+                self.writes.len(),
+                xxhash_rust::xxh3::Xxh3DefaultBuilder::new(),
+            );
+        let mut order = Vec::with_capacity(self.writes.len());
+        for (index, write) in self.writes.iter().enumerate() {
+            match slot_of.entry((cf_id(&write.cf), buf_slice(&self.buf, write.key))) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(order.len());
+                    order.push(index);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    order[*entry.get()] = index;
+                }
+            }
+        }
+        order
+    }
+
+    fn prepare_commit(&self) -> PreparedCommit {
+        PreparedCommit {
+            order: self.deduplicated_write_order(),
+        }
+    }
+
+    fn validate_write_conflicts(&self, prepared: &PreparedCommit) -> Result<()> {
+        for &index in &prepared.order {
+            let write = &self.writes[index];
+            let key = buf_slice(&self.buf, write.key);
+            if write.cf.peek_seq(key)? > self.read_seq {
+                return Err(OndaError::Conflict(format!(
+                    "write-write conflict on key {:?}",
+                    key.to_vec()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_read_conflicts(&self) -> Result<()> {
+        for (id, key) in &self.read_set {
+            let Some(cf) = self.read_cfs.get(id) else {
+                continue;
+            };
+            if cf.peek_seq(key)? > self.read_seq {
+                return Err(OndaError::Conflict("read-set changed".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_commit(&self, prepared: &PreparedCommit, needs_write_check: bool) -> Result<()> {
+        if needs_write_check {
+            self.validate_write_conflicts(prepared)?;
+        }
+        if self.isolation == IsolationLevel::Serializable {
+            self.validate_read_conflicts()?;
+        }
+        Ok(())
+    }
+
+    fn apply_prepared(&self, prepared: &PreparedCommit, start: u64) -> CommitApplication {
+        let mut hooks = Vec::new();
+        let mut groups: HashMap<usize, CfGroup<'_>> = HashMap::with_capacity(1);
+        for (slot, &index) in prepared.order.iter().enumerate() {
+            let seq = start + slot as u64;
+            let write = &self.writes[index];
+            let id = cf_id(&write.cf);
+            let group = groups.entry(id).or_insert_with(|| {
+                let has_hook = write.cf.has_commit_hook();
+                (write.cf.clone(), Vec::new(), Vec::new(), has_hook)
+            });
+            let key = buf_slice(&self.buf, write.key);
+            let value = buf_slice(&self.buf, write.value);
+            if group.3 {
+                group.2.push(CommitOp {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                    tombstone: write.tombstone,
+                    ttl: write.ttl,
+                });
+            }
+            group.1.push(RecordRef {
+                key,
+                value,
+                seq,
+                ttl: write.ttl,
+                tombstone: write.tombstone,
+                single_delete: write.single_delete,
+            });
+        }
+        let error = if let Some(unified) = &self.db.unified {
+            Self::apply_unified_groups(unified, groups, &mut hooks)
+        } else {
+            Self::apply_per_cf_groups(groups, &mut hooks)
+        };
+        CommitApplication { hooks, error }
+    }
+
+    fn apply_unified_groups(
+        unified: &Arc<crate::unified::UnifiedStore>,
+        groups: HashMap<usize, CfGroup<'_>>,
+        hooks: &mut Vec<(Arc<ColumnFamily>, Vec<CommitOp>)>,
+    ) -> Option<OndaError> {
+        let item_count: usize = groups
+            .values()
+            .map(|(_, records, _, _)| records.len())
+            .sum();
+        let mut items = Vec::with_capacity(item_count);
+        for (_, (cf, records, ops, has_hook)) in groups {
+            let cf_id = cf.id();
+            items.extend(records.into_iter().map(|record| (cf_id, record)));
+            if has_hook {
+                hooks.push((cf, ops));
+            }
+        }
+        unified.apply(&items).err()
+    }
+
+    fn apply_per_cf_groups(
+        groups: HashMap<usize, CfGroup<'_>>,
+        hooks: &mut Vec<(Arc<ColumnFamily>, Vec<CommitOp>)>,
+    ) -> Option<OndaError> {
+        for (_, (cf, records, ops, has_hook)) in groups {
+            if let Err(error) = cf.apply_commit(&records) {
+                return Some(error);
+            }
+            if has_hook {
+                hooks.push((cf, ops));
+            }
+        }
+        None
+    }
+
     /// Commit the transaction.  Returns [`OndaError::Conflict`] on a
     /// serialization conflict (Snapshot/Serializable).
     pub fn commit(&mut self) -> Result<()> {
@@ -395,138 +545,22 @@ impl Txn {
             self.release();
             return Ok(());
         }
-
-        // Dedup writes: last write per (cf, key) wins, sequenced in first-write
-        // order. `order[slot]` holds the index (into `self.writes`) of the winning
-        // write for that slot. Keys are hashed by reference — no clones. The
-        // single-write case (the `DB::put`/`delete` helpers) skips the map.
-        let order: Vec<usize> = if self.writes.len() == 1 {
-            vec![0]
-        } else {
-            // xxh3 hashes the whole key in wide lanes — much cheaper than
-            // SipHash for this throwaway in-process dedup map.
-            let mut slot_of: HashMap<(usize, &[u8]), usize, xxhash_rust::xxh3::Xxh3DefaultBuilder> =
-                HashMap::with_capacity_and_hasher(
-                    self.writes.len(),
-                    xxhash_rust::xxh3::Xxh3DefaultBuilder::new(),
-                );
-            let mut order = Vec::with_capacity(self.writes.len());
-            for (i, w) in self.writes.iter().enumerate() {
-                match slot_of.entry((cf_id(&w.cf), buf_slice(&self.buf, w.key))) {
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(order.len());
-                        order.push(i);
-                    }
-                    std::collections::hash_map::Entry::Occupied(o) => order[*o.get()] = i,
-                }
-            }
-            order
-        };
-
+        let prepared = self.prepare_commit();
         let db = self.db.clone();
         let _guard = if needs_check || self.isolation == IsolationLevel::Serializable {
             Some(db.commit_mu.lock())
         } else {
             None
         };
-
-        // Write-write conflict detection.
-        if needs_check {
-            let mut conflict: Option<Vec<u8>> = None;
-            for &i in &order {
-                let w = &self.writes[i];
-                let key = buf_slice(&self.buf, w.key);
-                if w.cf.peek_seq(key)? > self.read_seq {
-                    conflict = Some(key.to_vec());
-                    break;
-                }
-            }
-            if let Some(key) = conflict {
-                self.release();
-                return Err(OndaError::Conflict(format!(
-                    "write-write conflict on key {key:?}"
-                )));
-            }
-        }
-        // Serializable: validate the read set too. Every read key's CF handle is
-        // retained in `read_cfs`, so read-only keys (in CFs the txn never wrote) are
-        // validated as well — not just keys in written CFs.
-        if self.isolation == IsolationLevel::Serializable {
-            for (id, key) in &self.read_set {
-                if let Some(cf) = self.read_cfs.get(id) {
-                    if cf.peek_seq(key)? > self.read_seq {
-                        self.release();
-                        return Err(OndaError::Conflict("read-set changed".into()));
-                    }
-                }
-            }
+        if let Err(error) = self.validate_commit(&prepared, needs_check) {
+            self.release();
+            return Err(error);
         }
 
-        let n = order.len() as u64;
+        let n = prepared.order.len() as u64;
         let start = self.db.reserve_seq(n);
         let commit_seq = start + n - 1;
-
-        // Group records per column family. Records BORROW the transaction buffer
-        // (zero copies here); the WAL and memtable copy what they need. Hook
-        // payloads are only materialized for CFs that actually have a hook.
-        let mut applied: Vec<(Arc<ColumnFamily>, Vec<CommitOp>)> = Vec::new();
-        let mut apply_err: Option<OndaError> = None;
-        {
-            let buf = &self.buf;
-            let mut groups: HashMap<usize, CfGroup<'_>> = HashMap::with_capacity(1);
-            for (slot, &i) in order.iter().enumerate() {
-                let seq = start + slot as u64;
-                let w = &self.writes[i];
-                let id = cf_id(&w.cf);
-                let entry = groups.entry(id).or_insert_with(|| {
-                    let has_hook = w.cf.has_commit_hook();
-                    (w.cf.clone(), Vec::new(), Vec::new(), has_hook)
-                });
-                let key = buf_slice(buf, w.key);
-                let value = buf_slice(buf, w.value);
-                if entry.3 {
-                    entry.2.push(CommitOp {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                        tombstone: w.tombstone,
-                        ttl: w.ttl,
-                    });
-                }
-                entry.1.push(RecordRef {
-                    key,
-                    value,
-                    seq,
-                    ttl: w.ttl,
-                    tombstone: w.tombstone,
-                    single_delete: w.single_delete,
-                });
-            }
-
-            if let Some(u) = &self.db.unified {
-                // Unified mode: write every record to the shared store in one batch.
-                let mut items = Vec::with_capacity(n as usize);
-                for (_, (cf, recs, ops, has_hook)) in groups {
-                    let cid = cf.id();
-                    for r in recs {
-                        items.push((cid, r));
-                    }
-                    if has_hook {
-                        applied.push((cf, ops));
-                    }
-                }
-                apply_err = u.apply(&items).err();
-            } else {
-                for (_, (cf, recs, ops, has_hook)) in groups {
-                    if let Some(e) = cf.apply_commit(&recs).err() {
-                        apply_err = Some(e);
-                        break;
-                    }
-                    if has_hook {
-                        applied.push((cf, ops));
-                    }
-                }
-            }
-        }
+        let application = self.apply_prepared(&prepared, start);
         // The reserved range must be published even when the apply failed:
         // the gap-free cursor (invariant 5) never advances past an
         // unpublished range, so skipping this would freeze `visible_seq`
@@ -536,15 +570,15 @@ impl Txn {
         // WAL or memtable, so nothing unapplied becomes visible (the same
         // publish-before-data pattern `start_ingestion` uses).
         self.db.publish_range(start, start + n);
-        if let Some(e) = apply_err {
+        if let Some(error) = application.error {
             drop(_guard);
             self.release();
-            return Err(e);
+            return Err(error);
         }
-        self.db.note_thread_commit(start + n - 1);
+        self.db.note_thread_commit(commit_seq);
         drop(_guard);
 
-        for (cf, ops) in &applied {
+        for (cf, ops) in &application.hooks {
             cf.run_commit_hook(commit_seq, ops);
         }
         self.writes.clear();
@@ -618,6 +652,21 @@ mod tests {
     use super::*;
     use crate::config::ColumnFamilyConfig;
     use crate::Options;
+
+    #[test]
+    fn prepared_write_order_is_last_write_wins_in_first_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        let mut txn = db.begin();
+        txn.put(&cf, b"a", b"first", Duration::ZERO).unwrap();
+        txn.put(&cf, b"b", b"only", Duration::ZERO).unwrap();
+        txn.put(&cf, b"a", b"last", Duration::ZERO).unwrap();
+
+        assert_eq!(txn.deduplicated_write_order(), vec![2, 1]);
+    }
 
     #[test]
     fn txn_buf_reused_across_batches() {
