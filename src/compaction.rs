@@ -507,6 +507,388 @@ fn compact_into(
     compact_inputs(db, cf, level, target, inputs)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retention {
+    Drop,
+    Keep { filter_eligible: bool },
+}
+
+struct VersionRetention {
+    bottom: bool,
+    oldest_snapshot: u64,
+    now: i64,
+    cmp: ComparatorRef,
+    last_key: Option<Vec<u8>>,
+    emitted_at_or_below_snapshot: bool,
+}
+
+impl VersionRetention {
+    fn new(bottom: bool, oldest_snapshot: u64, now: i64, cmp: ComparatorRef) -> Self {
+        Self {
+            bottom,
+            oldest_snapshot,
+            now,
+            cmp,
+            last_key: None,
+            emitted_at_or_below_snapshot: false,
+        }
+    }
+
+    fn decide(&mut self, key: &[u8], seq: u64, tombstone: bool, ttl: i64) -> Retention {
+        let new_key = self
+            .last_key
+            .as_deref()
+            .is_none_or(|last| !self.cmp.compare(last, key).is_eq());
+        if new_key {
+            self.last_key = Some(key.to_vec());
+            self.emitted_at_or_below_snapshot = false;
+        }
+        if seq <= self.oldest_snapshot {
+            if self.emitted_at_or_below_snapshot {
+                return Retention::Drop;
+            }
+            self.emitted_at_or_below_snapshot = true;
+            if tombstone && self.bottom {
+                return Retention::Drop;
+            }
+        }
+        if self.bottom && !tombstone && ttl != 0 && ttl <= self.now {
+            return Retention::Drop;
+        }
+        Retention::Keep {
+            filter_eligible: !tombstone
+                && seq <= self.oldest_snapshot
+                && (ttl == 0 || ttl > self.now),
+        }
+    }
+}
+
+struct CurrentOutput {
+    writer: Writer,
+    klog: String,
+    id: u64,
+    bytes: u64,
+    partition: Option<String>,
+}
+
+struct CompactionOutputBuilder<'a> {
+    db: &'a Arc<DbInner>,
+    cf: &'a Arc<ColumnFamily>,
+    cmp: &'a ComparatorRef,
+    target: usize,
+    target_bytes: u64,
+    carry_entry_time: Option<i64>,
+    partitioner: Option<crate::config::PartitionResolver>,
+    current: Option<CurrentOutput>,
+    outputs: Vec<SstMeta>,
+    last_boundary: Option<Vec<u8>>,
+    #[cfg(debug_assertions)]
+    finalized_boundaries: std::collections::HashSet<Vec<u8>>,
+    finished: bool,
+}
+
+impl<'a> CompactionOutputBuilder<'a> {
+    fn new(
+        db: &'a Arc<DbInner>,
+        cf: &'a Arc<ColumnFamily>,
+        cmp: &'a ComparatorRef,
+        target: usize,
+        inputs: &[Arc<SstHandle>],
+        partitioner: Option<crate::config::PartitionResolver>,
+    ) -> Self {
+        Self {
+            db,
+            cf,
+            cmp,
+            target,
+            target_bytes: (cf.opts.target_file_size as u64).max(1),
+            carry_entry_time: inputs
+                .iter()
+                .filter_map(|handle| handle.meta.max_entry_time)
+                .max(),
+            partitioner,
+            current: None,
+            outputs: Vec::new(),
+            last_boundary: None,
+            #[cfg(debug_assertions)]
+            finalized_boundaries: std::collections::HashSet::new(),
+            finished: false,
+        }
+    }
+
+    fn finish_current(&mut self) -> Result<()> {
+        let Some(current) = self.current.take() else {
+            return Ok(());
+        };
+        let CurrentOutput {
+            writer,
+            klog,
+            id,
+            partition,
+            ..
+        } = current;
+        let file_meta = match writer.finish() {
+            Ok(meta) => meta,
+            Err(error) => {
+                let _ = std::fs::remove_file(&klog);
+                let _ = std::fs::remove_file(crate::sst::vlog_path_for(&klog));
+                return Err(error);
+            }
+        };
+        let mut meta = file_meta.to_sst_meta(id, self.target as u32);
+        meta.partition = partition;
+        meta.max_entry_time = self.carry_entry_time;
+        self.outputs.push(meta);
+        Ok(())
+    }
+
+    fn output_boundary_change(&self, key: &[u8], partition: &Option<String>) -> (bool, bool) {
+        let Some(current) = &self.current else {
+            return (false, false);
+        };
+        let boundary_changed = match (&self.partitioner, self.last_boundary.as_deref()) {
+            (Some(resolver), Some(previous)) => resolver.boundary(key) != Some(previous),
+            (Some(resolver), None) => resolver.boundary(key).is_some(),
+            (None, _) => false,
+        };
+        (
+            boundary_changed || current.partition != *partition,
+            boundary_changed,
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    fn record_boundary_crossing(&mut self, key: &[u8]) {
+        if let Some(previous) = &self.last_boundary {
+            self.finalized_boundaries.insert(previous.clone());
+        }
+        if let Some(next) = self.partitioner.as_ref().and_then(|p| p.boundary(key)) {
+            debug_assert!(
+                !self.finalized_boundaries.contains(next),
+                "PartitionFn is not order-compatible: boundary {next:?} reappeared after its \
+                 part was finalized, which would make a bottom SSTable span two partitions"
+            );
+        }
+    }
+
+    fn open_output(&mut self, partition: Option<String>) -> Result<()> {
+        let id = self.db.next_file_id();
+        let klog = self.cf.klog_path(id);
+        let writer = match Writer::new(&klog, cf_writer_opts(self.cf, self.cmp, self.target as u32))
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = std::fs::remove_file(&klog);
+                let _ = std::fs::remove_file(crate::sst::vlog_path_for(&klog));
+                return Err(error);
+            }
+        };
+        self.current = Some(CurrentOutput {
+            writer,
+            klog,
+            id,
+            bytes: 0,
+            partition,
+        });
+        Ok(())
+    }
+
+    fn write(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        seq: u64,
+        ttl: i64,
+        tombstone: bool,
+        single_delete: bool,
+    ) -> Result<()> {
+        let partition = self.partitioner.as_ref().and_then(|p| p.name_of(key));
+        let (cut, _boundary_changed) = self.output_boundary_change(key, &partition);
+        if cut {
+            #[cfg(debug_assertions)]
+            if _boundary_changed {
+                self.record_boundary_crossing(key);
+            }
+            self.finish_current()?;
+        }
+        self.last_boundary = self
+            .partitioner
+            .as_ref()
+            .and_then(|p| p.boundary(key))
+            .map(<[u8]>::to_vec);
+        if self.current.is_none() {
+            self.open_output(partition)?;
+        }
+        let current = self.current.as_mut().expect("output opened above");
+        current
+            .writer
+            .add(key, value, seq, ttl, tombstone, single_delete)?;
+        current.bytes += (key.len() + value.len()) as u64;
+        if current.bytes >= self.target_bytes {
+            self.finish_current()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<SstMeta>> {
+        self.finish_current()?;
+        self.finished = true;
+        Ok(std::mem::take(&mut self.outputs))
+    }
+}
+
+impl Drop for CompactionOutputBuilder<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(current) = self.current.take() {
+            current.writer.abort();
+        }
+        for meta in &self.outputs {
+            let klog = self.cf.klog_path(meta.id);
+            let _ = std::fs::remove_file(&klog);
+            let _ = std::fs::remove_file(crate::sst::vlog_path_for(&klog));
+        }
+    }
+}
+
+fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Option<usize> {
+    let mut best = None;
+    for (index, iterator) in its.iter().enumerate() {
+        if !iterator.valid() {
+            continue;
+        }
+        match best {
+            None => best = Some(index),
+            Some(previous) => {
+                let previous = &its[previous];
+                let order = cmp
+                    .compare(iterator.user_key(), previous.user_key())
+                    .then_with(|| previous.seq().cmp(&iterator.seq()));
+                if order.is_lt() {
+                    best = Some(index);
+                }
+            }
+        }
+    }
+    best
+}
+
+fn merge_compaction_inputs(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    cmp: &ComparatorRef,
+    target: usize,
+    inputs: &[Arc<SstHandle>],
+    bottom: bool,
+    oldest_snapshot: u64,
+    now: i64,
+    filter: Option<crate::column_family::CompactionFilterFn>,
+    partitioner: Option<crate::config::PartitionResolver>,
+) -> Result<Vec<SstMeta>> {
+    let mut iterators: Vec<SstIterator> = inputs
+        .iter()
+        .map(|table| table.reader().map(|reader| reader.iter()))
+        .collect::<Result<_>>()?;
+    for iterator in &mut iterators {
+        iterator.seek_to_first();
+    }
+    let mut retention = VersionRetention::new(bottom, oldest_snapshot, now, cmp.clone());
+    let mut outputs = CompactionOutputBuilder::new(db, cf, cmp, target, inputs, partitioner);
+    while let Some(index) = smallest_input(&iterators, cmp) {
+        let (key, seq, tombstone, ttl, single_delete) = {
+            let iterator = &iterators[index];
+            (
+                iterator.user_key().to_vec(),
+                iterator.seq(),
+                iterator.is_tombstone(),
+                iterator.ttl(),
+                iterator.is_single_delete(),
+            )
+        };
+        if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl) {
+            let value = iterators[index].value()?;
+            let filter_removes = filter_eligible
+                && filter.as_ref().is_some_and(|f| {
+                    f(&key, &value) == crate::column_family::FilterDecision::Remove
+                });
+            if !(filter_removes && bottom) {
+                outputs.write(
+                    &key,
+                    &value,
+                    seq,
+                    ttl,
+                    tombstone || filter_removes,
+                    single_delete,
+                )?;
+            }
+        }
+        iterators[index].next();
+    }
+    outputs.finish()
+}
+
+fn install_compaction_outputs(
+    cf: &Arc<ColumnFamily>,
+    cmp: &ComparatorRef,
+    level: usize,
+    target: usize,
+    inputs: &[Arc<SstHandle>],
+    outputs: &[SstMeta],
+) {
+    let new_handles: Vec<Arc<SstHandle>> = outputs
+        .iter()
+        .map(|meta| cf.handle_for(meta.clone()))
+        .collect();
+    let input_ids: std::collections::HashSet<u64> =
+        inputs.iter().map(|table| table.meta.id).collect();
+    cf.update_levels(|levels| {
+        let needed = (target + 1).max(levels.len());
+        let mut updated = Vec::with_capacity(needed);
+        for index in 0..needed {
+            let mut tables: Vec<Arc<SstHandle>> = levels
+                .get(index)
+                .map(|tables| {
+                    tables
+                        .iter()
+                        .filter(|table| !input_ids.contains(&table.meta.id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if index == target {
+                tables.extend(new_handles.iter().cloned());
+                tables.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+            }
+            updated.push(tables);
+        }
+        debug_assert!(
+            {
+                let before: std::collections::HashSet<u64> =
+                    levels.iter().flatten().map(|table| table.meta.id).collect();
+                let after: std::collections::HashSet<u64> = updated
+                    .iter()
+                    .flatten()
+                    .map(|table| table.meta.id)
+                    .collect();
+                before.difference(&after).all(|id| input_ids.contains(id))
+            },
+            "compaction dropped a table that was not one of its inputs — that \
+             is committed data becoming unreachable (level={level} target={target})"
+        );
+        updated
+    });
+}
+
+fn remove_compaction_inputs(db: &DbInner, cf: &ColumnFamily, inputs: &[Arc<SstHandle>]) {
+    for table in inputs {
+        table.close();
+        db.remove_sst_file(&cf.klog_path(table.meta.id));
+        db.remove_sst_file(&format!("{}/{}.vlog", cf.dir(), table.meta.id));
+    }
+}
+
 /// Merge `inputs` from `level` into `target` and install the result.
 ///
 /// The caller owns input selection *and* the range lock covering every input —
@@ -523,313 +905,39 @@ pub(crate) fn compact_inputs(
     if inputs.is_empty() {
         return Ok(());
     }
-    let num_levels = cf.with_levels(|levels| levels.len()).max(target + 1);
 
-    let bottom = target >= num_levels - 1 && {
-        // bottom only if no level beyond target holds data
-        cf.with_levels(|levels| levels.iter().skip(target + 1).all(|l| l.is_empty()))
-    };
+    let num_levels = cf.with_levels(|levels| levels.len()).max(target + 1);
+    let bottom = target >= num_levels - 1
+        && cf.with_levels(|levels| levels.iter().skip(target + 1).all(|level| level.is_empty()));
     let oldest_snapshot = db.oldest_snapshot();
     let now = now_nanos();
     let filter = cf.compaction_filter();
-    // Snapshot the partition rules once for the whole run. A rule added
-    // concurrently (via `DB::add_partition_rule`) must not change this run's cut
-    // boundaries — it takes effect on the next bottom compaction. Only bottom
-    // output is cut on partitions, so upper-level runs need no snapshot.
-    // Snapshotted once per run for both schemes; see
-    // `ColumnFamily::partition_resolver_snapshot`.
+    // Only bottom output is partition-cut. Snapshot the resolver once so a
+    // concurrent rule addition cannot change boundaries during this run.
     let partitioner = if bottom {
         Some(cf.partition_resolver_snapshot()?)
     } else {
         None
     };
 
-    // Merge-iterate all inputs and write new output SSTables.
-    let mut its: Vec<SstIterator> = inputs
-        .iter()
-        .map(|t| t.reader().map(|r| r.iter()))
-        .collect::<Result<_>>()?;
-    for it in its.iter_mut() {
-        it.seek_to_first();
-    }
+    let outputs = merge_compaction_inputs(
+        db,
+        cf,
+        &cmp,
+        target,
+        &inputs,
+        bottom,
+        oldest_snapshot,
+        now,
+        filter,
+        partitioner,
+    )?;
+    install_compaction_outputs(cf, &cmp, level, target, &inputs, &outputs);
 
-    // Output is cut at `target_file_size`, held apart from `write_buffer_size`
-    // since 0.8.0 — it sets how many files a level holds, and therefore how
-    // finely the level below can be compacted.
-    let target_bytes = (cf.opts.target_file_size as u64).max(1);
-    let mut outputs: Vec<SstMeta> = Vec::new();
-    // (writer, klog, id, bytes, partition). `partition` is the partition every
-    // key in the current output file belongs to — only meaningful at the bottom
-    // level, where output is cut on partition boundaries; `None` elsewhere.
-    let mut writer: Option<(Writer, String, u64, u64, Option<String>)> = None;
-
-    // Age carried onto every output: the maximum `max_entry_time` over the
-    // inputs. Carrying it forward (rather than stamping "now") means compaction
-    // rewriting cold data does not reset its age, so a bottom part keeps
-    // qualifying for a tier move; an input that predates timestamps contributes
-    // nothing, and if no input has one the output's age stays unknown (`None`).
-    let carry_entry_time: Option<i64> = inputs.iter().filter_map(|h| h.meta.max_entry_time).max();
-
-    // Finish `writer`, stamping the accumulated partition and carried age onto
-    // its manifest record, and push it to `outputs`.
-    let finish_output = |writer: &mut Option<(Writer, String, u64, u64, Option<String>)>,
-                         outputs: &mut Vec<SstMeta>|
-     -> Result<()> {
-        if let Some((wr, _klog, id, _bytes, part)) = writer.take() {
-            let mut meta = wr.finish()?.to_sst_meta(id, target as u32);
-            meta.partition = part;
-            meta.max_entry_time = carry_entry_time;
-            outputs.push(meta);
-        }
-        Ok(())
-    };
-
-    let mut last_key: Option<Vec<u8>> = None;
-    let mut emitted_le_for_key = false;
-    // Boundary bytes of the key currently being written, so a change can be
-    // detected without re-resolving the previous key.
-    let mut last_boundary: Option<Vec<u8>> = None;
-    // Debug-only guard against a misimplemented consumer `PartitionFn`. The
-    // documented contract is that boundaries are prefix-determined and
-    // order-compatible: keys arrive in ascending user-key order, so once
-    // compaction leaves a boundary it must never see it again. A partitioner
-    // that violates this reopens a finalized part, producing a bottom SSTable
-    // that spans two partitions — precisely the corruption partitioning exists
-    // to prevent, and one every operation would report as success. Cheap to
-    // catch here, invisible in release builds.
-    #[cfg(debug_assertions)]
-    let mut finalized_boundaries: std::collections::HashSet<Vec<u8>> =
-        std::collections::HashSet::new();
-
-    loop {
-        // pick the smallest (user_key asc, seq desc) across iterators
-        let mut best: Option<usize> = None;
-        for (i, it) in its.iter().enumerate() {
-            if !it.valid() {
-                continue;
-            }
-            match best {
-                None => best = Some(i),
-                Some(b) => {
-                    let bi = &its[b];
-                    let ord = cmp
-                        .compare(it.user_key(), bi.user_key())
-                        .then_with(|| bi.seq().cmp(&it.seq()));
-                    if ord.is_lt() {
-                        best = Some(i);
-                    }
-                }
-            }
-        }
-        let Some(bi) = best else { break };
-
-        let (uk, seq, tomb, ttl) = {
-            let it = &its[bi];
-            (
-                it.user_key().to_vec(),
-                it.seq(),
-                it.is_tombstone(),
-                it.ttl(),
-            )
-        };
-
-        // Per-key version-collapse decision.
-        let new_key = last_key.as_deref() != Some(uk.as_slice());
-        if new_key {
-            last_key = Some(uk.clone());
-            emitted_le_for_key = false;
-        }
-        let mut keep = true;
-        if seq > oldest_snapshot {
-            keep = true; // a snapshot above may need this version
-        } else if !emitted_le_for_key {
-            emitted_le_for_key = true;
-            if tomb && bottom {
-                keep = false; // tombstone with nothing below: drop the key
-            }
-        } else {
-            keep = false; // older than the version visible to the oldest snapshot
-        }
-        // Expired entries can also be dropped at the bottom.
-        if keep && bottom && ttl != 0 && ttl <= now && !tomb {
-            keep = false;
-        }
-
-        if keep {
-            let value = its[bi].value()?;
-            // Compaction filter: only the newest surviving non-tombstone
-            // version at or below the oldest snapshot is eligible (newer
-            // versions stay protected; older ones were dropped above).
-            let mut write_tomb = tomb;
-            if !tomb && seq <= oldest_snapshot && (ttl == 0 || ttl > now) {
-                if let Some(f) = &filter {
-                    if f(&uk, &value) == crate::column_family::FilterDecision::Remove {
-                        if bottom {
-                            keep = false; // nothing below can resurface
-                        } else {
-                            // Emit a tombstone so versions in lower levels
-                            // stay shadowed until they compact away.
-                            write_tomb = true;
-                        }
-                    }
-                }
-            }
-            if keep {
-                // Bottom-level output is cut at partition boundaries so no
-                // bottom SSTable spans two partitions. Keys arrive in ascending
-                // user-key order, so a change in `partition_of` means we have
-                // crossed into a different partition: finish the current file
-                // (stamped with its partition) before opening the next. Upper
-                // levels leave `part = None`, so this never cuts there.
-                let part = match &partitioner {
-                    Some(p) => p.name_of(&uk),
-                    None => None,
-                };
-                // Cut on a change in the *boundary bytes*, not the name. For
-                // rules the two are equivalent (a name is a function of the
-                // matched prefix). For a derived scheme the boundary is the
-                // stronger test: it keeps a part a contiguous key range even
-                // if an implementation's `name` collides across boundaries,
-                // which is what detach/attach, freeze and tiering rely on.
-                if let Some((_, _, _, _, cur)) = writer.as_ref() {
-                    let crossed = match (&partitioner, last_boundary.as_deref()) {
-                        (Some(p), Some(prev)) => p.boundary(&uk) != Some(prev),
-                        (Some(p), None) => p.boundary(&uk).is_some(),
-                        (None, _) => false,
-                    };
-                    if crossed || *cur != part {
-                        // The boundary we are leaving is now sealed into a part.
-                        // Re-entering it later would mean the partitioner is not
-                        // order-compatible (see `finalized_boundaries`).
-                        #[cfg(debug_assertions)]
-                        if crossed {
-                            if let Some(prev) = &last_boundary {
-                                finalized_boundaries.insert(prev.clone());
-                            }
-                            if let Some(next) = partitioner.as_ref().and_then(|p| p.boundary(&uk)) {
-                                debug_assert!(
-                                    !finalized_boundaries.contains(next),
-                                    "PartitionFn is not order-compatible: boundary {next:?} \
-                                     reappeared after its part was finalized, which would make a \
-                                     bottom SSTable span two partitions"
-                                );
-                            }
-                        }
-                        finish_output(&mut writer, &mut outputs)?;
-                    }
-                }
-                last_boundary = partitioner
-                    .as_ref()
-                    .and_then(|p| p.boundary(&uk))
-                    .map(<[u8]>::to_vec);
-                if writer.is_none() {
-                    let id = db.next_file_id();
-                    let klog = cf.klog_path(id);
-                    let w = Writer::new(&klog, cf_writer_opts(cf, &cmp, target as u32))?;
-                    writer = Some((w, klog, id, 0, part));
-                }
-                let w = writer.as_mut().unwrap();
-                w.0.add(
-                    &uk,
-                    &value,
-                    seq,
-                    ttl,
-                    write_tomb,
-                    its[bi].is_single_delete(),
-                )?;
-                w.3 += (uk.len() + value.len()) as u64;
-                if w.3 >= target_bytes {
-                    finish_output(&mut writer, &mut outputs)?;
-                }
-            }
-        }
-
-        its[bi].next();
-    }
-    finish_output(&mut writer, &mut outputs)?;
-
-    // Handles for the new tables. Readers are NOT opened here: compaction
-    // output is often not read for a while, and opening it would put its index
-    // and bloom in memory on the writer's behalf.
-    let mut new_handles = Vec::new();
-    for meta in &outputs {
-        new_handles.push(cf.handle_for(meta.clone()));
-    }
-
-    // Build the new level set.
-    let input_ids: std::collections::HashSet<u64> = inputs.iter().map(|t| t.meta.id).collect();
-    cf.update_levels(|levels| {
-        let mut out: Vec<Vec<Arc<SstHandle>>> = Vec::new();
-        let needed = (target + 1).max(levels.len());
-        for i in 0..needed {
-            if i == level {
-                // Drop all inputs that came from this level. (Tables added
-                // concurrently — e.g. a flush landing in L0 — are kept.)
-                let mut kept: Vec<Arc<SstHandle>> = levels
-                    .get(i)
-                    .map(|l| {
-                        l.iter()
-                            .filter(|t| !input_ids.contains(&t.meta.id))
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if level == target {
-                    // In-place rewrite: the outputs replace the inputs here.
-                    kept.extend(new_handles.iter().cloned());
-                    kept.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
-                }
-                out.push(kept);
-            } else if i == target {
-                // Live state minus the inputs — never a pre-compaction
-                // snapshot, so a table that arrived while this compaction ran
-                // survives instead of being overwritten.
-                let mut lvl: Vec<Arc<SstHandle>> = levels
-                    .get(i)
-                    .map(|l| {
-                        l.iter()
-                            .filter(|t| !input_ids.contains(&t.meta.id))
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                lvl.extend(new_handles.iter().cloned());
-                lvl.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
-                out.push(lvl);
-            } else {
-                out.push(levels.get(i).cloned().unwrap_or_default());
-            }
-        }
-        // Silent loss is the failure mode this rebuild had, so make it loud:
-        // every table present before must either be a compaction input or
-        // still be here. Debug-only — it is O(tables) and the invariant is
-        // structural, not data-dependent.
-        debug_assert!(
-            {
-                let before: std::collections::HashSet<u64> =
-                    levels.iter().flatten().map(|t| t.meta.id).collect();
-                let after: std::collections::HashSet<u64> =
-                    out.iter().flatten().map(|t| t.meta.id).collect();
-                before.difference(&after).all(|id| input_ids.contains(id))
-            },
-            "compaction dropped a table that was not one of its inputs — that \
-             is committed data becoming unreachable (level={level} target={target})"
-        );
-        out
-    });
-
-    // Persist the manifest before deleting old files.
+    // Writer::finish has synced every output and its parent directory. Publish
+    // that new level set durably before any obsolete input can be unlinked.
     db.persist_manifest()?;
-
-    // Delete and evict the obsolete input files (deferred if a checkpoint/backup
-    // has paused deletions, so it can copy a consistent file set).
-    for th in &inputs {
-        th.close();
-        let klog = cf.klog_path(th.meta.id);
-        let vlog = format!("{}/{}.vlog", cf.dir(), th.meta.id);
-        db.remove_sst_file(&klog);
-        db.remove_sst_file(&vlog);
-    }
+    remove_compaction_inputs(db, cf, &inputs);
     Ok(())
 }
 
@@ -879,4 +987,55 @@ fn key_span(tables: &[Arc<SstHandle>], cmp: &ComparatorRef) -> (Vec<u8>, Vec<u8>
 
 fn ranges_overlap(cmp: &ComparatorRef, amin: &[u8], amax: &[u8], bmin: &[u8], bmax: &[u8]) -> bool {
     cmp.compare(amin, bmax).is_le() && cmp.compare(bmin, amax).is_le()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Retention, VersionRetention};
+    use crate::comparator::{default_comparator, CaseInsensitive, ComparatorRef};
+
+    #[test]
+    fn version_retention_preserves_snapshots_and_reclaims_bottom_debris() {
+        let mut bottom = VersionRetention::new(true, 10, 100, default_comparator());
+
+        assert_eq!(
+            bottom.decide(b"a", 12, true, 0),
+            Retention::Keep {
+                filter_eligible: false
+            }
+        );
+        assert_eq!(
+            bottom.decide(b"a", 10, false, 0),
+            Retention::Keep {
+                filter_eligible: true
+            }
+        );
+        assert_eq!(bottom.decide(b"a", 9, false, 0), Retention::Drop);
+        assert_eq!(bottom.decide(b"b", 8, true, 0), Retention::Drop);
+        assert_eq!(bottom.decide(b"c", 8, false, 99), Retention::Drop);
+
+        let mut upper = VersionRetention::new(false, 10, 100, default_comparator());
+        assert_eq!(
+            upper.decide(b"a", 10, true, 0),
+            Retention::Keep {
+                filter_eligible: false
+            }
+        );
+        assert_eq!(
+            upper.decide(b"b", 10, false, 99),
+            Retention::Keep {
+                filter_eligible: false
+            }
+        );
+
+        let folded: ComparatorRef = Arc::new(CaseInsensitive);
+        let mut custom = VersionRetention::new(false, 10, 100, folded);
+        assert!(matches!(
+            custom.decide(b"A", 10, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert_eq!(custom.decide(b"a", 9, false, 0), Retention::Drop);
+    }
 }

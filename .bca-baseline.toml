@@ -11,18 +11,6 @@ version = 6
 tier = "hard"
 
 [[entry]]
-path = "src/compaction.rs"
-qualified = "compact_inputs"
-metric = "cognitive"
-value = 107.0
-
-[[entry]]
-path = "src/compaction.rs"
-qualified = "compact_inputs"
-metric = "cyclomatic"
-value = 46.0
-
-[[entry]]
 path = "src/error.rs"
 qualified = "OndaError::code"
 metric = "cyclomatic"

@@ -3,9 +3,7 @@
     "dirty": false,
     "revision": "6445ebe09a8e8df477806225121cccdf0d96c73a"
   },
-  "long_functions": {
-    "src/compaction.rs::compact_inputs": 321
-  },
+  "long_functions": {},
   "schema": "ondadb.metrics-baseline.v1",
   "tools": {
     "bca": "2.1.0",
