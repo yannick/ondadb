@@ -26,7 +26,12 @@ use crate::util::{coarse_now_nanos, now_nanos};
 use crate::wal::{self, Wal};
 use smallvec::SmallVec;
 
-const DATA_BLOCK_SIZE: usize = 4 << 10;
+/// The default target size of an SSTable data block.
+///
+/// No longer the only value: `ColumnFamilyConfig::data_block_size` overrides
+/// it per family, and this is what that field defaults to, so a config that
+/// never mentions it writes exactly what every earlier release wrote.
+pub(crate) const DEFAULT_DATA_BLOCK_SIZE: usize = 4 << 10;
 
 /// One operation visible to a commit hook.
 #[derive(Debug, Clone)]
@@ -864,7 +869,7 @@ impl ColumnFamily {
             enable_bloom: self.opts.enable_bloom_filter,
             bloom_fpr: self.opts.bloom_fpr,
             klog_value_threshold: self.opts.klog_value_threshold,
-            block_size: DATA_BLOCK_SIZE,
+            block_size: self.opts.data_block_size,
             expected_entries: expected,
             use_btree: self.opts.use_btree,
             restart_interval: crate::sst::RESTART_INTERVAL,

@@ -442,6 +442,32 @@ pub struct ColumnFamilyConfig {
     pub min_levels: u32,
     pub dividing_level_offset: i32,
     pub klog_value_threshold: usize,
+    /// Target size of an SSTable data block, in bytes. Default `4 << 10`.
+    ///
+    /// The writer cuts a block once it *exceeds* this target
+    /// (`sst/writer.rs`), so a single value larger than the target gets a
+    /// block to itself — and a block is the compression unit. A store whose
+    /// values are all bigger than the target therefore compresses every value
+    /// alone, with no shared window, however good the algorithm is.
+    ///
+    /// Measured by spadino on 99,996 real news articles (SPADINO-A10.md):
+    /// raising this from 4 KiB to 64 KiB took **12.8%** off the whole store,
+    /// and 11–15% off each of the five lanes that matter — it is not one
+    /// family's problem. Seals got faster too (39.7 s → 35.9 s) and full
+    /// compaction much faster (23.8 s → 15.8 s): fewer, larger compression
+    /// calls beat many small ones.
+    ///
+    /// The cost is read amplification — a point read decompresses a whole
+    /// block — which is why this is PER FAMILY. A consumer can take the bytes
+    /// on the families it scans and keep a small block on the families it
+    /// point-reads. Spadino measured +1.2..7.3% on p50 query latency at 64 KiB,
+    /// warm on local NVMe.
+    ///
+    /// Purely a write-side policy, like `compression_rules` and
+    /// `partition_rules`: blocks are self-describing and carry their own
+    /// length, so changing this rewrites nothing and existing tables keep
+    /// whatever they were written with.
+    pub data_block_size: usize,
     pub compression: Compression,
     /// Per-level override of `compression`. Empty = use `compression` for
     /// every level. Otherwise level L uses `compression_per_level[min(L,
@@ -577,6 +603,7 @@ impl Default for ColumnFamilyConfig {
             min_levels: 1,
             dividing_level_offset: 1,
             klog_value_threshold: 512, // WiscKey separation threshold
+            data_block_size: crate::column_family::DEFAULT_DATA_BLOCK_SIZE,
             compression: Compression::None,
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
@@ -604,8 +631,8 @@ impl Default for ColumnFamilyConfig {
             compaction_style: CompactionStyle::Leveled,
             fifo_max_bytes: 0,
             fifo_ttl: Duration::ZERO,
-            target_file_size: 16 << 20,      // 16 MiB
-            l1_base_bytes: 256 << 20,        // 256 MiB => ~16 files in L1
+            target_file_size: 16 << 20,             // 16 MiB
+            l1_base_bytes: 256 << 20,               // 256 MiB => ~16 files in L1
             soft_pending_compaction_bytes: 2 << 30, // 2 GiB
             hard_pending_compaction_bytes: 8 << 30, // 8 GiB
         }
@@ -915,6 +942,12 @@ impl ColumnFamilyConfig {
         if self.target_file_size == 0 {
             return Err("target_file_size must be non-zero".to_string());
         }
+        // The writer's own `0 => DEFAULT_BLOCK_SIZE` fallback would otherwise
+        // accept the setting and silently ignore it, which is the worst of
+        // both: configured, and not in effect.
+        if self.data_block_size == 0 {
+            return Err("data_block_size must be non-zero".to_string());
+        }
         if self.l1_base_bytes == 0 {
             return Err("l1_base_bytes must be non-zero".to_string());
         }
@@ -1073,6 +1106,16 @@ impl ColumnFamilyConfig {
             append_u64(&mut b, self.soft_pending_compaction_bytes);
             append_u64(&mut b, self.hard_pending_compaction_bytes);
         }
+
+        // The data block size, in its own tagged tail for the same reason as
+        // every tail above: a reader that predates it stops at a magic it does
+        // not know and keeps the struct default. Emitted only when it differs
+        // from that default, so a config that never touched it encodes
+        // byte-for-byte as earlier releases wrote it.
+        if self.data_block_size != d.data_block_size {
+            b.extend_from_slice(CONFIG_BLOCK_SIZE_MAGIC);
+            append_u64(&mut b, self.data_block_size as u64);
+        }
         b
     }
 
@@ -1104,6 +1147,8 @@ const CONFIG_OVERFLOW_MAGIC: &[u8; 8] = b"ONDAOVF1";
 const CONFIG_PARTITION_FN_MAGIC: &[u8; 8] = b"ONDAPFN1";
 /// Tag introducing the 0.8.0 compaction-geometry tail.
 const CONFIG_COMPACTION_MAGIC: &[u8; 8] = b"ONDACMP1";
+/// Tag introducing the per-family data-block-size tail.
+const CONFIG_BLOCK_SIZE_MAGIC: &[u8; 8] = b"ONDABLK1";
 
 fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     use crate::encoding::{read_u32, read_u64, uvarint};
@@ -1245,7 +1290,8 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     let Some(rest) = p.strip_prefix(CONFIG_OVERFLOW_MAGIC) else {
         // No overflow section; the derived-partitioner tail may still follow.
         let p = read_partition_fn_tail(p, cfg);
-        read_compaction_tail(p, cfg);
+        let p = read_compaction_tail(p, cfg);
+        read_block_size_tail(p, cfg);
         return Some(());
     };
     p = rest;
@@ -1327,7 +1373,8 @@ fn decode_into(mut p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         });
     }
     let p = read_partition_fn_tail(p, cfg);
-    read_compaction_tail(p, cfg);
+    let p = read_compaction_tail(p, cfg);
+    read_block_size_tail(p, cfg);
     Some(())
 }
 
@@ -1363,10 +1410,10 @@ fn read_partition_fn_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a 
 /// Consume the 0.8.0 compaction-geometry tail if present. Absent (every
 /// manifest written before 0.8.0, and any config left at the defaults), the
 /// struct defaults stand.
-fn read_compaction_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+fn read_compaction_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     use crate::encoding::read_u64;
     let Some(mut rest) = p.strip_prefix(CONFIG_COMPACTION_MAGIC) else {
-        return;
+        return p;
     };
     let mut next = || -> Option<u64> {
         if rest.len() < 8 {
@@ -1379,12 +1426,31 @@ fn read_compaction_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
     // All four or none: a truncated tail leaves every field at its default
     // rather than applying a half-read geometry.
     let (Some(tfs), Some(l1), Some(soft), Some(hard)) = (next(), next(), next(), next()) else {
-        return;
+        return p;
     };
     cfg.target_file_size = tfs as usize;
     cfg.l1_base_bytes = l1;
     cfg.soft_pending_compaction_bytes = soft;
     cfg.hard_pending_compaction_bytes = hard;
+    rest
+}
+
+/// Consume the data-block-size tail if present. Absent (every manifest written
+/// before it, and any config left at the default), the struct default stands.
+fn read_block_size_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    use crate::encoding::read_u64;
+    let Some(rest) = p.strip_prefix(CONFIG_BLOCK_SIZE_MAGIC) else {
+        return;
+    };
+    if rest.len() < 8 {
+        return;
+    }
+    let v = read_u64(rest) as usize;
+    // A zero here would be a truncated or corrupt tail, and the writer's own
+    // `0 => DEFAULT` fallback would hide it. Keep the default instead.
+    if v != 0 {
+        cfg.data_block_size = v;
+    }
 }
 
 #[cfg(test)]
@@ -1912,7 +1978,10 @@ mod per_level_tests {
         let def = ColumnFamilyConfig::default();
         assert_eq!(d.target_file_size, def.target_file_size);
         assert_eq!(d.l1_base_bytes, def.l1_base_bytes);
-        assert_eq!(d.hard_pending_compaction_bytes, def.hard_pending_compaction_bytes);
+        assert_eq!(
+            d.hard_pending_compaction_bytes,
+            def.hard_pending_compaction_bytes
+        );
     }
 
     /// The geometry tail must survive alongside the tails that precede it.
@@ -1939,5 +2008,85 @@ mod per_level_tests {
             ..ColumnFamilyConfig::default()
         };
         assert!(bad.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod block_size_tests {
+    use super::*;
+
+    /// A config that never sets the field encodes exactly as every earlier
+    /// release did — the property that lets this ship without a format bump.
+    #[test]
+    fn a_default_config_emits_no_block_size_tail() {
+        let blob = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            ..ColumnFamilyConfig::default()
+        }
+        .encode();
+        assert!(
+            !blob
+                .windows(CONFIG_BLOCK_SIZE_MAGIC.len())
+                .any(|w| w == CONFIG_BLOCK_SIZE_MAGIC),
+            "a default config must not emit the block-size tail"
+        );
+    }
+
+    #[test]
+    fn a_set_block_size_round_trips() {
+        let c = ColumnFamilyConfig {
+            data_block_size: 64 << 10,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(
+            ColumnFamilyConfig::decode(&c.encode()).data_block_size,
+            64 << 10
+        );
+    }
+
+    /// A manifest written before this field decodes to the default rather than
+    /// to zero, which the writer would silently replace with its own default —
+    /// configured, and not in effect.
+    #[test]
+    fn a_manifest_without_the_tail_decodes_to_the_default() {
+        let legacy = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            target_file_size: 8 << 20,
+            ..ColumnFamilyConfig::default()
+        }
+        .encode();
+        let d = ColumnFamilyConfig::decode(&legacy);
+        assert_eq!(
+            d.data_block_size,
+            ColumnFamilyConfig::default().data_block_size
+        );
+        // And the tail that PRECEDES it still decodes, so the chain is intact.
+        assert_eq!(d.target_file_size, 8 << 20);
+    }
+
+    /// The tail must survive alongside the ones before it — the same property
+    /// `compaction_tail_coexists_with_partition_fn_tail` asserts one level up.
+    #[test]
+    fn the_block_size_tail_coexists_with_the_tails_before_it() {
+        let c = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Unresolved("byhash".into()),
+            target_file_size: 2 << 20,
+            data_block_size: 16 << 10,
+            ..ColumnFamilyConfig::default()
+        };
+        let d = ColumnFamilyConfig::decode(&c.encode());
+        assert_eq!(d.data_block_size, 16 << 10);
+        assert_eq!(d.target_file_size, 2 << 20);
+        assert!(matches!(d.partition_scheme, PartitionScheme::Unresolved(ref n) if n == "byhash"));
+    }
+
+    #[test]
+    fn a_zero_block_size_is_rejected_rather_than_silently_defaulted() {
+        let c = ColumnFamilyConfig {
+            data_block_size: 0,
+            ..ColumnFamilyConfig::default()
+        };
+        let err = c.validate().expect_err("zero must not validate");
+        assert!(err.contains("data_block_size"), "{err}");
     }
 }

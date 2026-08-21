@@ -213,14 +213,19 @@ mod tests {
     fn disjoint_ranges_are_held_concurrently() {
         let l = locks();
         let _a = l.try_acquire(r("a", "c")).expect("first");
-        let _b = l.try_acquire(r("d", "f")).expect("disjoint must not conflict");
+        let _b = l
+            .try_acquire(r("d", "f"))
+            .expect("disjoint must not conflict");
     }
 
     #[test]
     fn overlapping_ranges_conflict() {
         let l = locks();
         let _a = l.try_acquire(r("a", "m")).expect("first");
-        assert!(l.try_acquire(r("f", "z")).is_none(), "overlap must conflict");
+        assert!(
+            l.try_acquire(r("f", "z")).is_none(),
+            "overlap must conflict"
+        );
     }
 
     /// Inclusive bounds: sharing exactly one key is still an overlap. A
@@ -230,7 +235,10 @@ mod tests {
     fn touching_bounds_overlap() {
         let l = locks();
         let _a = l.try_acquire(r("a", "m")).expect("first");
-        assert!(l.try_acquire(r("m", "z")).is_none(), "shared bound overlaps");
+        assert!(
+            l.try_acquire(r("m", "z")).is_none(),
+            "shared bound overlaps"
+        );
     }
 
     #[test]
