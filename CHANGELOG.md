@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.8.2
+
+**August 2026 code-review corrective release.** This release closes the five
+highest-severity findings, hardens recovery and transaction edge cases, and
+incorporates the published 0.8.1 per-column-family data-block-size work while
+preserving the `v0.8.1` release ancestry.
+
+### Correctness and durability
+
+- Backup, checkpoint, and column-family clone now resolve tiered tables and
+  create self-contained, durable default-tier copies. Their manifests no
+  longer point at source-tier objects that were not copied.
+- Classic and by-reference part attach validate input tables against each
+  other as well as live bottom-level tables. Mutually overlapping input is
+  routed to overlap-tolerant L0 instead of violating leveled-read ordering.
+- Attach finishes and syncs destination storage before its manifest flip.
+- Newly created WAL stripes fsync their parent directory, closing the crash
+  window in which an acknowledged full-sync commit could lose its directory
+  entry.
+- Transactions spanning more than one column family are now rejected in the
+  per-CF WAL layout. Use `unified_memtable = true` when atomic cross-CF commits
+  are required; unified mode records the entire commit in one WAL frame.
+
+### Recovery, transactions, and operations
+
+- Startup removes unreferenced SST output left in the default tier by a crash;
+  the documented named-tier/S3 orphan-GC gaps remain.
+- Manifest levels above 64 are rejected before allocation.
+- Serializable savepoint rollback now discards later read dependencies, and
+  transaction reset preserves the caller's publication floor.
+- Thread-local commit floors use stable database instance ids rather than
+  reusable allocation addresses.
+- Exact transaction-overlay ties have an explicit, tested overlay-first rule.
+- `flush_memtable(cf)` waits only for that CF's flushes, and background
+  compaction honors `num_compaction_threads`.
+- `CfStats` now reports a compaction failure count and latest error instead of
+  silently discarding failures.
+
+### Performance and configuration
+
+- Unified bytewise iteration uses lazy prefix-bounded cursors instead of
+  cloning the entire shared memtable. The review probe's median iterator setup
+  fell from 51,439 ns to 1,864 ns (27.6x); custom comparators retain the
+  materialized re-sort required by their ordering.
+- From 0.8.1, `ColumnFamilyConfig::data_block_size` controls flush, ingestion,
+  and compaction output per family. It defaults to the historical 4 KiB and is
+  persisted in the optional `ONDABLK1` config tail; existing SSTables remain
+  self-describing and require no migration.
+- Inactive public tuning fields are now documented as reserved/ignored rather
+  than implying mechanisms that do not exist. `single_delete` documentation
+  states its current conservative tombstone behavior.
+
+The complete finding-by-finding disposition, including measured no-change and
+deferred architectural items, is in
+[`docs/code-review-2026-08-resolution.md`](docs/code-review-2026-08-resolution.md).
+
+## 0.8.1
+
+**Per-family data block size (SPADINO-A10).** Added
+`ColumnFamilyConfig::data_block_size`, defaulting to the historical 4 KiB, as a
+write-side policy used by flush, ingestion, and compaction. The optional
+`ONDABLK1` config tail preserves non-default values without changing legacy
+default encodings.
+
 ## 0.8.0
 
 **Sustained writes.** Compaction jobs are bounded, writers pace against
