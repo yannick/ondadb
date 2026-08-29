@@ -7,7 +7,7 @@
 //! `parking_lot` `Mutex`/`Condvar`.
 
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
@@ -225,6 +225,9 @@ pub struct ColumnFamily {
     cond: Condvar,
 
     pub(crate) flushing: AtomicBool,
+    /// Per-family flush jobs queued or running. Manual flush waits use this
+    /// instead of the database-wide queue so unrelated CFs cannot delay them.
+    pub(crate) pending_flushes: AtomicUsize,
     pub(crate) compacting: AtomicBool,
     /// Serializes compaction runs on this CF. Two concurrent runs each
     /// snapshot the level set, merge, and `replace_levels` — the loser's
@@ -399,6 +402,7 @@ impl ColumnFamily {
             }),
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
+            pending_flushes: AtomicUsize::new(0),
             compacting: AtomicBool::new(false),
             compact_mu: Mutex::new(()),
             range_locks: crate::range_lock::RangeLocks::new(cmp.clone()),
@@ -521,6 +525,7 @@ impl ColumnFamily {
             }),
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
+            pending_flushes: AtomicUsize::new(0),
             compacting: AtomicBool::new(false),
             compact_mu: Mutex::new(()),
             range_locks: crate::range_lock::RangeLocks::new(cmp.clone()),
@@ -761,6 +766,7 @@ impl ColumnFamily {
 
         // Enqueue for the flush worker (which drains the queue on shutdown).
         self.ctx.pending_flush.fetch_add(1, Ordering::SeqCst);
+        self.pending_flushes.fetch_add(1, Ordering::SeqCst);
         if self
             .ctx
             .flush_tx
@@ -771,6 +777,7 @@ impl ColumnFamily {
             .is_err()
         {
             self.ctx.pending_flush.fetch_sub(1, Ordering::SeqCst);
+            self.pending_flushes.fetch_sub(1, Ordering::SeqCst);
         }
     }
 

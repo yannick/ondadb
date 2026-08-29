@@ -969,7 +969,14 @@ impl DB {
     /// flush is enqueued and drained).
     pub fn flush_memtable(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
         cf.rotate_memtable(true);
-        while self.inner.pending_flush.load(Ordering::SeqCst) > 0 {
+        let pending = || {
+            if self.inner.unified.is_some() {
+                self.inner.pending_flush.load(Ordering::SeqCst)
+            } else {
+                cf.pending_flushes.load(Ordering::SeqCst)
+            }
+        };
+        while pending() > 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -1315,7 +1322,10 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
 
 fn process_flush_job(db: &Arc<DbInner>, job: FlushJob) {
     match job {
-        FlushJob::PerCf { cf, imm } => flush_per_cf(db, cf, imm),
+        FlushJob::PerCf { cf, imm } => {
+            flush_per_cf(db, cf.clone(), imm);
+            cf.pending_flushes.fetch_sub(1, Ordering::SeqCst);
+        }
         FlushJob::Unified { imm } => flush_unified(db, imm),
     }
     db.pending_flush.fetch_sub(1, Ordering::SeqCst);
@@ -1384,6 +1394,39 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_memtable_waits_only_for_target_cf() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let a = db
+            .create_column_family("a", ColumnFamilyConfig::default())
+            .unwrap();
+        let _b = db
+            .create_column_family("b", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&a, b"key", b"value", Duration::ZERO).unwrap();
+
+        // Stand in for a queued flush belonging to B. The target-A wait must
+        // complete without depending on this database-wide accounting entry.
+        db.inner.pending_flush.fetch_add(1, Ordering::SeqCst);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                done_tx.send(db.flush_memtable(&a)).unwrap();
+            });
+            let completed = done_rx.recv_timeout(Duration::from_secs(1));
+            // Always release the artificial work before asserting, so the old
+            // implementation can exit and the scoped thread cannot deadlock.
+            db.inner.pending_flush.fetch_sub(1, Ordering::SeqCst);
+            assert!(
+                completed.is_ok(),
+                "flush_memtable(A) waited for unrelated CF B work"
+            );
+            completed.unwrap().unwrap();
+        });
+        db.close().unwrap();
+    }
 
     #[test]
     fn flush_compaction_schedule_respects_style_trigger_and_close() {
