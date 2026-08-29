@@ -402,6 +402,7 @@ impl DB {
         }
 
         let visible = self.inner.visible_seq();
+        let default_storage = cf.tiers().storage_for(None);
         // (handle, at_bottom). Built and validated before anything is installed.
         let mut staged: Vec<(Arc<SstHandle>, bool)> = Vec::new();
         let mut staged_bottom: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -416,12 +417,12 @@ impl DB {
                 let new_id = self.inner.next_file_id();
                 let dst_klog = cf.klog_path(new_id);
                 let dst_vlog = vlog_path_for(&dst_klog);
-                std::fs::copy(&src_klog, &dst_klog)?;
                 copied.push(dst_klog.clone());
+                copy_into_storage(Path::new(&src_klog), &dst_klog, &default_storage)?;
                 let has_vlog = Path::new(&src_vlog).exists();
                 if has_vlog {
-                    std::fs::copy(&src_vlog, &dst_vlog)?;
                     copied.push(dst_vlog.clone());
+                    copy_into_storage(Path::new(&src_vlog), &dst_vlog, &default_storage)?;
                 }
 
                 // Open on the default tier: this validates footer magic + the
@@ -480,7 +481,7 @@ impl DB {
         if let Err(e) = result {
             // Roll back: nothing was installed, so unlink the copies we made.
             for p in &copied {
-                let _ = std::fs::remove_file(p);
+                let _ = default_storage.delete(p);
             }
             return Err(e);
         }
@@ -1088,6 +1089,44 @@ fn eligible_part_target<'a>(rules: &'a [TierRule], part: &BottomPart, now: i64) 
 }
 
 #[cfg(test)]
+mod attach_copy_tests {
+    use std::io::Write;
+
+    use super::copy_into_writer;
+    use crate::error::OndaError;
+    use crate::storage::StorageWriter;
+
+    struct FailingFinishWriter(Vec<u8>);
+
+    impl Write for FailingFinishWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl StorageWriter for FailingFinishWriter {
+        fn finish(self: Box<Self>) -> crate::Result<()> {
+            Err(std::io::Error::other("injected finish failure").into())
+        }
+    }
+
+    #[test]
+    fn attach_copy_propagates_storage_finish_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.klog");
+        std::fs::write(&src, b"sst bytes").unwrap();
+
+        let err = copy_into_writer(&src, Box::new(FailingFinishWriter(Vec::new())))
+            .expect_err("attach copy must not publish an unfinished object");
+        assert!(matches!(err, OndaError::Io(_)));
+    }
+}
+
+#[cfg(test)]
 mod mover_policy_tests {
     use std::time::Duration;
 
@@ -1279,6 +1318,23 @@ fn copy_to_storage(
     copied()?;
     dst.finish()?;
     Ok(())
+}
+
+fn copy_into_storage(
+    from: &Path,
+    to: &str,
+    storage: &Arc<dyn crate::storage::Storage>,
+) -> Result<()> {
+    copy_into_writer(from, storage.create(to)?)
+}
+
+fn copy_into_writer(
+    from: &Path,
+    mut writer: Box<dyn crate::storage::StorageWriter>,
+) -> Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    std::io::copy(&mut src, &mut *writer)?;
+    writer.finish()
 }
 
 fn observe_move(
