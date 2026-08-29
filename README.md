@@ -2,18 +2,20 @@
 
 A safe, performance-focused **Rust** key/value LSM storage engine.
 Single crate, synchronous API, std threads + crossbeam (no async runtime),
-`#![forbid(unsafe_code)]` by default.
+unsafe code denied by default, with one audited Linux coarse-clock call.
 
 ## Highlights
 
-- **100% safe Rust by default** (`#![forbid(unsafe_code)]`); two opt-in fast-path
-  features add small, documented `unsafe` regions for mmap reads and an arena
-  memtable — see [Builds](#builds).
+- **Safe Rust data structures by default** (`#![deny(unsafe_code)]`); one audited
+  Linux `clock_gettime` call serves coarse TTL checks. Two opt-in fast-path
+  features add documented `unsafe` regions for mmap reads and an arena memtable
+  — see [Builds](#builds).
 - **Column families** — isolated, independently configured key/value stores, each
   with its own memtable, WAL and LSM levels.
 - **MVCC transactions** — five isolation levels, savepoints, post-commit hooks,
   and bidirectional snapshot-consistent iterators, with write-conflict detection
-  on Snapshot/Serializable.
+  on Snapshot/Serializable. Cross-column-family atomic commits require unified
+  memtable mode; per-CF WAL mode rejects them rather than exposing partial state.
 - **Tiered storage, including S3** — hot data lives on local SSD; aged bottom
   parts are pushed to a second disk, an NFS-style mount, or an S3-compatible
   object store (cargo feature `s3`) and read back through bounded HTTP range GETs
@@ -160,10 +162,11 @@ concepts, worked examples, S3 setup and operational notes.
   WAL syncs (so a `SyncMode::Full` consumer can *verify*, not assume) and
   `DB::column_family_config(name)` returns a CF's effective durable configuration.
 - **Observability** — `approximate_len()`, per-CF read counters (point reads,
-  bloom-filter skips, SSTable probes), cache hit/miss stats, `DB::reader_memory`
-  and `DB::table_cache_bytes()`.
-- **Maintenance** — checkpoint (hard-link), backup (copy), column-family clone,
-  per-CF and database stats. See [`docs/architecture.md`](docs/architecture.md).
+  bloom-filter skips, SSTable probes), compaction failure count/latest error,
+  cache hit/miss stats, `DB::reader_memory` and `DB::table_cache_bytes()`.
+- **Maintenance** — checkpoint, backup, and column-family clone resolve tiered
+  tables and materialize self-contained default-tier copies, plus per-CF and
+  database stats. See [`docs/architecture.md`](docs/architecture.md).
 
 ### Modes
 
@@ -182,7 +185,7 @@ independent object-store feature:
 
 | Feature | `unsafe` | What it adds |
 |---------|----------|--------------|
-| **default** | none (`#![forbid(unsafe_code)]`) | lock-free `crossbeam-skiplist` memtable, group-commit WAL, LRU caches, zero-allocation iterator |
+| **default** | one audited Linux clock call (`#![deny(unsafe_code)]`) | lock-free `crossbeam-skiplist` memtable, group-commit WAL, LRU caches, zero-allocation iterator |
 | **`mmap-reads`** | one contained region | `mmap` zero-copy SSTable/vlog reads (helps point reads and SST-resident scans) |
 | **`arena-memtable`** | one contained region | arena-backed skip-list memtable (chunked arena, one writer per shard, lock-free readers) |
 | **`unsafe-fastpath`** | both regions | back-compat alias enabling `mmap-reads` + `arena-memtable` together |
@@ -241,6 +244,9 @@ txn.set_savepoint("sp")?;
 txn.put(&cf, b"b", b"2", Duration::ZERO)?;
 txn.rollback_to_savepoint("sp")?;                  // drops "b"
 txn.commit()?;
+
+// A transaction spanning multiple CFs is atomic only in unified-memtable
+// mode. Per-CF WAL mode rejects such a commit with InvalidArgs.
 
 // Iteration (bidirectional, snapshot-consistent).
 let mut txn = db.begin();
@@ -328,7 +334,9 @@ layout. `unified_memtable_stall_threshold` (default 6) bounds sealed memtables
 when flush falls behind.
 
 Point reads work under any per-CF comparator (exact prefixed-key lookup); ordered
-iteration and flush re-sort a CF's slice with that CF's comparator. Implemented in
+iteration over bytewise CFs uses lazy prefix-bounded cursors without cloning the
+shared memtable. Custom-comparator CFs materialize and re-sort their slice to restore
+that comparator's order. Split flushes likewise re-sort per CF. Implemented in
 [`src/unified.rs`](src/unified.rs).
 
 ## Storage tiers & S3

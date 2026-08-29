@@ -165,9 +165,10 @@ assert_eq!(fcf.name(), "default"); // only the log part's data is inside
 `freeze_part` doubles as a non-destructive probe: it returns
 `OndaError::NotFound` when no bottom part carries that partition name.
 
-Limitation: detach/attach/freeze move and link files with `std::fs`, so they
-operate on parts resident on the **default tier**. A part already moved to a
-remote tier cannot be detached or frozen in 0.3.0.
+Limitation: detach and freeze use local filesystem moves/links and therefore
+operate on parts resident on the **default tier**. Classic attach reads a local
+detached directory and writes durable copies through the default-tier storage
+backend. A part already moved to a remote tier cannot be detached or frozen.
 
 ## Describing a part: `export_part`
 
@@ -500,11 +501,18 @@ layer above the engine. Consequence: an S3 bucket alone is not a backup — a
 usable copy of a tiered database is the DB directory (manifest + WAL + hot
 parts) *plus* the tier objects.
 
+`DB::backup`, `DB::checkpoint`, and `DB::clone_column_family` are the exception
+to that operational shorthand: each resolves every source table through its
+configured tier, writes a durable copy into the destination's default tier,
+and clears the copied table's tier/object metadata. Their output is therefore
+self-contained and reopens without the source tier configuration or objects.
+
 **Crash residue & the S3 leak gap.** A crash mid-move strands either a copy
 on the target tier (before the manifest flip) or the source files (after
-it). On **local** tiers, `DB::open` sweeps both cases automatically (it
-deletes any manifest-known table id found on the wrong tier). The sweep
-walks directories with `std::fs`, so it does **not** cover S3; likewise,
+it). On the **default tier**, `DB::open` also deletes unreferenced SST file
+pairs left by a crash before a manifest install. On named local tiers it
+sweeps manifest-known table ids found on the wrong tier. These sweeps walk
+directories with `std::fs`, so they do **not** cover S3; likewise,
 compaction's obsolete-input deletion resolves default-tier paths, so
 compacting or re-cutting an S3-resident part strands its old objects.
 Both gaps leak *storage only* — the manifest is the source of truth, reads

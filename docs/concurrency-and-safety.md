@@ -1,10 +1,11 @@
 # Concurrency & safety
 
-The default build is `#![forbid(unsafe_code)]`. The `unsafe-fastpath` feature
-lifts that for exactly two modules — `memtable_arena.rs` and the mmap paths in
-`sst/reader.rs` / `sst/mod.rs` — whose contracts are spelled out below. Adding
-`unsafe` anywhere else needs a documented contract here and a strong measured
-justification.
+The default build is `#![deny(unsafe_code)]`, with one localized audited
+exception for Linux `clock_gettime(CLOCK_REALTIME_COARSE)` in `util.rs`. The
+`unsafe-fastpath` feature additionally permits exactly two implementation areas
+— `memtable_arena.rs` and the mmap paths in `sst/reader.rs` / `sst/mod.rs` —
+whose contracts are spelled out below. Adding unsafe anywhere else needs a
+documented contract here and a strong measured justification.
 
 ## Fail-stop poisoning (`util::Poison`)
 
@@ -41,7 +42,7 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   so while another thread's earlier-reserved commit is in flight, a thread's
   own completed commit sits *above* the watermark and a ReadCommitted `get()`
   right after `put()` returned the PREVIOUS value. `THREAD_COMMIT_FLOOR` (a
-  thread-local keyed by `DbInner` address) gives ReadCommitted point reads and
+  thread-local keyed by a process-monotonic `DbInner::instance_id`) gives ReadCommitted point reads and
   iterators `max(visible_seq, own_floor)`. Fixed-snapshot levels keep the
   gap-free watermark on purpose — the floor may sit inside a publication gap,
   which is acceptable for read-committed but not for repeatable reads.
@@ -95,11 +96,6 @@ argument has a hole or the race is elsewhere in the traversal — `cmp_node`'s
 8-byte prefix shortcut and the shard selection used by `put` versus `get` are
 the two unexamined candidates.
 
-One latent hazard noticed while reading, independent of this failure and not
-demonstrated to cause it: `db_key()` keys `THREAD_COMMIT_FLOOR` by `DbInner`
-*address*, so a dropped DB whose allocation is reused would hand a stale
-read floor to its successor.
-
 ## Lock inventory (order within = acquisition order; never invert)
 
 | Lock | Guards | Held across |
@@ -110,7 +106,8 @@ read floor to its successor.
 | `DbInner::file_deletion` | deferred-SST-delete state | short; `pause_deletions` returns an RAII guard |
 | `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating` | gate checks, rotation drain |
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
-| `ColumnFamily::compact_mu` (Mutex) | level-structure rewrites | a whole compaction run; also `detach_part`/`attach_part`/`relocate_part` (they snapshot + rewrite the bottom level, so they must not race a compaction). NB: a part move holds it across the copy to the target tier — on a remote (S3) tier that is network time, during which this CF cannot compact |
+| `ColumnFamily::compact_mu` (Mutex) | whole-CF compaction operations | manual compaction sweep and FIFO eviction; acquired before the whole-keyspace range lock |
+| `ColumnFamily::range_locks` | key ranges being rewritten | bounded compaction jobs use non-blocking acquisition; attach takes the whole keyspace; detach and part moves block on the affected partition span, including copy + manifest flip |
 | `ColumnFamily::live_partition_rules` (RwLock) | the live partition-rule set | `append_partition_rule` validates + appends under one write acquisition (concurrent duplicate adds: exactly one wins); released **before** `persist_manifest`, which re-reads the rules via `effective_config` |
 | `Wal::qstate` / per-stripe file mutexes | group-commit queue / file appends | one frame write |
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
@@ -148,7 +145,7 @@ writer's predicate check and its condition-variable wait.
 
 ## Memtable
 
-256 shards (`NUM_SHARDS`), routed by `xxh3(user_key)`. Default build: one
+16 shards (`NUM_SHARDS`), routed by `xxh3(user_key)`. Default build: one
 `crossbeam_skiplist::SkipMap<IKey, Val>` per shard (lock-free); `IKey` avoids
 a comparator `Arc` clone and virtual calls for the byte-wise default.
 `put_batch` counting-sorts a committed batch into per-shard runs and updates
@@ -169,7 +166,7 @@ the shared `approx_size`/`num_entries`/`max_seq` atomics **once per batch**.
   split at `klen`), plus an inline `kprefix: u64` (zero-padded big-endian
   first 8 key bytes) and `nseq: u64` so most probes never touch `data`'s
   cache line. `MAX_HEIGHT = 8` (shards are bounded by
-  `write_buffer_size / 256`).
+  `write_buffer_size / 16`).
 - `ShardCursor` hands out `&'a [u8]` borrows of node data tied to the shard
   borrow — only valid because flush runs on sealed memtables (no writer) and
   nodes are immortal until drop.
@@ -240,17 +237,14 @@ snapshot-consistent** by design: new reads lose the range immediately,
 whatever their snapshot seq; pre-existing iterators keep it.
 
 The mover pass (`DbInner::run_part_mover`) snapshots `bottom_parts()` under
-`state.read()`, then takes `compact_mu` per actual move. Between snapshot and
-move a compaction may rewrite a part — the relocate then re-snapshots under
-the lock, finds nothing for that partition and returns `NotFound`, which the
-pass treats as a benign miss. It can thus only skip work, never move stale
-data. The scheduled pass runs on the compaction worker (between jobs, every
-`part_mover_interval`), so a mover pass and a compaction never overlap on
-that thread; a concurrent *manual* `run_part_mover` is still safe via
-`compact_mu`.
+`state.read()`, then `lock_partition_span` re-reads and locks the selected
+partition's current key range before each move. A compaction that wins the race
+first changes the re-snapshot; a move that wins blocks overlapping compaction
+for copy + manifest flip. Disjoint ranges remain concurrent. `mover_running`
+serializes scheduled/manual mover passes.
 
 `DB::move_part_to_tier_observed` is the deterministic crash-test form of the
-same mover. Its synchronous `MovePhaseObserver` runs under `compact_mu` at four
+same mover. Its synchronous `MovePhaseObserver` runs under the partition range lock at four
 semantic boundaries: copied bytes before each destination writer finishes, all
 destination objects durable, manifest flip durable, and source cleanup issued.
 An observer may block for an external subprocess kill. An injected error before
@@ -276,9 +270,9 @@ Contract:
   would deadlock here; do not "simplify" to one).
 - Engine threads **block** for the full network round-trip. No engine lock
   is held across a *read* (`read_exact_at` is called from the reader's
-  block-miss path, outside all locks), but a part move holds the CF's
-  `compact_mu` across its copy loop — S3 PUT latency stalls that CF's
-  compaction, accepted because moves are rare and background.
+  block-miss path, outside all locks), but a part move holds its partition range
+  lock across the copy loop — S3 PUT latency stalls overlapping compaction,
+  accepted because moves are rare and background.
 - Never call `S3Storage` methods from inside the tokio runtime's own worker
   context (`block_on` would panic); nothing in the engine does — all callers
   are plain std threads.
@@ -293,7 +287,7 @@ Contract:
   identical object. Callers must not add their own retry layers on top —
   the worst-case added latency under total outage is bounded (~175 ms of
   backoff plus the request timeouts) and already accounted for in the
-  "part move holds `compact_mu`" stall analysis above.
+  part-move range-lock stall analysis above.
 - `S3ReadHandle` holds no OS resource (`release` is a no-op); handles are
   cheap to construct and never go through the `FileCache`, so the
   `max_open_sstables` bound does not apply to S3-resident tables.
@@ -303,7 +297,8 @@ Contract:
 
 ## Background workers
 
-`spawn_workers`: `num_flush_threads` flush workers + 1 compaction worker, fed
+`spawn_workers`: `num_flush_threads.max(1)` flush workers plus
+`num_compaction_threads.max(1)` compaction workers, fed
 by unbounded crossbeam channels, polling with 50 ms tick to observe `stop`.
 `DB::close`: set `closing` → rotate every CF (+unified) with `force` → spin
 until `pending_flush == 0` → set `stop`, join workers → final

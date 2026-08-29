@@ -549,8 +549,11 @@ impl Reader {
         }
     }
 
-    /// Resolve `user_key` as of `read_seq`. `found` indicates a version exists in
-    /// this SSTable; `deleted` indicates a tombstone or expired entry.
+    /// Resolve `user_key` as of `read_seq`, including this reader's bloom
+    /// check. `found` indicates a version exists in this SSTable; `deleted`
+    /// indicates a tombstone or expired entry. The column-family read path
+    /// hashes once across candidate tables and therefore calls
+    /// [`get_unfiltered`](Self::get_unfiltered) after pre-filtering instead.
     pub fn get(
         &self,
         user_key: &[u8],

@@ -24,7 +24,7 @@ use crate::comparator::ComparatorRef;
 use crate::format::{self, flags};
 use crate::memtable::{Entry, Lookup};
 
-// Memtables are bounded by `write_buffer_size` and split across 256 shards, so
+// Memtables are bounded by `write_buffer_size` and split across 16 shards, so
 // a shard holds a few thousand entries; with p = 1/4 a height of 8 covers
 // shards up to ~64k entries. Smaller towers mean smaller nodes (each level is
 // an AtomicPtr) and denser arena chunks.

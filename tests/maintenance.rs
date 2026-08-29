@@ -450,3 +450,46 @@ fn fifo_ttl_evicts_aged_tables() {
     assert_eq!(db.get(&cf, b"new").unwrap(), b"v");
     db.close().unwrap();
 }
+
+#[test]
+#[ignore = "manual FIFO TTL metadata-selection timing probe"]
+fn fifo_ttl_selection_probe() {
+    use ondadb::CompactionStyle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "fifo-probe",
+            ColumnFamilyConfig {
+                compaction_style: CompactionStyle::Fifo,
+                fifo_ttl: Duration::from_secs(3_600),
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    for i in 0..100u32 {
+        db.put(
+            &cf,
+            format!("key-{i:03}").as_bytes(),
+            b"value",
+            Duration::ZERO,
+        )
+        .unwrap();
+        db.flush_memtable(&cf).unwrap();
+    }
+    // Let automatically queued FIFO passes settle so this times one explicit
+    // selection pass rather than scheduler backlog.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = cf.stats().levels[0].0;
+    let start = std::time::Instant::now();
+    db.compact(&cf).unwrap();
+    let elapsed = start.elapsed();
+    let after = cf.stats().levels[0].0;
+    eprintln!(
+        "FIFO TTL selection: {} us, {} victims across {before} tables",
+        elapsed.as_micros(),
+        before.saturating_sub(after)
+    );
+    db.close().unwrap();
+}

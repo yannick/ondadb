@@ -53,30 +53,11 @@ pub(crate) const FOOTER_RESTARTS: u8 = 0x04;
 pub(crate) const FOOTER_VLOG_V2: u8 = 0x08;
 /// Entries per restart interval written by default.
 pub(crate) const RESTART_INTERVAL: usize = 8;
-/// Default target data-block size.
-///
-/// **16 KiB, raised from 4 KiB.** Every data block costs one resident
-/// [`IndexEntry`] — a heap-allocated key plus a handle — and `Reader::open`
-/// loads the whole index eagerly and holds it for the column family's
-/// lifetime. That memory is therefore proportional to *total stored bytes*,
-/// not to the working set, and it is paid at startup whether or not the table
-/// is ever read.
-///
-/// Measured: a 48 GiB store of 14,051 SSTables at 4 KiB carries ~12 million
-/// index entries, and opening it took a spada server past 12 GB resident
-/// before it finished starting (spada `decisions.md` S-121/S-122). Four times
-/// the block size is a quarter of the index entries.
-///
-/// **The trade is read amplification on small point reads**: a single value
-/// fetch now pulls up to 16 KiB rather than 4 KiB. That suits the primary
-/// consumer — spada reads ~11 KiB posting frames and scans them sequentially
-/// behind a forward cursor — and it is why this is a default rather than a
-/// hard-coded constant's worth of assumption. Callers that do many small
-/// random point reads should set `SstOptions::block_size` down.
-///
-/// Existing files are unaffected: a block size is a property of the file that
-/// wrote it, recovered from its own index.
-pub(crate) const DEFAULT_BLOCK_SIZE: usize = 16 << 10;
+/// Default target data-block size used by low-level writers when their option
+/// is zero. Engine write paths pass `ColumnFamilyConfig::data_block_size`
+/// explicitly; its default is the same 4 KiB value. Existing files are
+/// unaffected because block boundaries are self-describing.
+pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4 << 10;
 /// Length of the per-value CRC32-C prefix in the vlog frame.
 pub(crate) const VLOG_CRC_LEN: usize = 4;
 /// Length of the v2 vlog frame header: crc32c(4) + alg(1) + comp_len(4).

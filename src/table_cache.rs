@@ -59,8 +59,9 @@
 //! It does not partition the index. RocksDB's
 //! [partitioned index/filters](https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters)
 //! exist for ~256 MiB tables whose monolithic index is megabytes; this engine's
-//! tables average a few MiB, so at a 16 KiB block size an index is tens of
-//! kilobytes and partitioning it would buy nothing. The problem here is table
+//! tables average a few MiB, so at the default 4 KiB block size an index is
+//! still modest compared with those tables. Index partitioning would buy
+//! little here. The problem is table
 //! **count**, not per-table index size.
 
 use std::collections::HashMap;

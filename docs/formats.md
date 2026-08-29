@@ -72,7 +72,9 @@ Every block (data/bloom/index) is framed by `block.rs`:
 
 `alg` is the `Compression` enum; if compression does not shrink a block it is
 stored with `alg = None`. The CRC covers the compressed payload. Data blocks
-target 4 KiB raw (`DATA_BLOCK_SIZE`).
+target `ColumnFamilyConfig::data_block_size` raw bytes (default 4 KiB). Block
+handles make each file self-describing, so changing the policy does not affect
+reads of existing tables.
 
 Data-block entry (`sst::encode_entry` / `decode_entry`):
 
@@ -178,8 +180,8 @@ parent-dir fsync. The temp path is fixed, so all saves MUST be serialized by
 The per-SST record list above is a flat sequential encoding with no framing,
 so optional per-record fields cannot be added in place without breaking older
 readers. Instead they live in a tail between the last CF's records and the
-CRC (the CRC covers the tail). The tail holds up to **four
-sections**, always in this order:
+CRC (the CRC covers the tail). Its four original sections are always in this
+order; later tagged A2 sections are described below:
 
 ```
 1. partition section   per CF, in manifest CF order:
@@ -246,9 +248,7 @@ in this order: sync_mode u8 + sync_interval u64 (µs); compression_per_level
 (count u8 + `{prefix* | name*}`); **tier_rules** (count u8 + `{prefix* |
 tier_name* | min_age u64 (µs)}`). `decode_into` stops early on a short blob
 via `?`, so a blob from any older version reconstructs the missing trailing
-fields as struct defaults (empty rule lists) — backward compatible in both
-directions, with the same rewrite-strips-the-tail caveat as the manifest
-tail.
+fields as struct defaults (empty rule lists).
 
 Version 0.3.1 retains those four `u8` counts and their first 255 entries
 byte-for-byte. If any list is longer, the normal config blob is followed by
@@ -257,6 +257,20 @@ byte-for-byte. If any list is longer, the normal config blob is followed by
 entry encoding shown above. A 0.3.0 reader ignores this tagged tail and keeps
 the first 255 entries; a 0.3.1 reader appends every overflow entry. The tag is
 inside the manifest body and is therefore covered by the manifest CRC32-C.
+
+Later tagged config tails follow in this fixed order:
+
+```
+ONDAPFN1 | scheme_name*                         derived partition function
+ONDACMP1 | target_file_size u64 | l1_base_bytes u64
+          | soft_pending_compaction_bytes u64
+          | hard_pending_compaction_bytes u64   compaction geometry
+ONDABLK1 | data_block_size u64                  per-CF block target
+```
+
+Each tag is omitted when its setting is absent or equal to the release default.
+Decoders consume only tags they recognize and leave missing or truncated tails
+at defaults; all bytes remain covered by the enclosing manifest checksum.
 
 ## Unified-memtable WAL (`unified.rs`)
 

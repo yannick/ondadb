@@ -12,7 +12,7 @@ type/function names — grep for them; line numbers rot.
 | `db.rs` | `DB`/`DbInner`: CF registry, global sequence + publish machinery, snapshot refcounts, background flush/compaction workers, recovery, manifest persistence, deferred SST deletion, `LOCK` file, fail-stop poisoning |
 | `column_family.rs` | `ColumnFamily`: per-CF memtable + WAL + LSM levels; commit application, memtable rotation, flush to L0, point reads, iterator construction |
 | `txn.rs` | `Txn`: arena-buffered writes, five isolation levels, conflict detection, savepoints; also the `DB::put/get/delete` single-op helpers |
-| `memtable.rs` | Sharded (256) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath) |
+| `memtable.rs` | Sharded (16) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath) |
 | `memtable_arena.rs` | *(unsafe-fastpath only)* arena skip-list shard: single-allocation nodes with inline key prefix + seq; `ShardCursor` for zero-copy flush |
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
@@ -83,6 +83,11 @@ Unified-memtable mode replaces step 6 with `UnifiedStore::apply` (records get
 an 8-byte big-endian CF-id key prefix, one shared WAL + memtable). Its sealed
 queue is bounded by `unified_memtable_stall_threshold` (default 6).
 
+In per-CF WAL mode, commit rejects a transaction touching more than one column
+family: independent WAL frames cannot provide crash or partial-I/O atomicity.
+Unified mode encodes every touched CF in one shared WAL frame and is the
+supported atomic cross-CF layout.
+
 ## Read path
 
 Point get (`ColumnFamily::get`): consult, newest-wins by seq —
@@ -116,7 +121,7 @@ borrowed slices from per-child pinned blocks where possible; see
 
 The memtable `ChildIter::Mem` is **lazy**. It does *not* materialize the
 memtable. `LazyMemIter` (`memtable.rs`) runs a bidirectional k-way merge
-(`MemMerge`) directly over the 256 shard skip lists — one persistent
+(`MemMerge`) directly over the 16 shard skip lists — one persistent
 `crossbeam_skiplist::map::Entry` cursor per shard, which is an `O(1)`
 forward/backward cursor (`move_next`/`move_prev`) plus `lower_bound`/`upper_bound`
 for (re-)seeks. So **constructing/positioning a memtable iterator is `O(shards)`,
@@ -128,7 +133,13 @@ with memtable size) because the old path cloned and sorted every entry into a
 `LazyMemIter` owns the `Arc<Memtable>` and, in the same struct, holds cursors
 borrowing from inside it. That self-reference is expressed safely with the
 `self_cell` crate (macro-only; its `unsafe` is contained in that crate), so the
-default build stays `#![forbid(unsafe_code)]`.
+default build keeps unsafe denied. The only default-build exception is the
+audited Linux `clock_gettime(CLOCK_REALTIME_COARSE)` call used for TTL checks.
+
+For a bytewise CF in unified mode, `UnifiedMemIter` lazily bounds the shared
+memtable cursor to that CF's contiguous eight-byte id prefix and strips it from
+reported keys. Custom-comparator CFs retain the materialize-and-reinsert path,
+because the shared memtable's bytewise order cannot represent their ordering.
 
 Bidirectionality follows LevelDB's merging-iterator scheme: a `dir` flag selects
 a min-heap (forward) or max-heap (backward); reversing direction repositions
@@ -170,7 +181,7 @@ descending)`. Internal key encoding: `user_key || big_endian(!seq)`
   state write lock, enqueue `FlushJob::PerCf { imm }`.
 
 Flush worker (`db.rs::flush_worker`):
-- `ColumnFamily::flush_imm` → under fastpath `write_l0_streaming`: a 256-way
+- `ColumnFamily::flush_imm` → under fastpath `write_l0_streaming`: a 16-way
   `FlushMerge` over borrowing `ShardCursor`s feeds `Writer::add` directly —
   no `Vec<Entry>` materialization, no sort. Safe build: `snapshot()` + sort.
 - `Writer::finish` fsyncs klog+vlog and the CF directory.
@@ -317,7 +328,9 @@ ClickHouse's parts, it is the unit of backup, retention and tiering:
   `max_seq` must not exceed the current visible sequence (foreign databases
   are rejected; cross-DB attach with seq remapping is future work). Files
   are copied in under fresh ids; a part whose range does not overlap a live
-  bottom table slots into the bottom level, else into L0. All-or-nothing:
+  bottom table slots into the bottom level only when it also avoids every table
+  staged earlier in the same attach; overlapping input is routed to L0.
+  All-or-nothing:
   any rejection cleans up the copies before anything is installed.
 - `DB::freeze_part(cf, partition, dir)` — hard-links the part's files and
   writes a one-part manifest slice, producing a standalone, independently
@@ -425,14 +438,16 @@ protocol.
 3. `observe_seq` bumps `next_seq`/`visible` past the highest replayed seq.
 4. Fresh WAL generation opened; replayed WALs stay on disk until their
    memtable flushes (they are listed in `pending_wals`).
-5. Read-write opens only: `sweep_move_orphans` deletes tier-move residue a
-   crash left behind (see § Part mover), then the workers start — so no
-   background move races the sweep.
+5. Read-write opens only: `sweep_move_orphans` deletes unreferenced default-tier
+   SST output and local tier-move residue a crash left behind (see § Part
+   mover), then the workers start — so no background move races the sweep.
 
 ## Maintenance (`maintenance.rs`)
 
-`checkpoint` (hard links) / `backup` (copies): flush all CFs, persist the
-manifest, then — under `DbInner::pause_deletions` so compaction cannot unlink
-anything — link/copy **exactly the files the freshly-loaded manifest
-references** and write that same manifest into the target. `clone_column_family`
-hard-links a CF's SSTs under new file ids, also under a deletion pause.
+`checkpoint` / `backup`: flush all CFs, persist the manifest, then — under
+`DbInner::pause_deletions` so compaction cannot unlink anything — resolve
+**exactly the files the freshly-loaded manifest references** through their
+storage tiers and durably materialize them into the target's default tier. The
+target manifest clears tier/object metadata and is self-contained.
+`clone_column_family` applies the same rule to one CF under fresh file ids,
+also under a deletion pause.

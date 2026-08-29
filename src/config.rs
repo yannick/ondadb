@@ -144,8 +144,11 @@ pub enum LogLevel {
 #[derive(Debug, Clone)]
 pub struct Options {
     pub path: String,
+    /// Number of background flush workers. At least one is always spawned.
     pub num_flush_threads: usize,
+    /// Number of background compaction workers. At least one is always spawned.
     pub num_compaction_threads: usize,
+    /// Reserved for a future logging subsystem; currently ignored.
     pub log_level: LogLevel,
     pub block_cache_size: usize,
     /// Maximum SSTable readers held open at once — the `max_open_files`
@@ -187,6 +190,7 @@ pub struct Options {
     /// plus the concurrent in-flight readers.
     pub max_open_reader_bytes: usize,
     pub max_open_sstables: usize,
+    /// Reserved for a future database-wide memory governor; currently ignored.
     pub max_memory_usage: u64,
     pub read_only: bool,
     /// Whether [`DB::close`](crate::DB::close) drains queued compaction work
@@ -201,10 +205,14 @@ pub struct Options {
     /// close drained the queue regardless of this setting. On a database that
     /// had just ingested 20M records that made `close()` take 35 seconds.
     pub finish_compactions_on_close: bool,
+    /// Reserved for separate flush admission control; currently ignored.
     pub max_concurrent_flushes: usize,
     pub unified_memtable: bool,
     pub unified_memtable_write_buffer_size: usize,
+    /// Reserved unified skip-list tuning; the shared store currently uses the
+    /// ordinary memtable constants and ignores this field.
     pub unified_memtable_skip_list_max_level: u32,
+    /// Reserved unified skip-list tuning; currently ignored.
     pub unified_memtable_skip_list_probability: f64,
     pub unified_memtable_sync_mode: SyncMode,
     pub unified_memtable_sync_interval: Duration,
@@ -415,10 +423,10 @@ impl Default for Options {
             max_open_readers: crate::table_cache::DEFAULT_MAX_OPEN_READERS,
             max_open_reader_bytes: crate::table_cache::DEFAULT_MAX_OPEN_READER_BYTES,
             max_open_sstables: 256,
-            max_memory_usage: 0, // 0 => auto (≈75% system memory)
+            max_memory_usage: 0, // reserved; currently ignored
             read_only: false,
             finish_compactions_on_close: false,
-            max_concurrent_flushes: 0, // 0 => == num_flush_threads
+            max_concurrent_flushes: 0, // reserved; currently ignored
             unified_memtable: false,
             unified_memtable_write_buffer_size: 64 << 20,
             unified_memtable_skip_list_max_level: 12,
@@ -439,7 +447,9 @@ impl Default for Options {
 pub struct ColumnFamilyConfig {
     pub write_buffer_size: usize,
     pub level_size_ratio: u64,
+    /// Reserved level-geometry knob; level count is currently data-derived.
     pub min_levels: u32,
+    /// Reserved level-geometry knob; currently ignored.
     pub dividing_level_offset: i32,
     pub klog_value_threshold: usize,
     /// Target size of an SSTable data block, in bytes. Default 4 KiB.
@@ -508,20 +518,31 @@ pub struct ColumnFamilyConfig {
     pub tier_rules: Vec<TierRule>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
+    /// Reserved sampled-index policy; indexes are currently exhaustive.
     pub enable_block_indexes: bool,
+    /// Reserved sampled-index policy; currently ignored.
     pub index_sample_ratio: u32,
+    /// Reserved sampled-index policy; currently ignored.
     pub block_index_prefix_len: usize,
     pub sync_mode: SyncMode,
     pub sync_interval: Duration,
     pub comparator_name: String,
+    /// Reserved comparator context; built-in comparators currently take none.
     pub comparator_ctx_str: String,
+    /// Reserved memtable tuning; the implementation uses fixed constants.
     pub skip_list_max_level: u32,
+    /// Reserved memtable tuning; the implementation uses a fixed probability.
     pub skip_list_probability: f64,
+    /// Reserved per-CF default; [`DB::begin`](crate::DB::begin) currently uses
+    /// Snapshot and explicit callers choose via `begin_with_isolation`.
     pub default_isolation_level: IsolationLevel,
+    /// Reserved for a future disk-space admission guard; currently ignored.
     pub min_disk_space: u64,
     pub l1_file_count_trigger: u32,
     pub l0_queue_stall_threshold: u32,
+    /// Reserved tombstone-density trigger; currently ignored.
     pub tombstone_density_trigger: f64,
+    /// Reserved tombstone-density trigger; currently ignored.
     pub tombstone_density_min_entries: u64,
     pub use_btree: bool,
     pub compaction_style: CompactionStyle,

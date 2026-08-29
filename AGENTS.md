@@ -17,7 +17,7 @@ Deep documentation (read the one that matches your task):
 ## Build, test, verify
 
 ```sh
-cargo build                                    # default: #![forbid(unsafe_code)]
+cargo build                                    # default: deny unsafe; one audited Linux clock call
 cargo build --features unsafe-fastpath         # mmap reads + arena memtable
 cargo test                                     # must pass in BOTH configs
 cargo test --features unsafe-fastpath

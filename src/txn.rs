@@ -264,7 +264,9 @@ impl Txn {
         Ok(())
     }
 
-    /// Buffer a single-delete (a delete hint for keys written at most once).
+    /// Buffer a single-delete marker for format compatibility. It currently
+    /// has conservative ordinary-tombstone semantics; compaction does not yet
+    /// implement the single-delete collapse optimization.
     pub fn single_delete(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<()> {
         if self.done {
             return Err(OndaError::InvalidArgs(

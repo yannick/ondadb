@@ -27,7 +27,7 @@ use crate::wal::{self, Wal};
 use smallvec::SmallVec;
 
 /// Historical/default target size of an SSTable data block.
-pub(crate) const DEFAULT_DATA_BLOCK_SIZE: usize = 4 << 10;
+pub(crate) const DEFAULT_DATA_BLOCK_SIZE: usize = crate::sst::DEFAULT_BLOCK_SIZE;
 const MAX_MANIFEST_LEVEL: u32 = 64;
 
 /// One operation visible to a commit hook.
