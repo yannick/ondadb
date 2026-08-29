@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ondadb::{ColumnFamily, ColumnFamilyConfig, IsolationLevel, Options, DB};
+use ondadb::{ColumnFamily, ColumnFamilyConfig, IsolationLevel, OndaError, Options, DB};
 
 fn open(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>) {
     let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
@@ -240,7 +240,7 @@ fn iterator_values_inline_and_vlog() {
 }
 
 #[test]
-fn multi_cf_atomic() {
+fn per_cf_multi_cf_commit_is_rejected_without_partial_apply() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
     let a = db
@@ -252,9 +252,14 @@ fn multi_cf_atomic() {
     let mut t = db.begin();
     t.put(&a, b"k", b"va", Duration::ZERO).unwrap();
     t.put(&b, b"k", b"vb", Duration::ZERO).unwrap();
-    t.commit().unwrap();
-    assert_eq!(db.get(&a, b"k").unwrap(), b"va");
-    assert_eq!(db.get(&b, b"k").unwrap(), b"vb");
+    let err = t.commit().expect_err("per-CF WALs cannot commit atomically");
+    assert!(matches!(
+        err,
+        OndaError::InvalidArgs(ref message)
+            if message == "multi-column-family transactions require unified_memtable=true for atomic commit"
+    ));
+    assert!(matches!(db.get(&a, b"k"), Err(OndaError::NotFound)));
+    assert!(matches!(db.get(&b, b"k"), Err(OndaError::NotFound)));
     db.close().unwrap();
 }
 

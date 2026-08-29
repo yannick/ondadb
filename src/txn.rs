@@ -546,6 +546,21 @@ impl Txn {
             return Ok(());
         }
         let prepared = self.prepare_commit();
+        if self.db.unified.is_none() {
+            let first_cf = cf_id(&self.writes[prepared.order[0]].cf);
+            if prepared
+                .order
+                .iter()
+                .skip(1)
+                .any(|&index| cf_id(&self.writes[index].cf) != first_cf)
+            {
+                self.release();
+                return Err(OndaError::InvalidArgs(
+                    "multi-column-family transactions require unified_memtable=true for atomic commit"
+                        .into(),
+                ));
+            }
+        }
         let db = self.db.clone();
         let _guard = if needs_check || self.isolation == IsolationLevel::Serializable {
             Some(db.commit_mu.lock())
