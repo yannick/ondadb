@@ -2,13 +2,89 @@
 
 use std::time::Duration;
 
-use ondadb::{ColumnFamilyConfig, Options, DB};
+use ondadb::{ColumnFamilyConfig, Options, PartitionRule, TierDef, DB};
 
 fn fill(db: &DB, cf: &std::sync::Arc<ondadb::ColumnFamily>, n: u32) {
     for i in 0..n {
         db.put(cf, format!("k{i:05}").as_bytes(), b"value", Duration::ZERO)
             .unwrap();
     }
+}
+
+fn tiered_options(db: &std::path::Path, tier: &std::path::Path) -> Options {
+    let mut options = Options::new(db.to_str().unwrap());
+    options.tiers = vec![TierDef::new("hdd", tier.to_str().unwrap().to_string())];
+    options
+}
+
+fn materialize_tiered_partition(db: &DB) -> std::sync::Arc<ondadb::ColumnFamily> {
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                partition_rules: vec![PartitionRule {
+                    prefix: b"img/".to_vec(),
+                    name: "img".into(),
+                }],
+                l1_file_count_trigger: 1,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    db.put(&cf, b"img/000", b"IMG", Duration::ZERO).unwrap();
+    db.put(&cf, b"etc/000", b"ETC", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+    cf
+}
+
+fn assert_snapshot_is_self_contained(path: &std::path::Path) {
+    let db = DB::open(Options::new(path.to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+    assert_eq!(db.get(&cf, b"etc/000").unwrap(), b"ETC");
+    db.close().unwrap();
+}
+
+#[test]
+fn tiered_backup_is_default_tier_self_contained() {
+    let source = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let db = DB::open(tiered_options(source.path(), tier.path())).unwrap();
+    materialize_tiered_partition(&db);
+    db.backup(backup.path()).unwrap();
+    db.close().unwrap();
+
+    assert_snapshot_is_self_contained(backup.path());
+}
+
+#[test]
+fn tiered_checkpoint_is_default_tier_self_contained() {
+    let source = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    let db = DB::open(tiered_options(source.path(), tier.path())).unwrap();
+    materialize_tiered_partition(&db);
+    db.checkpoint(checkpoint.path()).unwrap();
+    db.close().unwrap();
+
+    assert_snapshot_is_self_contained(checkpoint.path());
+}
+
+#[test]
+fn clone_of_tiered_cf_copies_data_to_the_default_tier() {
+    let source = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let db = DB::open(tiered_options(source.path(), tier.path())).unwrap();
+    let src = materialize_tiered_partition(&db);
+    let clone = db.clone_column_family("default", "clone").unwrap();
+
+    assert_eq!(db.get(&clone, b"img/000").unwrap(), b"IMG");
+    assert_eq!(db.get(&clone, b"etc/000").unwrap(), b"ETC");
+    assert_eq!(db.get(&src, b"img/000").unwrap(), b"IMG");
+    db.close().unwrap();
 }
 
 #[test]

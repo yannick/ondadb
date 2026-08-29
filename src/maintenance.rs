@@ -1,6 +1,7 @@
 //! Maintenance operations: checkpoint, backup, column-family clone, and stats.
 //!
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,6 +9,48 @@ use crate::column_family::{ColumnFamily, SstHandle};
 use crate::db::DB;
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, Manifest, SstMeta};
+use crate::storage::Storage;
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn copy_storage_file(storage: &dyn Storage, src: &str, dst: &Path) -> Result<()> {
+    let reader = storage.open_read(src)?;
+    let size = reader.size()?;
+    let mut file = std::fs::File::create(dst)?;
+    let mut offset = 0u64;
+    let mut buffer = vec![0u8; 256 << 10];
+    while offset < size {
+        let len = usize::try_from((size - offset).min(buffer.len() as u64))
+            .expect("bounded copy chunk fits usize");
+        reader.read_exact_at(&mut buffer[..len], offset)?;
+        file.write_all(&buffer[..len])?;
+        offset += len as u64;
+    }
+    file.sync_all()?;
+    sync_parent_dir(dst)
+}
+
+fn place_storage_file(
+    storage: &dyn Storage,
+    src: &str,
+    dst: &Path,
+    prefer_hard_link: bool,
+) -> Result<()> {
+    match std::fs::remove_file(dst) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if prefer_hard_link && Path::new(src).exists() && std::fs::hard_link(src, dst).is_ok() {
+        return sync_parent_dir(dst);
+    }
+    copy_storage_file(storage, src, dst)
+}
 
 /// Per-column-family statistics.
 #[derive(Debug, Clone, Default)]
@@ -127,24 +170,29 @@ impl DB {
         // the copied catalog and the copied files are guaranteed consistent — even if
         // a compaction rewrote the live manifest after our persist above.
         let src_manifest = manifest_path(&self.inner.dir);
-        let manifest = Manifest::load(&src_manifest)?;
-        for cfm in &manifest.cfs {
+        let mut manifest = Manifest::load(&src_manifest)?;
+        for cfm in &mut manifest.cfs {
+            let source_cf = cfs
+                .iter()
+                .find(|cf| cf.name() == cfm.name)
+                .ok_or(OndaError::NotFound)?;
             let cf_dir = dir.join(format!("cf-{}", cfm.name));
             std::fs::create_dir_all(&cf_dir)?;
-            for sst in &cfm.sstables {
-                for ext in ["klog", "vlog"] {
-                    let src = format!("{}/{}.{ext}", self.inner.cf_dir(&cfm.name), sst.id);
-                    if !Path::new(&src).exists() {
-                        continue; // vlog absent when the SSTable has no large values
+            for sst in &mut cfm.sstables {
+                let storage = source_cf.tiers().storage_for(sst.tier.as_deref());
+                let src_klog = source_cf.klog_path_for(sst);
+                for (ext, src, size) in [
+                    ("klog", src_klog.clone(), sst.klog_size),
+                    ("vlog", crate::sst::vlog_path_for(&src_klog), sst.vlog_size),
+                ] {
+                    if ext == "vlog" && size == 0 {
+                        continue;
                     }
                     let dst = cf_dir.join(format!("{}.{ext}", sst.id));
-                    let _ = std::fs::remove_file(&dst);
-                    if hard_link {
-                        std::fs::hard_link(&src, &dst)?;
-                    } else {
-                        std::fs::copy(&src, &dst)?;
-                    }
+                    place_storage_file(storage.as_ref(), &src, &dst, hard_link)?;
                 }
+                sst.tier = None;
+                sst.object = None;
             }
         }
         // Persist the same manifest we linked against, so the backup catalog matches
@@ -172,16 +220,24 @@ impl DB {
         let mut by_level: Vec<Vec<Arc<SstHandle>>> = Vec::new();
         for meta in src_metas {
             let new_id = self.inner.next_file_id();
-            for ext in ["klog", "vlog"] {
-                let s = format!("{}/{}.{ext}", src_cf.dir(), meta.id);
-                if Path::new(&s).exists() {
-                    let d = format!("{}/{new_id}.{ext}", dst_cf.dir());
-                    std::fs::hard_link(&s, &d)?;
+            let storage = src_cf.tiers().storage_for(meta.tier.as_deref());
+            let src_klog = src_cf.klog_path_for(&meta);
+            for (ext, source, size) in [
+                ("klog", src_klog.clone(), meta.klog_size),
+                ("vlog", crate::sst::vlog_path_for(&src_klog), meta.vlog_size),
+            ] {
+                if ext == "vlog" && size == 0 {
+                    continue;
                 }
+                let destination =
+                    std::path::PathBuf::from(format!("{}/{new_id}.{ext}", dst_cf.dir()));
+                place_storage_file(storage.as_ref(), &source, &destination, true)?;
             }
             let level = meta.level as usize;
             let mut new_meta = meta;
             new_meta.id = new_id;
+            new_meta.tier = None;
+            new_meta.object = None;
             while by_level.len() <= level {
                 by_level.push(Vec::new());
             }
