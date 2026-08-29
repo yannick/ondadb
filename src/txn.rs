@@ -70,11 +70,14 @@ pub struct Txn {
     buf: Vec<u8>,
     writes: Vec<WriteEntry>,
     read_set: HashSet<(usize, Vec<u8>)>,
+    /// First-insertion order for `read_set`, allowing savepoint rollback to
+    /// remove only reads performed after that savepoint.
+    read_log: Vec<(usize, Vec<u8>)>,
     /// CF handles for every key in `read_set`, so commit-time validation can call
     /// `peek_seq` even on CFs the transaction only read (never wrote).
     read_cfs: HashMap<usize, Arc<ColumnFamily>>,
-    /// Named savepoints: `(name, writes_len, buf_len)`.
-    savepoints: Vec<(String, usize, usize)>,
+    /// Named savepoints: `(name, writes_len, buf_len, read_log_len)`.
+    savepoints: Vec<(String, usize, usize, usize)>,
     done: bool,
 }
 
@@ -175,6 +178,7 @@ impl DB {
             buf: take_buf(),
             writes: Vec::new(),
             read_set: HashSet::new(),
+            read_log: Vec::new(),
             read_cfs: HashMap::new(),
             savepoints: Vec::new(),
             done: false,
@@ -284,7 +288,10 @@ impl Txn {
             }
         }
         if self.isolation == IsolationLevel::Serializable {
-            self.read_set.insert((id, key.to_vec()));
+            let read = (id, key.to_vec());
+            if self.read_set.insert(read.clone()) {
+                self.read_log.push(read);
+            }
             self.read_cfs.entry(id).or_insert_with(|| cf.clone());
         }
         let rs = if self.fixed {
@@ -353,8 +360,12 @@ impl Txn {
 
     /// Name a savepoint at the current buffer position.
     pub fn set_savepoint(&mut self, name: &str) -> Result<()> {
-        self.savepoints
-            .push((name.to_string(), self.writes.len(), self.buf.len()));
+        self.savepoints.push((
+            name.to_string(),
+            self.writes.len(),
+            self.buf.len(),
+            self.read_log.len(),
+        ));
         Ok(())
     }
 
@@ -363,11 +374,17 @@ impl Txn {
         let pos = self
             .savepoints
             .iter()
-            .rposition(|(n, _, _)| n == name)
+            .rposition(|(n, _, _, _)| n == name)
             .ok_or_else(|| OndaError::InvalidArgs(format!("no savepoint {name}")))?;
-        let (_, wlen, blen) = self.savepoints[pos];
+        let (_, wlen, blen, read_len) = self.savepoints[pos];
         self.writes.truncate(wlen);
         self.buf.truncate(blen);
+        for read in &self.read_log[read_len..] {
+            self.read_set.remove(read);
+        }
+        self.read_log.truncate(read_len);
+        let live_cfs: HashSet<usize> = self.read_set.iter().map(|(id, _)| *id).collect();
+        self.read_cfs.retain(|id, _| live_cfs.contains(id));
         self.savepoints.truncate(pos + 1);
         Ok(())
     }
@@ -377,7 +394,7 @@ impl Txn {
         let pos = self
             .savepoints
             .iter()
-            .rposition(|(n, _, _)| n == name)
+            .rposition(|(n, _, _, _)| n == name)
             .ok_or_else(|| OndaError::InvalidArgs(format!("no savepoint {name}")))?;
         self.savepoints.truncate(pos);
         Ok(())
@@ -542,6 +559,10 @@ impl Txn {
         );
 
         if self.writes.is_empty() {
+            self.read_set.clear();
+            self.read_log.clear();
+            self.read_cfs.clear();
+            self.savepoints.clear();
             self.release();
             return Ok(());
         }
@@ -597,6 +618,10 @@ impl Txn {
             cf.run_commit_hook(commit_seq, ops);
         }
         self.writes.clear();
+        self.read_set.clear();
+        self.read_log.clear();
+        self.read_cfs.clear();
+        self.savepoints.clear();
         put_buf(std::mem::take(&mut self.buf));
         self.release();
         Ok(())
@@ -609,6 +634,10 @@ impl Txn {
         }
         self.done = true;
         self.writes.clear();
+        self.read_set.clear();
+        self.read_log.clear();
+        self.read_cfs.clear();
+        self.savepoints.clear();
         put_buf(std::mem::take(&mut self.buf));
         self.release();
         Ok(())
@@ -640,6 +669,7 @@ impl Txn {
             self.buf.clear();
         }
         self.read_set.clear();
+        self.read_log.clear();
         self.read_cfs.clear();
         self.savepoints.clear();
         self.done = false;

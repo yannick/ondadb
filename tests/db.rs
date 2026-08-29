@@ -283,6 +283,28 @@ fn savepoints() {
 }
 
 #[test]
+fn serializable_savepoint_rollback_discards_later_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    db.put(&cf, b"later", b"old", Duration::ZERO).unwrap();
+
+    let mut original = db.begin_with_isolation(IsolationLevel::Serializable);
+    original.set_savepoint("before-read").unwrap();
+    assert_eq!(original.get(&cf, b"later").unwrap(), b"old");
+    original.rollback_to_savepoint("before-read").unwrap();
+
+    db.put(&cf, b"later", b"new", Duration::ZERO).unwrap();
+    original
+        .put(&cf, b"unrelated", b"value", Duration::ZERO)
+        .unwrap();
+    original
+        .commit()
+        .expect("a rolled-back read must not remain in Serializable validation");
+    assert_eq!(db.get(&cf, b"unrelated").unwrap(), b"value");
+    db.close().unwrap();
+}
+
+#[test]
 fn persistence_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
