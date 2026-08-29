@@ -61,6 +61,11 @@ pub struct CfStats {
     pub approximate_len: u64,
     pub flush_count: u64,
     pub compaction_count: u64,
+    /// Number of manual or background compaction attempts that returned an
+    /// error since this column family was opened.
+    pub compaction_failures: u64,
+    /// Most recently observed compaction error, if any.
+    pub last_compaction_error: Option<String>,
     /// Point lookups served by this CF.
     pub point_reads: u64,
     /// SSTable probes skipped by a bloom-filter negative.
@@ -101,6 +106,10 @@ impl ColumnFamily {
             compaction_count: self
                 .compaction_count
                 .load(std::sync::atomic::Ordering::Relaxed),
+            compaction_failures: self
+                .compaction_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            last_compaction_error: self.last_compaction_error.lock().clone(),
             point_reads: self.point_reads.load(std::sync::atomic::Ordering::Relaxed),
             bloom_skips: self.bloom_skips.load(std::sync::atomic::Ordering::Relaxed),
             sst_probes: self.sst_probes.load(std::sync::atomic::Ordering::Relaxed),

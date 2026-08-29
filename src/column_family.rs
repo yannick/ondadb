@@ -261,6 +261,8 @@ pub struct ColumnFamily {
 
     pub(crate) flush_count: AtomicU64,
     pub(crate) compaction_count: AtomicU64,
+    pub(crate) compaction_failures: AtomicU64,
+    pub(crate) last_compaction_error: Mutex<Option<String>>,
 
     // Read-path counters (relaxed; observability only).
     pub(crate) point_reads: AtomicU64,
@@ -407,6 +409,8 @@ impl ColumnFamily {
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
+            compaction_failures: AtomicU64::new(0),
+            last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             sst_probes: AtomicU64::new(0),
@@ -527,6 +531,8 @@ impl ColumnFamily {
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
+            compaction_failures: AtomicU64::new(0),
+            last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             sst_probes: AtomicU64::new(0),
@@ -541,6 +547,12 @@ impl ColumnFamily {
 
     pub(crate) fn comparator(&self) -> &ComparatorRef {
         &self.cmp
+    }
+
+    pub(crate) fn record_compaction_failure(&self, error: &OndaError) {
+        self.compaction_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.last_compaction_error.lock() = Some(error.to_string());
     }
 
     /// Install a post-commit hook.

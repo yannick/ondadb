@@ -980,7 +980,11 @@ impl DB {
     /// tombstones and shadowed versions are reclaimed even when no size
     /// trigger fires (e.g. a fully deleted CF).
     pub fn compact(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
-        compaction::run_manual(&self.inner, cf)
+        let result = compaction::run_manual(&self.inner, cf);
+        if let Err(error) = &result {
+            cf.record_compaction_failure(error);
+        }
+        result
     }
 
     /// Force an fsync of every write-ahead log (all column families plus the
@@ -1344,7 +1348,9 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
                 if stop.load(Ordering::SeqCst) && !db.opts.finish_compactions_on_close {
                     break;
                 }
-                let _ = compaction::run(&db, &cf);
+                if let Err(error) = compaction::run(&db, &cf) {
+                    cf.record_compaction_failure(&error);
+                }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::SeqCst) {

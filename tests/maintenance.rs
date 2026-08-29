@@ -256,6 +256,51 @@ fn approximate_len_and_read_stats() {
 }
 
 #[test]
+fn compaction_failure_is_reported_in_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                klog_value_threshold: 64,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    db.put(&cf, b"large", &[b'V'; 4096], Duration::ZERO)
+        .unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let vlog = std::fs::read_dir(dir.path().join("cf-default"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "vlog")
+        })
+        .expect("flush created a vlog");
+    let mut bytes = std::fs::read(&vlog).unwrap();
+    bytes.last_mut().map(|byte| *byte ^= 0xff).unwrap();
+    std::fs::write(&vlog, bytes).unwrap();
+
+    let error = db
+        .compact(&cf)
+        .expect_err("corrupt input must fail compaction");
+    assert_eq!(error.kind(), "corruption");
+    let stats = cf.stats();
+    assert_eq!(stats.compaction_failures, 1);
+    let last = stats
+        .last_compaction_error
+        .expect("last compaction error should be retained")
+        .to_ascii_lowercase();
+    assert!(
+        last.contains("checksum") || last.contains("corrupt"),
+        "{last}"
+    );
+}
+
+#[test]
 fn compaction_filter_removes_and_respects_snapshots() {
     use std::sync::Arc;
 
