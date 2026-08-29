@@ -107,8 +107,106 @@ fn unified_iteration() {
         it.next();
     }
     assert_eq!(got, vec!["a", "b", "c", "d", "e"]);
+
+    it.seek(b"c");
+    assert_eq!(it.key(), b"c");
+    it.next();
+    assert_eq!(it.key(), b"d");
+    it.prev();
+    assert_eq!(it.key(), b"c", "forward-to-backward switch must not skip");
+    it.seek_for_prev(b"cc");
+    assert_eq!(it.key(), b"c");
+    it.prev();
+    assert_eq!(it.key(), b"b");
+    it.next();
+    assert_eq!(it.key(), b"c", "backward-to-forward switch must not skip");
     drop(it);
+
+    let mut bounded = t.new_iterator_bounded(
+        &a,
+        std::ops::Bound::Excluded(b"b".as_slice()),
+        std::ops::Bound::Included(b"d".as_slice()),
+    );
+    bounded.seek_to_first();
+    assert_eq!(bounded.key(), b"c");
+    bounded.seek_to_last();
+    assert_eq!(bounded.key(), b"d");
+    bounded.next();
+    assert!(!bounded.valid(), "upper bound must terminate iteration");
+    drop(bounded);
     t.rollback().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+#[ignore = "manual unified iterator construction timing probe"]
+fn unified_iterator_construction_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_unified(dir.path().to_str().unwrap());
+    let a = db
+        .create_column_family("a", ColumnFamilyConfig::default())
+        .unwrap();
+    let b = db
+        .create_column_family("b", ColumnFamilyConfig::default())
+        .unwrap();
+    db.put(&a, b"needle", b"value", Duration::ZERO).unwrap();
+    for i in 0..2_000u32 {
+        db.put(
+            &b,
+            format!("other/{i:06}").as_bytes(),
+            b"value",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+
+    let txn = db.begin();
+    let iterations = 200u32;
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let mut it = txn.new_iterator(&a);
+        it.seek(b"needle");
+        std::hint::black_box((it.key(), it.value()));
+    }
+    let elapsed = start.elapsed();
+    eprintln!(
+        "unified iterator construction: {} ns/iteration",
+        elapsed.as_nanos() / u128::from(iterations)
+    );
+    drop(txn);
+    db.close().unwrap();
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn unified_iteration_does_not_materialize_shared_memtable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_unified(dir.path().to_str().unwrap());
+    let a = db
+        .create_column_family("a", ColumnFamilyConfig::default())
+        .unwrap();
+    let b = db
+        .create_column_family("b", ColumnFamilyConfig::default())
+        .unwrap();
+    db.put(&a, b"a", b"A", Duration::ZERO).unwrap();
+    db.put(&a, b"b", b"B", Duration::ZERO).unwrap();
+    db.put(&b, b"other", b"X", Duration::ZERO).unwrap();
+
+    ondadb::memtable::reset_snapshot_calls();
+    let txn = db.begin();
+    let mut it = txn.new_iterator(&a);
+    it.seek_to_first();
+    while it.valid() {
+        std::hint::black_box((it.key(), it.value()));
+        it.next();
+    }
+    assert_eq!(
+        ondadb::memtable::snapshot_calls(),
+        0,
+        "bytewise unified iteration must use lazy prefix cursors"
+    );
+    drop(it);
+    drop(txn);
     db.close().unwrap();
 }
 

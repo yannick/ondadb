@@ -9,6 +9,7 @@ use crate::comparator::ComparatorRef;
 use crate::error::Result;
 use crate::memtable::MemIter;
 use crate::sst::{Block, SstIterator};
+use crate::unified::UnifiedMemIter;
 
 /// A merge-iterator child: a memtable or SSTable iterator.  Yields entries in
 /// internal order (user key ascending, sequence descending), every version.
@@ -19,6 +20,7 @@ use crate::sst::{Block, SstIterator};
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ChildIter {
     Mem(MemIter),
+    Unified(UnifiedMemIter),
     Sst(SstIterator),
 }
 
@@ -27,6 +29,7 @@ impl ChildIter {
     fn valid(&self) -> bool {
         match self {
             ChildIter::Mem(m) => m.valid(),
+            ChildIter::Unified(m) => m.valid(),
             ChildIter::Sst(s) => s.valid(),
         }
     }
@@ -34,6 +37,7 @@ impl ChildIter {
     fn user_key(&self) -> &[u8] {
         match self {
             ChildIter::Mem(m) => m.user_key(),
+            ChildIter::Unified(m) => m.user_key(),
             ChildIter::Sst(s) => s.user_key(),
         }
     }
@@ -44,6 +48,7 @@ impl ChildIter {
     fn key_prefix8(&self) -> u64 {
         match self {
             ChildIter::Mem(m) => m.key_prefix(),
+            ChildIter::Unified(m) => m.key_prefix(),
             ChildIter::Sst(s) => s.key_prefix(),
         }
     }
@@ -51,6 +56,7 @@ impl ChildIter {
     fn seq(&self) -> u64 {
         match self {
             ChildIter::Mem(m) => m.seq(),
+            ChildIter::Unified(m) => m.seq(),
             ChildIter::Sst(s) => s.seq(),
         }
     }
@@ -58,6 +64,7 @@ impl ChildIter {
     fn ttl(&self) -> i64 {
         match self {
             ChildIter::Mem(m) => m.ttl(),
+            ChildIter::Unified(m) => m.ttl(),
             ChildIter::Sst(s) => s.ttl(),
         }
     }
@@ -65,6 +72,7 @@ impl ChildIter {
     fn tombstone(&self) -> bool {
         match self {
             ChildIter::Mem(m) => m.is_tombstone(),
+            ChildIter::Unified(m) => m.is_tombstone(),
             ChildIter::Sst(s) => s.is_tombstone(),
         }
     }
@@ -72,6 +80,10 @@ impl ChildIter {
     fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
             ChildIter::Mem(m) => {
+                out.extend_from_slice(m.value_ref());
+                Ok(())
+            }
+            ChildIter::Unified(m) => {
                 out.extend_from_slice(m.value_ref());
                 Ok(())
             }
@@ -83,7 +95,7 @@ impl ChildIter {
     #[inline]
     fn value_block_ref(&self) -> Option<(&Block, usize, usize)> {
         match self {
-            ChildIter::Mem(_) => None,
+            ChildIter::Mem(_) | ChildIter::Unified(_) => None,
             ChildIter::Sst(s) => s.value_block_ref(),
         }
     }
@@ -92,7 +104,7 @@ impl ChildIter {
     #[inline]
     fn key_block_ref(&self) -> Option<(&Block, usize, usize)> {
         match self {
-            ChildIter::Mem(_) => None,
+            ChildIter::Mem(_) | ChildIter::Unified(_) => None,
             ChildIter::Sst(s) => s.key_block_ref(),
         }
     }
@@ -100,6 +112,7 @@ impl ChildIter {
     fn next(&mut self) {
         match self {
             ChildIter::Mem(m) => m.next(),
+            ChildIter::Unified(m) => m.next(),
             ChildIter::Sst(s) => s.next(),
         }
     }
@@ -107,30 +120,35 @@ impl ChildIter {
     fn prev(&mut self) {
         match self {
             ChildIter::Mem(m) => m.prev(),
+            ChildIter::Unified(m) => m.prev(),
             ChildIter::Sst(s) => s.prev(),
         }
     }
     fn seek_to_first(&mut self) {
         match self {
             ChildIter::Mem(m) => m.seek_to_first(),
+            ChildIter::Unified(m) => m.seek_to_first(),
             ChildIter::Sst(s) => s.seek_to_first(),
         }
     }
     fn seek_to_last(&mut self) {
         match self {
             ChildIter::Mem(m) => m.seek_to_last(),
+            ChildIter::Unified(m) => m.seek_to_last(),
             ChildIter::Sst(s) => s.seek_to_last(),
         }
     }
     fn seek_ge(&mut self, k: &[u8], s: u64) {
         match self {
             ChildIter::Mem(m) => m.seek_ge(k, s),
+            ChildIter::Unified(m) => m.seek_ge(k, s),
             ChildIter::Sst(it) => it.seek(k, s),
         }
     }
     fn seek_le(&mut self, k: &[u8], s: u64) {
         match self {
             ChildIter::Mem(m) => m.seek_le(k, s),
+            ChildIter::Unified(m) => m.seek_le(k, s),
             ChildIter::Sst(it) => it.seek_for_prev(k, s),
         }
     }

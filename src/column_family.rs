@@ -1079,20 +1079,28 @@ impl ColumnFamily {
         }
         // Unified mode: overlay this CF's slice of the shared memtable.
         if let Some(u) = &self.ctx.unified {
-            let entries = u.entries_for_cf(self.id);
-            if !entries.is_empty() {
-                let overlay = Memtable::new(self.cmp.clone());
-                for e in entries {
-                    overlay.put(
-                        &e.user_key,
-                        e.value,
-                        e.seq,
-                        e.ttl,
-                        e.tombstone,
-                        e.single_delete,
-                    );
+            if self.cmp.is_bytewise() {
+                children.extend(
+                    u.iterators_for_cf(self.id)
+                        .into_iter()
+                        .map(ChildIter::Unified),
+                );
+            } else {
+                let entries = u.entries_for_cf(self.id);
+                if !entries.is_empty() {
+                    let overlay = Memtable::new(self.cmp.clone());
+                    for e in entries {
+                        overlay.put(
+                            &e.user_key,
+                            e.value,
+                            e.seq,
+                            e.ttl,
+                            e.tombstone,
+                            e.single_delete,
+                        );
+                    }
+                    children.push(ChildIter::Mem(overlay.iter()));
                 }
-                children.push(ChildIter::Mem(overlay.iter()));
             }
         }
         children.push(ChildIter::Mem(state.mem.iter()));

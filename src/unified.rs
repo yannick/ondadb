@@ -21,7 +21,7 @@ use crate::column_family::FlushJob;
 use crate::comparator::default_comparator;
 use crate::config::Options;
 use crate::error::Result;
-use crate::memtable::{Entry, Lookup, Memtable};
+use crate::memtable::{Entry, Lookup, MemIter, Memtable};
 use crate::wal::{self, Wal};
 
 /// Stable column-family id: 64-bit FNV-1a of the name.
@@ -41,6 +41,101 @@ fn prefixed(id: u64, user_key: &[u8]) -> Vec<u8> {
     k.extend_from_slice(&id.to_be_bytes());
     k.extend_from_slice(user_key);
     k
+}
+
+/// Lazy view of one column family's contiguous prefix inside a unified
+/// bytewise memtable. Keys exposed to the merge iterator have the CF id
+/// stripped; positioning adds it back and stops at either prefix boundary.
+pub(crate) struct UnifiedMemIter {
+    inner: MemIter,
+    prefix: [u8; 8],
+    valid: bool,
+}
+
+impl UnifiedMemIter {
+    fn new(mem: Arc<Memtable>, id: u64) -> UnifiedMemIter {
+        UnifiedMemIter {
+            inner: mem.iter(),
+            prefix: id.to_be_bytes(),
+            valid: false,
+        }
+    }
+
+    #[inline]
+    fn refresh_valid(&mut self) {
+        self.valid = self.inner.valid() && self.inner.user_key().starts_with(&self.prefix);
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.valid
+    }
+
+    pub(crate) fn seek_to_first(&mut self) {
+        self.inner.seek_ge(&self.prefix, u64::MAX);
+        self.refresh_valid();
+    }
+
+    pub(crate) fn seek_to_last(&mut self) {
+        if let Some(next) = u64::from_be_bytes(self.prefix).checked_add(1) {
+            self.inner.seek_le(&next.to_be_bytes(), u64::MAX);
+        } else {
+            self.inner.seek_to_last();
+        }
+        self.refresh_valid();
+    }
+
+    pub(crate) fn seek_ge(&mut self, user_key: &[u8], seq: u64) {
+        self.inner
+            .seek_ge(&prefixed_key(self.prefix, user_key), seq);
+        self.refresh_valid();
+    }
+
+    pub(crate) fn seek_le(&mut self, user_key: &[u8], seq: u64) {
+        self.inner
+            .seek_le(&prefixed_key(self.prefix, user_key), seq);
+        self.refresh_valid();
+    }
+
+    pub(crate) fn next(&mut self) {
+        self.inner.next();
+        self.refresh_valid();
+    }
+
+    pub(crate) fn prev(&mut self) {
+        self.inner.prev();
+        self.refresh_valid();
+    }
+
+    pub(crate) fn user_key(&self) -> &[u8] {
+        &self.inner.user_key()[8..]
+    }
+
+    pub(crate) fn key_prefix(&self) -> u64 {
+        crate::sst::key_prefix8(self.user_key())
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.inner.seq()
+    }
+
+    pub(crate) fn ttl(&self) -> i64 {
+        self.inner.ttl()
+    }
+
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.inner.is_tombstone()
+    }
+
+    pub(crate) fn value_ref(&self) -> &[u8] {
+        self.inner.value_ref()
+    }
+}
+
+fn prefixed_key(prefix: [u8; 8], user_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + user_key.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(user_key);
+    key
 }
 
 /// A sealed unified memtable awaiting a split flush.
@@ -282,6 +377,21 @@ impl UnifiedStore {
         for imm in &s.imm {
             collect(imm.mem.snapshot(), &mut out);
         }
+        out
+    }
+
+    /// Return one lazy prefix iterator for the active shared memtable and each
+    /// immutable predecessor. Valid only for bytewise column-family ordering.
+    pub(crate) fn iterators_for_cf(&self, id: u64) -> Vec<UnifiedMemIter> {
+        let s = self.state.read();
+        let mut out = Vec::with_capacity(1 + s.imm.len());
+        out.push(UnifiedMemIter::new(s.mem.clone(), id));
+        out.extend(
+            s.imm
+                .iter()
+                .rev()
+                .map(|imm| UnifiedMemIter::new(imm.mem.clone(), id)),
+        );
         out
     }
 

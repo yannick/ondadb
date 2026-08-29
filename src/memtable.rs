@@ -24,6 +24,23 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtOrd};
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
+static SNAPSHOT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reset the debug-build snapshot materialization counter.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn reset_snapshot_calls() {
+    SNAPSHOT_CALLS.store(0, AtOrd::Relaxed);
+}
+
+/// Read the debug-build snapshot materialization counter.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn snapshot_calls() -> usize {
+    SNAPSHOT_CALLS.load(AtOrd::Relaxed)
+}
+
 #[cfg(not(feature = "arena-memtable"))]
 use crossbeam_skiplist::map::Entry as SkipEntry;
 #[cfg(not(feature = "arena-memtable"))]
@@ -518,6 +535,8 @@ impl Memtable {
     /// Materialize all live entries in internal order
     /// (user key ascending, sequence descending).
     pub fn snapshot(&self) -> Vec<Entry> {
+        #[cfg(debug_assertions)]
+        SNAPSHOT_CALLS.fetch_add(1, AtOrd::Relaxed);
         let mut out = Vec::with_capacity(self.num_entries.load(AtOrd::Relaxed).max(0) as usize);
         #[cfg(not(feature = "arena-memtable"))]
         for shard in &self.shards {
