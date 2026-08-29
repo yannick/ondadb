@@ -134,7 +134,11 @@ fn batch_recovery() {
     let folder = tempfile::tempdir().unwrap();
 
     for i in 0_u128..25 {
-        let db = open(folder.path());
+        // This case specifically verifies one atomic batch spanning two CFs,
+        // which requires ondaDB's unified WAL layout.
+        let mut options = Options::new(folder.path().to_str().unwrap());
+        options.unified_memtable = true;
+        let db = DB::open(options).unwrap();
         let tree = keyspace(&db, "default");
         let tree2 = keyspace(&db, "default2");
 
