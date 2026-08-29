@@ -1123,6 +1123,36 @@ fn unknown_default_tier_sst_orphans_are_removed_on_open() {
     db.close().unwrap();
 }
 
+#[test]
+fn manifest_level_above_limit_is_corruption() {
+    use ondadb::manifest::{manifest_path, Manifest};
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (db, cf) = open(dir.path());
+        db.put(&cf, b"key", b"value", ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.close().unwrap();
+    }
+
+    let path = manifest_path(dir.path());
+    let mut manifest = Manifest::load(&path).unwrap();
+    let table = manifest
+        .cfs
+        .first_mut()
+        .and_then(|cf| cf.sstables.first_mut())
+        .expect("fixture has one manifest table");
+    table.level = 65;
+    manifest.save(&path).unwrap();
+
+    let error = DB::open(Options::new(dir.path().to_str().unwrap()))
+        .expect_err("impossible manifest level must be rejected");
+    assert!(matches!(
+        error,
+        OndaError::Corruption(ref message) if message.contains("level 65")
+    ));
+}
+
 /// A comparable engine silently lost the level ratio passed at creation on
 /// recovery. The comparator is the highest-stakes ondaDB analog (invariant
 /// 7: a CF's comparator defines its on-disk order and is persisted by name).

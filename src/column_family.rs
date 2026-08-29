@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 
 /// Historical/default target size of an SSTable data block.
 pub(crate) const DEFAULT_DATA_BLOCK_SIZE: usize = 4 << 10;
+const MAX_MANIFEST_LEVEL: u32 = 64;
 
 /// One operation visible to a commit hook.
 #[derive(Debug, Clone)]
@@ -433,6 +434,12 @@ impl ColumnFamily {
         cmp: ComparatorRef,
         ssts: &[SstMeta],
     ) -> Result<(Arc<ColumnFamily>, u64)> {
+        if let Some(table) = ssts.iter().find(|table| table.level > MAX_MANIFEST_LEVEL) {
+            return Err(OndaError::Corruption(format!(
+                "column family {name:?} table {} has manifest level {}; supported maximum is {}",
+                table.id, table.level, MAX_MANIFEST_LEVEL
+            )));
+        }
         let mut max_level = 1usize;
         for s in ssts {
             max_level = max_level.max(s.level as usize + 1);
