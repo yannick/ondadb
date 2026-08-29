@@ -442,6 +442,12 @@ pub struct ColumnFamilyConfig {
     pub min_levels: u32,
     pub dividing_level_offset: i32,
     pub klog_value_threshold: usize,
+    /// Target size of an SSTable data block, in bytes. Default 4 KiB.
+    ///
+    /// Blocks are self-describing, so this is a per-family write policy rather
+    /// than a format choice. Larger blocks improve compression windows at the
+    /// cost of decompressing more bytes for a point read.
+    pub data_block_size: usize,
     pub compression: Compression,
     /// Per-level override of `compression`. Empty = use `compression` for
     /// every level. Otherwise level L uses `compression_per_level[min(L,
@@ -577,6 +583,7 @@ impl Default for ColumnFamilyConfig {
             min_levels: 1,
             dividing_level_offset: 1,
             klog_value_threshold: 512, // WiscKey separation threshold
+            data_block_size: crate::column_family::DEFAULT_DATA_BLOCK_SIZE,
             compression: Compression::None,
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
@@ -915,6 +922,9 @@ impl ColumnFamilyConfig {
         if self.target_file_size == 0 {
             return Err("target_file_size must be non-zero".to_string());
         }
+        if self.data_block_size == 0 {
+            return Err("data_block_size must be non-zero".to_string());
+        }
         if self.l1_base_bytes == 0 {
             return Err("l1_base_bytes must be non-zero".to_string());
         }
@@ -941,6 +951,7 @@ impl ColumnFamilyConfig {
         encode_overflow_policies(&mut b, self, counts);
         encode_partition_scheme(&mut b, self);
         encode_compaction_geometry(&mut b, self);
+        encode_block_size(&mut b, self);
         b
     }
 
@@ -972,6 +983,8 @@ const CONFIG_OVERFLOW_MAGIC: &[u8; 8] = b"ONDAOVF1";
 const CONFIG_PARTITION_FN_MAGIC: &[u8; 8] = b"ONDAPFN1";
 /// Tag introducing the 0.8.0 compaction-geometry tail.
 const CONFIG_COMPACTION_MAGIC: &[u8; 8] = b"ONDACMP1";
+/// Tag introducing the 0.8.1 per-family data-block-size tail.
+const CONFIG_BLOCK_SIZE_MAGIC: &[u8; 8] = b"ONDABLK1";
 
 #[derive(Clone, Copy)]
 struct LegacyPolicyCounts {
@@ -1133,6 +1146,16 @@ fn encode_compaction_geometry(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
     append_u64(b, cfg.hard_pending_compaction_bytes);
 }
 
+fn encode_block_size(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_u64;
+
+    if cfg.data_block_size == ColumnFamilyConfig::default().data_block_size {
+        return;
+    }
+    b.extend_from_slice(CONFIG_BLOCK_SIZE_MAGIC);
+    append_u64(b, cfg.data_block_size as u64);
+}
+
 #[derive(Clone, Copy)]
 struct ConfigCursor<'a> {
     remaining: &'a [u8],
@@ -1200,7 +1223,8 @@ fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
         decode_overflow_policies(&mut cursor, cfg)?;
     }
     let p = read_partition_fn_tail(cursor.into_remaining(), cfg);
-    read_compaction_tail(p, cfg);
+    let p = read_compaction_tail(p, cfg);
+    read_block_size_tail(p, cfg);
     Some(())
 }
 
@@ -1388,10 +1412,10 @@ fn read_partition_fn_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a 
 /// Consume the 0.8.0 compaction-geometry tail if present. Absent (every
 /// manifest written before 0.8.0, and any config left at the defaults), the
 /// struct defaults stand.
-fn read_compaction_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+fn read_compaction_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     use crate::encoding::read_u64;
     let Some(mut rest) = p.strip_prefix(CONFIG_COMPACTION_MAGIC) else {
-        return;
+        return p;
     };
     let mut next = || -> Option<u64> {
         if rest.len() < 8 {
@@ -1404,12 +1428,26 @@ fn read_compaction_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
     // All four or none: a truncated tail leaves every field at its default
     // rather than applying a half-read geometry.
     let (Some(tfs), Some(l1), Some(soft), Some(hard)) = (next(), next(), next(), next()) else {
-        return;
+        return p;
     };
     cfg.target_file_size = tfs as usize;
     cfg.l1_base_bytes = l1;
     cfg.soft_pending_compaction_bytes = soft;
     cfg.hard_pending_compaction_bytes = hard;
+    rest
+}
+
+fn read_block_size_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    let Some(rest) = p.strip_prefix(CONFIG_BLOCK_SIZE_MAGIC) else {
+        return;
+    };
+    if rest.len() < 8 {
+        return;
+    }
+    let value = crate::encoding::read_u64(rest) as usize;
+    if value != 0 {
+        cfg.data_block_size = value;
+    }
 }
 
 #[cfg(test)]
@@ -1992,5 +2030,61 @@ mod per_level_tests {
             ..ColumnFamilyConfig::default()
         };
         assert!(bad.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod block_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_default_config_emits_no_block_size_tail() {
+        let blob = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            ..ColumnFamilyConfig::default()
+        }
+        .encode();
+        assert!(!blob
+            .windows(CONFIG_BLOCK_SIZE_MAGIC.len())
+            .any(|window| window == CONFIG_BLOCK_SIZE_MAGIC));
+    }
+
+    #[test]
+    fn a_set_block_size_round_trips() {
+        let config = ColumnFamilyConfig {
+            data_block_size: 64 << 10,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(
+            ColumnFamilyConfig::decode(&config.encode()).data_block_size,
+            64 << 10
+        );
+    }
+
+    #[test]
+    fn the_block_size_tail_coexists_with_preceding_tails() {
+        let config = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Unresolved("byhash".into()),
+            target_file_size: 2 << 20,
+            data_block_size: 16 << 10,
+            ..ColumnFamilyConfig::default()
+        };
+        let decoded = ColumnFamilyConfig::decode(&config.encode());
+        assert_eq!(decoded.data_block_size, 16 << 10);
+        assert_eq!(decoded.target_file_size, 2 << 20);
+        assert!(matches!(
+            decoded.partition_scheme,
+            PartitionScheme::Unresolved(ref name) if name == "byhash"
+        ));
+    }
+
+    #[test]
+    fn a_zero_block_size_is_rejected() {
+        let config = ColumnFamilyConfig {
+            data_block_size: 0,
+            ..ColumnFamilyConfig::default()
+        };
+        let error = config.validate().expect_err("zero must not validate");
+        assert!(error.contains("data_block_size"), "{error}");
     }
 }

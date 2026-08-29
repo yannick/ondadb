@@ -972,7 +972,7 @@ fn cf_writer_opts(
         enable_bloom: cf.opts.enable_bloom_filter,
         bloom_fpr: cf.opts.bloom_fpr,
         klog_value_threshold: cf.opts.klog_value_threshold,
-        block_size: 4 << 10,
+        block_size: cf.opts.data_block_size,
         // Capacity hint for the writer's bloom-hash buffer ONLY. It used to
         // size the filter itself, which is why every compacted table carried a
         // filter built for 4,096 keys while holding a million — saturated, and
