@@ -1328,10 +1328,7 @@ fn copy_into_storage(
     copy_into_writer(from, storage.create(to)?)
 }
 
-fn copy_into_writer(
-    from: &Path,
-    mut writer: Box<dyn crate::storage::StorageWriter>,
-) -> Result<()> {
+fn copy_into_writer(from: &Path, mut writer: Box<dyn crate::storage::StorageWriter>) -> Result<()> {
     let mut src = std::fs::File::open(from)?;
     std::io::copy(&mut src, &mut *writer)?;
     writer.finish()

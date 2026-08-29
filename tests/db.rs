@@ -252,7 +252,9 @@ fn per_cf_multi_cf_commit_is_rejected_without_partial_apply() {
     let mut t = db.begin();
     t.put(&a, b"k", b"va", Duration::ZERO).unwrap();
     t.put(&b, b"k", b"vb", Duration::ZERO).unwrap();
-    let err = t.commit().expect_err("per-CF WALs cannot commit atomically");
+    let err = t
+        .commit()
+        .expect_err("per-CF WALs cannot commit atomically");
     assert!(matches!(
         err,
         OndaError::InvalidArgs(ref message)

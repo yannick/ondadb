@@ -1,11 +1,25 @@
 //! Small shared helpers.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
 use crate::error::{OndaError, Result};
+
+/// Fsync the parent directory of `path`, making a newly-created directory
+/// entry durable. A path without a parent is already relative to the caller's
+/// current directory and needs no additional handling here.
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if parent.as_os_str().is_empty() {
+            return Ok(());
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
 
 /// Current wall-clock time in Unix nanoseconds (used for TTL evaluation).
 pub fn now_nanos() -> i64 {

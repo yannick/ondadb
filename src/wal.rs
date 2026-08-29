@@ -219,6 +219,15 @@ impl Wal {
     /// Open (creating if needed) the WAL at `path` for appending.  Under
     /// [`SyncMode::Interval`] a background thread fsyncs every `interval`.
     pub fn open(path: impl AsRef<Path>, mode: SyncMode, interval: Duration) -> Result<Wal> {
+        Self::open_inner(path.as_ref(), mode, interval, crate::util::sync_parent_dir)
+    }
+
+    fn open_inner(
+        path: &Path,
+        mode: SyncMode,
+        interval: Duration,
+        sync_parent: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Wal> {
         let nstripes = if mode == SyncMode::Full {
             1
         } else {
@@ -226,13 +235,16 @@ impl Wal {
         };
         let mut files = Vec::with_capacity(nstripes);
         let mut size = 0i64;
+        let mut created = false;
         for k in 0..nstripes {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(stripe_path(path.as_ref(), k))?;
+            let stripe = stripe_path(path, k);
+            created |= !stripe.exists();
+            let f = OpenOptions::new().create(true).append(true).open(stripe)?;
             size += f.metadata()?.len() as i64;
             files.push(Mutex::new(Some(f)));
+        }
+        if created {
+            sync_parent(path)?;
         }
         let shared = Arc::new(Shared {
             files,
@@ -588,6 +600,40 @@ fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_wal_creation_propagates_parent_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let err = Wal::open_inner(&path, SyncMode::Full, Duration::ZERO, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::other("injected parent sync failure").into())
+        })
+        .expect_err("a new WAL must not open when its directory sync fails");
+
+        assert!(matches!(err, OndaError::Io(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn existing_wal_does_not_require_creation_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        drop(Wal::open(&path, SyncMode::Full, Duration::ZERO).unwrap());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        drop(
+            Wal::open_inner(&path, SyncMode::Full, Duration::ZERO, |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap(),
+        );
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn concurrent_append_replay_complete() {

@@ -527,7 +527,7 @@ impl Writer {
         // are durable. Without this a crash can leave the manifest referencing files
         // whose directory entry never reached disk. `sync_all` above only persists
         // file *contents*, not the link in the parent directory.
-        sync_parent_dir(&self.klog_path)?;
+        crate::util::sync_parent_dir(Path::new(&self.klog_path))?;
 
         self.finished = true;
         Ok(FileMeta {
@@ -577,20 +577,6 @@ pub(crate) fn shortest_separator(a: &[u8], b: &[u8]) -> Vec<u8> {
         return s;
     }
     a.to_vec()
-}
-
-/// fsync the parent directory of `file_path`, making a just-created file's
-/// directory entry durable. A missing parent is treated as success.
-fn sync_parent_dir(file_path: &str) -> Result<()> {
-    if let Some(dir) = Path::new(file_path).parent() {
-        // An empty parent means the current directory; skip.
-        if dir.as_os_str().is_empty() {
-            return Ok(());
-        }
-        let d = File::open(dir)?;
-        d.sync_all()?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

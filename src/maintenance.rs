@@ -10,13 +10,7 @@ use crate::db::DB;
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, Manifest, SstMeta};
 use crate::storage::Storage;
-
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
+use crate::util::sync_parent_dir;
 
 fn copy_storage_file(storage: &dyn Storage, src: &str, dst: &Path) -> Result<()> {
     let reader = storage.open_read(src)?;
