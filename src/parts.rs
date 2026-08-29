@@ -39,6 +39,18 @@ use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
 use crate::range_lock::{KeyRange, RangeGuard};
 use crate::sst::vlog_path_for;
 
+fn staged_range_overlaps(
+    cf: &ColumnFamily,
+    staged_bottom: &[(Vec<u8>, Vec<u8>)],
+    min_key: &[u8],
+    max_key: &[u8],
+) -> bool {
+    let cmp = cf.cmp();
+    staged_bottom.iter().any(|(staged_min, staged_max)| {
+        cmp.compare(min_key, staged_max).is_le() && cmp.compare(staged_min, max_key).is_le()
+    })
+}
+
 /// Lock the key span covering `partition`'s bottom-level tables, so compaction
 /// cannot rewrite them between the caller's snapshot and its removal.
 ///
@@ -392,6 +404,7 @@ impl DB {
         let visible = self.inner.visible_seq();
         // (handle, at_bottom). Built and validated before anything is installed.
         let mut staged: Vec<(Arc<SstHandle>, bool)> = Vec::new();
+        let mut staged_bottom: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         // dest paths copied so far, for cleanup on any rejection.
         let mut copied: Vec<String> = Vec::new();
 
@@ -429,7 +442,11 @@ impl DB {
 
                 let min_key = reader.min_key().to_vec();
                 let max_key = reader.max_key().to_vec();
-                let at_bottom = !cf.bottom_overlaps(&min_key, &max_key);
+                let at_bottom = !cf.bottom_overlaps(&min_key, &max_key)
+                    && !staged_range_overlaps(cf, &staged_bottom, &min_key, &max_key);
+                if at_bottom {
+                    staged_bottom.push((min_key.clone(), max_key.clone()));
+                }
                 meta.level = if at_bottom {
                     cf.bottom_level_index() as u32
                 } else {
@@ -546,6 +563,7 @@ impl DB {
 
         // Stage and validate every table before installing anything.
         let mut staged: Vec<(Arc<SstHandle>, bool)> = Vec::new();
+        let mut staged_bottom: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for t in &part.tables {
             let new_id = self.inner.next_file_id();
             let mut meta = SstMeta {
@@ -573,7 +591,11 @@ impl DB {
                     t.max_seq,
                 )));
             }
-            let at_bottom = !cf.bottom_overlaps(&t.min_key, &t.max_key);
+            let at_bottom = !cf.bottom_overlaps(&t.min_key, &t.max_key)
+                && !staged_range_overlaps(cf, &staged_bottom, &t.min_key, &t.max_key);
+            if at_bottom {
+                staged_bottom.push((t.min_key.clone(), t.max_key.clone()));
+            }
             meta.level = if at_bottom {
                 cf.bottom_level_index() as u32
             } else {

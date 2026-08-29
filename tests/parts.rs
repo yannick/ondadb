@@ -176,6 +176,45 @@ fn attach_overlapping_range_goes_to_l0() {
 }
 
 #[test]
+fn attach_mutually_overlapping_staged_tables_uses_l0() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+
+    let detached = db.detach_part(&cf, "img").unwrap();
+    let original = std::fs::read_dir(&detached.dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "klog"))
+        .expect("detached part has a klog");
+    std::fs::copy(
+        &original,
+        std::path::Path::new(&detached.dir).join("duplicate.klog"),
+    )
+    .unwrap();
+
+    let before = cf.stats();
+    let bottom_before = before.levels.last().unwrap().0;
+    let l0_before = before.levels[0].0;
+    db.attach_part(&cf, &detached.dir).unwrap();
+    let after = cf.stats();
+
+    assert_eq!(
+        after.levels.last().unwrap().0,
+        bottom_before + 1,
+        "only one mutually-overlapping staged table may enter bottom"
+    );
+    assert_eq!(
+        after.levels[0].0,
+        l0_before + 1,
+        "the other staged table must use overlap-tolerant L0"
+    );
+    assert_eq!(db.get(&cf, b"img/003").unwrap(), b"IMG");
+    db.close().unwrap();
+}
+
+#[test]
 fn freeze_part_is_independently_openable() {
     let dir = tempfile::tempdir().unwrap();
     let frozen = tempfile::tempdir().unwrap();

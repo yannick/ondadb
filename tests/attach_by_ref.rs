@@ -14,10 +14,17 @@ use ondadb::{ColumnFamily, ColumnFamilyConfig, OndaError, Options, PartitionRule
 
 fn shared_cfg() -> ColumnFamilyConfig {
     ColumnFamilyConfig {
-        partition_rules: vec![PartitionRule {
-            prefix: b"img/".to_vec(),
-            name: "img".into(),
-        }],
+        partition_rules: vec![
+            PartitionRule {
+                prefix: b"img/".to_vec(),
+                name: "img".into(),
+            },
+            PartitionRule {
+                prefix: b"log/".to_vec(),
+                name: "log".into(),
+            },
+        ],
+        min_levels: 2,
         l1_file_count_trigger: 1,
         ..ColumnFamilyConfig::default()
     }
@@ -110,6 +117,44 @@ fn attach_by_ref_mounts_without_copying() {
         "attach-by-ref must not copy bytes into the sharer's directory"
     );
     assert_eq!(sst_files_under(shared.path()), shared_before);
+}
+
+#[test]
+fn attach_by_ref_mutually_overlapping_tables_uses_l0() {
+    let shared = tempfile::tempdir().unwrap();
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+    let shared_root = shared.path().to_str().unwrap();
+
+    let db1 = open_with_shared(d1.path().to_str().unwrap(), shared_root);
+    let cf1 = db1.create_column_family("default", shared_cfg()).unwrap();
+    fill_and_publish(&db1, &cf1, b"IMG");
+    let mut part = db1.export_part(&cf1, "img").unwrap();
+    assert_eq!(part.tables.len(), 1, "fixture should publish one table");
+    part.tables.push(part.tables[0].clone());
+
+    let db2 = open_with_shared(d2.path().to_str().unwrap(), shared_root);
+    let cf2 = db2.create_column_family("default", shared_cfg()).unwrap();
+    for i in 0..8u32 {
+        db2.put(
+            &cf2,
+            format!("log/{i:03}").as_bytes(),
+            b"LOG",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    db2.flush_memtable(&cf2).unwrap();
+    db2.compact(&cf2).unwrap();
+    let before = cf2.stats();
+    let bottom = before.levels.len() - 1;
+    assert_ne!(bottom, 0, "fixture needs a distinct bottom level");
+    db2.attach_part_by_ref(&cf2, &part, "cas").unwrap();
+    let after = cf2.stats();
+
+    assert_eq!(after.levels[bottom].0, before.levels[bottom].0 + 1);
+    assert_eq!(after.levels[0].0, before.levels[0].0 + 1);
+    assert_eq!(db2.get(&cf2, b"img/000").unwrap(), b"IMG");
 }
 
 #[test]
