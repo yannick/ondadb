@@ -204,6 +204,13 @@ impl MergingIter {
             // Higher sequence sorts first in internal (forward) order.
             c = cj.seq().cmp(&ci.seq());
         }
+        if c == std::cmp::Ordering::Equal {
+            // Exact transaction-overlay ties must be deterministic and
+            // overlay-first in both directions. Children are appended in
+            // priority order; reversing this tie with the scan direction
+            // would make the committed value win backward iteration.
+            return i < j;
+        }
         if self.dir > 0 {
             c.is_lt()
         } else {
@@ -724,7 +731,47 @@ impl Iterator {
 
 #[cfg(test)]
 mod tests {
-    use super::{VersionDecision, VisibleVersion};
+    use std::ops::Bound;
+
+    use super::{ChildIter, Iterator, MergingIter, VersionDecision, VisibleVersion};
+    use crate::comparator::default_comparator;
+    use crate::memtable::Memtable;
+
+    fn exact_tie_children() -> Vec<ChildIter> {
+        let comparator = default_comparator();
+        let overlay = Memtable::new(comparator.clone());
+        overlay.put(b"key", b"overlay".to_vec(), 7, 0, false, false);
+        let committed = Memtable::new(comparator);
+        committed.put(b"key", b"committed".to_vec(), 7, 0, false, false);
+        vec![
+            ChildIter::Mem(overlay.iter()),
+            ChildIter::Mem(committed.iter()),
+        ]
+    }
+
+    #[test]
+    fn exact_ties_prefer_earlier_child_in_both_directions() {
+        let comparator = default_comparator();
+        let mut merge = MergingIter::new(comparator.clone(), exact_tie_children());
+        merge.seek_to_first();
+        assert!(merge.before(0, 1));
+        assert!(!merge.before(1, 0));
+        merge.dir = -1;
+        assert!(merge.before(0, 1));
+        assert!(!merge.before(1, 0));
+
+        let mut iterator = Iterator::new(
+            comparator,
+            exact_tie_children(),
+            7,
+            0,
+            (Bound::Unbounded, Bound::Unbounded),
+        );
+        iterator.seek_to_first();
+        assert_eq!(iterator.value(), b"overlay");
+        iterator.seek_to_last();
+        assert_eq!(iterator.value(), b"overlay");
+    }
 
     #[test]
     fn visible_version_keeps_the_highest_sequence_at_the_snapshot() {
