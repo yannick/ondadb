@@ -1227,13 +1227,14 @@ fn spawn_workers(
                 .expect("spawn flush worker"),
         );
     }
-    {
+    let n_compact = inner.opts.num_compaction_threads.max(1);
+    for worker in 0..n_compact {
         let db = inner.clone();
-        let rx = compact_rx;
+        let rx = compact_rx.clone();
         let stop = inner.stop.clone();
         handles.push(
             std::thread::Builder::new()
-                .name("onda-compact".into())
+                .name(format!("onda-compact-{worker}"))
                 .spawn(move || compact_worker(db, rx, stop))
                 .expect("spawn compaction worker"),
         );

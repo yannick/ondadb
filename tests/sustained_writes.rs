@@ -12,6 +12,52 @@ use std::time::{Duration, Instant};
 
 use ondadb::{ColumnFamilyConfig, IsolationLevel, Options, DB};
 
+#[test]
+fn configured_compaction_workers_run_disjoint_cfs_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new(dir.path().to_str().unwrap());
+    options.num_compaction_threads = 2;
+    let db = DB::open(options).unwrap();
+    let config = ColumnFamilyConfig {
+        l1_file_count_trigger: 1,
+        ..ColumnFamilyConfig::default()
+    };
+    let a = db.create_column_family("a", config.clone()).unwrap();
+    let b = db.create_column_family("b", config).unwrap();
+
+    let (entered_tx, entered_rx) = crossbeam_channel::unbounded::<&'static str>();
+    let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
+    for (name, cf) in [("a", &a), ("b", &b)] {
+        let entered = entered_tx.clone();
+        let release = release_rx.clone();
+        let first = Arc::new(AtomicBool::new(true));
+        cf.set_compaction_filter(Some(Arc::new(move |_, _| {
+            if first.swap(false, Ordering::Relaxed) {
+                entered.send(name).unwrap();
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test releases blocked compaction");
+            }
+            ondadb::FilterDecision::Keep
+        })));
+    }
+
+    db.put(&a, b"key-a", b"value", Duration::ZERO).unwrap();
+    db.flush_memtable(&a).unwrap();
+    db.put(&b, b"key-b", b"value", Duration::ZERO).unwrap();
+    db.flush_memtable(&b).unwrap();
+
+    let first = entered_rx.recv_timeout(Duration::from_secs(2));
+    let second = entered_rx.recv_timeout(Duration::from_millis(500));
+    release_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+
+    let first = first.expect("one compaction should enter its filter");
+    let second = second.expect("two configured workers should compact concurrently");
+    assert_ne!(first, second);
+    db.close().unwrap();
+}
+
 /// Small geometry so the tests build a multi-level tree from a modest number of
 /// records; the ratios, not the absolute sizes, are what is under test.
 fn small_geometry() -> ColumnFamilyConfig {
