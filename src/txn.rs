@@ -654,7 +654,12 @@ impl Txn {
                 | IsolationLevel::Snapshot
                 | IsolationLevel::Serializable
         );
-        let read_seq = self.db.visible_seq();
+        let read_seq = if fixed {
+            self.db.wait_visible_at_own_floor();
+            self.db.visible_seq()
+        } else {
+            self.db.read_floor_seq()
+        };
         if fixed {
             self.db.acquire_snapshot(read_seq);
         }
@@ -697,6 +702,35 @@ mod tests {
     use super::*;
     use crate::config::ColumnFamilyConfig;
     use crate::Options;
+
+    #[test]
+    fn reset_fixed_snapshot_waits_for_own_commit_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let mut txn = db.begin_with_isolation(IsolationLevel::ReadCommitted);
+        let reserved = db.inner.reserve_seq(1);
+        db.inner.note_thread_commit(reserved);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let helper_barrier = barrier.clone();
+        let inner = db.inner.clone();
+        let helper = std::thread::spawn(move || {
+            helper_barrier.wait();
+            std::thread::sleep(Duration::from_millis(100));
+            inner.publish_range(reserved, reserved + 1);
+        });
+        barrier.wait();
+
+        txn.reset(IsolationLevel::Snapshot).unwrap();
+        assert!(
+            txn.read_seq >= reserved,
+            "reset pinned {} below this thread's own commit floor {reserved}",
+            txn.read_seq
+        );
+        helper.join().unwrap();
+        txn.rollback().unwrap();
+        db.close().unwrap();
+    }
 
     #[test]
     fn prepared_write_order_is_last_write_wins_in_first_key_order() {
