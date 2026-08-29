@@ -25,6 +25,7 @@ use crate::manifest::{manifest_path, CfManifest, Manifest, WalLayout};
 
 const MAX_CF_NAME_LEN: usize = 128;
 const WORKER_TICK: Duration = Duration::from_millis(50);
+static NEXT_DB_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 struct PublishState {
     cursor: u64,                  // next start sequence expected to publish
@@ -45,6 +46,7 @@ struct FileDeletionState {
 pub struct DbInner {
     pub(crate) opts: Options,
     pub(crate) dir: String,
+    pub(crate) instance_id: u64,
     pub(crate) cfs: RwLock<HashMap<String, Arc<ColumnFamily>>>,
     /// CFs keyed by their stable id, for unified-memtable flush routing.
     pub(crate) cf_by_id: RwLock<HashMap<u64, Arc<ColumnFamily>>>,
@@ -144,9 +146,10 @@ thread_local! {
     /// it — breaking read-your-own-writes for read-modify-write callers
     /// (found by marekvs's chaos suite: INCR under concurrent load silently
     /// lost ~2-6% of increments). ReadCommitted reads therefore use
-    /// `max(visible_seq, own floor)`. Keyed by DbInner address; entries
-    /// die with the thread.
-    static THREAD_COMMIT_FLOOR: std::cell::RefCell<std::collections::HashMap<usize, u64>> =
+    /// `max(visible_seq, own floor)`. Keyed by a stable process-local database
+    /// identity so allocator address reuse cannot transfer a closed DB's floor
+    /// to a later instance. Entries die with the thread.
+    static THREAD_COMMIT_FLOOR: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -155,8 +158,8 @@ impl DbInner {
         self.next_seq.fetch_add(n, Ordering::SeqCst)
     }
 
-    fn db_key(&self) -> usize {
-        self as *const DbInner as usize
+    fn db_key(&self) -> u64 {
+        self.instance_id
     }
 
     /// Record that this thread committed up to `seq` (called post-publish).
@@ -511,6 +514,7 @@ fn build_db_inner(
     let inner = Arc::new(DbInner {
         opts: opts.clone(),
         dir,
+        instance_id: NEXT_DB_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         cfs: RwLock::new(HashMap::new()),
         cf_by_id: RwLock::new(HashMap::new()),
         ctx,
@@ -1394,6 +1398,22 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_instance_ids_are_monotonic_and_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut previous = 0;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+            let id = db.inner.instance_id;
+            assert_ne!(id, 0);
+            assert!(id > previous, "database identities must be monotonic");
+            assert!(seen.insert(id), "database identity {id} was reused");
+            previous = id;
+            db.close().unwrap();
+        }
+    }
 
     #[test]
     fn flush_memtable_waits_only_for_target_cf() {
