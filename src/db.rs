@@ -1061,9 +1061,10 @@ impl DB {
 /// source delete leaves a copy on the *source* tier that the manifest now
 /// attributes to the target. In both cases a `<id>.klog`/`<id>.vlog` file sits in
 /// a tier directory that disagrees with the manifest's tier for that id — so we
-/// delete exactly those. Files whose id the manifest does not know (in-flight
-/// flush/compaction output, WALs) are left untouched; correctly-placed files
-/// match and are kept.
+/// delete exactly those. Unknown numeric SST files on the database-owned default
+/// tier are also incomplete flush/compaction outputs and are removed. Unknown
+/// named-tier files remain untouched because that storage may have external
+/// ownership; correctly-placed manifest files are kept.
 /// Mint the per-database instance nonce (A2): 8 bytes of SHA-256 over the
 /// database path, the wall clock, and the pid. Not a cryptographic identity —
 /// a collision needs two databases minting in the same nanosecond with the
@@ -1145,7 +1146,10 @@ fn sweep_sst_entry(
 }
 
 fn sst_is_misplaced(manifest_tier: Option<&Option<String>>, location: Option<&str>) -> bool {
-    manifest_tier.is_some_and(|tier| tier.as_deref() != location)
+    match manifest_tier {
+        Some(tier) => tier.as_deref() != location,
+        None => location.is_none(),
+    }
 }
 
 /// Parse the table id from an SSTable file name (`<id>.klog` or `<id>.vlog`),
@@ -1419,7 +1423,8 @@ mod tests {
         let default = None;
         let cold = Some("cold".to_owned());
 
-        assert!(!sst_is_misplaced(None, None));
+        assert!(sst_is_misplaced(None, None));
+        assert!(!sst_is_misplaced(None, Some("cold")));
         assert!(!sst_is_misplaced(Some(&default), None));
         assert!(sst_is_misplaced(Some(&default), Some("cold")));
         assert!(!sst_is_misplaced(Some(&cold), Some("cold")));

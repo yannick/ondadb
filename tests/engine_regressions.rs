@@ -1087,6 +1087,42 @@ fn stray_files_ignored_on_open() {
     db.close().unwrap();
 }
 
+#[test]
+fn unknown_default_tier_sst_orphans_are_removed_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (db, cf) = open(dir.path());
+        db.put(&cf, b"kept", b"value", ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.close().unwrap();
+    }
+
+    let cf_dir = dir.path().join("cf-default");
+    let known_klogs: Vec<_> = std::fs::read_dir(&cf_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "klog")
+        })
+        .collect();
+    assert!(
+        !known_klogs.is_empty(),
+        "fixture needs a manifest-owned SST"
+    );
+    let orphan_klog = cf_dir.join("999999.klog");
+    let orphan_vlog = cf_dir.join("999999.vlog");
+    std::fs::write(&orphan_klog, b"crash orphan").unwrap();
+    std::fs::write(&orphan_vlog, b"crash orphan").unwrap();
+
+    let (db, cf) = open(dir.path());
+    assert_eq!(db.get(&cf, b"kept").unwrap(), b"value");
+    assert!(!orphan_klog.exists());
+    assert!(!orphan_vlog.exists());
+    assert!(known_klogs.iter().all(|path| path.exists()));
+    db.close().unwrap();
+}
+
 /// A comparable engine silently lost the level ratio passed at creation on
 /// recovery. The comparator is the highest-stakes ondaDB analog (invariant
 /// 7: a CF's comparator defines its on-disk order and is persisted by name).
