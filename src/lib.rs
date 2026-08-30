@@ -29,6 +29,14 @@
 )]
 #![warn(missing_debug_implementations)]
 
+// `tests/support/levels.rs` (the 0.2 overlapping-level fixture generator) is
+// shared verbatim between the integration tests and the in-crate compaction
+// benchmark, so it names types through the crate's PUBLIC path. This alias is
+// what lets that one file compile in both positions instead of being copied.
+// Test builds only; it adds nothing to a released binary.
+#[cfg(test)]
+extern crate self as ondadb;
+
 pub mod block;
 pub mod bloom;
 pub mod cache;

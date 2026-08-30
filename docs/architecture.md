@@ -219,6 +219,31 @@ overlap each other, so a job takes the **oldest** `l1_file_count_trigger` of
 them — safe because `levels[0]` is newest-first and reads walk it in that
 order, so a version left in a newer L0 file still shadows the copy pushed down.
 
+### Which file the sweep takes first (0.2)
+
+Within a level `i >= 1`, candidates are visited in ascending **overlap ratio**
+— `overlap_bytes(c) / max(1, c.klog_size + c.vlog_size)`, where
+`overlap_bytes` is the full size of every `levels[i+1]` table the candidate's
+span intersects (whole tables: a job rewrites them end to end, not the fraction
+of them the span covers). Ratios are compared by cross-multiplication in
+`u128`, so two ratios that differ by one byte never compare equal the way f64
+would round them together. Ties fall back to cyclic distance from the cursor,
+which keeps the sweep's fairness where scores are uniform.
+
+It is an **ordering, not a selection**. The try-loop is still a full sweep that
+wraps: the minimum-score candidate may be unusable, either because
+`gather_target` vetoes it (a foreign mount overlaps its *target* span — the
+candidate filter cannot see that, since it only screens the source table) or
+because `lock_job` finds the range held by a running job. Stopping at the
+minimum would wedge the level on either. The cursor still advances only after a
+usable pick, and still stores the picked table's `max_key`. **L0 is excluded**:
+its oldest-`l1_file_count_trigger` window is a correctness invariant, not a
+cost choice.
+
+Measured on the overlapping-level fixture (`tests/support/levels.rs`, skewed
+record sizes so overlap ratios actually differ): compaction bytes per ingested
+byte fell from 2.77 to 2.48, roughly 10%. Raw runs in `bench-results/0.2/`.
+
 Before 0.8.0 a job took the whole source level plus every overlapping target
 file. Under random keys an L0 file spans nearly the entire keyspace, so each
 push-down rewrote all of the level below, and the work in one job grew with the

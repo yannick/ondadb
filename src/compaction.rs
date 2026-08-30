@@ -33,6 +33,18 @@
 //! path walks it in that order, so a version left behind in a newer L0 file
 //! still shadows the copy pushed down to L1. A job therefore takes the oldest
 //! `l1_file_count_trigger` files.
+//!
+//! # Minimum overlap ratio (0.2)
+//!
+//! Which candidate a level's sweep takes first is a cost choice, and bounded
+//! jobs made it a live one: two same-sized files push down for very different
+//! prices depending on how many bytes of the next level their spans cover. The
+//! sweep therefore visits candidates in ascending
+//! `overlap_bytes / (klog_size + vlog_size)` ([`rank_candidates`]) instead of
+//! in cursor order. It remains an *ordering* — the loop is still a full sweep
+//! that wraps, because the cheapest candidate may be vetoed or already locked
+//! — and it applies to levels >= 1 only: L0's oldest-first window is a
+//! correctness invariant, not a cost choice.
 
 use std::sync::Arc;
 
@@ -308,9 +320,16 @@ fn build_job(
     };
 
     // One full sweep from the cursor, wrapping once, so a blocked candidate
-    // never wedges the level.
-    for k in 0..candidates.len() {
-        let idx = (start + k) % candidates.len();
+    // never wedges the level — visited cheapest-first (0.2): the file that
+    // rewrites the least target-level data per source byte goes first. This is
+    // an ORDERING, not a selection. The minimum-score candidate can be
+    // unusable, either because `gather_target` vetoes it (a foreign mount
+    // overlaps its TARGET span, which the candidate filter above cannot see —
+    // it only screens the source table) or because `lock_job` finds the range
+    // already held. Picking the minimum and stopping would wedge the level on
+    // either; the sweep survives both.
+    let order = cf.with_levels(|levels| rank_candidates(levels, &cmp, target, &candidates, start));
+    for idx in order {
         let pick = candidates[idx].clone();
         let (min_key, max_key) = key_span(std::slice::from_ref(&pick), &cmp);
         let Some(inputs) = gather_target(db, cf, target, &min_key, &max_key, vec![pick.clone()])
@@ -358,6 +377,106 @@ fn gather_target(
         return None;
     }
     Some(inputs)
+}
+
+/// Test-only override restoring the pre-0.2 first-fit cursor sweep, so the
+/// write-amplification benchmark can measure both pickers inside one test
+/// binary without a second build. Compiled out entirely otherwise.
+///
+/// It is process-global and the benchmark that flips it is `#[ignore]`d, so a
+/// plain `cargo test` never runs it concurrently with the ordering tests.
+#[cfg(test)]
+static FIRST_FIT_ORDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bytes of SSTable written by compaction since the last reset. See the
+/// accounting hook in [`compact_inputs`].
+#[cfg(test)]
+static COMPACTION_OUTPUT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of `levels[target]` a compaction over `[min_key, max_key]` would have
+/// to rewrite: the **whole** size of every target table the span intersects.
+///
+/// Whole tables, not the geometric fraction of them the span covers, because
+/// that is what a job actually rewrites. Purely advisory: `gather_target` is
+/// what builds the real input set, and it may still veto a span scored here
+/// (a foreign mount below it). Scoring a span that is later vetoed costs
+/// nothing — the try-loop moves on to the next candidate.
+///
+/// A linear scan rather than the two-pointer pass sortedness would allow: it
+/// is correct for any level layout (no disjointness precondition to violate),
+/// and at a few hundred files per level the comparisons are lost next to the
+/// compaction this schedules.
+fn overlap_bytes(
+    levels: &[Vec<Arc<SstHandle>>],
+    cmp: &ComparatorRef,
+    target: usize,
+    min_key: &[u8],
+    max_key: &[u8],
+) -> u64 {
+    let Some(lvl) = levels.get(target) else {
+        return 0; // nothing below the deepest level
+    };
+    lvl.iter()
+        .filter(|t| ranges_overlap(cmp, &t.meta.min_key, &t.meta.max_key, min_key, max_key))
+        .fold(0u64, |sum, t| {
+            sum.saturating_add(t.meta.klog_size.saturating_add(t.meta.vlog_size))
+        })
+}
+
+/// Order `candidates` (indices into it) by minimum overlap ratio:
+/// `overlap_bytes(c) / max(1, c.klog_size + c.vlog_size)` ascending — the file
+/// that rewrites the least of the level below per byte it contributes.
+///
+/// Ties break by cyclic distance from `start`, which keeps the cursor sweep's
+/// fairness intact when scores are equal (a fresh, evenly-shaped level scores
+/// uniformly, and visiting it in cursor order is what advances jobs across the
+/// keyspace instead of re-picking its head). `meta.id` is a determinism
+/// backstop below that; two distinct indices cannot share a cyclic distance,
+/// so it never actually decides, but it makes the order a total one.
+///
+/// Ratios are compared by cross-multiplication in `u128`: exact for every
+/// `u64` size, no float rounding to make two different ratios compare equal,
+/// and a product of two `u64`s cannot overflow a `u128`.
+fn rank_candidates(
+    levels: &[Vec<Arc<SstHandle>>],
+    cmp: &ComparatorRef,
+    target: usize,
+    candidates: &[Arc<SstHandle>],
+    start: usize,
+) -> Vec<usize> {
+    let n = candidates.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    #[cfg(test)]
+    if FIRST_FIT_ORDER.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0..n).map(|k| (start + k) % n).collect();
+    }
+
+    // (overlap bytes, source bytes) per candidate. The source floor of 1 keeps
+    // a zero-sized table from making every ratio compare equal to it.
+    let scores: Vec<(u128, u128)> = candidates
+        .iter()
+        .map(|c| {
+            let over = overlap_bytes(levels, cmp, target, &c.meta.min_key, &c.meta.max_key);
+            let src = c.meta.klog_size.saturating_add(c.meta.vlog_size).max(1);
+            (over as u128, src as u128)
+        })
+        .collect();
+
+    let start = start % n;
+    let cyclic = |i: usize| (i + n - start) % n;
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        (scores[a].0 * scores[b].1)
+            .cmp(&(scores[b].0 * scores[a].1))
+            .then_with(|| cyclic(a).cmp(&cyclic(b)))
+            .then_with(|| candidates[a].meta.id.cmp(&candidates[b].meta.id))
+    });
+    order
 }
 
 /// Take the range lock covering every input, or `None` if it is already held.
@@ -951,6 +1070,19 @@ pub(crate) fn compact_inputs(
         partitioner,
     }
     .run()?;
+    // Benchmark accounting only (`overlap_ratio_write_amp_benchmark`): the
+    // numerator of compaction write amplification. Compiled out of every
+    // non-test build — write-amp statistics are a documented non-goal of the
+    // public API, and this exists so the 0.2 picker could be measured, not to
+    // become one.
+    #[cfg(test)]
+    COMPACTION_OUTPUT_BYTES.fetch_add(
+        outputs
+            .iter()
+            .map(|o| o.klog_size.saturating_add(o.vlog_size))
+            .sum::<u64>(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     install_compaction_outputs(cf, &cmp, level, target, &inputs, &outputs);
 
     // Writer::finish has synced every output and its parent directory. Publish
@@ -1008,11 +1140,20 @@ fn ranges_overlap(cmp: &ComparatorRef, amin: &[u8], amax: &[u8], bmin: &[u8], bm
     cmp.compare(amin, bmax).is_le() && cmp.compare(bmin, amax).is_le()
 }
 
+/// The 0.2 overlapping-level fixture generator, shared with the integration
+/// tests rather than copied (see `tests/support/levels.rs`).
+#[cfg(test)]
+#[path = "../tests/support/levels.rs"]
+mod fixture;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{Retention, VersionRetention};
+    use super::{
+        build_job, gather_target, key_span, overlap_bytes, rank_candidates, Retention,
+        VersionRetention, COMPACTION_OUTPUT_BYTES, FIRST_FIT_ORDER,
+    };
     use crate::comparator::{default_comparator, CaseInsensitive, ComparatorRef};
 
     #[test]
@@ -1056,5 +1197,523 @@ mod tests {
             Retention::Keep { .. }
         ));
         assert_eq!(custom.decide(b"a", 9, false, 0), Retention::Drop);
+    }
+
+    // ---- 0.2: minimum-overlap-ratio picking -------------------------------
+
+    /// Open a scratch database with one column family, so the picker tests can
+    /// install hand-built level sets through `replace_levels`. Nothing here
+    /// ever opens a reader — the picker reads `SstMeta` only — so the handles
+    /// may name files that do not exist.
+    fn picker_db(
+        dir: &tempfile::TempDir,
+        cfg: crate::config::ColumnFamilyConfig,
+    ) -> (crate::DB, Arc<crate::column_family::ColumnFamily>) {
+        let db =
+            crate::DB::open(crate::config::Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.create_column_family("default", cfg).unwrap();
+        (db, cf)
+    }
+
+    fn handle(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        id: u64,
+        level: u32,
+        min: &[u8],
+        max: &[u8],
+        klog: u64,
+        vlog: u64,
+    ) -> Arc<crate::column_family::SstHandle> {
+        cf.handle_for(crate::manifest::SstMeta {
+            id,
+            level,
+            klog_size: klog,
+            vlog_size: vlog,
+            min_key: min.to_vec(),
+            max_key: max.to_vec(),
+            ..crate::manifest::SstMeta::default()
+        })
+    }
+
+    /// A table `is_foreign_mount` rejects: it carries a shared-tier object
+    /// name, and a database that never published to a shared tier (no minted
+    /// instance nonce) treats every object-named table as mounted elsewhere.
+    fn foreign_handle(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        id: u64,
+        level: u32,
+        min: &[u8],
+        max: &[u8],
+        klog: u64,
+        vlog: u64,
+    ) -> Arc<crate::column_family::SstHandle> {
+        cf.handle_for(crate::manifest::SstMeta {
+            id,
+            level,
+            klog_size: klog,
+            vlog_size: vlog,
+            min_key: min.to_vec(),
+            max_key: max.to_vec(),
+            object: Some(format!("cf-default/{:016x}-{id}", 0xfeedu64)),
+            ..crate::manifest::SstMeta::default()
+        })
+    }
+
+    #[test]
+    fn overlap_bytes_sums_intersecting_target_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        let levels = vec![
+            Vec::new(),
+            Vec::new(),
+            vec![
+                handle(&cf, 1, 2, b"c", b"e", 10, 20),     // 30
+                handle(&cf, 2, 2, b"g", b"i", 100, 200),   // 300
+                handle(&cf, 3, 2, b"k", b"m", 1000, 2000), // 3000
+            ],
+        ];
+
+        // Disjoint span: nothing to rewrite.
+        assert_eq!(overlap_bytes(&levels, &cmp, 2, b"a", b"b"), 0);
+        // Contained in one table's span: that whole table, klog + vlog.
+        assert_eq!(overlap_bytes(&levels, &cmp, 2, b"cc", b"dd"), 30);
+        // Straddling two: both, in full — a job rewrites whole tables, not the
+        // fraction of them the span covers.
+        assert_eq!(overlap_bytes(&levels, &cmp, 2, b"d", b"h"), 330);
+        assert_eq!(overlap_bytes(&levels, &cmp, 2, b"d", b"l"), 3330);
+        // Inclusive boundaries: a target table whose max_key equals the span's
+        // min_key overlaps it, and is rewritten.
+        assert_eq!(overlap_bytes(&levels, &cmp, 2, b"e", b"f"), 30);
+        assert_eq!(overlap_bytes(&levels, &cmp, 2, b"b", b"c"), 30);
+        // An absent target level scores zero rather than panicking: the
+        // deepest level has nothing below it.
+        assert_eq!(overlap_bytes(&levels, &cmp, 9, b"a", b"z"), 0);
+    }
+
+    #[test]
+    fn rank_candidates_orders_by_overlap_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        // Equal-sized sources; the geometrically first one sits over the
+        // biggest target table and the last over almost nothing, so cursor
+        // order and ratio order disagree completely.
+        let candidates = vec![
+            handle(&cf, 10, 1, b"a", b"c", 100, 0),
+            handle(&cf, 11, 1, b"e", b"g", 100, 0),
+            handle(&cf, 12, 1, b"i", b"k", 100, 0),
+        ];
+        let levels = vec![
+            Vec::new(),
+            candidates.clone(),
+            vec![
+                handle(&cf, 20, 2, b"a", b"c", 10_000, 0),
+                handle(&cf, 21, 2, b"e", b"g", 5_000, 0),
+                handle(&cf, 22, 2, b"i", b"k", 10, 0),
+            ],
+        ];
+
+        assert_eq!(
+            rank_candidates(&levels, &cmp, 2, &candidates, 0),
+            vec![2, 1, 0]
+        );
+        // The cursor moves the tie-break, never the ratio order.
+        assert_eq!(
+            rank_candidates(&levels, &cmp, 2, &candidates, 1),
+            vec![2, 1, 0]
+        );
+    }
+
+    #[test]
+    fn rank_candidates_breaks_ties_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        // Three candidates with identical ratios: the sweep's fairness is the
+        // tie-break, so they are visited in cursor order, wrapping once. (The
+        // `meta.id` tie-break below it is a determinism backstop only — two
+        // distinct indices can never share a cyclic distance.)
+        let candidates = vec![
+            handle(&cf, 30, 1, b"a", b"c", 100, 0),
+            handle(&cf, 31, 1, b"e", b"g", 100, 0),
+            handle(&cf, 32, 1, b"i", b"k", 100, 0),
+        ];
+        let levels = vec![
+            Vec::new(),
+            candidates.clone(),
+            vec![
+                handle(&cf, 40, 2, b"a", b"c", 200, 0),
+                handle(&cf, 41, 2, b"e", b"g", 200, 0),
+                handle(&cf, 42, 2, b"i", b"k", 200, 0),
+            ],
+        ];
+
+        assert_eq!(
+            rank_candidates(&levels, &cmp, 2, &candidates, 2),
+            vec![2, 0, 1]
+        );
+        // Repeatable: the order is a total order, not a hash iteration.
+        for _ in 0..4 {
+            assert_eq!(
+                rank_candidates(&levels, &cmp, 2, &candidates, 1),
+                vec![1, 2, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn rank_candidates_uses_u128_not_float() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        // Two ratios that differ only in the last integer bit. Both round to
+        // exactly 1.0 in f64, so a float comparison would tie them and fall
+        // through to cursor order — which here puts the WORSE one first.
+        let big = 1u64 << 62;
+        let candidates = vec![
+            handle(&cf, 50, 1, b"e", b"g", big, 0), // worse ratio, cursor-first
+            handle(&cf, 51, 1, b"a", b"c", big, 0), // better by one byte
+        ];
+        let levels = vec![
+            Vec::new(),
+            candidates.clone(),
+            vec![
+                handle(&cf, 60, 2, b"a", b"c", big + 1, 0),
+                handle(&cf, 61, 2, b"e", b"g", big + 2, 0),
+            ],
+        ];
+        assert_eq!(rank_candidates(&levels, &cmp, 2, &candidates, 0), vec![1, 0]);
+
+        // Saturating sizes must not wrap or panic: klog + vlog saturates at
+        // u64::MAX and the cross-multiplication stays inside u128.
+        let huge = vec![
+            handle(&cf, 70, 1, b"a", b"c", u64::MAX, u64::MAX),
+            handle(&cf, 71, 1, b"e", b"g", u64::MAX, u64::MAX),
+        ];
+        let huge_levels = vec![
+            Vec::new(),
+            huge.clone(),
+            vec![
+                handle(&cf, 80, 2, b"a", b"c", u64::MAX, u64::MAX),
+                handle(&cf, 81, 2, b"e", b"g", 1, 0),
+            ],
+        ];
+        assert_eq!(rank_candidates(&huge_levels, &cmp, 2, &huge, 0), vec![1, 0]);
+    }
+
+    #[test]
+    fn build_job_skips_unusable_minimum_score_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        // `a` has by far the lowest ratio, but a foreign mount covers its
+        // target span — a veto the candidate filter cannot see, because it
+        // only screens the SOURCE table. Stopping at the minimum would wedge
+        // the level; the sweep must fall through to `b`.
+        let candidates = vec![
+            handle(&cf, 100, 1, b"a000", b"a099", 1000, 0),
+            handle(&cf, 101, 1, b"b000", b"b099", 1000, 0),
+        ];
+        cf.replace_levels(vec![
+            Vec::new(),
+            candidates.clone(),
+            vec![
+                foreign_handle(&cf, 200, 2, b"a000", b"a099", 10, 0),
+                handle(&cf, 201, 2, b"b000", b"b099", 100_000, 0),
+            ],
+        ]);
+
+        let (job, _guard) =
+            build_job(&db.inner, &cf, 1).expect("the next-best candidate is usable");
+        assert_eq!((job.level, job.target), (1, 2));
+        let ids: Vec<u64> = job.inputs.iter().map(|t| t.meta.id).collect();
+        assert_eq!(ids, vec![101, 201], "picked the vetoed minimum, or gave up");
+    }
+
+    #[test]
+    fn build_job_l0_branch_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(
+            &dir,
+            crate::config::ColumnFamilyConfig {
+                l1_file_count_trigger: 2,
+                ..crate::config::ColumnFamilyConfig::default()
+            },
+        );
+        // `levels[0]` is newest-first. The L0 branch takes the OLDEST
+        // `l1_file_count_trigger` files regardless of how much of L1 they
+        // overlap — newest-first shadowing is a correctness invariant, so
+        // scoring must never touch this path.
+        cf.replace_levels(vec![
+            vec![
+                handle(&cf, 3, 0, b"x", b"z", 10, 0), // newest, cheapest overlap
+                handle(&cf, 2, 0, b"a", b"z", 10, 0),
+                handle(&cf, 1, 0, b"a", b"z", 10, 0), // oldest
+            ],
+            vec![
+                handle(&cf, 10, 1, b"a", b"c", 100_000, 0),
+                handle(&cf, 11, 1, b"x", b"z", 10, 0),
+            ],
+            Vec::new(),
+        ]);
+
+        let (job, _guard) = build_job(&db.inner, &cf, 0).expect("L0 is compactable");
+        assert_eq!((job.level, job.target), (0, 1));
+        let ids: Vec<u64> = job.inputs.iter().map(|t| t.meta.id).collect();
+        assert_eq!(ids, vec![1, 2, 10, 11], "L0 input selection changed");
+        // The L0 branch never touches the level cursor.
+        assert!(cf.compact_cursor.lock().get(&0).is_none());
+    }
+
+    #[test]
+    fn cursor_advances_only_on_usable_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        // Every candidate's target span is covered by a foreign mount, so no
+        // pick is usable at all.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![
+                handle(&cf, 100, 1, b"a000", b"a099", 1000, 0),
+                handle(&cf, 101, 1, b"b000", b"b099", 1000, 0),
+            ],
+            vec![foreign_handle(&cf, 200, 2, b"a000", b"b099", 10, 0)],
+        ]);
+        assert!(build_job(&db.inner, &cf, 1).is_none());
+        assert!(
+            cf.compact_cursor.lock().get(&1).is_none(),
+            "the cursor advanced past a level that produced no job"
+        );
+
+        // Free the target level: the pick succeeds and the cursor lands on the
+        // picked table's max_key.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![
+                handle(&cf, 100, 1, b"a000", b"a099", 1000, 0),
+                handle(&cf, 101, 1, b"b000", b"b099", 1000, 0),
+            ],
+            vec![
+                handle(&cf, 200, 2, b"a000", b"a099", 100_000, 0),
+                handle(&cf, 201, 2, b"b000", b"b099", 10, 0),
+            ],
+        ]);
+        let (job, _guard) = build_job(&db.inner, &cf, 1).expect("a usable candidate exists");
+        assert_eq!(job.inputs[0].meta.id, 101);
+        assert_eq!(
+            cf.compact_cursor.lock().get(&1).cloned(),
+            Some(b"b099".to_vec())
+        );
+    }
+
+    /// Deterministic 64-bit generator: the property test must reproduce
+    /// exactly from its seed, and `rand`'s stream is not a stable contract.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n.max(1)
+        }
+    }
+
+    #[test]
+    fn picked_candidate_minimizes_score_among_usable() {
+        for seed in 0..48u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+            let cmp = cf.cmp();
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+
+            // Random disjoint, sorted geometry for both levels, with foreign
+            // mounts sprinkled into the target so some candidates are vetoed.
+            let n_src = 2 + rng.below(6) as usize;
+            let mut source = Vec::new();
+            let mut key = 0u64;
+            for i in 0..n_src {
+                let lo = key + rng.below(3);
+                let hi = lo + 1 + rng.below(9);
+                key = hi + 1;
+                source.push(handle(
+                    &cf,
+                    1000 + i as u64,
+                    1,
+                    format!("{lo:06}").as_bytes(),
+                    format!("{hi:06}").as_bytes(),
+                    1 + rng.below(4096),
+                    rng.below(4096),
+                ));
+            }
+            let n_tgt = 1 + rng.below(10) as usize;
+            let mut target = Vec::new();
+            let mut key = 0u64;
+            for i in 0..n_tgt {
+                let lo = key + rng.below(3);
+                let hi = lo + 1 + rng.below(6);
+                key = hi + 1;
+                let id = 2000 + i as u64;
+                let (lo_k, hi_k) = (format!("{lo:06}"), format!("{hi:06}"));
+                let (klog, vlog) = (1 + rng.below(65536), rng.below(65536));
+                target.push(if rng.below(5) == 0 {
+                    foreign_handle(&cf, id, 2, lo_k.as_bytes(), hi_k.as_bytes(), klog, vlog)
+                } else {
+                    handle(&cf, id, 2, lo_k.as_bytes(), hi_k.as_bytes(), klog, vlog)
+                });
+            }
+            let levels = vec![Vec::new(), source.clone(), target];
+            cf.replace_levels(levels.clone());
+
+            // Score every candidate `gather_target` would accept. Nothing else
+            // holds a range lock here, so acceptance is the only usability
+            // constraint.
+            let usable: Vec<(u64, u128, u128)> = source
+                .iter()
+                .filter(|c| {
+                    gather_target(
+                        &db.inner,
+                        &cf,
+                        2,
+                        &c.meta.min_key,
+                        &c.meta.max_key,
+                        vec![(*c).clone()],
+                    )
+                    .is_some()
+                })
+                .map(|c| {
+                    let over =
+                        overlap_bytes(&levels, &cmp, 2, &c.meta.min_key, &c.meta.max_key) as u128;
+                    let src = c.meta.klog_size.saturating_add(c.meta.vlog_size).max(1) as u128;
+                    (c.meta.id, over, src)
+                })
+                .collect();
+
+            match build_job(&db.inner, &cf, 1) {
+                None => assert!(usable.is_empty(), "seed {seed}: gave up on a usable level"),
+                Some((job, guard)) => {
+                    let picked = job.inputs[0].meta.id;
+                    let me = usable
+                        .iter()
+                        .find(|(id, _, _)| *id == picked)
+                        .unwrap_or_else(|| panic!("seed {seed}: picked an unusable candidate"));
+                    for other in &usable {
+                        assert!(
+                            me.1 * other.2 <= other.1 * me.2,
+                            "seed {seed}: picked {picked} over cheaper usable {}",
+                            other.0
+                        );
+                    }
+                    // The job's range lock covers the union span of its
+                    // inputs: while the guard lives that exact span cannot be
+                    // taken again, and it frees on drop.
+                    let (min_key, max_key) = key_span(&job.inputs, &cmp);
+                    let span =
+                        crate::range_lock::KeyRange::new(min_key.clone(), max_key.clone());
+                    assert!(
+                        cf.range_locks.try_acquire(span).is_none(),
+                        "seed {seed}: the job's span is not locked"
+                    );
+                    drop(guard);
+                    assert!(cf
+                        .range_locks
+                        .try_acquire(crate::range_lock::KeyRange::new(min_key, max_key))
+                        .is_some());
+                }
+            }
+        }
+    }
+
+    /// Compaction write amplification of the 0.2 ratio picker against the
+    /// first-fit sweep it replaces, on the shared overlapping-level fixture.
+    ///
+    /// `#[ignore]`d: it writes hundreds of megabytes and takes minutes, and it
+    /// flips the process-global [`FIRST_FIT_ORDER`], which the ordering tests
+    /// above read. A plain `cargo test` runs neither, so they never collide.
+    ///
+    /// ```sh
+    /// cargo test --release --lib -- --ignored --nocapture write_amp
+    /// ```
+    ///
+    /// Arms alternate so thermal drift lands on both. One CSV line per run:
+    /// `picker,run,ingested_bytes,compaction_bytes,ratio`.
+    #[test]
+    #[ignore]
+    fn overlap_ratio_write_amp_benchmark() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let runs: usize = std::env::var("ONDADB_BENCH_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let geometry = super::fixture::LevelGeometry::default();
+        let ingested = geometry.ingested_bytes();
+
+        /// One ingest of the whole fixture, drained at close so deferred
+        /// compaction is counted rather than abandoned. Returns the bytes
+        /// compaction wrote.
+        fn one_run(geometry: &super::fixture::LevelGeometry, first_fit: bool) -> u64 {
+            let dir = tempfile::tempdir().unwrap();
+            FIRST_FIT_ORDER.store(first_fit, Relaxed);
+            COMPACTION_OUTPUT_BYTES.store(0, Relaxed);
+            let mut opts = crate::config::Options::new(dir.path().to_str().unwrap());
+            // Otherwise the backlog is abandoned at close and the arm that
+            // deferred the most work would look like the cheapest one.
+            opts.finish_compactions_on_close = true;
+            let db = crate::DB::open(opts).unwrap();
+            let cf = db
+                .create_column_family("fixture", geometry.compacting_config())
+                .unwrap();
+            geometry.write(&db, &cf);
+            db.close().unwrap();
+            FIRST_FIT_ORDER.store(false, Relaxed);
+            COMPACTION_OUTPUT_BYTES.load(Relaxed)
+        }
+
+        let mut baseline = Vec::new();
+        let mut candidate = Vec::new();
+        println!("picker,run,ingested_bytes,compaction_bytes,ratio");
+        for run in 0..runs {
+            for (name, first_fit, out) in [
+                ("first-fit", true, &mut baseline),
+                ("min-overlap-ratio", false, &mut candidate),
+            ] {
+                let bytes = one_run(&geometry, first_fit);
+                let ratio = bytes as f64 / ingested as f64;
+                println!("{name},{run},{ingested},{bytes},{ratio:.4}");
+                out.push(ratio);
+            }
+        }
+
+        let summarize = |name: &str, mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = v[v.len() / 2];
+            println!(
+                "{name}: median {median:.4}  min {:.4}  max {:.4}  spread {:.4}",
+                v[0],
+                v[v.len() - 1],
+                v[v.len() - 1] - v[0]
+            );
+            (median, v[v.len() - 1] - v[0])
+        };
+        let (base_median, base_spread) = summarize("first-fit", baseline);
+        let (cand_median, _) = summarize("min-overlap-ratio", candidate);
+        // The acceptance gate: the candidate's median must beat the baseline's
+        // by MORE than the baseline's own min-max spread, or the difference is
+        // indistinguishable from this machine's run-to-run noise.
+        println!(
+            "gate: improvement {:.4} vs baseline spread {base_spread:.4} => {}",
+            base_median - cand_median,
+            if base_median - cand_median > base_spread {
+                "MET"
+            } else {
+                "NOT MET"
+            }
+        );
     }
 }

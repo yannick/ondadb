@@ -32,6 +32,23 @@ which does not depend on how large the level has grown. A per-level cursor
 sweeps the keyspace so successive jobs advance across it rather than repeatedly
 picking the same file.
 
+Which file the sweep takes first is a cost choice. Since 0.2 the level's
+candidates are visited **cheapest first**: the file that rewrites the least
+data in the level below per byte of its own — its *overlap ratio*. Two files
+of the same size cost very different amounts to push down when one sits over a
+dense stretch of the next level and the other over a sparse one, and taking the
+cheap one first means fewer bytes rewritten for the same amount of debt paid.
+On a fixture with skewed record sizes this cut compaction bytes per ingested
+byte by about 10%; on a perfectly uniform workload every candidate scores the
+same and the order is the old cursor order, so there is nothing to gain and
+nothing to lose. There is no knob: it is not a behavior change you can observe
+except in bytes written.
+
+Ordering is all it is. If the cheapest candidate cannot actually be compacted —
+a read-only mounted part overlaps what it would rewrite, or another job already
+holds that key range — the sweep moves on to the next-cheapest rather than
+giving up, so one blocked file never wedges the level.
+
 L0 is the exception, twice. Its files overlap, so an arbitrary subset cannot be
 merged — that would reorder versions of a key. The **oldest** files can be,
 because L0 is kept newest-first and reads walk it in that order, so a version

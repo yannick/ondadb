@@ -493,3 +493,39 @@ fn fifo_ttl_selection_probe() {
     );
     db.close().unwrap();
 }
+
+#[path = "support/levels.rs"]
+mod levels;
+
+/// The overlapping-level fixture generator (0.2) is a shared asset: the
+/// picker's write-amplification benchmark compares two runs against each
+/// other, and 0.1's and 0.8's benchmarks will reuse it, so a fixture that
+/// drifted between runs would silently turn every such comparison into noise.
+/// One seed must therefore produce one table sequence, byte for byte.
+#[test]
+fn level_fixture_is_deterministic() {
+    let geometry = levels::LevelGeometry {
+        // Small enough to stay a test, large enough to cut several tables.
+        batches: 3,
+        keys_per_batch: 900,
+        ..levels::LevelGeometry::default()
+    };
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let a = geometry.materialize_quiescent(first.path());
+    let b = geometry.materialize_quiescent(second.path());
+
+    assert_eq!(a.len(), geometry.batches, "one flushed table per batch");
+    assert_eq!(
+        levels::fingerprint(&a),
+        levels::fingerprint(&b),
+        "same seed produced a different table sequence"
+    );
+
+    // A different seed must actually move the geometry, or the determinism
+    // above would be the trivial kind.
+    let third = tempfile::tempdir().unwrap();
+    let other = geometry.clone().with_seed(0x5EED).materialize_quiescent(third.path());
+    assert_ne!(levels::fingerprint(&a), levels::fingerprint(&other));
+}

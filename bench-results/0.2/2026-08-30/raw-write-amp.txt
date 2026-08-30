@@ -1,0 +1,32 @@
+warning: struct `NonPrefixDetermined` is never constructed
+    --> src/parts.rs:1621:12
+     |
+1621 |     struct NonPrefixDetermined;
+     |            ^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ondadb` (lib test) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.30s
+     Running unittests src/lib.rs (/Volumes/cargo/cargo-build/86/a353fcba440328/release/deps/ondadb-601a6154a62830ec)
+
+running 1 test
+picker,run,ingested_bytes,compaction_bytes,ratio
+test compaction::tests::overlap_ratio_write_amp_benchmark has been running for over 60 seconds
+first-fit,0,195450464,541014709,2.7680
+min-overlap-ratio,0,195450464,485074003,2.4818
+first-fit,1,195450464,552811961,2.8284
+min-overlap-ratio,1,195450464,475195283,2.4313
+first-fit,2,195450464,554224950,2.8356
+min-overlap-ratio,2,195450464,478252404,2.4469
+first-fit,3,195450464,541014709,2.7680
+min-overlap-ratio,3,195450464,479302621,2.4523
+first-fit,4,195450464,541014709,2.7680
+min-overlap-ratio,4,195450464,479302621,2.4523
+first-fit: median 2.7680  min 2.7680  max 2.8356  spread 0.0676
+min-overlap-ratio: median 2.4523  min 2.4313  max 2.4818  spread 0.0505
+gate: improvement 0.3157 vs baseline spread 0.0676 => MET
+test compaction::tests::overlap_ratio_write_amp_benchmark ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 172 filtered out; finished in 1218.34s
+
