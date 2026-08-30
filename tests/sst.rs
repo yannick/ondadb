@@ -49,6 +49,7 @@ fn build_sst(
         bc,
         1,
         default_comparator(),
+        0,
     )
     .unwrap();
     (r, keys)
@@ -91,6 +92,7 @@ fn large_value_vlog() {
         bc,
         2,
         default_comparator(),
+        0,
     )
     .unwrap();
     let (v, _, found, _) = r.get(b"b", u64::MAX, 0).unwrap();
@@ -126,6 +128,7 @@ fn corrupt_vlog_value_is_detected() {
         bc,
         42,
         default_comparator(),
+        0,
     )
     .unwrap();
     let res = r.get(b"a", u64::MAX, 0);
@@ -164,6 +167,7 @@ fn corrupt_vlog_value_is_detected_on_every_read() {
         Arc::new(BlockCache::new(1 << 20)),
         43,
         default_comparator(),
+        0,
     )
     .unwrap();
 
@@ -228,6 +232,7 @@ fn vlog_values_stable_across_repeat_reads() {
             Arc::new(BlockCache::new(1 << 20)),
             44,
             default_comparator(),
+            0,
         )
         .unwrap();
         for round in 0..4 {
@@ -259,6 +264,7 @@ fn tombstone_and_mvcc() {
         bc,
         3,
         default_comparator(),
+        0,
     )
     .unwrap();
 
@@ -340,6 +346,7 @@ fn btree_hybrid_klog_round_trip() {
         bc,
         7,
         default_comparator(),
+        0,
     )
     .unwrap();
 
@@ -413,6 +420,7 @@ fn vlog_compression_roundtrip_and_shrinks() {
             bc,
             1,
             default_comparator(),
+            0,
         )
         .unwrap();
         for i in 0..n {
@@ -478,6 +486,7 @@ fn vlog_incompressible_stored_raw() {
         bc,
         1,
         default_comparator(),
+        0,
     )
     .unwrap();
     for i in 0..n {
@@ -541,6 +550,7 @@ fn per_prefix_compression_rules() {
         bc,
         1,
         default_comparator(),
+        0,
     )
     .unwrap();
     for k in &keys {
@@ -588,6 +598,7 @@ fn footer_unknown_flag_bit_is_unsupported_format() {
         Arc::new(BlockCache::new(1 << 20)),
         1,
         default_comparator(),
+        0,
     )
     .expect_err("an unknown footer flag must be refused");
     assert_eq!(err.kind(), "unsupported_format");
@@ -617,6 +628,7 @@ fn fuzz_footer_flags_never_panic() {
             Arc::new(BlockCache::new(1 << 20)),
             1,
             default_comparator(),
+            0,
         );
         if let Err(e) = res {
             // Only the two fail-closed taxonomies are acceptable here.
@@ -627,4 +639,294 @@ fn fuzz_footer_flags_never_panic() {
             );
         }
     }
+}
+// ---------------------------------------------------------------------------
+// Vlog value cache (feature 0.5)
+// ---------------------------------------------------------------------------
+
+/// Open a reader over `klog` with the vlog value cache limited to `limit`
+/// bytes, sharing `bc` so the test can inspect admissions.
+fn open_reader(klog: &str, bc: Arc<BlockCache>, file_id: u64, limit: usize) -> Arc<Reader> {
+    Reader::open(
+        klog,
+        LocalStorage::new(Arc::new(FileCache::new(16)), cfg!(feature = "mmap-reads")),
+        bc,
+        file_id,
+        default_comparator(),
+        limit,
+    )
+    .unwrap()
+}
+
+/// Write a one-key table whose value is separated into the vlog.
+fn build_vlog_table(dir: &std::path::Path, name: &str, key: &[u8], value: &[u8]) -> String {
+    build_vlog_table_with(dir, name, &[(key, value)], Compression::None)
+}
+
+fn build_vlog_table_with(
+    dir: &std::path::Path,
+    name: &str,
+    entries: &[(&[u8], &[u8])],
+    alg: Compression,
+) -> String {
+    let klog = dir.join(format!("{name}.klog"));
+    let klog = klog.to_str().unwrap().to_string();
+    // Threshold 64 separates every value used here; 1 KiB blocks.
+    let mut w = Writer::new(&klog, opts(alg, entries.len(), 64, 1024)).unwrap();
+    for (i, (k, v)) in entries.iter().enumerate() {
+        w.add(k, v, (i + 1) as u64, 0, false, false).unwrap();
+    }
+    let meta = w.finish().unwrap();
+    assert!(meta.vlog_size > 0, "expected a vlog for {name}");
+    klog
+}
+
+/// `(file_id, 0)` names both the first klog data block and the first vlog
+/// frame. Without the `BlockDomain` tag on the cache key, one would be handed
+/// out where the other was asked for. Reading in both orders pins that.
+#[test]
+fn klog_block_and_vlog_frame_at_same_offset_do_not_alias() {
+    for reversed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        // "a" is inline (below the threshold), so the first data block holds it
+        // at klog offset 0; "b" is separated, so its frame sits at vlog offset 0.
+        let big = vec![b'X'; 4096];
+        let klog = build_vlog_table_with(
+            dir.path(),
+            "alias",
+            &[(b"a", b"tiny"), (b"b", big.as_slice())],
+            Compression::None,
+        );
+        let bc = Arc::new(BlockCache::new(1 << 20));
+        let r = open_reader(&klog, bc, 7, 1 << 20);
+
+        let read_value = || {
+            let (v, _, found, _) = r.get(b"b", u64::MAX, 0).unwrap();
+            assert!(found, "separated value missing");
+            assert_eq!(v.as_deref(), Some(big.as_slice()), "vlog frame aliased");
+        };
+        let read_block = || {
+            let (v, _, found, _) = r.get(b"a", u64::MAX, 0).unwrap();
+            assert!(found, "inline value missing");
+            assert_eq!(v.as_deref(), Some(b"tiny".as_slice()), "data block aliased");
+        };
+
+        if reversed {
+            read_block();
+            read_value();
+        } else {
+            read_value();
+            read_block();
+        }
+        // ...and again, now that both are resident.
+        read_value();
+        read_block();
+    }
+}
+
+/// The second read of a hot frame must do no vlog I/O and no decompression —
+/// in both feature configs. Under `mmap-reads` this is the assertion that the
+/// cache is consulted *before* the mmap path, which would otherwise decompress
+/// a v2 frame on every read.
+#[test]
+fn hot_vlog_frame_is_served_from_cache() {
+    for alg in [Compression::None, Compression::Zstd] {
+        let dir = tempfile::tempdir().unwrap();
+        let big: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        let klog = build_vlog_table_with(dir.path(), "hot", &[(b"k", big.as_slice())], alg);
+        let bc = Arc::new(BlockCache::new(1 << 20));
+        let r = open_reader(&klog, bc, 11, 1 << 20);
+
+        let cold = ondadb::perf::enter();
+        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        let cold = cold.finish();
+        assert!(found && v.as_deref() == Some(big.as_slice()));
+        assert_eq!(cold.vlog_reads, 1, "{alg:?} cold read");
+        assert_eq!(cold.vlog_cache_hits, 0, "{alg:?} cold read");
+
+        let warm = ondadb::perf::enter();
+        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        let warm = warm.finish();
+        assert!(found && v.as_deref() == Some(big.as_slice()));
+        assert_eq!(warm.vlog_reads, 0, "{alg:?}: warm read touched the vlog");
+        assert_eq!(warm.vlog_cache_hits, 1, "{alg:?}: warm read was not a hit");
+        assert_eq!(
+            warm.bytes_decompressed, 0,
+            "{alg:?}: warm read decompressed"
+        );
+    }
+}
+
+/// Admission is bounded by the configured limit, and a limit of 0 admits
+/// nothing at all.
+#[test]
+fn vlog_admission_respects_limit() {
+    const LIMIT: usize = 4096;
+    for (len, want_entry) in [(LIMIT - 1, true), (LIMIT, true), (LIMIT + 1, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let val = vec![b'q'; len];
+        let klog = build_vlog_table(dir.path(), "lim", b"k", &val);
+        let bc = Arc::new(BlockCache::new(1 << 20));
+        let r = open_reader(&klog, bc.clone(), 21, LIMIT);
+
+        let before = bc.stats().vlog_entries;
+        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        assert!(found && v.as_deref() == Some(val.as_slice()));
+        let added = bc.stats().vlog_entries - before;
+        assert_eq!(
+            added,
+            usize::from(want_entry),
+            "len {len} vs limit {LIMIT}: entries added {added}"
+        );
+    }
+
+    // Disabled: nothing is ever admitted, however small the value.
+    let dir = tempfile::tempdir().unwrap();
+    let val = vec![b'q'; 100];
+    let klog = build_vlog_table(dir.path(), "off", b"k", &val);
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    let r = open_reader(&klog, bc.clone(), 22, 0);
+    let before = bc.stats().vlog_entries;
+    for _ in 0..3 {
+        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        assert!(found && v.as_deref() == Some(val.as_slice()));
+    }
+    assert_eq!(
+        bc.stats().vlog_entries,
+        before,
+        "a disabled vlog cache admitted an entry"
+    );
+    let ctx = ondadb::perf::enter();
+    let _ = r.get(b"k", u64::MAX, 0).unwrap();
+    assert_eq!(ctx.finish().vlog_cache_hits, 0);
+}
+
+/// A frame that fails its CRC must never be admitted — a cache that memoized a
+/// corrupt decode would turn a detected corruption into a silent wrong answer
+/// for the life of the process.
+#[test]
+fn corrupt_vlog_frame_is_not_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = vec![b'Z'; 4096];
+    let klog = build_vlog_table(dir.path(), "bad", b"a", &big);
+    let vlog = dir.path().join("bad.vlog");
+
+    let good = std::fs::read(&vlog).unwrap();
+    let mut bytes = good.clone();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xFF;
+    std::fs::write(&vlog, &bytes).unwrap();
+
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    {
+        let r = open_reader(&klog, bc.clone(), 31, 1 << 20);
+        let before = bc.stats().vlog_entries;
+        assert!(
+            r.get(b"a", u64::MAX, 0).is_err(),
+            "a corrupt frame must be rejected"
+        );
+        assert_eq!(
+            bc.stats().vlog_entries,
+            before,
+            "a corrupt decode was admitted to the cache"
+        );
+        // Still an error on the retry: nothing memoized the bad bytes.
+        assert!(r.get(b"a", u64::MAX, 0).is_err());
+        assert_eq!(bc.stats().vlog_entries, before);
+    }
+
+    // Repair and reopen: the same frame now decodes and is admitted.
+    std::fs::write(&vlog, &good).unwrap();
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    let r = open_reader(&klog, bc.clone(), 32, 1 << 20);
+    let before = bc.stats().vlog_entries;
+    let (v, _, found, _) = r.get(b"a", u64::MAX, 0).unwrap();
+    assert!(found && v.as_deref() == Some(big.as_slice()));
+    assert_eq!(
+        bc.stats().vlog_entries,
+        before + 1,
+        "repaired frame not admitted"
+    );
+}
+
+/// Two threads racing on the same cold frame both decode correctly, and the
+/// duplicate insert leaves exactly one entry (there is no singleflight in v1;
+/// `put` keeps the resident value).
+#[test]
+fn concurrent_vlog_misses_both_return_correct_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let big: Vec<u8> = (0..48_000u32).map(|i| (i % 253) as u8).collect();
+    let klog = build_vlog_table(dir.path(), "race", b"k", &big);
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    let r = open_reader(&klog, bc.clone(), 41, 1 << 20);
+
+    let before = bc.stats().vlog_entries;
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let big = Arc::new(big);
+    let mut hs = Vec::new();
+    for _ in 0..2 {
+        let (r, start, big) = (r.clone(), start.clone(), big.clone());
+        hs.push(std::thread::spawn(move || {
+            start.wait();
+            let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+            assert!(found && v.as_deref() == Some(big.as_slice()));
+        }));
+    }
+    for h in hs {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        bc.stats().vlog_entries,
+        before + 1,
+        "a duplicate insert must not add a second entry"
+    );
+}
+
+/// Tables written before the v2 vlog frame layout (`FOOTER_VLOG_V2` clear) must
+/// cache and serve identically — the cache keys on the frame offset, not on the
+/// frame's shape. Today's writer only emits v2, so the v1 table is synthesised:
+/// one value, so its frame is at vlog offset 0 either way.
+#[test]
+fn legacy_v1_vlog_frames_are_cached() {
+    const FOOTER_SIZE: usize = 64;
+    const FOOTER_VLOG_V2: u8 = 0x08;
+
+    let dir = tempfile::tempdir().unwrap();
+    let big = vec![b'L'; 8192];
+    let klog = build_vlog_table(dir.path(), "v1", b"k", &big);
+
+    // v1 frame: CRC32-C of the value, then the raw value.
+    let vlog = dir.path().join("v1.vlog");
+    let mut frame = ondadb::encoding::checksum(&big).to_le_bytes().to_vec();
+    frame.extend_from_slice(&big);
+    std::fs::write(&vlog, &frame).unwrap();
+
+    // Clear the v2 flag in the klog footer (the footer carries no checksum of
+    // its own, only the trailing magic).
+    let mut klog_bytes = std::fs::read(&klog).unwrap();
+    let flags = klog_bytes.len() - FOOTER_SIZE + 48;
+    assert!(
+        klog_bytes[flags] & FOOTER_VLOG_V2 != 0,
+        "expected a v2 table"
+    );
+    klog_bytes[flags] &= !FOOTER_VLOG_V2;
+    std::fs::write(&klog, &klog_bytes).unwrap();
+
+    let bc = Arc::new(BlockCache::new(1 << 20));
+    let r = open_reader(&klog, bc.clone(), 51, 1 << 20);
+    let before = bc.stats().vlog_entries;
+
+    let cold = ondadb::perf::enter();
+    let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+    let cold = cold.finish();
+    assert!(found && v.as_deref() == Some(big.as_slice()));
+    assert_eq!(cold.vlog_reads, 1);
+    assert_eq!(bc.stats().vlog_entries, before + 1, "v1 frame not admitted");
+
+    let warm = ondadb::perf::enter();
+    let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+    let warm = warm.finish();
+    assert!(found && v.as_deref() == Some(big.as_slice()));
+    assert_eq!(warm.vlog_reads, 0);
+    assert_eq!(warm.vlog_cache_hits, 1);
 }

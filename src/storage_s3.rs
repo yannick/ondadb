@@ -531,7 +531,8 @@ mod tests {
 
         // Open a Reader backed by S3 (mmap off, block cache fronting range GETs).
         let bc = Arc::new(BlockCache::new(1 << 20));
-        let reader = Reader::open(&key, s3.clone(), bc.clone(), 7, default_comparator()).unwrap();
+        let reader =
+            Reader::open(&key, s3.clone(), bc.clone(), 7, default_comparator(), 0).unwrap();
 
         // A single point get must not download the whole file: it costs a HEAD
         // (on open) + a handful of range GETs (footer, index, bloom, one data

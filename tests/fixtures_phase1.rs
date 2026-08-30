@@ -402,6 +402,7 @@ fn legacy_corpus_decodes_unchanged() {
             Arc::new(BlockCache::new(1 << 20)),
             1,
             default_comparator(),
+            0,
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
 

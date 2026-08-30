@@ -40,7 +40,8 @@ Read/scan path:
 - CRC-once-per-block bitmap in `Reader` — N scanning threads don't re-verify
   the same immutable block N times.
 - CRC-once-per-vlog-frame set in `Reader` — the same rule for large values, on
-  both the mmap and buffered paths (see "Vlog reads" below).
+  both the mmap and buffered paths (see "Vlog reads" below). Opt-in caching of
+  the *decoded* value on top of it (`max_cached_vlog_value_bytes`, default 0).
 - `uvarint` single-byte inline fast path; mmap + `madvise(WillNeed)` prefault.
 
 Flush path:
@@ -117,8 +118,9 @@ not say why, and a plausible story about why is not evidence. Open a
 [`PerfContext`](../src/perf.rs) scope (`DB::get_with_perf`, `Txn::get_with_perf`,
 `Iterator::perf_scope`) around a representative operation and quote the counter
 that moved — `bloom_negatives` for a filter change, `block_misses` for a cache
-change, `vlog_reads` for a value-separation change. A latency win with no
-counter movement behind it is a measurement artifact until proven otherwise.
+change, `vlog_reads`/`vlog_cache_hits` for a value-separation or vlog-cache
+change. A latency win with no counter movement behind it is a measurement
+artifact until proven otherwise.
 Counters are per-operation and thread-affine, so they cost nothing to the
 threads that are not measuring: the nil path is a thread-local depth check
 (measured at 0.10; see `bench-results/0.10/2026-08-30/summary.md`).
@@ -238,7 +240,7 @@ settled tree. Neither number is wrong; they answer different questions. See
   **Existing SSTables keep their broken filters until rewritten** — the fix
   applies to newly written tables, and a full compaction migrates the rest.
 
-## Vlog reads: CRC-once, and why the values are not cached
+## Vlog reads: CRC-once, and the opt-in value cache
 
 Large values (`>= klog_value_threshold`) live in the vlog, and every read of one
 used to re-checksum the whole stored payload — a klog data block was verified
@@ -261,27 +263,66 @@ selected at runtime, median of 3 runs, `--test-threads=1`:
 | buffered, **CRC-once** | **9.29 GB/s** (1.9×) | **6.47 GB/s** (1.7×) |
 | buffered, CRC-once + block cache | 29.0 GB/s (3.1×) | (above the cap — uncached) |
 
-**Vlog values are deliberately not put in the block cache.** The measurement is
-why, and it splits by path. On the mmap path caching is a **32% regression**
-(45.1 → 30.8 GB/s): the caller wants an owned `Vec`, so a cached value is
-memcpy'd out of an `Arc` instead of straight from the page-cache-resident
-mapping — the cache adds a copy and a shard lock and removes no work, because
-the bytes were already resident. That is the path spada compiles
-(`ondadb = { features = ["mmap-reads"] }`), and the path this was reported from.
+**Vlog values are cacheable, and off by default** (feature 0.5). The table above
+is why it is a per-family opt-in
+(`ColumnFamilyConfig::max_cached_vlog_value_bytes`, default 0) and not a
+default: caching is a win in exactly one of the three regimes below. Two things
+had to be true before it could exist at all:
 
-On the buffered path caching does win (3.1×), by skipping a `pread` — but it
-pays for that with the shared 64 MiB block-cache budget, at up to the per-value
-cap each, evicting roughly 256 klog blocks per MiB of value, to avoid re-reading
-bytes the OS page cache is already holding. Trading the index-and-hot-block
-cache for a second copy of the page cache is the wrong trade at the default
-size, so it is not made.
+- The block cache needed a **key domain**. A `Reader` owns a klog and a vlog
+  under one `file_id`, and both offset spaces start at zero, so `(file_id, 0)`
+  named both the first data block and the first vlog frame. `BlockKey` now
+  carries a `BlockDomain` (`Klog` | `Vlog`);
+  `tests/sst.rs::klog_block_and_vlog_frame_at_same_offset_do_not_alias` pins it.
+  That is a correctness fix, not part of the opt-in surface.
+- The lookup had to sit **before** the mmap attempt, not after, or the
+  `mmap-reads` config would keep paying the v2 decompression on every read.
 
-The case that would genuinely change this is a **remote tier** (`s3`), where a
-miss is an HTTP GET rather than a page-cache hit and the arithmetic is not close.
-Vlog values on S3 tiers are re-fetched per read today; caching them is real
-future work, deliberately not done here because it cannot be measured on this
-machine (S3 tests need `ONDADB_S3_ENDPOINT`) and this repo does not ship
-unmeasured performance changes.
+### What it costs and buys (0.5 acceptance, `bench-results/0.5/2026-08-30/`)
+
+`tests/vlog_read_bench.rs::vlog_value_cache_hot_cold_point_reads`, 5 invocations
+per config, arms alternated off/on/off inside each run. 64 KiB values, an 8 MiB
+block cache shared with 120k small keys, 40 small point reads interleaved per
+large read. Both domains share one capacity, which is the whole measurement.
+
+| build / hot set | hot latency (median of 5) | vlog hit rate | klog hit-rate delta |
+|---|---|---|---|
+| default, hot set **fits** (1 MiB of 8) | **2.61× faster** (range 2.34–4.14×) | 100% | **−5.35 pp** |
+| default, hot set **thrashes** (6 MiB of 8) | **0.55× — a 1.8× regression** | 0% | **−26.18 pp** |
+| `unsafe-fastpath`, either hot set | **0.83× — a 1.2× regression** | 100% | not measurable |
+
+Three regimes, and only the first is a win.
+
+**Default build, hot set fits.** The read becomes a shard-locked memcpy out of
+an `Arc` instead of a `pread` plus a CRC, and the klog pays about five points of
+hit rate for it. This is the case the feature exists for.
+
+**Default build, hot set thrashes.** Every admission is a 64 KiB copy plus an
+eviction sweep that is never reused, *and* it evicts a quarter of the klog
+residency — strictly worse than not caching, in both terms at once. There is no
+adaptive admission policy in v1, so the operator owns that judgement, and the
+default (0) is the safe side of it.
+
+**`unsafe-fastpath`, always.** Unchanged from the original finding above: the
+caller wants an owned `Vec`, so a cached value is memcpy'd out of an `Arc`
+instead of straight from the page-cache-resident mapping. The cache adds a copy
+and a shard lock and removes no work, and it loses even at a 100% hit rate. Do
+not enable the option on a build that mmaps its tables.
+
+The klog delta is quoted from the **default build only**, and reported as `NaN`
+under `mmap-reads` on purpose: an uncompressed klog block is served straight
+from the mapping by `read_data_block_local` and never enters the block cache, so
+there is no klog residency there for vlog admission to displace.
+
+The case with no such trade-off is a **remote tier** (`s3`), where a miss is an
+HTTP range GET rather than a page-cache hit and the arithmetic is not close:
+`tests/s3_tier.rs::warm_vlog_value_issues_no_range_get` asserts a warm large
+value costs zero requests. It is `ONDADB_S3_ENDPOINT`-gated and so is *not* part
+of the numbers above — this repo does not publish unmeasured claims.
+
+`vlog_verified` is kept, not replaced: it still serves bypassed, evicted and
+oversized frames, and it is what keeps a cache miss cheap on the second read of
+an oversized value.
 
 Scope, honestly: this is once per *open reader*, not once per process — closing
 and re-opening a table re-verifies, which is the same guarantee the klog bitmap

@@ -458,6 +458,19 @@ pub struct ColumnFamilyConfig {
     /// than a format choice. Larger blocks improve compression windows at the
     /// cost of decompressing more bytes for a point read.
     pub data_block_size: usize,
+    /// Byte ceiling on a decoded vlog value the block cache may hold. `0`
+    /// (the default) disables vlog value caching entirely.
+    ///
+    /// A separated value costs a positional read plus a CRC verify plus (v2) a
+    /// decompression on **every** access — `Reader::vlog_verified` memoizes
+    /// the checksum, never the bytes. Caching the decoded bytes removes all
+    /// three for hot values, at the cost of sharing the block cache's fixed
+    /// capacity with klog data blocks. Off by default because that trade is
+    /// workload-specific; a practical starting value is 1 MiB.
+    ///
+    /// Must be either 0 or at least `klog_value_threshold` — nothing shorter
+    /// than the threshold ever reaches the vlog.
+    pub max_cached_vlog_value_bytes: usize,
     pub compression: Compression,
     /// Per-level override of `compression`. Empty = use `compression` for
     /// every level. Otherwise level L uses `compression_per_level[min(L,
@@ -605,6 +618,7 @@ impl Default for ColumnFamilyConfig {
             dividing_level_offset: 1,
             klog_value_threshold: 512, // WiscKey separation threshold
             data_block_size: crate::column_family::DEFAULT_DATA_BLOCK_SIZE,
+            max_cached_vlog_value_bytes: 0, // vlog value caching off
             compression: Compression::None,
             compression_per_level: Vec::new(),
             compression_rules: Vec::new(),
@@ -946,6 +960,18 @@ impl ColumnFamilyConfig {
         if self.data_block_size == 0 {
             return Err("data_block_size must be non-zero".to_string());
         }
+        // A limit under the separation threshold is indistinguishable from
+        // "off" at runtime but reads as "on" in the config — reject it rather
+        // than let it look like a tuning that did nothing.
+        if self.max_cached_vlog_value_bytes != 0
+            && self.max_cached_vlog_value_bytes < self.klog_value_threshold
+        {
+            return Err(format!(
+                "max_cached_vlog_value_bytes ({}) is below klog_value_threshold ({}), \
+                 so no vlog value could ever be cached",
+                self.max_cached_vlog_value_bytes, self.klog_value_threshold
+            ));
+        }
         if self.l1_base_bytes == 0 {
             return Err("l1_base_bytes must be non-zero".to_string());
         }
@@ -973,6 +999,7 @@ impl ColumnFamilyConfig {
         encode_partition_scheme(&mut b, self);
         encode_compaction_geometry(&mut b, self);
         encode_block_size(&mut b, self);
+        encode_vlog_cache(&mut b, self);
         b
     }
 
@@ -1006,6 +1033,8 @@ const CONFIG_PARTITION_FN_MAGIC: &[u8; 8] = b"ONDAPFN1";
 const CONFIG_COMPACTION_MAGIC: &[u8; 8] = b"ONDACMP1";
 /// Tag introducing the 0.8.1 per-family data-block-size tail.
 const CONFIG_BLOCK_SIZE_MAGIC: &[u8; 8] = b"ONDABLK1";
+/// Tag introducing the vlog-value-cache tail (feature 0.5).
+const CONFIG_VLOG_CACHE_MAGIC: &[u8; 8] = b"ONDAVVC1";
 
 #[derive(Clone, Copy)]
 struct LegacyPolicyCounts {
@@ -1177,6 +1206,19 @@ fn encode_block_size(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
     append_u64(b, cfg.data_block_size as u64);
 }
 
+fn encode_vlog_cache(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_u64;
+
+    // Eliding the default keeps an untouched family's blob byte-identical to
+    // what a pre-0.5 binary wrote.
+    if cfg.max_cached_vlog_value_bytes == ColumnFamilyConfig::default().max_cached_vlog_value_bytes
+    {
+        return;
+    }
+    b.extend_from_slice(CONFIG_VLOG_CACHE_MAGIC);
+    append_u64(b, cfg.max_cached_vlog_value_bytes as u64);
+}
+
 #[derive(Clone, Copy)]
 struct ConfigCursor<'a> {
     remaining: &'a [u8],
@@ -1245,7 +1287,8 @@ fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     }
     let p = read_partition_fn_tail(cursor.into_remaining(), cfg);
     let p = read_compaction_tail(p, cfg);
-    read_block_size_tail(p, cfg);
+    let p = read_block_size_tail(p, cfg);
+    read_vlog_cache_tail(p, cfg);
     Some(())
 }
 
@@ -1458,17 +1501,31 @@ fn read_compaction_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u
     rest
 }
 
-fn read_block_size_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+fn read_block_size_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     let Some(rest) = p.strip_prefix(CONFIG_BLOCK_SIZE_MAGIC) else {
-        return;
+        return p;
     };
     if rest.len() < 8 {
-        return;
+        return p;
     }
     let value = crate::encoding::read_u64(rest) as usize;
     if value != 0 {
         cfg.data_block_size = value;
     }
+    &rest[8..]
+}
+
+fn read_vlog_cache_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    let Some(rest) = p.strip_prefix(CONFIG_VLOG_CACHE_MAGIC) else {
+        return;
+    };
+    if rest.len() < 8 {
+        return;
+    }
+    // Unlike the block size, 0 is a meaningful value here (disabled) — but the
+    // encoder elides it, so a stored 0 can only come from a truncated or
+    // hand-edited blob. Take it at face value: it is also the default.
+    cfg.max_cached_vlog_value_bytes = crate::encoding::read_u64(rest) as usize;
 }
 
 #[cfg(test)]
@@ -2097,6 +2154,76 @@ mod block_size_tests {
             decoded.partition_scheme,
             PartitionScheme::Unresolved(ref name) if name == "byhash"
         ));
+    }
+
+    #[test]
+    fn vlog_cache_blob_omits_default() {
+        // The default (0, disabled) must add no bytes: old readers decode new
+        // blobs, and an untouched family's blob does not change shape.
+        let blob = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            data_block_size: 16 << 10,
+            ..ColumnFamilyConfig::default()
+        }
+        .encode();
+        assert!(!blob
+            .windows(CONFIG_VLOG_CACHE_MAGIC.len())
+            .any(|window| window == CONFIG_VLOG_CACHE_MAGIC));
+    }
+
+    #[test]
+    fn a_set_vlog_cache_limit_round_trips() {
+        let config = ColumnFamilyConfig {
+            max_cached_vlog_value_bytes: 1 << 20,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(
+            ColumnFamilyConfig::decode(&config.encode()).max_cached_vlog_value_bytes,
+            1 << 20
+        );
+    }
+
+    #[test]
+    fn the_vlog_cache_tail_coexists_with_preceding_tails() {
+        let config = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Unresolved("byhash".into()),
+            target_file_size: 2 << 20,
+            data_block_size: 16 << 10,
+            max_cached_vlog_value_bytes: 4 << 20,
+            ..ColumnFamilyConfig::default()
+        };
+        let decoded = ColumnFamilyConfig::decode(&config.encode());
+        assert_eq!(decoded.max_cached_vlog_value_bytes, 4 << 20);
+        assert_eq!(decoded.data_block_size, 16 << 10);
+        assert_eq!(decoded.target_file_size, 2 << 20);
+        assert!(matches!(
+            decoded.partition_scheme,
+            PartitionScheme::Unresolved(ref name) if name == "byhash"
+        ));
+    }
+
+    #[test]
+    fn a_vlog_cache_limit_below_the_separation_threshold_is_rejected() {
+        // No value shorter than `klog_value_threshold` ever reaches the vlog,
+        // so such a limit reads as "on" while admitting nothing.
+        let config = ColumnFamilyConfig {
+            klog_value_threshold: 512,
+            max_cached_vlog_value_bytes: 511,
+            ..ColumnFamilyConfig::default()
+        };
+        let error = config.validate().expect_err("must not validate");
+        assert!(error.contains("max_cached_vlog_value_bytes"), "{error}");
+
+        // Exactly at the threshold is the smallest useful limit.
+        assert!(ColumnFamilyConfig {
+            klog_value_threshold: 512,
+            max_cached_vlog_value_bytes: 512,
+            ..ColumnFamilyConfig::default()
+        }
+        .validate()
+        .is_ok());
+        // ...and 0 (disabled) is always fine.
+        assert!(ColumnFamilyConfig::default().validate().is_ok());
     }
 
     #[test]

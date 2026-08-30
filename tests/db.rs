@@ -1366,3 +1366,44 @@ fn tail_surfaces_iterator_construction_failure() {
     );
     let _ = db.close();
 }
+
+/// The vlog value cache limit is persisted per family (feature 0.5). A setting
+/// that silently reverts on the first reopen is worse than no setting at all:
+/// the tuning appears to hold for the life of the process and then vanishes.
+#[test]
+fn vlog_value_cache_limit_round_trips_through_reopen() {
+    assert_eq!(
+        ColumnFamilyConfig::default().max_cached_vlog_value_bytes,
+        0,
+        "the cache must be off unless a family opts in"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    db.create_column_family(
+        "tuned",
+        ColumnFamilyConfig {
+            max_cached_vlog_value_bytes: 1 << 20,
+            ..ColumnFamilyConfig::default()
+        },
+    )
+    .unwrap();
+    db.create_column_family("plain", ColumnFamilyConfig::default())
+        .unwrap();
+    drop(db);
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    assert_eq!(
+        db.column_family_config("tuned")
+            .unwrap()
+            .max_cached_vlog_value_bytes,
+        1 << 20
+    );
+    assert_eq!(
+        db.column_family_config("plain")
+            .unwrap()
+            .max_cached_vlog_value_bytes,
+        0,
+        "a family that never set the field must recover the default"
+    );
+}

@@ -9,7 +9,7 @@ use super::{
     KNOWN_FOOTER_FLAGS, VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
 };
 use crate::bloom::Bloom;
-use crate::cache::BlockCache;
+use crate::cache::{BlockCache, BlockDomain};
 use crate::comparator::ComparatorRef;
 use crate::config::Compression;
 use crate::encoding::{checksum, read_u32, read_u64, uvarint};
@@ -64,6 +64,13 @@ pub struct Reader {
     /// that does touch its vlog is *not* counted there, which reports what is
     /// loaded eagerly at open.
     vlog_verified: OnceLock<Box<[AtomicU64]>>,
+
+    /// Byte ceiling on a decoded vlog value this reader admits to the block
+    /// cache (`ColumnFamilyConfig::max_cached_vlog_value_bytes`); 0 disables
+    /// vlog value caching. Fixed at open — a `Reader` is immutable and shared
+    /// behind an `Arc`, and the setting is per-family durable state, so there
+    /// is nothing to reconfigure without reopening the table.
+    vlog_cache_limit: usize,
 
     #[cfg(feature = "mmap-reads")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
@@ -180,12 +187,17 @@ impl Reader {
     /// per file for block-cache keying. When `storage.supports_mmap()` is false
     /// (a slow/remote tier), the reader never mmaps and every read goes through
     /// the buffered `pread` path plus the block cache.
+    ///
+    /// `vlog_cache_limit` is the family's `max_cached_vlog_value_bytes`: the
+    /// largest decoded vlog value this reader may admit to the block cache,
+    /// or 0 to never cache vlog values.
     pub fn open(
         klog_path: &str,
         storage: Arc<dyn Storage>,
         bc: Arc<BlockCache>,
         file_id: u64,
         cmp: ComparatorRef,
+        vlog_cache_limit: usize,
     ) -> Result<Arc<Reader>> {
         let mut r = Reader {
             klog_path: klog_path.to_string(),
@@ -203,6 +215,7 @@ impl Reader {
             has_restarts: false,
             vlog_v2: false,
             vlog_verified: OnceLock::new(),
+            vlog_cache_limit,
             #[cfg(feature = "mmap-reads")]
             klog_mmap: None,
             #[cfg(feature = "mmap-reads")]
@@ -451,7 +464,7 @@ impl Reader {
                 });
             }
             // Compressed: decompress once, cache the owned result.
-            if let Some(raw) = self.bc.get(self.file_id, h.offset) {
+            if let Some(raw) = self.bc.get(self.file_id, h.offset, BlockDomain::Klog) {
                 crate::perf::bump(|p| p.block_cache_hits += 1);
                 return Ok(Block::Owned(raw));
             }
@@ -462,11 +475,12 @@ impl Reader {
             let raw = crate::compress::decompress(alg, payload, raw_len)?;
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
             let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
-            self.bc.put(self.file_id, h.offset, arc.clone());
+            self.bc
+                .put(self.file_id, h.offset, BlockDomain::Klog, arc.clone());
             return Ok(Block::Owned(arc));
         }
 
-        if let Some(raw) = self.bc.get(self.file_id, h.offset) {
+        if let Some(raw) = self.bc.get(self.file_id, h.offset, BlockDomain::Klog) {
             crate::perf::bump(|p| p.block_cache_hits += 1);
             return Ok(Block::Owned(raw));
         }
@@ -480,7 +494,8 @@ impl Reader {
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
         }
         let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
-        self.bc.put(self.file_id, h.offset, arc.clone());
+        self.bc
+            .put(self.file_id, h.offset, BlockDomain::Klog, arc.clone());
         Ok(Block::Owned(arc))
     }
 
@@ -800,6 +815,29 @@ impl Reader {
     /// logical (uncompressed) value length.
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
         let len = usize::try_from(length).map_err(|_| corrupt())?;
+        // Consult the cache *before* the mmap attempt. A v2 frame is
+        // decompressed on every mmap read — `vlog_verified` memoizes only the
+        // checksum — so under `mmap-reads` this lookup is the one thing that
+        // can remove the decompression, not just the I/O.
+        if self.vlog_cache_limit > 0 {
+            if let Some(cached) = self.bc.get(self.file_id, off, BlockDomain::Vlog) {
+                // The domain tag makes the key unambiguous, so this can only
+                // differ if the cache handed back something that was never
+                // this frame. Trip loudly in debug; in release refuse the read
+                // and drop the entry rather than return the wrong bytes.
+                debug_assert_eq!(cached.len(), len, "vlog cache entry length");
+                if cached.len() != len {
+                    self.bc.remove(self.file_id, off, BlockDomain::Vlog);
+                    return Err(corrupt());
+                }
+                out.extend_from_slice(&cached);
+                crate::perf::bump(|p| p.vlog_cache_hits += 1);
+                return Ok(());
+            }
+        }
+        // Where this value's bytes start, so admission sees exactly the decode
+        // and nothing the caller had already buffered.
+        let start = out.len();
         #[cfg(feature = "mmap-reads")]
         let served = self.read_vlog_from_mmap(off, len, out)?;
         #[cfg(not(feature = "mmap-reads"))]
@@ -813,6 +851,17 @@ impl Reader {
             p.vlog_reads += 1;
             p.vlog_read_bytes += length;
         });
+        // Admit only here, at the single join point of the two decode paths, so
+        // both configs share one admission rule — and only after a complete
+        // decode: every error above returned, so nothing cancelled, truncated
+        // or CRC-failed can reach this line. An oversized value bypasses
+        // without the copy `Arc::from` would cost.
+        if self.vlog_cache_limit > 0 && len <= self.vlog_cache_limit && self.bc.enabled() {
+            let decoded = &out[start..];
+            debug_assert_eq!(decoded.len(), len, "decoded vlog value length");
+            self.bc
+                .put(self.file_id, off, BlockDomain::Vlog, Arc::from(decoded));
+        }
         Ok(())
     }
 
@@ -927,6 +976,7 @@ mod tests {
             Arc::new(BlockCache::new(1 << 20)),
             1,
             default_comparator(),
+            0,
         )
         .unwrap()
     }
@@ -981,6 +1031,7 @@ mod tests {
             Arc::new(BlockCache::new(1 << 20)),
             2,
             default_comparator(),
+            0,
         )
         .unwrap();
         assert!(!r.has_restarts);

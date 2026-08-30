@@ -1,5 +1,5 @@
 //! Sharded, byte-bounded CLOCK (second-chance) cache of decompressed SSTable
-//! blocks keyed by `(file_id, offset)`.  Cached values are immutable
+//! bytes keyed by `(file_id, domain, offset)`.  Cached values are immutable
 //! (`Arc<[u8]>`); callers must not mutate them.
 //!
 //! Reads are deliberately **non-serializing**: a hit takes the shard's
@@ -18,10 +18,39 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+/// Which of an SSTable's two files an offset addresses.
+///
+/// A `Reader` owns a klog and a vlog under one `file_id`, and their offset
+/// spaces are independent and both start at zero — so `(file_id, 0)` names
+/// both the first data block and the first vlog frame. Without this tag a
+/// cached vlog value would be returned where a data block was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockDomain {
+    /// A decompressed klog data block.
+    Klog,
+    /// A decoded (CRC-verified, decompressed) vlog value.
+    Vlog,
+}
+
+impl BlockDomain {
+    /// Hash salt, mixed into `shard_for` so the two domains of one
+    /// `(file_id, off)` pair do not land in the same shard in lockstep — vlog
+    /// admission would otherwise evict exactly the klog blocks it aliases.
+    /// `Klog` keeps the zero salt so its shard placement is unchanged.
+    #[inline]
+    fn salt(self) -> u64 {
+        match self {
+            BlockDomain::Klog => 0,
+            BlockDomain::Vlog => 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct BlockKey {
     file_id: u64,
     off: u64,
+    domain: BlockDomain,
 }
 
 struct CacheEntry {
@@ -41,9 +70,30 @@ struct Shard {
     ring: VecDeque<BlockKey>,
     used: i64,
     cap: i64,
+    /// The [`BlockDomain::Vlog`] share of `map.len()` and `used`, maintained
+    /// incrementally. Both domains share one capacity, so telling them apart
+    /// is how the cost of vlog admission to klog blocks is observed — and a
+    /// `stats()` that walked the map to find out would be O(entries) on a call
+    /// that DB-wide stats makes routinely.
+    vlog_entries: usize,
+    vlog_used: i64,
 }
 
 impl Shard {
+    /// Drop `k`'s map entry, keeping `used` and the per-domain tallies right.
+    /// A no-op when `k` is absent. The caller owns the ring.
+    fn unlink(&mut self, k: &BlockKey) {
+        let Some(e) = self.map.remove(k) else {
+            return;
+        };
+        let len = e.data.len() as i64;
+        self.used -= len;
+        if k.domain == BlockDomain::Vlog {
+            self.vlog_entries -= 1;
+            self.vlog_used -= len;
+        }
+    }
+
     /// Evict with the clock hand until under capacity: pop the ring front;
     /// a referenced entry is cleared and pushed to the back (second chance),
     /// an unreferenced one is evicted.
@@ -66,8 +116,8 @@ impl Shard {
             if spared < CLOCK_SWEEP_BUDGET && e.referenced.swap(false, Ordering::Relaxed) {
                 spared += 1;
                 self.ring.push_back(k); // second chance
-            } else if let Some(e) = self.map.remove(&k) {
-                self.used -= e.data.len() as i64;
+            } else {
+                self.unlink(&k);
             }
         }
     }
@@ -76,10 +126,24 @@ impl Shard {
 /// Hit/miss/size counters.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheStats {
+    /// Klog data-block hits. Deliberately **not** a total: vlog value hits are
+    /// reported separately so "block cache hit rate" keeps meaning what it
+    /// meant before vlog values shared the cache.
     pub hits: u64,
+    /// Klog data-block misses.
     pub misses: u64,
+    /// Entries of both domains.
     pub entries: usize,
+    /// Bytes held by both domains.
     pub bytes: i64,
+    /// Decoded vlog values served from the cache.
+    pub vlog_hits: u64,
+    /// Vlog lookups that found nothing and had to decode the frame.
+    pub vlog_misses: u64,
+    /// The vlog share of `entries`.
+    pub vlog_entries: usize,
+    /// The vlog share of `bytes`.
+    pub vlog_bytes: i64,
 }
 
 /// A sharded CLOCK block cache (see module docs).
@@ -88,6 +152,8 @@ pub struct BlockCache {
     mask: u64,
     hits: AtomicU64,
     misses: AtomicU64,
+    vlog_hits: AtomicU64,
+    vlog_misses: AtomicU64,
 }
 
 impl std::fmt::Debug for BlockCache {
@@ -110,6 +176,8 @@ impl BlockCache {
                 mask: 0,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
+                vlog_hits: AtomicU64::new(0),
+                vlog_misses: AtomicU64::new(0),
             };
         }
         let per = (capacity_bytes / NUM_SHARDS as i64).max(1);
@@ -120,6 +188,8 @@ impl BlockCache {
                     ring: VecDeque::new(),
                     used: 0,
                     cap: per,
+                    vlog_entries: 0,
+                    vlog_used: 0,
                 })
             })
             .collect();
@@ -128,6 +198,8 @@ impl BlockCache {
             mask: (NUM_SHARDS - 1) as u64,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            vlog_hits: AtomicU64::new(0),
+            vlog_misses: AtomicU64::new(0),
         }
     }
 
@@ -138,17 +210,22 @@ impl BlockCache {
 
     fn shard_for(&self, k: &BlockKey) -> &RwLock<Shard> {
         let mut h = k.file_id.wrapping_mul(1099511628211) ^ k.off;
+        h = h.wrapping_add(k.domain.salt());
         h ^= h >> 33;
         &self.shards[(h & self.mask) as usize]
     }
 
-    /// Look up the block cached at `(file_id, off)`. Hits take the shard lock
-    /// in read mode only — concurrent readers do not serialize.
-    pub fn get(&self, file_id: u64, off: u64) -> Option<Arc<[u8]>> {
+    /// Look up the bytes cached at `(file_id, domain, off)`. Hits take the
+    /// shard lock in read mode only — concurrent readers do not serialize.
+    pub fn get(&self, file_id: u64, off: u64, domain: BlockDomain) -> Option<Arc<[u8]>> {
         if !self.enabled() {
             return None;
         }
-        let k = BlockKey { file_id, off };
+        let k = BlockKey {
+            file_id,
+            off,
+            domain,
+        };
         let out = {
             let s = self.shard_for(&k).read();
             s.map.get(&k).map(|e| {
@@ -156,20 +233,28 @@ impl BlockCache {
                 e.data.clone()
             })
         };
+        let (hit, miss) = match domain {
+            BlockDomain::Klog => (&self.hits, &self.misses),
+            BlockDomain::Vlog => (&self.vlog_hits, &self.vlog_misses),
+        };
         match &out {
-            Some(_) => self.hits.fetch_add(1, Ordering::Relaxed),
-            None => self.misses.fetch_add(1, Ordering::Relaxed),
+            Some(_) => hit.fetch_add(1, Ordering::Relaxed),
+            None => miss.fetch_add(1, Ordering::Relaxed),
         };
         out
     }
 
-    /// Insert a block, evicting not-recently-referenced blocks if over
+    /// Insert a value, evicting not-recently-referenced entries if over
     /// capacity.
-    pub fn put(&self, file_id: u64, off: u64, val: Arc<[u8]>) {
+    pub fn put(&self, file_id: u64, off: u64, domain: BlockDomain, val: Arc<[u8]>) {
         if !self.enabled() {
             return;
         }
-        let k = BlockKey { file_id, off };
+        let k = BlockKey {
+            file_id,
+            off,
+            domain,
+        };
         let mut s = self.shard_for(&k).write();
         if let Some(e) = s.map.get(&k) {
             // Already present: blocks are immutable, so keep the existing
@@ -177,7 +262,12 @@ impl BlockCache {
             e.referenced.store(true, Ordering::Relaxed);
             return;
         }
-        s.used += val.len() as i64;
+        let len = val.len() as i64;
+        s.used += len;
+        if domain == BlockDomain::Vlog {
+            s.vlog_entries += 1;
+            s.vlog_used += len;
+        }
         s.map.insert(
             k,
             CacheEntry {
@@ -193,20 +283,47 @@ impl BlockCache {
         }
     }
 
+    /// Drop the entry at `(file_id, domain, off)`, if present.
+    ///
+    /// Only the map entry is unlinked; the ring slot is left for the clock
+    /// hand to reap, which it already tolerates (`evict_to_cap` skips a ring
+    /// key with no map entry). Unlinking from a `VecDeque` would be a linear
+    /// scan under the write lock, and removal is a rare corruption path.
+    pub fn remove(&self, file_id: u64, off: u64, domain: BlockDomain) {
+        if !self.enabled() {
+            return;
+        }
+        let k = BlockKey {
+            file_id,
+            off,
+            domain,
+        };
+        let mut s = self.shard_for(&k).write();
+        s.unlink(&k);
+    }
+
     /// Aggregate hit/miss counters and approximate size.
     pub fn stats(&self) -> CacheStats {
         let mut entries = 0;
         let mut bytes = 0;
+        let mut vlog_entries = 0;
+        let mut vlog_bytes = 0;
         for shard in &self.shards {
             let s = shard.read();
             entries += s.map.len();
             bytes += s.used;
+            vlog_entries += s.vlog_entries;
+            vlog_bytes += s.vlog_used;
         }
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             entries,
             bytes,
+            vlog_hits: self.vlog_hits.load(Ordering::Relaxed),
+            vlog_misses: self.vlog_misses.load(Ordering::Relaxed),
+            vlog_entries,
+            vlog_bytes,
         }
     }
 }
@@ -223,18 +340,18 @@ mod tests {
     fn disabled_cache_always_misses() {
         let c = BlockCache::new(0);
         assert!(!c.enabled());
-        c.put(1, 0, blk(10, 1));
-        assert!(c.get(1, 0).is_none());
+        c.put(1, 0, BlockDomain::Klog, blk(10, 1));
+        assert!(c.get(1, 0, BlockDomain::Klog).is_none());
     }
 
     #[test]
     fn get_after_put() {
         let c = BlockCache::new(1 << 20);
-        c.put(1, 4096, blk(100, 7));
-        let v = c.get(1, 4096).expect("hit");
+        c.put(1, 4096, BlockDomain::Klog, blk(100, 7));
+        let v = c.get(1, 4096, BlockDomain::Klog).expect("hit");
         assert_eq!(v.len(), 100);
         assert_eq!(v[0], 7);
-        assert!(c.get(2, 0).is_none());
+        assert!(c.get(2, 0, BlockDomain::Klog).is_none());
         let st = c.stats();
         assert_eq!(st.hits, 1);
         assert_eq!(st.misses, 1);
@@ -245,7 +362,7 @@ mod tests {
         // Small cap so most inserts get evicted.
         let c = BlockCache::new(NUM_SHARDS as i64 * 256);
         for i in 0..1000u64 {
-            c.put(1, i * 4096, blk(200, i as u8));
+            c.put(1, i * 4096, BlockDomain::Klog, blk(200, i as u8));
         }
         let st = c.stats();
         // Each shard holds <= ~ cap/200 entries; far fewer than 1000.
@@ -258,12 +375,126 @@ mod tests {
         // Hot key is touched between inserts, cold keys are not; under
         // pressure the hot key must survive (second chance).
         let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
-        c.put(1, 0, blk(200, 1)); // hot
+        c.put(1, 0, BlockDomain::Klog, blk(200, 1)); // hot
         for i in 1..200u64 {
-            let _ = c.get(1, 0); // keep the reference bit set
-            c.put(1, i * 4096, blk(200, i as u8)); // cold churn
+            let _ = c.get(1, 0, BlockDomain::Klog); // keep the reference bit set
+            c.put(1, i * 4096, BlockDomain::Klog, blk(200, i as u8)); // cold churn
         }
-        assert!(c.get(1, 0).is_some(), "hot block was evicted");
+        assert!(
+            c.get(1, 0, BlockDomain::Klog).is_some(),
+            "hot block was evicted"
+        );
+    }
+
+    #[test]
+    fn domains_do_not_alias() {
+        // klog and vlog share a file_id with independent offset spaces, so
+        // (7, 0) names both a data block and a vlog frame. The domain tag is
+        // what keeps them apart.
+        let c = BlockCache::new(1 << 20);
+        c.put(7, 0, BlockDomain::Klog, blk(64, 0xAA));
+        c.put(7, 0, BlockDomain::Vlog, blk(32, 0xBB));
+
+        let k = c.get(7, 0, BlockDomain::Klog).expect("klog entry");
+        let v = c.get(7, 0, BlockDomain::Vlog).expect("vlog entry");
+        assert_eq!(k.len(), 64);
+        assert_eq!(k[0], 0xAA);
+        assert_eq!(v.len(), 32);
+        assert_eq!(v[0], 0xBB);
+        let st = c.stats();
+        assert_eq!(st.entries, 2, "neither insert evicted the other");
+        assert_eq!(st.vlog_entries, 1, "only the vlog insert is a vlog entry");
+        assert_eq!(st.vlog_bytes, 32);
+        assert_eq!(st.hits, 1, "klog hits stay klog-only");
+        assert_eq!(st.vlog_hits, 1);
+    }
+
+    #[test]
+    fn shard_for_separates_domains() {
+        // The two domains must not land in lockstep: if the domain were not
+        // mixed into the hash, every Klog/Vlog pair would share a shard and
+        // vlog admission would evict exactly the klog blocks it aliases.
+        let c = BlockCache::new(1 << 20);
+        let mut same = 0usize;
+        let total = 512usize;
+        for i in 0..total as u64 {
+            let (file_id, off) = (i / 8 + 1, (i % 8) * 4096);
+            let kk = BlockKey {
+                file_id,
+                off,
+                domain: BlockDomain::Klog,
+            };
+            let vk = BlockKey {
+                file_id,
+                off,
+                domain: BlockDomain::Vlog,
+            };
+            if std::ptr::eq(c.shard_for(&kk), c.shard_for(&vk)) {
+                same += 1;
+            }
+        }
+        // Independent placement collides ~1/NUM_SHARDS of the time; a hash
+        // that ignored the domain would collide every time. Assert only a
+        // non-degenerate spread, not a distribution.
+        assert!(
+            same < total / 2,
+            "domains land in the same shard {same}/{total} times"
+        );
+        // Both domains must still spread over the shards — a domain pinned to
+        // one shard would separate the two at the cost of its own capacity.
+        for domain in [BlockDomain::Klog, BlockDomain::Vlog] {
+            let mut seen = std::collections::HashSet::new();
+            for i in 0..total as u64 {
+                let k = BlockKey {
+                    file_id: i / 8 + 1,
+                    off: (i % 8) * 4096,
+                    domain,
+                };
+                seen.insert(self_shard_index(&c, &k));
+            }
+            assert!(
+                seen.len() > NUM_SHARDS / 2,
+                "{domain:?} used only {} of {NUM_SHARDS} shards",
+                seen.len()
+            );
+        }
+    }
+
+    /// The shard index `shard_for` picked, by pointer identity.
+    fn self_shard_index(c: &BlockCache, k: &BlockKey) -> usize {
+        let target = c.shard_for(k) as *const _;
+        c.shards
+            .iter()
+            .position(|s| std::ptr::eq(s, target))
+            .expect("shard_for returns one of our shards")
+    }
+
+    #[test]
+    fn remove_drops_entry_and_survives_sweep() {
+        let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
+        c.put(3, 0, BlockDomain::Vlog, blk(200, 9));
+        assert!(c.get(3, 0, BlockDomain::Vlog).is_some());
+        c.remove(3, 0, BlockDomain::Vlog);
+        assert!(c.get(3, 0, BlockDomain::Vlog).is_none());
+        // The ring still holds the removed key; the sweep must tolerate it.
+        for i in 0..500u64 {
+            c.put(3, (i + 1) * 4096, BlockDomain::Vlog, blk(200, i as u8));
+        }
+        let st = c.stats();
+        assert!(st.bytes >= 0, "used went negative: {}", st.bytes);
+        assert_eq!(
+            st.vlog_entries, st.entries,
+            "every surviving entry is a vlog entry here"
+        );
+        assert_eq!(st.vlog_bytes, st.bytes, "per-domain byte tally drifted");
+        assert!(
+            st.bytes <= NUM_SHARDS as i64 * 1024 + 200,
+            "bytes={}",
+            st.bytes
+        );
+        // Removing an absent key is a no-op, not an accounting error.
+        c.remove(3, 1 << 40, BlockDomain::Klog);
+        assert_eq!(c.stats().bytes, st.bytes);
     }
 
     #[test]
@@ -271,7 +502,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         let c = StdArc::new(BlockCache::new(1 << 20));
         for i in 0..64u64 {
-            c.put(1, i * 4096, blk(256, i as u8));
+            c.put(1, i * 4096, BlockDomain::Klog, blk(256, i as u8));
         }
         let mut handles = Vec::new();
         for t in 0..8u64 {
@@ -279,11 +510,16 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..20_000u64 {
                     let k = (i * 31 + t) % 64;
-                    if let Some(v) = c.get(1, k * 4096) {
+                    if let Some(v) = c.get(1, k * 4096, BlockDomain::Klog) {
                         assert_eq!(v[0], k as u8);
                     }
                     if i % 512 == 0 {
-                        c.put(2, (t * 100_000 + i) * 4096, blk(256, t as u8));
+                        c.put(
+                            2,
+                            (t * 100_000 + i) * 4096,
+                            BlockDomain::Klog,
+                            blk(256, t as u8),
+                        );
                     }
                 }
             }));

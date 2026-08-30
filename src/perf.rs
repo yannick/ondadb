@@ -43,6 +43,10 @@ pub struct PerfContext {
     pub vlog_reads: u64,
     /// Logical (uncompressed) bytes of those values.
     pub vlog_read_bytes: u64,
+    /// Separated values served whole from the block cache — no positional
+    /// read, no CRC verify, no decompression. Disjoint from `vlog_reads`:
+    /// a hit is not a read.
+    pub vlog_cache_hits: u64,
     /// `seek*` calls on an iterator (not `next`/`prev`).
     pub iterator_seeks: u64,
     /// Key groups an iterator surfaced to its caller.
@@ -66,6 +70,7 @@ impl PerfContext {
             bytes_decompressed: 0,
             vlog_reads: 0,
             vlog_read_bytes: 0,
+            vlog_cache_hits: 0,
             iterator_seeks: 0,
             iterator_steps: 0,
         }

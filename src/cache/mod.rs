@@ -5,5 +5,5 @@
 mod block;
 mod file;
 
-pub use block::{BlockCache, CacheStats};
+pub use block::{BlockCache, BlockDomain, CacheStats};
 pub use file::FileCache;

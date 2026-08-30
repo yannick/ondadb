@@ -86,8 +86,17 @@ pub struct DbStats {
     pub num_column_families: usize,
     pub total_sstables: usize,
     pub total_bytes: u64,
+    /// Klog data-block cache hits/misses. Vlog values share the same cache but
+    /// are counted separately, so these keep meaning what they always did.
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,
+    /// Decoded vlog values served from the block cache
+    /// (`max_cached_vlog_value_bytes`; always 0 when no family enables it).
+    pub vlog_cache_hits: u64,
+    pub vlog_cache_misses: u64,
+    /// Bytes of the block cache currently held by decoded vlog values — the
+    /// capacity vlog admission is taking from klog data blocks.
+    pub vlog_cache_bytes: i64,
 }
 
 impl ColumnFamily {
@@ -140,6 +149,9 @@ impl DB {
             total_bytes,
             block_cache_hits: bc.hits,
             block_cache_misses: bc.misses,
+            vlog_cache_hits: bc.vlog_hits,
+            vlog_cache_misses: bc.vlog_misses,
+            vlog_cache_bytes: bc.vlog_bytes,
         }
     }
 

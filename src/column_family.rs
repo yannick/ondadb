@@ -342,6 +342,7 @@ impl ColumnFamily {
             bc: self.ctx.bc.clone(),
             file_id: meta.id,
             cmp: self.cmp.clone(),
+            vlog_cache_limit: self.opts.max_cached_vlog_value_bytes,
         };
         Arc::new(SstHandle {
             meta,
@@ -358,6 +359,7 @@ impl ColumnFamily {
             self.ctx.bc.clone(),
             meta.id,
             self.cmp.clone(),
+            self.opts.max_cached_vlog_value_bytes,
         )
     }
 
@@ -469,6 +471,7 @@ impl ColumnFamily {
                 bc: ctx.bc.clone(),
                 file_id: s.id,
                 cmp: cmp.clone(),
+                vlog_cache_limit: opts.max_cached_vlog_value_bytes,
             };
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),

@@ -685,6 +685,7 @@ mod tests {
             Arc::new(BlockCache::new(1 << 20)),
             7,
             default_comparator(),
+            0,
         )
         .unwrap();
         assert!(r.index.len() > 100, "expected many blocks with 2 KiB keys");

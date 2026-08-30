@@ -109,6 +109,10 @@ pub(crate) struct TableRef {
     pub bc: Arc<BlockCache>,
     pub file_id: u64,
     pub cmp: ComparatorRef,
+    /// The owning family's `max_cached_vlog_value_bytes`. Carried on the ref
+    /// because the table cache opens readers lazily, long after the family
+    /// that named the table is out of scope.
+    pub vlog_cache_limit: usize,
 }
 
 /// One cached reader with its second-chance bit.
@@ -289,6 +293,7 @@ impl TableCache {
             Arc::clone(&t.bc),
             t.file_id,
             t.cmp.clone(),
+            t.vlog_cache_limit,
         )?;
         self.opens.fetch_add(1, Ordering::Relaxed);
 

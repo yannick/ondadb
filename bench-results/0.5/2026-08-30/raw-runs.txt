@@ -1,0 +1,121 @@
+########## config: default (buffered pread + block cache) ##########
+----- run 1 -----
+   Compiling ondadb v0.8.2 (/Volumes/HOME/code/storage-engines/ondadb/.claude/worktrees/agent-a15f7e8047bdb7baf)
+    Finished `release` profile [optimized] target(s) in 5.35s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-00a04f39e621d907)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [default (buffered)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     9.4 us/read   6.98 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.9 us/read  22.97 GB/s   klog hit  71.28%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     7.0 us/read   9.30 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 2.88x (8.2 -> 2.9 us), klog hit-rate delta -5.35 pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     8.8 us/read   7.42 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot    15.6 us/read   4.21 GB/s   klog hit  62.63%   vlog hit   0.00%   vlog resident   2.0 MiB
+   off (B)   hot     8.4 us/read   7.84 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.55x (8.6 -> 15.6 us), klog hit-rate delta -26.18 pp
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.94s
+
+----- run 2 -----
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-00a04f39e621d907)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [default (buffered)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     6.2 us/read  10.51 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.41 GB/s   klog hit  71.28%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     5.8 us/read  11.24 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 2.34x (6.0 -> 2.6 us), klog hit-rate delta -5.35 pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     8.1 us/read   8.10 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot    14.2 us/read   4.61 GB/s   klog hit  62.63%   vlog hit   0.00%   vlog resident   2.0 MiB
+   off (B)   hot     7.6 us/read   8.68 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.55x (7.8 -> 14.2 us), klog hit-rate delta -26.18 pp
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.68s
+
+----- run 3 -----
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-00a04f39e621d907)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [default (buffered)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot    15.5 us/read   4.22 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.7 us/read  24.14 GB/s   klog hit  71.28%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     6.9 us/read   9.45 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 4.14x (11.2 -> 2.7 us), klog hit-rate delta -5.35 pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     6.3 us/read  10.35 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot    13.2 us/read   4.98 GB/s   klog hit  62.63%   vlog hit   0.00%   vlog resident   2.0 MiB
+   off (B)   hot     7.5 us/read   8.70 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.53x (6.9 -> 13.2 us), klog hit-rate delta -26.18 pp
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.71s
+
+----- run 4 -----
+    Finished `release` profile [optimized] target(s) in 0.28s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-00a04f39e621d907)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [default (buffered)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     8.1 us/read   8.13 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     3.0 us/read  21.73 GB/s   klog hit  71.28%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     7.6 us/read   8.61 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 2.60x (7.8 -> 3.0 us), klog hit-rate delta -5.35 pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     7.9 us/read   8.30 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot    15.8 us/read   4.15 GB/s   klog hit  62.63%   vlog hit   0.00%   vlog resident   2.0 MiB
+   off (B)   hot     7.9 us/read   8.27 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.50x (7.9 -> 15.8 us), klog hit-rate delta -26.18 pp
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.66s
+
+----- run 5 -----
+    Finished `release` profile [optimized] target(s) in 0.16s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-00a04f39e621d907)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [default (buffered)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     7.6 us/read   8.57 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.8 us/read  23.16 GB/s   klog hit  71.28%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     7.1 us/read   9.21 GB/s   klog hit  76.63%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 2.61x (7.4 -> 2.8 us), klog hit-rate delta -5.35 pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     8.3 us/read   7.90 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot    14.0 us/read   4.67 GB/s   klog hit  62.63%   vlog hit   0.00%   vlog resident   2.0 MiB
+   off (B)   hot     8.2 us/read   8.03 GB/s   klog hit  88.81%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.59x (8.2 -> 14.0 us), klog hit-rate delta -26.18 pp
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.68s

@@ -160,3 +160,85 @@ fn part_mover_moves_aged_part_to_s3_and_reads_back_across_reopen() {
 
     cleanup(&cfg, &prefix);
 }
+
+/// On an S3-resident part every uncached vlog read is a range GET, which is
+/// where the value cache pays for itself most visibly. The second read of a hot
+/// large value must issue **no** request at all: the klog block and the decoded
+/// vlog value are both resident by then.
+///
+/// The tier is registered with `TierDef::custom` rather than `TierDef::s3` for
+/// one reason only: it hands the test the very `S3Storage` the DB will use, so
+/// `S3Metrics.range_gets` counts the DB's own requests. The backend, and
+/// therefore the read path, is identical.
+#[test]
+fn warm_vlog_value_issues_no_range_get() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 vlog cache test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let metrics = s3.metrics();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::custom("s3", prefix.clone(), s3.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+
+    let db = DB::open(opts).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                // 1 MiB ceiling: comfortably above the 32 KiB value below.
+                max_cached_vlog_value_bytes: 1 << 20,
+                ..s3_mover_cfg()
+            },
+        )
+        .unwrap();
+
+    // One separated value (well above the 512-byte default threshold) plus
+    // enough neighbours to make a real part.
+    let big = vec![b'V'; 32 << 10];
+    for i in 0..5u32 {
+        db.put(&cf, format!("img/{i:03}").as_bytes(), &big, Duration::ZERO)
+            .unwrap();
+        db.put(
+            &cf,
+            format!("log/{i:03}").as_bytes(),
+            b"LOG",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    assert_eq!(db.run_part_mover().unwrap(), 1, "the img/ part must move");
+
+    // Cold: this is the read that pays for the range GETs.
+    assert_eq!(db.get(&cf, b"img/002").unwrap(), big);
+
+    let before = metrics
+        .range_gets
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let hits_before = db.stats().vlog_cache_hits;
+    for _ in 0..3 {
+        assert_eq!(db.get(&cf, b"img/002").unwrap(), big);
+    }
+    let after = metrics
+        .range_gets
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        after, before,
+        "a warm large-value read must not touch the object store"
+    );
+    assert_eq!(
+        db.stats().vlog_cache_hits - hits_before,
+        3,
+        "each warm read must be a vlog cache hit"
+    );
+
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}

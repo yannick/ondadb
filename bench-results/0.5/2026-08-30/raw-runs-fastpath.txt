@@ -1,0 +1,129 @@
+########## config: unsafe-fastpath ##########
+----- run 1 -----
+   Compiling memmap2 v0.9.11
+   Compiling ondadb v0.8.2 (/Volumes/HOME/code/storage-engines/ondadb/.claude/worktrees/agent-a15f7e8047bdb7baf)
+    Finished `release` profile [optimized] target(s) in 23.03s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-332b9c9efcf4b78f)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [unsafe-fastpath (mmap)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.2 us/read  29.52 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.09 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     2.1 us/read  31.17 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.83x (2.2 -> 2.6 us), klog hit-rate delta NaN pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.1 us/read  31.79 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.48 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   6.0 MiB
+   off (B)   hot     2.2 us/read  29.49 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.83x (2.1 -> 2.6 us), klog hit-rate delta NaN pp
+   (klog hit rate is not meaningful in this config: uncompressed klog blocks are served from the mmap and never enter the cache)
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.69s
+
+----- run 2 -----
+    Finished `release` profile [optimized] target(s) in 0.49s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-332b9c9efcf4b78f)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [unsafe-fastpath (mmap)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.2 us/read  29.68 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.50 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     2.0 us/read  33.13 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.81x (2.1 -> 2.6 us), klog hit-rate delta NaN pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.1 us/read  30.98 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     3.0 us/read  22.06 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   6.0 MiB
+   off (B)   hot     2.1 us/read  30.77 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.71x (2.1 -> 3.0 us), klog hit-rate delta NaN pp
+   (klog hit rate is not meaningful in this config: uncompressed klog blocks are served from the mmap and never enter the cache)
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.50s
+
+----- run 3 -----
+    Finished `release` profile [optimized] target(s) in 0.18s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-332b9c9efcf4b78f)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [unsafe-fastpath (mmap)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.2 us/read  29.55 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.5 us/read  26.07 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     2.2 us/read  30.01 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.88x (2.2 -> 2.5 us), klog hit-rate delta NaN pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.2 us/read  30.28 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.23 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   6.0 MiB
+   off (B)   hot     2.3 us/read  28.93 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.85x (2.2 -> 2.6 us), klog hit-rate delta NaN pp
+   (klog hit rate is not meaningful in this config: uncompressed klog blocks are served from the mmap and never enter the cache)
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.57s
+
+----- run 4 -----
+    Finished `release` profile [optimized] target(s) in 0.16s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-332b9c9efcf4b78f)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [unsafe-fastpath (mmap)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.1 us/read  31.18 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.22 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     1.9 us/read  33.71 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.78x (2.0 -> 2.6 us), klog hit-rate delta NaN pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.0 us/read  32.38 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.5 us/read  26.51 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   6.0 MiB
+   off (B)   hot     2.2 us/read  29.52 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.86x (2.1 -> 2.5 us), klog hit-rate delta NaN pp
+   (klog hit rate is not meaningful in this config: uncompressed klog blocks are served from the mmap and never enter the cache)
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.47s
+
+----- run 5 -----
+    Finished `release` profile [optimized] target(s) in 0.14s
+     Running tests/vlog_read_bench.rs (/Volumes/cargo/cargo-build/36/49d108f4a0d544/release/deps/vlog_read_bench-332b9c9efcf4b78f)
+
+running 1 test
+
+== vlog value cache, hot/cold large-value point reads [unsafe-fastpath (mmap)] ==
+   64 KiB values, 120000 small keys, 40 small reads per large read, 8 MiB cache, 12 rounds
+
+   -- hot set fits: 16 hot values = 1.0 MiB of a 8 MiB cache --
+   off (A)   hot     2.0 us/read  32.04 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.5 us/read  26.51 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   1.0 MiB
+   off (B)   hot     2.1 us/read  31.41 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.84x (2.1 -> 2.5 us), klog hit-rate delta NaN pp
+
+   -- hot set thrashes: 96 hot values = 6.0 MiB of a 8 MiB cache --
+   off (A)   hot     1.8 us/read  35.58 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   on  1MiB  hot     2.6 us/read  25.52 GB/s   klog hit    NaN%   vlog hit 100.00%   vlog resident   6.0 MiB
+   off (B)   hot     1.9 us/read  34.38 GB/s   klog hit    NaN%   vlog hit     n/a   vlog resident   0.0 MiB
+   => hot latency 0.73x (1.9 -> 2.6 us), klog hit-rate delta NaN pp
+   (klog hit rate is not meaningful in this config: uncompressed klog blocks are served from the mmap and never enter the cache)
+test vlog_value_cache_hot_cold_point_reads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.48s
+
+ALL DONE

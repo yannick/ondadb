@@ -98,6 +98,31 @@ one binary-searched table per level ≥ 1. SSTable get: bloom filter →
 `find_block` binary search on the in-memory index → linear entry scan inside
 the data block → inline value or vlog read (CRC-verified).
 
+**The block cache holds two key domains.** A `Reader` owns two files under one
+`file_id` — the klog and the vlog — and their offset spaces are independent and
+both start at zero, so `(file_id, 0)` names both the first data block and the
+first vlog frame. `BlockKey` therefore carries a `BlockDomain` (`Klog` |
+`Vlog`), mixed into `shard_for` so the two domains do not share a shard in
+lockstep, and every `get`/`put`/`remove` names one. Decompressed klog data
+blocks are always admitted; decoded vlog values are admitted only when the
+family sets `max_cached_vlog_value_bytes` (default 0 = off) and only up to that
+size. Both domains share one capacity, so `CacheStats` reports the vlog share
+separately (`vlog_hits`, `vlog_misses`, `vlog_entries`, `vlog_bytes`) and
+`hits`/`misses` stay klog-only.
+
+A vlog value is admitted at one place — the join point of the mmap and buffered
+decode paths in `Reader::read_vlog_into`, after a complete decode — so nothing
+cancelled, truncated or CRC-failed can ever enter the cache, and both feature
+configs share one admission rule. The lookup sits *before* the mmap attempt,
+because a v2 frame is decompressed on every mmap read (`vlog_verified`
+memoizes the checksum, never the bytes), so the cache is the only thing that
+removes that cost under `mmap-reads`.
+
+Retiring a table (compaction, part move) evicts nothing: `next_file_id` never
+reuses an id, so a dead table's entries can never be mistaken for a live one's
+and simply age out under CLOCK. Explicit eviction there would be hygiene, not
+correctness, and is not done.
+
 Every SSTable touched by a read or scan resolves its reader through the shared
 `TableCache` (`table_cache.rs`), not by opening the file directly: `SstHandle`
 holds only the information to re-open a reader and asks the cache for one. A

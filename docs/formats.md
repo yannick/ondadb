@@ -339,6 +339,7 @@ ONDACMP1 | target_file_size u64 | l1_base_bytes u64
           | soft_pending_compaction_bytes u64
           | hard_pending_compaction_bytes u64   compaction geometry
 ONDABLK1 | data_block_size u64                  per-CF block target
+ONDAVVC1 | max_cached_vlog_value_bytes u64      per-CF vlog value cache limit
 ```
 
 Each tag is omitted when its setting is absent or equal to the release default.
