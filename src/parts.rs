@@ -782,6 +782,11 @@ impl DB {
         let manifest = Manifest {
             next_file_id: max_id + 1,
             global_seq: self.inner.visible_seq(),
+            // A frozen slice is written as a plain snapshot with no edit log
+            // (2.2): it is a one-shot artifact, never appended to.
+            generation: 0,
+            applied_through: 0,
+            next_edit_id: 1,
             // A frozen slice is a standalone database with no shared tiers;
             // it mints its own nonce if it ever configures one.
             instance_nonce: None,

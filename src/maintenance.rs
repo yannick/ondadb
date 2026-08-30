@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::column_family::{ColumnFamily, SstHandle};
 use crate::db::DB;
 use crate::error::{OndaError, Result};
-use crate::manifest::{manifest_path, Manifest, SstMeta};
+use crate::manifest::SstMeta;
 use crate::storage::Storage;
 use crate::util::sync_parent_dir;
 
@@ -212,8 +212,13 @@ impl DB {
         // paused, every file any persisted manifest lists still exists on disk, so
         // the copied catalog and the copied files are guaranteed consistent — even if
         // a compaction rewrote the live manifest after our persist above.
-        let src_manifest = manifest_path(&self.inner.dir);
-        let mut manifest = Manifest::load(&src_manifest)?;
+        // `recover_catalog`, not `Manifest::load`: with 2.2's edit log the
+        // snapshot on disk is only the whole catalog once the log has been
+        // replayed into it. A read-only source cannot force a compaction
+        // (`persist_manifest` returns early), so loading the bare snapshot there
+        // would silently drop every edit since the last one — which is what
+        // would make the "read-only-capable backup" claim false.
+        let mut manifest = crate::manifest_edit::recover_catalog(&self.inner.dir)?;
         for cfm in &mut manifest.cfs {
             let source_cf = cfs
                 .iter()
@@ -239,7 +244,14 @@ impl DB {
             }
         }
         // Persist the same manifest we linked against, so the backup catalog matches
-        // its files exactly.
+        // its files exactly. The destination is **snapshot-only**: a fresh
+        // generation, nothing applied, and no `MANIFEST-EDITS` beside it. It
+        // grows a log the first time it is opened writable and mutated. Copying
+        // the source's cursor instead would describe a log the destination does
+        // not have.
+        manifest.generation = 1;
+        manifest.applied_through = 0;
+        manifest.next_edit_id = 1;
         manifest.save(dir.join("MANIFEST"))?;
         Ok(())
     }

@@ -1827,3 +1827,194 @@ fn periodic_reclaims_on_the_real_clock() {
     drop(cf);
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 2.2 — checkpoint and backup materialize a fresh snapshot with no edit log
+// ---------------------------------------------------------------------------
+
+/// A database with `CAP_MANIFEST_EDITS` enabled, one CF, and data on disk.
+fn edits_source(dir: &std::path::Path) -> (DB, std::sync::Arc<ondadb::ColumnFamily>) {
+    let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .unwrap();
+    db.enable_format_capabilities(ondadb::format::CAP_MANIFEST_EDITS)
+        .unwrap();
+    fill(&db, &cf, 64);
+    db.flush_memtable(&cf).unwrap();
+    (db, cf)
+}
+
+fn assert_fresh_snapshot_only(dest: &std::path::Path) {
+    assert!(
+        !ondadb::manifest_edit::edit_log_path(dest).exists(),
+        "the destination is snapshot-only: it grows a log when it is first \
+         opened writable and mutated, not before"
+    );
+    let m = ondadb::manifest_edit::recover_catalog(dest).unwrap();
+    assert_eq!(m.generation, 1, "a fresh generation, not the source's");
+    assert_eq!(m.applied_through, 0);
+    assert_eq!(m.next_edit_id, 1);
+}
+
+#[test]
+fn checkpoint_writes_a_fresh_snapshot_with_no_edit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let (db, cf) = edits_source(dir.path());
+    assert!(ondadb::manifest_edit::edit_log_path(dir.path()).exists());
+    db.checkpoint(dest.path().join("cp")).unwrap();
+    drop(cf);
+    db.close().unwrap();
+    assert_fresh_snapshot_only(&dest.path().join("cp"));
+
+    let back = DB::open(Options::new(dest.path().join("cp").to_str().unwrap())).unwrap();
+    let cf = back.get_column_family("default").unwrap();
+    assert_eq!(back.get(&cf, b"k00000").unwrap(), b"value");
+    back.close().unwrap();
+}
+
+#[test]
+fn backup_writes_a_fresh_snapshot_with_no_edit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let (db, cf) = edits_source(dir.path());
+    db.backup(dest.path().join("bk")).unwrap();
+    drop(cf);
+    db.close().unwrap();
+    assert_fresh_snapshot_only(&dest.path().join("bk"));
+
+    let back = DB::open(Options::new(dest.path().join("bk").to_str().unwrap())).unwrap();
+    let cf = back.get_column_family("default").unwrap();
+    assert_eq!(back.get(&cf, b"k00063").unwrap(), b"value");
+    back.close().unwrap();
+}
+
+/// A read-only source cannot force a snapshot compaction, so `snapshot_to`
+/// must replay the edit log into the catalog it copies. Without that, every
+/// edit since the last compaction is silently dropped and the
+/// "read-only-capable backup" claim is false.
+#[test]
+fn backup_from_a_read_only_db_includes_uncompacted_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    {
+        let (db, cf) = edits_source(dir.path());
+        drop(cf);
+        db.close().unwrap();
+    }
+    // Append an edit the on-disk snapshot does not contain — a partition
+    // restamp, which needs no new file, so the only thing under test is whether
+    // the backup replayed the log or stopped at the snapshot.
+    let before = ondadb::manifest_edit::recover_catalog(dir.path()).unwrap();
+    let table_id = before.cfs[0].sstables[0].id;
+    let mut log = ondadb::manifest_edit::open_log_for_append(dir.path())
+        .unwrap()
+        .expect("the source has a log");
+    log.append(
+        before.next_edit_id,
+        &ondadb::manifest_edit::VersionEdit::new(vec![ondadb::manifest_edit::Op::UpdateTable {
+            cf: "default".into(),
+            id: table_id,
+            update: ondadb::manifest_edit::TableUpdate {
+                partition: Some(Some("uncompacted".into())),
+                ..Default::default()
+            },
+        }]),
+    )
+    .unwrap();
+    drop(log);
+
+    let mut o = Options::new(dir.path().to_str().unwrap());
+    o.read_only = true;
+    let db = DB::open(o).unwrap();
+    db.backup(dest.path().join("ro")).unwrap();
+    db.close().unwrap();
+
+    let copied = ondadb::manifest_edit::recover_catalog(dest.path().join("ro")).unwrap();
+    assert_eq!(
+        copied.cfs[0]
+            .sstables
+            .iter()
+            .find(|s| s.id == table_id)
+            .and_then(|s| s.partition.as_deref()),
+        Some("uncompacted"),
+        "the backup must carry the uncompacted edit, not just the snapshot"
+    );
+    assert_fresh_snapshot_only(&dest.path().join("ro"));
+}
+
+/// Guards RV-F1: the destination catalog must be self-contained, so every
+/// table's tier and object annotation is cleared.
+#[test]
+fn backup_clears_tier_and_object_on_every_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let tier = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let db = DB::open(tiered_options(dir.path(), tier.path())).unwrap();
+    let cf = materialize_tiered_partition(&db);
+    db.enable_format_capabilities(ondadb::format::CAP_MANIFEST_EDITS)
+        .unwrap();
+    db.backup(dest.path().join("bk")).unwrap();
+    drop(cf);
+    db.close().unwrap();
+    let m = ondadb::manifest_edit::recover_catalog(dest.path().join("bk")).unwrap();
+    for cfm in &m.cfs {
+        for sst in &cfm.sstables {
+            assert_eq!(sst.tier, None, "table {} keeps a tier", sst.id);
+            assert_eq!(sst.object, None, "table {} keeps an object", sst.id);
+        }
+    }
+    assert_fresh_snapshot_only(&dest.path().join("bk"));
+}
+
+/// A frozen part is a one-shot standalone artifact: a plain snapshot, never a
+/// log, whatever the source database has enabled.
+#[test]
+fn frozen_part_has_no_edit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .unwrap();
+    db.enable_format_capabilities(ondadb::format::CAP_MANIFEST_EDITS)
+        .unwrap();
+    fill(&db, &cf, 64);
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    let out = dest.path().join("frozen");
+    let froze = db.freeze_part(&cf, "img", &out).is_ok();
+    drop(cf);
+    db.close().unwrap();
+    if froze {
+        assert!(
+            !ondadb::manifest_edit::edit_log_path(&out).exists(),
+            "a frozen slice is a plain snapshot with no log"
+        );
+        let m = ondadb::manifest_edit::recover_catalog(&out).unwrap();
+        assert_eq!((m.generation, m.applied_through, m.next_edit_id), (0, 0, 1));
+    }
+}
+
+/// `close`'s final persist is the closing snapshot compaction, and its failure
+/// is the caller's (the prerequisite `close` fix, seen through 2.2's lens).
+#[test]
+fn close_compacts_the_log_and_reports_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = edits_source(dir.path());
+    // A structural change lands in the log...
+    let before = ondadb::manifest_edit::recover_catalog(dir.path()).unwrap();
+    let generation_before = before.generation;
+    drop(cf);
+    db.close().unwrap();
+    // ...and close leaves a compacted snapshot with an empty log behind it.
+    let after = ondadb::manifest_edit::recover_catalog(dir.path()).unwrap();
+    assert!(
+        after.generation > generation_before,
+        "close ran a snapshot compaction"
+    );
+    let bytes = std::fs::read(ondadb::manifest_edit::edit_log_path(dir.path())).unwrap();
+    assert_eq!(bytes.len(), 28, "the log restarts at its header");
+    assert_eq!(after.applied_through, after.next_edit_id - 1);
+}

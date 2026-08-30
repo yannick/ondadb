@@ -36,6 +36,10 @@ const FORMAT_CAPS_TAG: &[u8; 8] = b"ONDACAP1";
 /// Per-table periodic-compaction age state (0.3), written only by a database
 /// that has enabled [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE).
 const LAST_COMPACTION_TAG: &[u8; 8] = b"ONDAAGE1";
+/// Edit-log bookkeeping (2.2): `generation | applied_through | next_edit_id`,
+/// three `u64` LE. Emitted only once a database has an edit log, so a legacy
+/// database's bytes are unchanged.
+const MANIFEST_EDITS_TAG: &[u8; 8] = b"ONDAMED1";
 
 /// WAL/memtable layout persisted for the whole database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -133,6 +137,19 @@ pub struct Manifest {
     /// [`crate::format::KNOWN_CAPS`]). `0` — the default — means the database
     /// writes only legacy artifacts, and its manifest stays VERSION 1.
     pub caps: u64,
+    /// Snapshot generation, incremented by each snapshot compaction (2.2).
+    /// **Informational**: recovery logs it and the golden fixtures pin it, but
+    /// it carries no decision power — see [`Manifest::applied_through`].
+    pub generation: u64,
+    /// Highest edit id this snapshot already contains. Recovery skips log
+    /// records at or below it and applies the rest, and the log header's
+    /// `base_applied_through` must not exceed it.
+    pub applied_through: u64,
+    /// Id the next appended edit takes. Always `applied_through + 1` at the
+    /// moment a snapshot is written; a manifest with no edit-log tail decodes
+    /// to `1`, which is the same "nothing has been appended" statement a fresh
+    /// database makes.
+    pub next_edit_id: u64,
 }
 
 impl Default for Manifest {
@@ -144,6 +161,9 @@ impl Default for Manifest {
             wal_layout: WalLayout::PerColumnFamily,
             instance_nonce: None,
             caps: 0,
+            generation: 0,
+            applied_through: 0,
+            next_edit_id: 1,
         }
     }
 }
@@ -175,16 +195,18 @@ impl Manifest {
                 .truncate(true)
                 .write(true)
                 .open(&tmp)?;
+            crate::util::fault::check(crate::util::fault::Call::Write)?;
             f.write_all(&data)?;
+            crate::util::fault::check(crate::util::fault::Call::Sync)?;
             f.sync_all()?;
         }
+        crate::util::fault::check(crate::util::fault::Call::Rename)?;
         std::fs::rename(&tmp, path)?;
-        // fsync the directory so the rename is durable.
-        if let Some(dir) = path.parent() {
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
+        // fsync the directory so the rename is durable. The error propagates:
+        // under the edit-log protocol two renames in a row are load-bearing
+        // (snapshot compaction), and a dropped directory fsync there can lose
+        // the rename that makes a fresh log authoritative.
+        crate::util::sync_parent_dir(path)?;
         Ok(())
     }
 
@@ -210,7 +232,7 @@ impl Manifest {
         // Version gate, after the tail: a capability word may only appear in a
         // manifest that already announces itself as v2, so an old binary's
         // exact-equality version check is a complete fence.
-        if tags.caps != 0 && header.version == VERSION_V1 {
+        if (tags.caps != 0 || tags.edits.is_some()) && header.version == VERSION_V1 {
             return Err(corrupt_manifest());
         }
         // Same fence one level down: the age tail is written only by a database
@@ -221,6 +243,19 @@ impl Manifest {
             return Err(corrupt_manifest());
         }
         crate::format::check_caps(tags.caps)?;
+        // A manifest with no edit-log tail is one that has never had a log:
+        // generation 0, nothing applied, and the next id is the first one.
+        let edits = tags.edits.unwrap_or(EditLogTail {
+            generation: 0,
+            applied_through: 0,
+            next_edit_id: 1,
+        });
+        // `next_edit_id` names the id the next append takes, so it is always one
+        // past what the snapshot contains. Any other pairing is bytes no writer
+        // produces.
+        if edits.applied_through.checked_add(1) != Some(edits.next_edit_id) {
+            return Err(corrupt_manifest());
+        }
         Ok(Manifest {
             next_file_id: header.next_file_id,
             global_seq: header.global_seq,
@@ -228,6 +263,9 @@ impl Manifest {
             wal_layout: tags.wal_layout,
             instance_nonce: tags.instance_nonce,
             caps: tags.caps,
+            generation: edits.generation,
+            applied_through: edits.applied_through,
+            next_edit_id: edits.next_edit_id,
         })
     }
 }
@@ -245,6 +283,7 @@ struct ManifestTailPresence {
     nonce: bool,
     caps: bool,
     last_compaction: bool,
+    edits: bool,
     layout: bool,
 }
 
@@ -266,6 +305,9 @@ impl ManifestTailPresence {
             // conjunction never silently drops a stamp.
             last_compaction: manifest.caps & crate::format::CAP_PERIODIC_AGE != 0
                 && has(|sst| sst.last_compaction_time.is_some()),
+            edits: manifest.generation != 0
+                || manifest.applied_through != 0
+                || manifest.next_edit_id != 1,
             layout: manifest.wal_layout == WalLayout::Unified,
         }
     }
@@ -277,17 +319,17 @@ impl ManifestTailPresence {
     /// read as a partition name section — silent corruption rather than
     /// rejection. Every new tag must be added here as well as to the encoder.
     fn tagged(self) -> bool {
-        self.object || self.nonce || self.caps || self.last_compaction
+        self.object || self.nonce || self.caps || self.last_compaction || self.edits
     }
 }
 
 fn encode_manifest_header(b: &mut Vec<u8>, manifest: &Manifest) {
     append_u32(b, MAGIC);
     // Lowest version that can express this manifest: a database using no
-    // capability keeps writing v1 bytes forever.
+    // capability and no edit log keeps writing v1 bytes forever.
     append_u32(
         b,
-        if manifest.caps != 0 {
+        if manifest.caps != 0 || ManifestTailPresence::detect(manifest).edits {
             VERSION_V2
         } else {
             VERSION_V1
@@ -350,6 +392,12 @@ fn encode_tagged_tails(b: &mut Vec<u8>, manifest: &Manifest, presence: ManifestT
         encode_u64_section(b, &manifest.cfs, |sst| {
             sst.last_compaction_time.map(|time| time as u64)
         });
+    }
+    if presence.edits {
+        b.extend_from_slice(MANIFEST_EDITS_TAG);
+        append_u64(b, manifest.generation);
+        append_u64(b, manifest.applied_through);
+        append_u64(b, manifest.next_edit_id);
     }
     if presence.layout {
         b.extend_from_slice(WAL_LAYOUT_TAG);
@@ -504,6 +552,15 @@ struct TaggedTails {
     /// Whether [`LAST_COMPACTION_TAG`] was present, checked against `caps`
     /// after the loop — the tag may legally precede or follow the caps word.
     last_compaction: bool,
+    edits: Option<EditLogTail>,
+}
+
+/// Payload of [`MANIFEST_EDITS_TAG`].
+#[derive(Clone, Copy)]
+struct EditLogTail {
+    generation: u64,
+    applied_through: u64,
+    next_edit_id: u64,
 }
 
 /// Decode the tagged tail sections by dispatching on each 8-byte tag.
@@ -556,6 +613,19 @@ fn decode_tagged_tails(mut p: &[u8], cfs: &mut [CfManifest]) -> Result<TaggedTai
             decode_u64_section(rest, cfs, |sst, value| {
                 sst.last_compaction_time = Some(value as i64)
             })?
+        } else if tag == MANIFEST_EDITS_TAG {
+            if out.edits.is_some() {
+                return Err(corrupt_manifest());
+            }
+            if rest.len() < 24 {
+                return Err(corrupt_manifest());
+            }
+            out.edits = Some(EditLogTail {
+                generation: read_u64(&rest[0..8]),
+                applied_through: read_u64(&rest[8..16]),
+                next_edit_id: read_u64(&rest[16..24]),
+            });
+            &rest[24..]
         } else if tag == WAL_LAYOUT_TAG {
             if std::mem::replace(&mut seen_layout, true) {
                 return Err(corrupt_manifest());
@@ -778,6 +848,131 @@ mod tests {
         read_u32(&bytes[4..8])
     }
 
+    /// Byte offset of `tag` inside an encoded manifest.
+    fn tag_offset(bytes: &[u8], tag: &[u8; 8]) -> Option<usize> {
+        bytes.windows(TAG_LEN).position(|w| w == tag)
+    }
+
+    #[test]
+    fn edits_tail_round_trips() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_MANIFEST_EDITS;
+        m.generation = 5;
+        m.applied_through = 4_096;
+        m.next_edit_id = 4_097;
+        let enc = m.encode();
+        assert_eq!(encoded_version(&enc), VERSION_V2);
+        let d = Manifest::decode(&enc).unwrap();
+        assert_eq!(d.generation, 5);
+        assert_eq!(d.applied_through, 4_096);
+        assert_eq!(d.next_edit_id, 4_097);
+        assert_eq!(d.encode(), enc);
+    }
+
+    /// The tail's bytes are the interoperability contract: tag, then three
+    /// little-endian `u64`s in declaration order, sitting after `ONDACAP1` and
+    /// before `ONDAWAL1`.
+    #[test]
+    fn edits_tail_bytes_are_frozen() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_MANIFEST_EDITS;
+        m.wal_layout = WalLayout::Unified;
+        m.generation = 0x0102_0304_0506_0708;
+        m.applied_through = 6;
+        m.next_edit_id = 7;
+        let enc = m.encode();
+        let at = tag_offset(&enc, MANIFEST_EDITS_TAG).expect("the tag must be present");
+        assert_eq!(&enc[at..at + 8], b"ONDAMED1");
+        assert_eq!(&enc[at + 8..at + 16], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(read_u64(&enc[at + 16..at + 24]), 6);
+        assert_eq!(read_u64(&enc[at + 24..at + 32]), 7);
+        // Placement: after the capability tag, before the WAL-layout tag.
+        assert!(tag_offset(&enc, FORMAT_CAPS_TAG).unwrap() < at);
+        assert!(at < tag_offset(&enc, WAL_LAYOUT_TAG).unwrap());
+    }
+
+    #[test]
+    fn edits_tail_coexists_with_object_and_nonce_tags() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_MANIFEST_EDITS;
+        m.instance_nonce = Some(0xABCD_EF01_2345_6789);
+        m.cfs[0].sstables[0].object = Some("cf-default/1".into());
+        m.cfs[0].sstables[1].tier = Some("cold".into());
+        m.generation = 2;
+        m.applied_through = 9;
+        m.next_edit_id = 10;
+        let enc = m.encode();
+        let d = Manifest::decode(&enc).unwrap();
+        assert_eq!(d.instance_nonce, m.instance_nonce);
+        assert_eq!(d.cfs[0].sstables[0].object.as_deref(), Some("cf-default/1"));
+        assert_eq!(d.cfs[0].sstables[1].tier.as_deref(), Some("cold"));
+        assert_eq!(
+            (d.generation, d.applied_through, d.next_edit_id),
+            (2, 9, 10)
+        );
+        assert_eq!(d.encode(), enc);
+        assert!(
+            tag_offset(&enc, OBJECT_TAG).unwrap() < tag_offset(&enc, MANIFEST_EDITS_TAG).unwrap()
+        );
+    }
+
+    /// Every manifest ever written before 2.2 lacks the tail, and must decode
+    /// as "no log yet" rather than as an inconsistent cursor.
+    #[test]
+    fn a_manifest_without_the_edits_tail_decodes_as_generation_zero() {
+        for name in V1_FIXTURES {
+            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(m.generation, 0, "{name}");
+            assert_eq!(m.applied_through, 0, "{name}");
+            assert_eq!(m.next_edit_id, 1, "{name}");
+            assert_eq!(m.encode(), bytes, "{name}: still byte-identical");
+        }
+    }
+
+    /// The tail is a v2 feature, so a VERSION-1 manifest carrying it is bytes
+    /// no writer produces — the same fence the capability word gets.
+    #[test]
+    fn edits_tail_under_version_1_is_corruption() {
+        let mut extra = MANIFEST_EDITS_TAG.to_vec();
+        extra.extend_from_slice(&[0u8; 24]);
+        let bytes = fixture_with_extra_tail("manifest_v1_object.bin", &extra);
+        assert_eq!(
+            Manifest::decode(&bytes).unwrap_err().kind(),
+            "corruption",
+            "an edit-log tail under VERSION 1 must fail closed"
+        );
+    }
+
+    #[test]
+    fn duplicate_edits_tag_is_corruption() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_MANIFEST_EDITS;
+        m.generation = 1;
+        m.applied_through = 1;
+        m.next_edit_id = 2;
+        let enc = m.encode();
+        let mut body = enc[..enc.len() - 4].to_vec();
+        body.extend_from_slice(MANIFEST_EDITS_TAG);
+        body.extend_from_slice(&[0u8; 24]);
+        let crc = checksum(&body);
+        append_u32(&mut body, crc);
+        assert_eq!(Manifest::decode(&body).unwrap_err().kind(), "corruption");
+    }
+
+    /// `next_edit_id` is always one past `applied_through`; any other pairing
+    /// is a lie no writer tells.
+    #[test]
+    fn an_inconsistent_edit_cursor_is_corruption() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_MANIFEST_EDITS;
+        m.generation = 1;
+        m.applied_through = 10;
+        m.next_edit_id = 10;
+        let enc = m.encode();
+        assert_eq!(Manifest::decode(&enc).unwrap_err().kind(), "corruption");
+    }
+
     #[test]
     fn caps_tail_round_trips() {
         let mut m = sample();
@@ -966,6 +1161,9 @@ mod tests {
         Manifest {
             next_file_id: 42,
             global_seq: 99,
+            generation: 0,
+            applied_through: 0,
+            next_edit_id: 1,
             wal_layout: WalLayout::PerColumnFamily,
             instance_nonce: None,
             caps: 0,
@@ -1061,6 +1259,57 @@ mod tests {
         assert_eq!(d.next_file_id, 42);
         assert_eq!(d.cfs[0].sstables.len(), 2);
         // No stray temp file left behind.
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    /// A directory whose read bit is clear still accepts a rename (write+search
+    /// are enough) but refuses `File::open`, which is exactly the call the
+    /// post-rename directory fsync makes. Returns `false` when the process can
+    /// read such a directory anyway (root), in which case the test is skipped.
+    #[cfg(unix)]
+    fn directory_permissions_are_enforced(probe: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(probe).unwrap();
+        std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = std::fs::File::open(probe).is_ok();
+        std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        !readable
+    }
+
+    /// The directory fsync after the rename must propagate its error: snapshot
+    /// compaction performs two renames whose durability is load-bearing, and a
+    /// dropped fsync there can lose the rename that makes a fresh edit log
+    /// authoritative.
+    #[cfg(unix)]
+    #[test]
+    fn save_propagates_a_directory_fsync_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        if !directory_permissions_are_enforced(&root.path().join("probe")) {
+            return; // running as root: directory permission bits do not apply
+        }
+        let dir = root.path().join("db");
+        std::fs::create_dir(&dir).unwrap();
+        let path = manifest_path(&dir);
+        let m = sample();
+        m.save(&path).expect("baseline save must succeed");
+        // Pre-create the temp file so reopening it needs only search permission,
+        // leaving the directory `File::open` as the single failing call.
+        std::fs::write(path.with_extension("tmp"), b"").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let res = m.save(&path);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = res.expect_err("an unreadable parent directory must fail the save");
+        assert_eq!(err.kind(), "io");
+    }
+
+    #[test]
+    fn save_still_round_trips_after_the_fsync_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = manifest_path(dir.path());
+        let m = sample();
+        m.save(&path).unwrap();
+        assert_eq!(Manifest::load(&path).unwrap().encode(), m.encode());
         assert!(!path.with_extension("tmp").exists());
     }
 
@@ -1306,6 +1555,9 @@ mod tests {
             let m = Manifest {
                 next_file_id: n as u64,
                 global_seq: 1,
+                generation: 0,
+                applied_through: 0,
+                next_edit_id: 1,
                 wal_layout: WalLayout::PerColumnFamily,
                 instance_nonce: None,
                 caps: 0,

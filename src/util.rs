@@ -21,6 +21,82 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fault injection for the catalog's durability calls.
+///
+/// The crash matrix of the manifest edit log (2.2) is a statement about *which*
+/// call failed and *when*, and neither can be produced by manipulating a
+/// directory's permission bits: "the second `sync_all` fails, the first
+/// succeeded" has no filesystem-level equivalent. So the four catalog calls —
+/// `write`, `flush`, `sync_all`, `rename` — consult this shim.
+///
+/// It is compiled unconditionally rather than behind `cfg(test)`, because the
+/// integration tests that drive the matrix are a separate crate and cannot see
+/// a `cfg(test)` item. The cost is one thread-local read per catalog write —
+/// a path that is already fsync-bound — and the plan is `None` unless a test
+/// installs one, so no production write can ever be failed by it. The plan is
+/// **thread-local**: a test installs it on its own thread and a background
+/// worker is unaffected.
+#[doc(hidden)]
+pub mod fault {
+    use std::cell::Cell;
+
+    /// The four calls whose failure the crash matrix distinguishes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Call {
+        Write,
+        Flush,
+        Sync,
+        Rename,
+    }
+
+    thread_local! {
+        static PLAN: Cell<Option<(Call, u32)>> = const { Cell::new(None) };
+        static SEEN: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Fail the `nth` (1-based) occurrence of `call` on this thread, and no
+    /// other call. Replaces any previous plan.
+    pub fn fail_nth(call: Call, nth: u32) {
+        assert!(nth >= 1, "occurrences are 1-based");
+        PLAN.with(|p| p.set(Some((call, nth))));
+        SEEN.with(|s| s.set(0));
+    }
+
+    /// Remove any installed plan. Always call this once the failing operation
+    /// has been driven, so the rest of the test runs on a healthy filesystem.
+    pub fn clear() {
+        PLAN.with(|p| p.set(None));
+        SEEN.with(|s| s.set(0));
+    }
+
+    /// Whether a plan is installed and has not fired yet.
+    pub fn armed() -> bool {
+        PLAN.with(|p| p.get()).is_some()
+    }
+
+    /// Consult the plan for one call site. `Ok(())` unless this is exactly the
+    /// occurrence the test asked to fail.
+    pub(crate) fn check(call: Call) -> std::io::Result<()> {
+        let Some((want, nth)) = PLAN.with(|p| p.get()) else {
+            return Ok(());
+        };
+        if want != call {
+            return Ok(());
+        }
+        let seen = SEEN.with(|s| {
+            let n = s.get() + 1;
+            s.set(n);
+            n
+        });
+        if seen == nth {
+            return Err(std::io::Error::other(format!(
+                "injected {call:?} failure (occurrence {nth})"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Current wall-clock time in Unix nanoseconds (used for TTL evaluation).
 pub fn now_nanos() -> i64 {
     SystemTime::now()

@@ -54,6 +54,7 @@ pub mod ioctrl;
 pub mod iterator;
 pub mod maintenance;
 pub mod manifest;
+pub mod manifest_edit;
 pub mod memtable;
 #[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;

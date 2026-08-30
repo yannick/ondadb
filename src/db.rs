@@ -22,6 +22,7 @@ use crate::comparator::comparator_by_name;
 use crate::config::{ColumnFamilyConfig, Options};
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, WalLayout};
+use crate::manifest_edit::VersionEdit;
 
 const MAX_CF_NAME_LEN: usize = 128;
 const WORKER_TICK: Duration = Duration::from_millis(50);
@@ -42,6 +43,36 @@ pub(crate) fn periodic_check_interval(interval: Duration) -> Duration {
     (interval / 4).clamp(PERIODIC_CHECK_MIN, PERIODIC_CHECK_MAX)
 }
 static NEXT_DB_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The database's view of its `MANIFEST-EDITS` cursor (2.2).
+///
+/// `next_edit_id` is always `applied_through + 1` at the moment a snapshot is
+/// written; between snapshots the log holds ids `applied_through + 1 ..
+/// next_edit_id - 1`. `log` is `None` until `CAP_MANIFEST_EDITS` is durably
+/// enabled — a database without the capability keeps rewriting whole snapshots,
+/// byte-for-byte as every release before 2.2 did.
+#[derive(Debug)]
+struct EditLogState {
+    generation: u64,
+    applied_through: u64,
+    next_edit_id: u64,
+    log: Option<crate::manifest_edit::EditLog>,
+    /// Size of the last snapshot written, feeding the compaction trigger's
+    /// "don't rewrite 40 MiB to reclaim 4" arm.
+    snapshot_bytes: u64,
+}
+
+impl Default for EditLogState {
+    fn default() -> EditLogState {
+        EditLogState {
+            generation: 0,
+            applied_through: 0,
+            next_edit_id: 1,
+            log: None,
+            snapshot_bytes: 0,
+        }
+    }
+}
 
 struct PublishState {
     cursor: u64,                  // next start sequence expected to publish
@@ -265,6 +296,11 @@ pub struct DbInner {
     manifest_mu: Mutex<()>,
     /// Durable database-wide WAL layout written by `persist_manifest`.
     wal_layout: Mutex<WalLayout>,
+    /// Edit-log cursor (2.2), guarded by `manifest_mu` in effect: it is only
+    /// read and written inside the manifest critical section. Kept beside the
+    /// catalog rather than derived at write time so a full rewrite carries the
+    /// cursor forward instead of silently resetting it to "no log".
+    edit_log: Mutex<EditLogState>,
     /// Per-database nonce naming this instance's objects on shared tiers
     /// (A2, `SPADINO-A2.md`). Minted at open when a shared tier is configured
     /// and no nonce is recorded yet; `None` otherwise. Never re-minted:
@@ -570,6 +606,11 @@ impl DbInner {
     }
 
     /// Rebuild and atomically persist the manifest.
+    ///
+    /// With `CAP_MANIFEST_EDITS` enabled this is a **snapshot compaction**: the
+    /// four-step protocol that writes a new snapshot and restarts the edit log
+    /// empty. Without the capability it is the full rewrite every release
+    /// before 2.2 performed, byte-for-byte.
     pub(crate) fn persist_manifest(&self) -> Result<()> {
         if self.opts.read_only {
             return Ok(());
@@ -578,6 +619,89 @@ impl DbInner {
         // the compaction worker, CF create/drop) can never race on the temp file
         // or publish an inconsistent manifest.
         let _mu = self.manifest_mu.lock();
+        let mut edits = self.edit_log.lock();
+        self.write_snapshot(&mut edits)
+    }
+
+    /// One catalog transaction: make the edit durable, then publish it.
+    ///
+    /// The seven steps, in order:
+    ///
+    /// 1. the caller built `edit` and the candidate in-memory state, and has
+    ///    published nothing;
+    /// 2. every newly referenced file is already finished and fsynced
+    ///    (`Writer::finish`), which this does not re-do;
+    /// 3. under `manifest_mu`, the complete record is appended, flushed and
+    ///    **fsynced** — this is the commit point, and the point WAL reclaim and
+    ///    obsolete-input deletion key off (AGENTS.md invariant 1);
+    /// 4. `publish` installs the candidate state;
+    /// 5. the caller retires removed handles, after publication, through
+    ///    `remove_sst_file` (invariant 6);
+    /// 6. still under `manifest_mu`, the snapshot-compaction trigger is checked;
+    /// 7. on failure nothing is published, the old state stays visible, and the
+    ///    database fail-stops — the caller cleans up its never-installed files.
+    ///
+    /// Until `CAP_MANIFEST_EDITS` is enabled there is no log, and this falls
+    /// back to the pre-2.2 order — publish, then rewrite the whole manifest —
+    /// so enabling the capability is the only thing that changes behaviour.
+    // Call-site migration is the next slice of 2.2: the twenty `persist_manifest`
+    // sites move onto this helper in the documented order (flush and unified
+    // flush, ingest, compaction, mover/parts, CF lifecycle, open paths). Until
+    // then its only callers are the crash-matrix tests below.
+    #[allow(dead_code)]
+    pub(crate) fn catalog_txn(&self, edit: VersionEdit, publish: impl FnOnce()) -> Result<()> {
+        self.poison.check()?;
+        if self.opts.read_only {
+            // Exactly `persist_manifest`'s early return: nothing is made
+            // durable. The in-memory publication still happens, so a read-only
+            // handle's view stays consistent with what it just did.
+            publish();
+            return Ok(());
+        }
+        let _mu = self.manifest_mu.lock();
+        let mut st = self.edit_log.lock();
+        if st.log.is_none() {
+            // Pre-capability: today's publish-then-persist order, unchanged.
+            publish();
+            return self.write_snapshot(&mut st);
+        }
+        let edit_id = st.next_edit_id;
+        let appended = st
+            .log
+            .as_mut()
+            .expect("checked just above")
+            .append(edit_id, &edit);
+        if let Err(e) = appended {
+            // Step 7. The candidate was never published, so the old state is
+            // still the visible one; the failed fsync may have dropped pages,
+            // so the database fail-stops exactly as a failed persist does.
+            self.fail_stop(format!("manifest edit {edit_id} failed: {e}"));
+            return Err(e);
+        }
+        st.next_edit_id = edit_id + 1;
+        // Step 4: publication follows the durable edit, never precedes it.
+        publish();
+        self.manifest_persists.fetch_add(1, Ordering::Relaxed);
+        // Step 6, in the same critical section: a record appended between a
+        // snapshot write and its log rename would be silently lost.
+        let (bytes, count) = st
+            .log
+            .as_ref()
+            .map(|l| (l.bytes(), l.count()))
+            .unwrap_or((0, 0));
+        if crate::manifest_edit::snapshot_due(bytes, count, st.snapshot_bytes) {
+            self.write_snapshot(&mut st)?;
+        }
+        Ok(())
+    }
+
+    /// Write the catalog as a snapshot, holding `manifest_mu` and `st`.
+    ///
+    /// With a log active this runs the full four-step compaction and installs
+    /// the fresh, empty log; without one it is a plain `Manifest::save`.
+    fn write_snapshot(&self, st: &mut EditLogState) -> Result<()> {
+        let edits_enabled =
+            self.caps_durable.load(Ordering::SeqCst) & crate::format::CAP_MANIFEST_EDITS != 0;
         let cfs = self.cfs.read();
         let mut m = Manifest {
             next_file_id: self.next_file_id.load(Ordering::SeqCst),
@@ -588,6 +712,12 @@ impl DbInner {
             // The staged word, not the active one: `enable_capability` must
             // make the bit durable BEFORE anything may write bytes using it.
             caps: self.caps_durable.load(Ordering::SeqCst),
+            // Edit-log bookkeeping (2.2). A full rewrite is a snapshot that
+            // contains everything appended so far, so it always carries the
+            // current cursor forward; snapshot compaction advances it.
+            generation: st.generation,
+            applied_through: st.applied_through,
+            next_edit_id: st.next_edit_id,
         };
         for cf in cfs.values() {
             m.cfs.push(CfManifest {
@@ -596,7 +726,26 @@ impl DbInner {
                 sstables: cf.snapshot_ssts(),
             });
         }
-        let res = m.save(manifest_path(&self.dir));
+        drop(cfs);
+        let res = if edits_enabled {
+            // Everything appended so far is in `m`, so the snapshot's
+            // `applied_through` is the last id the log handed out. The old log
+            // is replaced by a rename, never truncated in place.
+            let applied_through = st.next_edit_id - 1;
+            crate::manifest_edit::compact_snapshot(&self.dir, &mut m, applied_through).map(|log| {
+                st.generation = m.generation;
+                st.applied_through = applied_through;
+                st.next_edit_id = applied_through + 1;
+                st.log = Some(log);
+            })
+        } else {
+            m.save(manifest_path(&self.dir))
+        };
+        if res.is_ok() {
+            st.snapshot_bytes = std::fs::metadata(manifest_path(&self.dir))
+                .map(|md| md.len())
+                .unwrap_or(0);
+        }
         match &res {
             Ok(()) => {
                 self.manifest_persists.fetch_add(1, Ordering::Relaxed);
@@ -1010,6 +1159,23 @@ fn build_db_inner(
         stop,
         pending_flush,
     } = resources;
+    // A writable database with the capability keeps its log open for append,
+    // positioned past the last complete record recovery accepted; a read-only
+    // one replays the log and never writes to it (2.2 recovery rule r8).
+    //
+    // `None` here with the capability set is the legal transition state: the
+    // enable persisted the snapshot but crashed before the log's rename. It
+    // heals on the next persist, which is a snapshot compaction and creates
+    // one; until then `catalog_txn` takes its pre-capability path, which is
+    // still correct — it just rewrites the whole manifest.
+    let edit_log = if opts.read_only || manifest.caps & crate::format::CAP_MANIFEST_EDITS == 0 {
+        None
+    } else {
+        crate::manifest_edit::open_log_for_append(&dir)?
+    };
+    let snapshot_bytes = std::fs::metadata(manifest_path(&dir))
+        .map(|md| md.len())
+        .unwrap_or(0);
     let (unified, unified_max_seq) = open_unified_store(
         opts,
         &dir,
@@ -1080,6 +1246,13 @@ fn build_db_inner(
         periodic_check: AtomicU64::new(PERIODIC_DISABLED),
         manifest_mu: Mutex::new(()),
         wal_layout: Mutex::new(requested_layout),
+        edit_log: Mutex::new(EditLogState {
+            generation: manifest.generation,
+            applied_through: manifest.applied_through,
+            next_edit_id: manifest.next_edit_id,
+            log: edit_log,
+            snapshot_bytes,
+        }),
         instance_nonce: Mutex::new(manifest.instance_nonce),
         // A capability recorded in the manifest is already durable, so both
         // words start from it: a reopen after a crash between persist and flip
@@ -1245,10 +1418,17 @@ impl DB {
         let lock_file = acquire_dir_lock(&dir, opts.read_only)?;
         let resources = OpenResources::new(&opts, &dir)?;
 
+        // A leftover MANIFEST.tmp / MANIFEST-EDITS.tmp is a crash artifact, not
+        // state: it is removed before anything is loaded, and never read. A
+        // read-only open leaves them alone — it writes nothing, not even an
+        // unlink.
+        if !opts.read_only {
+            crate::manifest_edit::sweep_manifest_temp_files(&dir)?;
+        }
         // The WAL layout is a durable database-wide choice once the catalog
         // contains a column family. Opening under the other layout would make
         // recovery consult one set of WALs while new commits write another.
-        let manifest = Manifest::load(manifest_path(&dir))?;
+        let manifest = crate::manifest_edit::recover_catalog(&dir)?;
         let requested_layout = requested_wal_layout(&opts);
         validate_wal_layout(&manifest, requested_layout)?;
         let (inner, receivers) = build_db_inner(
@@ -1680,7 +1860,11 @@ impl DB {
         for h in handles {
             let _ = h.join();
         }
-        let _ = self.inner.persist_manifest();
+        // The final persist's result is the caller's: a silently dropped failure
+        // means the next open replays more than it should, or fails outright.
+        // Shutdown still runs to completion — resources are released and the
+        // directory lock dropped — and the failure is returned at the end.
+        let persist = self.inner.persist_manifest();
         if let Some(u) = &self.inner.unified {
             u.close();
         }
@@ -1695,7 +1879,7 @@ impl DB {
         // Release the directory lock last, once all state is durable, so a
         // concurrent open never sees a half-closed database.
         *self.inner.lock_file.lock() = None;
-        Ok(())
+        persist
     }
 }
 
@@ -2052,6 +2236,308 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
             db.run_periodic_scan();
             db.periodic_running.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_txn_tests {
+    use super::*;
+    use crate::manifest_edit::{recover_catalog, Op};
+    use crate::util::fault;
+    use std::sync::atomic::AtomicBool;
+
+    /// A database with `CAP_MANIFEST_EDITS` enabled and one column family, so
+    /// an `AddTable` edit has somewhere to land.
+    fn edits_db(dir: &std::path::Path) -> DB {
+        let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
+        db.create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
+            .unwrap();
+        db
+    }
+
+    fn add_table(id: u64) -> VersionEdit {
+        VersionEdit::new(vec![Op::AddTable {
+            cf: "default".into(),
+            meta: crate::manifest::SstMeta {
+                id,
+                level: 6,
+                max_seq: id,
+                ..Default::default()
+            },
+        }])
+    }
+
+    /// The fake sink the A rows publish into: it records whether publication
+    /// happened, and when.
+    #[derive(Default)]
+    struct Sink {
+        published: AtomicBool,
+    }
+
+    impl Sink {
+        fn publish(&self) {
+            self.published.store(true, Ordering::SeqCst);
+        }
+        fn published(&self) -> bool {
+            self.published.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The edit ids the log on disk holds.
+    fn log_ids(dir: &std::path::Path) -> Vec<u64> {
+        let data = std::fs::read(crate::manifest_edit::edit_log_path(dir)).unwrap();
+        crate::manifest_edit::decode_records(&data)
+            .unwrap()
+            .0
+            .iter()
+            .map(|r| r.edit_id)
+            .collect()
+    }
+
+    /// A1/A3 — nothing is published until the record's fsync returns `Ok`. The
+    /// injected failure is the fsync itself, so the write went to the page
+    /// cache and the record may or may not be on disk: either way the candidate
+    /// state stays invisible.
+    #[test]
+    fn txn_publishes_nothing_before_the_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        let sink = Sink::default();
+        fault::fail_nth(fault::Call::Sync, 1);
+        let err = db
+            .inner
+            .catalog_txn(add_table(41), || sink.publish())
+            .expect_err("a failed fsync must fail the transaction");
+        fault::clear();
+        assert_eq!(err.kind(), "io", "{err:?}");
+        assert!(
+            !sink.published(),
+            "publication must never precede the durable edit"
+        );
+    }
+
+    #[test]
+    fn txn_publishes_after_a_successful_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        let sink = Sink::default();
+        db.inner
+            .catalog_txn(add_table(41), || sink.publish())
+            .unwrap();
+        assert!(sink.published());
+        assert_eq!(log_ids(dir.path()), vec![1]);
+        db.close().unwrap();
+    }
+
+    /// A4 — a failed fsync fail-stops the database. Both outcomes are
+    /// consistent: the record is either absent (Old) or complete (New), and the
+    /// only recovery is a reopen, which reads whichever is on disk.
+    #[test]
+    fn txn_rolls_back_and_poisons_on_a_sync_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        fault::fail_nth(fault::Call::Sync, 1);
+        let _ = db.inner.catalog_txn(add_table(41), || {});
+        fault::clear();
+        assert!(db.poisoned().is_some(), "a durability failure fail-stops");
+        let err = db
+            .inner
+            .catalog_txn(add_table(42), || {})
+            .expect_err("a poisoned database accepts no further transactions");
+        assert!(matches!(err, OndaError::Poisoned(_)), "{err:?}");
+    }
+
+    /// A2 — a torn (failed) write leaves the old state visible and the old
+    /// catalog on disk, with no record the next replay would apply.
+    #[test]
+    fn txn_leaves_old_state_visible_on_an_append_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        let sink = Sink::default();
+        fault::fail_nth(fault::Call::Write, 1);
+        let err = db
+            .inner
+            .catalog_txn(add_table(41), || sink.publish())
+            .expect_err("a failed write must fail the transaction");
+        fault::clear();
+        assert_eq!(err.kind(), "io");
+        assert!(!sink.published());
+        assert!(log_ids(dir.path()).is_empty(), "nothing reached the log");
+        let back = recover_catalog(dir.path()).unwrap();
+        assert!(
+            back.cfs.iter().all(|cf| cf.sstables.is_empty()),
+            "the old catalog is what a reopen sees"
+        );
+    }
+
+    /// A5 — a crash after the fsync but before publication is a *committed*
+    /// transaction: the next open replays the record and publishes it.
+    #[test]
+    fn txn_state_after_the_fsync_survives_a_crash_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        // The empty publish closure *is* the crash: the record is fsynced and
+        // the candidate state was never installed.
+        db.inner.catalog_txn(add_table(41), || {}).unwrap();
+        assert_eq!(log_ids(dir.path()), vec![1], "the record is durable");
+        // What the next open would read, computed from the files as they stand.
+        let back = recover_catalog(dir.path()).unwrap();
+        let ids: Vec<u64> = back.cfs[0].sstables.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![41], "the durable edit is replayed at open");
+        assert_eq!(back.applied_through, 1);
+        drop(db);
+    }
+
+    /// A6 — retirement happens after publication, so a crash in between leaves
+    /// files no catalog references (orphans the sweep collects), never a
+    /// catalog referencing files that are gone.
+    #[test]
+    fn txn_retires_handles_only_after_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        let victim = dir.path().join("9999.klog");
+        std::fs::write(&victim, b"x").unwrap();
+        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        db.inner
+            .catalog_txn(add_table(41), || order.lock().push("publish"))
+            .unwrap();
+        db.inner.remove_sst_file(victim.to_str().unwrap(), 4096);
+        order.lock().push("retire");
+        assert_eq!(*order.lock(), vec!["publish", "retire"]);
+        assert!(!victim.exists());
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn txn_is_a_noop_in_read_only_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = edits_db(dir.path());
+            db.close().unwrap();
+        }
+        let before = std::fs::read(crate::manifest_edit::edit_log_path(dir.path())).unwrap();
+        let mut o = Options::new(dir.path().to_str().unwrap());
+        o.read_only = true;
+        let db = DB::open(o).unwrap();
+        let sink = Sink::default();
+        db.inner
+            .catalog_txn(add_table(41), || sink.publish())
+            .expect("a read-only transaction is not an error");
+        assert!(sink.published(), "the in-memory publication still happens");
+        assert_eq!(
+            std::fs::read(crate::manifest_edit::edit_log_path(dir.path())).unwrap(),
+            before,
+            "a read-only database writes nothing"
+        );
+        db.close().unwrap();
+    }
+
+    /// Without the capability the database behaves exactly as it did before
+    /// 2.2: no log file, and the whole manifest rewritten.
+    #[test]
+    fn edits_are_written_only_after_the_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        db.create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        db.inner.catalog_txn(add_table(41), || {}).unwrap();
+        assert!(
+            !crate::manifest_edit::edit_log_path(dir.path()).exists(),
+            "no capability, no log"
+        );
+        assert_eq!(manifest_version(dir.path()), 1);
+
+        db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
+            .unwrap();
+        assert!(
+            crate::manifest_edit::edit_log_path(dir.path()).exists(),
+            "the capability is durable before the first append, and creates the log"
+        );
+        assert_eq!(manifest_version(dir.path()), 2);
+        db.inner.catalog_txn(add_table(42), || {}).unwrap();
+        assert_eq!(log_ids(dir.path()), vec![1]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn capability_enable_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        let before = db.inner.manifest_persist_count();
+        for _ in 0..3 {
+            db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
+                .unwrap();
+        }
+        assert_eq!(
+            db.inner.manifest_persist_count(),
+            before,
+            "re-enabling an active capability persists nothing"
+        );
+        db.close().unwrap();
+    }
+
+    /// A database written before the capability existed opens, upgrades, and
+    /// keeps every table it had.
+    #[test]
+    fn a_pre_capability_database_opens_and_upgrades_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+            let cf = db
+                .create_column_family("default", ColumnFamilyConfig::default())
+                .unwrap();
+            db.put(&cf, b"k", b"v", std::time::Duration::ZERO).unwrap();
+            db.flush_memtable(&cf).unwrap();
+            db.close().unwrap();
+        }
+        assert_eq!(manifest_version(dir.path()), 1);
+        assert!(!crate::manifest_edit::edit_log_path(dir.path()).exists());
+        {
+            let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+            let cf = db.get_column_family("default").unwrap();
+            assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+            db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
+                .unwrap();
+            db.inner.catalog_txn(add_table(4_242), || {}).unwrap();
+            db.close().unwrap();
+        }
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.get_column_family("default").unwrap();
+        assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+        assert_eq!(db.format_capabilities(), crate::format::CAP_MANIFEST_EDITS);
+        db.close().unwrap();
+    }
+
+    /// The trigger runs inside the same critical section that appended, so a
+    /// log that crosses the count threshold is compacted away and the snapshot
+    /// carries everything.
+    #[test]
+    fn the_trigger_compacts_the_log_inside_the_append_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edits_db(dir.path());
+        // One oversized edit crosses the byte threshold, which keeps the test
+        // to a handful of fsyncs instead of the four thousand the count arm
+        // would need.
+        let mut fat = add_table(1_000);
+        if let Op::AddTable { meta, .. } = &mut fat.ops[0] {
+            meta.min_key = vec![7u8; (crate::manifest_edit::SNAPSHOT_MIN_EDIT_BYTES + 1) as usize];
+        }
+        db.inner.catalog_txn(fat, || {}).unwrap();
+        assert!(
+            log_ids(dir.path()).is_empty(),
+            "the trigger fired inside the same section and restarted the log empty"
+        );
+        let back = recover_catalog(dir.path()).unwrap();
+        assert!(back.generation >= 2, "a compaction advanced the generation");
+        assert_eq!(back.applied_through, back.next_edit_id - 1);
+        db.close().unwrap();
+    }
+
+    fn manifest_version(dir: &std::path::Path) -> u32 {
+        let bytes = std::fs::read(manifest_path(dir.to_str().unwrap())).unwrap();
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap())
     }
 }
 

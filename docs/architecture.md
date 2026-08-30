@@ -22,6 +22,7 @@ type/function names — grep for them; line numbers rot.
 | `compaction.rs` | Leveled compaction: pick level, k-way merge, version collapse, tombstone/TTL GC, compaction filters; bottom-level output cut at partition boundaries; FIFO style (oldest-table eviction) |
 | `ingest.rs` | Bulk ingestion: pre-sorted stream → L0 SSTables directly (no WAL/memtable); atomic install at `finish()` |
 | `manifest.rs` | Durable catalog (`MANIFEST`): next file id, global seq, per-CF config blob + SST set (incl. per-table partition/tier/max-entry-time via the append-tolerant tail); crash-atomic save |
+| `manifest_edit.rs` | Numbered catalog edits (2.2): `VersionEdit`/`Op` codec, all-or-nothing `apply_edit` with per-op preconditions, the `MANIFEST-EDITS` log writer, the four-step snapshot-compaction protocol and `recover_catalog` |
 | `storage.rs` | `Storage`/`ReadHandle`/`StorageWriter` traits, `LocalStorage`, `TierRegistry` — the choke point all SSTable file access flows through so parts can live on multiple tiers |
 | `storage_s3.rs` | *(feature `s3`)* `S3Storage`: object-store backend — range-GET reads, single-PUT writes, own tokio runtime |
 | `parts.rs` | Part lifecycle: `detach_part`/`attach_part`/`freeze_part`, `move_part_to_tier`, the policy-driven part mover, live partition-rule add/remove |
@@ -538,9 +539,59 @@ protocol.
   HTTP status failure surfaces as `Ok` with a non-2xx `status_code()` and
   can never trigger a retry.
 
+## Catalog persistence (`db.rs`, `manifest_edit.rs`)
+
+Every structural change (flush, compaction, ingest, part move, CF lifecycle)
+ends by making the catalog durable. Two shapes exist, chosen by one durable bit:
+
+- **without `CAP_MANIFEST_EDITS`** (the default): `DbInner::persist_manifest`
+  rebuilds the whole `Manifest` from the live CFs under `manifest_mu` and
+  `Manifest::save`s it — the pre-2.2 behaviour, byte-for-byte. Cost is
+  O(catalog) per change: 12.4 MiB re-encoded and fsynced per persist at 100k
+  parts.
+- **with the capability**: `DbInner::catalog_txn(edit, publish)` appends one
+  CRC-framed record to `MANIFEST-EDITS` and fsyncs it — **the commit point** —
+  and only then runs `publish`. `persist_manifest` becomes a snapshot
+  compaction: the four-step protocol that writes a new `MANIFEST` and restarts
+  the log empty (`docs/formats.md` § Snapshot compaction).
+
+`catalog_txn`'s seven steps, in order: build the edit and the candidate state
+without publishing → ensure every newly referenced file is already fsynced
+(`Writer::finish`) → **under `manifest_mu`, append + fsync the record** →
+publish the candidate → retire removed handles through
+`DbInner::remove_sst_file` → still under `manifest_mu`, check the
+snapshot-compaction trigger → on failure publish nothing, leave the old state
+visible, and fail-stop.
+
+This **inverts** today's order at every mutating site, which publishes before
+persisting. Appends and snapshot compaction both hold `manifest_mu`, and that is
+not optional: compaction renames a fresh log over the live one, so a record
+appended between the snapshot write and the rename would be silently lost.
+
+The capability is taken through `DB::enable_format_capabilities`, which persists
+the bit *before* the first append (`enable_capability`'s persist-before-use
+ordering), and that persist is the compaction that creates the log. A database
+that never takes it never grows a log file.
+
+**Migration status:** the twenty `persist_manifest` call sites still use the
+pre-2.2 publish-then-persist order; moving them onto `catalog_txn` — and with
+them restating invariant 1's WAL-reclaim gate as "after the edit fsync" — is the
+next slice of 2.2. Until then the durable behaviour of a running database is
+unchanged, whether or not the capability is enabled.
+
 ## Recovery (`DB::open`)
 
-1. `Manifest::load` — missing file = empty DB; CRC failure = hard error. The
+0. Read-write opens only: `sweep_manifest_temp_files` unlinks any leftover
+   `MANIFEST.tmp` / `MANIFEST-EDITS.tmp` before anything is loaded. They are
+   crash artifacts of a snapshot compaction, never state, and are never read.
+1. `recover_catalog` — `Manifest::load` (missing file = empty DB; CRC failure =
+   hard error), then, if `CAP_MANIFEST_EDITS` is set, replay `MANIFEST-EDITS`
+   into it: accept the log iff `header.base_applied_through <=
+   snapshot.applied_through`, skip ids at or below `applied_through`, apply the
+   rest with contiguous ids, and reconcile `next_file_id`/`global_seq`. See
+   `docs/formats.md` § Edit-log tail tag for the full recovery rules. A writable
+   open then reopens the log for append, truncating any torn tail away; a
+   read-only open replays it and writes nothing. The
    persisted WAL layout must match the requested mode. An explicit
    per-CF→unified migration first recovers and flushes the legacy layout, then
    atomically flips the manifest; an implicit layout change is rejected.

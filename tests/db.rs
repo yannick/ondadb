@@ -2730,3 +2730,38 @@ fn periodic_refuses_fifo_at_create() {
     assert!(matches!(error, OndaError::InvalidArgs(_)), "{error:?}");
     db.close().unwrap();
 }
+
+/// `close`'s final persist must not be discarded: under the edit-log protocol
+/// it becomes the closing snapshot compaction, and a dropped failure leaves the
+/// next open replaying a longer log than it should. A database directory with
+/// no write permission fails exactly that write and nothing before it.
+#[cfg(unix)]
+#[test]
+fn close_reports_a_failed_final_persist() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let probe = root.path().join("probe");
+    std::fs::create_dir(&probe).unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let enforced = std::fs::write(probe.join("x"), b"").is_err();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if !enforced {
+        return; // running as root: directory permission bits do not apply
+    }
+
+    let dir = root.path().join("db");
+    std::fs::create_dir(&dir).unwrap();
+    let (db, cf) = open(&dir);
+    db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    drop(cf);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let res = db.close();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = res.expect_err("close must report a failed final persist");
+    assert_eq!(err.kind(), "io", "{err:?}");
+    assert!(
+        db.poisoned().is_some(),
+        "a failed persist fail-stops the DB"
+    );
+}

@@ -1,0 +1,38 @@
+# 2.2 manifest edit log vs full snapshot rewrite
+# host: Darwin 25.5.0 arm64  date: 2026-08-30T12:32:05Z
+# probe: tests/manifest_edits.rs::manifest_edit_scale_probe (release)
+# 10k-table catalog, 4096 structural changes
+#   (each change = UpdateTable{Tier,Object}, i.e. one part-mover flip)
+# full  = one Manifest::save (write+fsync+rename+dir-fsync) per change
+# edits = one appended, fsynced MANIFEST-EDITS record per change
+
+--- run 1 ---
+tables=10000 changes=4096 snapshot=1264901 bytes
+full   bytes=  5181034496 fsyncs=  8192 write=     201.80s replay=    2.72ms
+edits  bytes=      273202 fsyncs=  4096 write=      40.52s replay=    9.53ms
+ratio  bytes=18964.1x write=5.0x
+
+--- run 2 ---
+tables=10000 changes=4096 snapshot=1264901 bytes
+full   bytes=  5181034496 fsyncs=  8192 write=     128.44s replay=    6.51ms
+edits  bytes=      273202 fsyncs=  4096 write=      46.31s replay=   17.29ms
+ratio  bytes=18964.1x write=2.8x
+
+--- run 3 ---
+tables=10000 changes=4096 snapshot=1264901 bytes
+full   bytes=  5181034496 fsyncs=  8192 write=     218.22s replay=    5.94ms
+edits  bytes=      273202 fsyncs=  4096 write=      44.51s replay=   12.21ms
+ratio  bytes=18964.1x write=4.9x
+
+--- run 4 ---
+tables=10000 changes=4096 snapshot=1264901 bytes
+full   bytes=  5181034496 fsyncs=  8192 write=     259.13s replay=    5.13ms
+edits  bytes=      273202 fsyncs=  4096 write=      80.44s replay=   24.80ms
+ratio  bytes=18964.1x write=3.2x
+
+--- run 5 ---
+tables=10000 changes=4096 snapshot=1264901 bytes
+full   bytes=  5181034496 fsyncs=  8192 write=     371.09s replay=    5.51ms
+edits  bytes=      273202 fsyncs=  4096 write=     117.66s replay=   14.84ms
+ratio  bytes=18964.1x write=3.2x
+

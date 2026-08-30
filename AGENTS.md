@@ -9,7 +9,7 @@ Deep documentation (read the one that matches your task):
 | Doc | Covers |
 |---|---|
 | `docs/architecture.md` | Module map, write/read/flush/compaction/recovery data flow |
-| `docs/formats.md` | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest, internal keys |
+| `docs/formats.md` | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest + `MANIFEST-EDITS`, internal keys |
 | `docs/concurrency-and-safety.md` | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime/blocking contract, all `unsafe` contracts |
 | `docs/parts-and-tiers.md` | User-facing guide to partitions, parts and storage tiers (0.3.0): concepts, worked examples, S3 setup, operational notes |
 | `docs/performance.md` | Fast paths, benchmark methodology, known measurement artifacts |
@@ -58,13 +58,17 @@ ratios between engines, not absolute numbers across sessions. See
    deleted (`wal::remove_wal_files`). Same ordering for compaction: manifest
    before input-file deletion.
 2. **Manifest writes are serialized** by `DbInner::manifest_mu`; `Manifest::save`
-   is temp-file + fsync + rename + dir-fsync. Never write the manifest outside
-   `persist_manifest`.
+   is temp-file + fsync + rename + dir-fsync (the dir fsync propagates its
+   error). Never write the manifest outside `persist_manifest`. Under 2.2's
+   `CAP_MANIFEST_EDITS` the same lock covers edit-log appends *and* snapshot
+   compaction, in one critical section: compaction renames a fresh
+   `MANIFEST-EDITS` over the live one, so a record appended in between would be
+   silently lost. `DbInner::catalog_txn` is the only thing that may append.
 3. **WAL batch atomicity**: one frame per committed batch. Replay must never
    surface a partial batch (frame CRC covers the whole payload).
 4. **Every stored byte is checksummed**: WAL frames (CRC32-C), SSTable blocks
    (CRC32-C), vlog values (per-value CRC32-C prefix), manifest (whole-file
-   CRC32-C). Blocks and vlog frames are verified **at least once per open
+   CRC32-C), edit-log header and every edit record (CRC32-C). Blocks and vlog frames are verified **at least once per open
    reader** — never fewer (the first read always checks, and a frame that fails
    is never marked verified), and re-verified on re-open. Adding a new persisted
    structure without a checksum is a regression.

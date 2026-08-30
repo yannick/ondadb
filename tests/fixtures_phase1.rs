@@ -185,6 +185,9 @@ fn manifest_base() -> Manifest {
     Manifest {
         next_file_id: 42,
         global_seq: 99,
+        generation: 0,
+        applied_through: 0,
+        next_edit_id: 1,
         wal_layout: WalLayout::PerColumnFamily,
         instance_nonce: None,
         caps: 0,

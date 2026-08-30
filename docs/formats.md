@@ -626,3 +626,165 @@ Who sets the field:
 The enable-time stamping is what makes the trigger restart-safe. "Eligible one
 interval after open" is not: open time is not durable, so a database restarted
 more often than its interval would never become eligible at all.
+## Edit-log tail tag and `MANIFEST-EDITS` (2.2)
+
+A full `MANIFEST` rewrite costs O(catalog) bytes and one fsync per structural
+change — 12.4 MiB per persist at 100k parts, paid by every flush. With
+`CAP_MANIFEST_EDITS` the durable catalog becomes a **periodic snapshot**
+(`MANIFEST`, unchanged in shape) plus an **append-only log of numbered edits**
+(`MANIFEST-EDITS`). Without the capability nothing changes: no log file is
+created and the manifest is still rewritten in full, byte-for-byte as before.
+
+### Snapshot tail tag
+
+```
+ONDAMED1 | generation u64 | applied_through u64 | next_edit_id u64   (32 bytes)
+```
+
+Decoded **after `ONDACAP1`, before `ONDAWAL1`**, so the full emitted tail order is
+
+```
+[positional: partition | tier | max_entry_time]
+[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDAMED1 …] [ONDAWAL1 layout]
+[crc32c u32]
+```
+
+`ManifestTailPresence::tagged()` includes `edits`, for the same load-bearing
+reason `caps` is in it. The tag is emitted only when the triple differs from
+`(0, 0, 1)` — a database that has never had a log writes exactly the bytes it
+wrote before 2.2 — and, like `ONDACAP1`, it forces header version 2 and is
+`Corruption` inside a VERSION-1 manifest. `next_edit_id != applied_through + 1`
+is `Corruption`: no writer produces that pairing. The whole-file CRC already
+covers the tail, so no new checksum is introduced on the snapshot side.
+
+`applied_through` is the highest edit id the snapshot already contains;
+`generation` is **informational only** (see Recovery below).
+
+### `MANIFEST-EDITS` header (fixed 28 bytes, at offset 0)
+
+```
+off  len  field
+  0    4  magic  u32 LE = 0x4F4E_4445 ("ONDE"; on disk: 45 44 4E 4F)
+  4    4  schema u32 LE = 1
+  8    8  base_applied_through u64   — no record in this file has id <= this
+ 16    8  snapshot_generation  u64   — informational only
+ 24    4  crc32c u32 over bytes [0, 24)
+```
+
+The magic is ondaDB-namespaced on purpose: `"WD…"` is the wavesdb namespace and
+the two engines are expected to share tiers, so a wavesdb-looking magic here
+would invite cross-engine mount confusion. A file shorter than 28 bytes, a bad
+header CRC, or an unknown magic/schema is `Corruption` — never a torn tail. The
+header is written once, by snapshot compaction, and fsynced before any record.
+
+### Record framing (records begin at offset 28, contiguous)
+
+```
+off  len   field
+  0    4   len u32 LE    — payload byte count; the record occupies 8 + len bytes
+  4    4   crc32c u32    — over the payload
+  8  len   payload
+
+payload:  edit_id u64 LE | op_count uvarint | op × op_count
+op:       op_code uvarint | op payload
+```
+
+`len` is capped at `MAX_EDIT_RECORD_BYTES` = 64 MiB, checked **before any
+allocation**.
+
+The shape matches the WAL's `[len][crc][payload]` but the torn-tail contract is
+the **opposite**, and the WAL's helpers must not be reused here: `wal::replay`
+treats any unreadable trailing frame as a clean tail, whereas here only an
+**EOF-truncated** frame header or payload ends replay cleanly. A complete record
+with a bad CRC, an unknown op code, an out-of-sequence id or a failed
+precondition is `Corruption`.
+
+### Op payloads
+
+`opt<T>` is `0x00` (None) or `0x01` followed by `T`; `str` is a length-prefixed
+byte string, UTF-8 validated on decode. `sst_meta` mirrors the `SstMeta`
+declaration order exactly, so the inventory guard reads as a field-by-field walk:
+
+```
+sst_meta: id, level, num_entries, num_tombstones, max_seq, klog_size,
+          vlog_size (all uvarint) | min_key* | max_key*
+        | partition opt<str> | tier opt<str>
+        | max_entry_time opt<varint> | object opt<str>
+```
+
+`UpdateTable`'s field mask is a uvarint bitset whose present values follow in
+**ascending bit order**; a mask of 0, or a bit above `0x10`, is `Corruption`:
+
+```
+0x01 Level uvarint | 0x02 Tier opt<str> | 0x04 Object opt<str>
+0x08 Partition opt<str> | 0x10 MaxEntryTime opt<varint>
+```
+
+| code | op | payload | precondition |
+| ---: | --- | --- | --- |
+| 1 | `AddTable` | cf str, sst_meta | cf exists; id absent from it |
+| 2 | `RemoveTable` | cf str, id, expected_level | id present at that level |
+| 3 | `UpdateTable` | cf str, id, mask, values | id present in cf |
+| 4 | `CreateCF` | name str, config bytes | name absent |
+| 5 | `DropCF` | name str | name present; the same edit removed all its tables |
+| 6 | `SetCFConfig` | name str, config bytes | name present |
+| 7 | `SetNextFileID` | value uvarint | `value >= current` |
+| 8 | `SetGlobalSeq` | value uvarint | `value >= current` |
+| 9 | `SetWalLayout` | unified u8 (0/1) | one-way, per-CF → unified |
+| 10 | `SetNonce` | nonce u64 | not yet minted |
+| 11 | `SetCapability` | bits u64 | `KNOWN_CAPS` only |
+| 12 | `RemoveTables` | cf str, count, id × count | every id present in cf |
+
+Codes 13..63 are unassigned and reject as `Corruption` naming the code and the
+op index; codes ≥ 64 are never assigned, mirroring the WAL's kind rule.
+
+Column families are **name-keyed**: `CfManifest.name` is a CF's only catalog
+identity (`unified::cf_id` is a WAL routing hash and is never a catalog
+identity). Partition rules and tier rules are **not** manifest fields — they
+travel inside the opaque `CfManifest.config` blob, so `CreateCF`/`SetCFConfig`
+carry them.
+
+Applying an edit is **all-or-nothing**: `apply_edit` validates every op against
+a candidate that costs O(edit), then mutates. A failed precondition leaves the
+manifest untouched.
+
+### Snapshot compaction
+
+Entirely under `manifest_mu`, with `N` = the last durable edit id:
+
+1. write `MANIFEST.tmp` {generation `G+1`, `applied_through = N`,
+   `next_edit_id = N+1`, full catalog}, fsync;
+2. rename over `MANIFEST`, fsync the directory;
+3. write `MANIFEST-EDITS.tmp` {header with `base_applied_through = N`}, fsync;
+4. rename over `MANIFEST-EDITS`, fsync the directory again.
+
+The live log is **never truncated in place**. A crash between steps 2 and 4
+leaves the new snapshot beside the old log, which is consistent because replay
+skips ids at or below `applied_through`. Both temp files are unlinked at open,
+before anything is loaded, and are never read — a leftover temp is a crash
+artifact, not state. The trigger, checked after each append in the same critical
+section: `edit_bytes > max(4 MiB, snapshot_bytes)` or `edit_count > 4096`.
+
+### Recovery
+
+1. load and CRC-verify `MANIFEST` (a CRC-invalid one fails `DB::open`; a missing
+   one is an empty database);
+2. a log present without `CAP_MANIFEST_EDITS` in the snapshot is `Corruption` —
+   a newer binary wrote state this one cannot interpret;
+3. verify the log header and accept **iff
+   `header.base_applied_through <= snapshot.applied_through`**. That is the
+   whole predicate. `snapshot_generation` carries no decision power: the legal
+   crash-between-steps-2-and-4 state has the snapshot at `G+1` while the
+   surviving log still says `G`, so requiring equality would reject a consistent
+   database;
+4. record ids must be contiguous from `base_applied_through + 1`; ids at or
+   below `applied_through` are skipped, the rest applied. A gap or a duplicate
+   is `Corruption`;
+5. an EOF-truncated frame ends replay cleanly; everything else is `Corruption`
+   (see the framing note above). Reopening for append truncates the partial
+   frame away, so the next record is reachable rather than stranded behind it;
+6. a missing log is valid — it is the state before the first append, and the
+   state a fresh backup/checkpoint destination is handed;
+7. reconcile `next_file_id >= max table id + 1` and `global_seq >= max max_seq`;
+8. read-only opens replay the log but never compact it and never write to it —
+   not even the temp-file sweep.
