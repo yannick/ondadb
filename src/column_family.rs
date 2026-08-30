@@ -1005,6 +1005,14 @@ impl ColumnFamily {
     }
 
     fn writer_opts(&self, expected: usize) -> WriterOptions {
+        // Delta output is the option AND the durable capability: the bit
+        // reaches the manifest before the first byte using it exists, so a
+        // binary too old to decode the footer flag refuses the whole database
+        // rather than reading delta bytes as legacy ones.
+        let prefix_delta = self.opts.enable_prefix_delta_keys
+            && self.ctx.caps.load(Ordering::SeqCst)
+                & crate::format::CAPS_PREFIX_DELTA_WRITE
+                == crate::format::CAPS_PREFIX_DELTA_WRITE;
         WriterOptions {
             // Flush and ingestion always write L0.
             compression: self.opts.compression_for_level(0),
@@ -1021,10 +1029,12 @@ impl ColumnFamily {
             block_size: self.opts.data_block_size,
             expected_entries: expected,
             use_btree: self.opts.use_btree,
-            restart_interval: crate::sst::RESTART_INTERVAL,
-            // No engine path writes extended entries yet (1.0-B ships the
-            // codec; 1.1/1.2 are the first producers).
+            restart_interval: self.opts.block_restart_interval,
+            // No engine path writes extended entries on their own yet (1.0-B
+            // ships the codec; 1.1/1.2 are the first producers) — but a delta
+            // table is an extended table, and `Writer` sets both footer flags.
             extended_entries: false,
+            prefix_delta,
         }
     }
 

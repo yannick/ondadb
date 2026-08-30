@@ -1891,6 +1891,12 @@ fn cf_writer_opts(
     target_level: u32,
     bottom: bool,
 ) -> crate::sst::WriterOptions {
+    // Same gate as flush/ingest: the option alone never produces a delta
+    // table, the durably-enabled capability is what authorizes it.
+    let prefix_delta = cf.opts.enable_prefix_delta_keys
+        && cf.ctx.caps.load(std::sync::atomic::Ordering::SeqCst)
+            & crate::format::CAPS_PREFIX_DELTA_WRITE
+            == crate::format::CAPS_PREFIX_DELTA_WRITE;
     crate::sst::WriterOptions {
         compression: cf.opts.compression_for_level(target_level),
         compression_rules: cf.opts.compression_rules.clone(),
@@ -1910,8 +1916,9 @@ fn cf_writer_opts(
         // hint costs a few reallocs and nothing else.
         expected_entries: 4096,
         use_btree: cf.opts.use_btree,
-        restart_interval: crate::sst::RESTART_INTERVAL,
+        restart_interval: cf.opts.block_restart_interval,
         extended_entries: false,
+        prefix_delta,
     }
 }
 

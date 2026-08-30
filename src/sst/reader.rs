@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
 use std::sync::{Arc, OnceLock};
 
 use super::{
-    cmp_internal, decode_aux_sections, decode_entry, vlog_path_for, Block, BlockHandle,
-    EntryLayout, IndexEntry, SstIterator, AUX_HANDLE_LEN, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK,
-    FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
+    cmp_internal, decode_aux_sections, decode_delta_anchor, decode_entry, decode_entry_delta,
+    restart_lower_bound, validate_delta_restarts, vlog_path_for, Block, BlockHandle, EntryLayout,
+    IndexEntry, SstIterator, AUX_HANDLE_LEN, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK, FOOTER_HAS_BLOOM,
+    FOOTER_MAGIC, FOOTER_PREFIX_DELTA, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
     KNOWN_FOOTER_FLAGS, VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
 };
 use crate::bloom::Bloom;
@@ -43,6 +44,13 @@ pub struct Reader {
     /// by construction ([`FOOTER_EXTENDED_BLOCK`]), so every block of this file
     /// decodes the same way.
     entry_layout: EntryLayout,
+    /// Data-block entries are prefix-delta encoded ([`FOOTER_PREFIX_DELTA`]).
+    /// Table-level, like [`Self::entry_layout`], and validated at open against
+    /// the two flags it requires.
+    prefix_delta: bool,
+    /// `cmp.is_bytewise()`, resolved once: the delta decoder's in-block order
+    /// check is exact only under byte-wise ordering (AGENTS.md invariant 7).
+    bytewise: bool,
     /// Aux-block handle of an extended table (`(0, 0)` when absent), `None` for
     /// a legacy table that has no such prefix at all.
     aux_handle: Option<BlockHandle>,
@@ -247,6 +255,8 @@ impl Reader {
             has_restarts: false,
             vlog_v2: false,
             entry_layout: EntryLayout::Legacy,
+            prefix_delta: false,
+            bytewise: false,
             aux_handle: None,
             vlog_verified: OnceLock::new(),
             vlog_cache_limit,
@@ -257,6 +267,7 @@ impl Reader {
             #[cfg(feature = "mmap-reads")]
             verified: Vec::new(),
         };
+        r.bytewise = r.cmp.is_bytewise();
         let f = r.storage.open_read(klog_path)?;
         let size = f.size()?;
         if size < FOOTER_SIZE as u64 {
@@ -281,6 +292,24 @@ impl Reader {
         }
         r.has_restarts = flags & FOOTER_RESTARTS != 0;
         r.vlog_v2 = flags & FOOTER_VLOG_V2 != 0;
+        r.prefix_delta = flags & FOOTER_PREFIX_DELTA != 0;
+        if r.prefix_delta {
+            // Both are `Corruption`, not `UnsupportedFormat`: the bits name
+            // formats this binary DOES implement, in a combination no writer
+            // can produce. The delta layout is defined only over the extended
+            // entry, and without a restart trailer a delta block is decodable
+            // only from offset 0 — no seek, no reverse iteration.
+            if flags & FOOTER_EXTENDED_BLOCK == 0 {
+                return Err(OndaError::Corruption(
+                    "sst: FOOTER_PREFIX_DELTA without FOOTER_EXTENDED_BLOCK".into(),
+                ));
+            }
+            if flags & FOOTER_RESTARTS == 0 {
+                return Err(OndaError::Corruption(
+                    "sst: FOOTER_PREFIX_DELTA without FOOTER_RESTARTS".into(),
+                ));
+            }
+        }
         if flags & FOOTER_EXTENDED_BLOCK != 0 {
             r.entry_layout = EntryLayout::Extended;
             // The 16 bytes ahead of the footer are the aux-block handle.
@@ -495,6 +524,20 @@ impl Reader {
         self.entry_layout
     }
 
+    /// Whether this table's data-block entries are prefix-delta encoded
+    /// ([`FOOTER_PREFIX_DELTA`]).
+    #[inline]
+    pub(crate) fn prefix_delta(&self) -> bool {
+        self.prefix_delta
+    }
+
+    /// Whether this table's comparator orders byte-wise, which is what makes
+    /// the delta decoder's in-block order check exact.
+    #[inline]
+    pub(crate) fn bytewise(&self) -> bool {
+        self.bytewise
+    }
+
     /// This table's aux-block handle as `(offset, length)`, or `None` for a
     /// legacy table (one without [`FOOTER_EXTENDED_BLOCK`], which has no such
     /// prefix at all). `Some((0, 0))` means an extended table with no aux block.
@@ -638,14 +681,33 @@ impl Reader {
             .filter(|&t| t <= raw.len())
             .ok_or_else(corrupt)?;
         let entries_end = raw.len() - trailer;
-        Ok((&raw[..entries_end], &raw[entries_end..raw.len() - 4]))
+        let (entries, restarts) = (&raw[..entries_end], &raw[entries_end..raw.len() - 4]);
+        if self.prefix_delta {
+            // Decoder validation rule 3. A delta block is unreadable without a
+            // sound anchor array — every seek and every reverse step enters
+            // through one — so it is checked here, at the single point every
+            // reader splits a block, rather than at each of the four entry
+            // points. One `u32` per `restart_interval` entries makes this ~10
+            // comparisons for a 4 KiB block at the default.
+            validate_delta_restarts(entries.len(), restarts)?;
+        }
+        Ok((entries, restarts))
     }
 
     /// Number of data blocks in this table. A [`find_block`](Self::find_block)
     /// result at or above this means the key sorts past the last block.
     #[inline]
-    pub(crate) fn data_block_count(&self) -> usize {
+    pub fn data_block_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Whether this table's data blocks are prefix-delta encoded (2.1).
+    ///
+    /// Public because the property is *self-describing*: a detached, frozen or
+    /// mounted table answers this from its own footer, with no manifest
+    /// involved, and an operator inspecting a loose klog should be able to ask.
+    pub fn is_prefix_delta(&self) -> bool {
+        self.prefix_delta
     }
 
     /// Index of the first data block whose last key is `>= (user_key, seq)`.
@@ -717,26 +779,26 @@ impl Reader {
             return Ok(0);
         }
         // Find the first restart entry >= target, then scan from its
-        // predecessor so the target cannot lie in a skipped interval.
+        // predecessor so the target cannot lie in a skipped interval. Restart
+        // anchors are self-contained in both layouts (a delta anchor has
+        // `shared_len == 0`), so the search needs no key materialization at all.
         let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
-        let (mut lo, mut hi) = (0usize, restarts.len() / 4);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let (entry, _) = decode_entry(raw, self.entry_layout, restart_off(mid))?;
-            if cmp_internal(
+        let lo = restart_lower_bound(restarts.len() / 4, |i| {
+            let off = restart_off(i);
+            let (entry, _) = if self.prefix_delta {
+                decode_delta_anchor(raw, off)?
+            } else {
+                decode_entry(raw, self.entry_layout, off)?
+            };
+            Ok(cmp_internal(
                 &self.cmp,
                 entry.user_key(raw),
                 entry.seq,
                 user_key,
                 read_seq,
             )
-            .is_lt()
-            {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
+            .is_lt())
+        })?;
         Ok(if lo > 0 { restart_off(lo - 1) } else { 0 })
     }
 
@@ -752,9 +814,20 @@ impl Reader {
         read_seq: u64,
         now: i64,
     ) -> Result<PointResult> {
+        // Delta blocks need a running previous key; legacy blocks borrow each
+        // key straight out of the block and allocate nothing.
+        let mut scratch = Vec::new();
         while offset < raw.len() {
-            let (entry, next) = decode_entry(raw, self.entry_layout, offset)?;
-            let entry_key = entry.user_key(raw);
+            let (entry, next) = if self.prefix_delta {
+                decode_entry_delta(raw, offset, &mut scratch, self.bytewise)?
+            } else {
+                decode_entry(raw, self.entry_layout, offset)?
+            };
+            let entry_key: &[u8] = if self.prefix_delta {
+                &scratch
+            } else {
+                entry.user_key(raw)
+            };
             if cmp_internal(&self.cmp, entry_key, entry.seq, user_key, read_seq).is_lt() {
                 offset = next;
                 continue;
@@ -1073,6 +1146,7 @@ mod tests {
                 use_btree: false,
                 restart_interval: 8,
                 extended_entries: false,
+                prefix_delta: false,
             },
         )
         .unwrap();
@@ -1129,6 +1203,7 @@ mod tests {
                 use_btree: false,
                 restart_interval: 0, // legacy: no trailer, no footer flag
                 extended_entries: false,
+                prefix_delta: false,
             },
         )
         .unwrap();
@@ -1186,6 +1261,134 @@ mod tests {
         assert_eq!(out, before, "a corrupt frame must not append partial data");
     }
 
+    /// Build a table at `path` with `opts`, filling it with prefix-heavy keys.
+    fn write_table(path: &str, opts: WriterOptions, n: usize) {
+        let mut w = Writer::new(path, opts).unwrap();
+        for i in 0..n {
+            let k = format!("tenant/alpha/cluster/{:04}/segment", i);
+            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+                .unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn delta_opts(restart_interval: usize) -> WriterOptions {
+        WriterOptions {
+            compression: Compression::None,
+            compression_rules: Vec::new(),
+            cmp: default_comparator(),
+            enable_bloom: false,
+            bloom_fpr: None,
+            klog_value_threshold: 1 << 20,
+            block_size: 512,
+            expected_entries: 128,
+            use_btree: false,
+            restart_interval,
+            extended_entries: false,
+            prefix_delta: true,
+        }
+    }
+
+    /// Flip the footer flag byte of the klog at `path`.
+    fn patch_footer_flags(path: &str, f: impl Fn(u8) -> u8) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.len() - FOOTER_SIZE + 48;
+        bytes[at] = f(bytes[at]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn open_at(path: &str) -> Result<Arc<Reader>> {
+        Reader::open(
+            path,
+            local(),
+            Arc::new(BlockCache::new(1 << 20)),
+            9,
+            default_comparator(),
+            0,
+        )
+    }
+
+    /// The delta layout is defined only over the extended entry, so the two
+    /// flags may not be separated — and the combination cannot come from any
+    /// writer, which is why it is `Corruption` and not `UnsupportedFormat`.
+    #[test]
+    fn prefix_delta_without_extended_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("d.klog");
+        let klog = klog.to_str().unwrap();
+        write_table(klog, delta_opts(8), 64);
+        open_at(klog).expect("the unpatched delta table must open");
+        patch_footer_flags(klog, |f| f & !FOOTER_EXTENDED_BLOCK);
+        let err = open_at(klog).expect_err("delta without extended must be refused");
+        assert_eq!(err.kind(), "corruption", "{err}");
+        assert!(err.to_string().contains("FOOTER_EXTENDED_BLOCK"), "{err}");
+    }
+
+    /// Without a restart trailer a delta block is decodable only from offset 0
+    /// — no seek, no reverse iteration.
+    #[test]
+    fn prefix_delta_without_restarts_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("d.klog");
+        let klog = klog.to_str().unwrap();
+        write_table(klog, delta_opts(8), 64);
+        patch_footer_flags(klog, |f| f & !FOOTER_RESTARTS);
+        let err = open_at(klog).expect_err("delta without restarts must be refused");
+        assert_eq!(err.kind(), "corruption", "{err}");
+        assert!(err.to_string().contains("FOOTER_RESTARTS"), "{err}");
+    }
+
+    /// Task-5 refactor guard: `restart_scan_offset` now runs through the shared
+    /// `restart_lower_bound`, and must return byte-for-byte the offsets the
+    /// open-coded binary search returned over a frozen legacy fixture.
+    #[test]
+    fn restart_lower_bound_matches_legacy_scan_offset() {
+        let path = crate::util::phase1_fixture("klog_legacy_flat_restarts_bloom.klog");
+        let path = path.to_str().unwrap();
+        let r = open_at(path).unwrap();
+        assert!(r.has_restarts && !r.prefix_delta);
+        // The pre-refactor body, verbatim.
+        let legacy = |raw: &[u8], restarts: &[u8], key: &[u8], seq: u64| -> usize {
+            if restarts.len() < 8 {
+                return 0;
+            }
+            let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
+            let (mut lo, mut hi) = (0usize, restarts.len() / 4);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (entry, _) = decode_entry(raw, r.entry_layout, restart_off(mid)).unwrap();
+                if cmp_internal(&r.cmp, entry.user_key(raw), entry.seq, key, seq).is_lt() {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo > 0 {
+                restart_off(lo - 1)
+            } else {
+                0
+            }
+        };
+        let mut probes: Vec<String> = (1..45u64).map(|i| format!("k{i:02}")).collect();
+        probes.extend(["a".into(), "k00".into(), "k99".into(), "zzz".into()]);
+        let mut checked = 0;
+        for bi in 0..r.data_block_count() {
+            let block = r.read_data_block_local(bi).unwrap();
+            let (raw, restarts) = r.split_block(block.bytes()).unwrap();
+            for probe in &probes {
+                for seq in [0u64, 25, u64::MAX] {
+                    let want = legacy(raw, restarts, probe.as_bytes(), seq);
+                    let got = r
+                        .restart_scan_offset(raw, restarts, probe.as_bytes(), seq)
+                        .unwrap();
+                    assert_eq!(got, want, "block {bi}, probe {probe}, seq {seq}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "the fixture must exercise the search");
+    }
+
     /// The batch point-read planner in `column_family.rs` drives the reader's
     /// block walk itself (one block fetch for many keys) instead of calling
     /// `get_unfiltered` per key. This pins that the hand-driven sequence is
@@ -1210,6 +1413,7 @@ mod tests {
                 use_btree: false,
                 restart_interval: 4,
                 extended_entries: false,
+                prefix_delta: false,
             },
         )
         .unwrap();

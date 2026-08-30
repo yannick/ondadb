@@ -120,6 +120,12 @@ pub const CAP_MANIFEST_EDITS: u64 = 1 << 4;
 pub const CAP_PERIODIC_AGE: u64 = 1 << 5;
 /// Persisted transaction decisions (3.2).
 pub const CAP_TXN_DECISIONS: u64 = 1 << 6;
+/// Capabilities a writer must hold before it may emit a prefix-delta table
+/// (2.1). Both, not just [`CAP_PREFIX_DELTA`]: a delta block *is* an extended
+/// block — the layout is defined only over the kind-bearing envelope — and
+/// [`CAP_EXTENDED_RECORDS`] is the permission for that envelope.
+pub const CAPS_PREFIX_DELTA_WRITE: u64 = CAP_EXTENDED_RECORDS | CAP_PREFIX_DELTA;
+
 /// Mask of every capability bit this roadmap has assigned (`0x7F`).
 pub const KNOWN_CAPS: u64 = CAP_EXTENDED_RECORDS
     | CAP_MERGE_OPERANDS

@@ -553,6 +553,32 @@ pub struct ColumnFamilyConfig {
     /// than a format choice. Larger blocks improve compression windows at the
     /// cost of decompressing more bytes for a point read.
     pub data_block_size: usize,
+    /// Store each data-block key as the bytes it does not share with its
+    /// predecessor (2.1). Default `false`: legacy full-key blocks.
+    ///
+    /// A write policy, never a read one — tables already written keep their own
+    /// encoding, which is recorded in their footer, and both formats coexist in
+    /// any level, part, checkpoint or attach. Turning it on is inert until
+    /// [`CAP_PREFIX_DELTA`](crate::format::CAP_PREFIX_DELTA) is durably
+    /// enabled: a table this binary writes must be refused outright by a binary
+    /// too old to decode it, and the capability word in the manifest is what
+    /// makes that refusal happen.
+    pub enable_prefix_delta_keys: bool,
+    /// Entries per in-block restart point. Default
+    /// [`RESTART_INTERVAL`](crate::sst::RESTART_INTERVAL) (8); valid range
+    /// `[1, 1024]`.
+    ///
+    /// A restart anchor is self-contained, so the interval trades index density
+    /// (bounded seek and reverse-step cost, `4` trailer bytes per anchor)
+    /// against how many full keys a block repeats. It applies whether or not
+    /// `enable_prefix_delta_keys` is set.
+    ///
+    /// `0` is **not** accepted even though `WriterOptions::restart_interval`
+    /// takes it: there it means "emit no restart trailer at all", the legacy
+    /// block shape, which stays reachable only by constructing `WriterOptions`
+    /// directly. Mapping a config `0` to the default would make the config
+    /// value mean the opposite of the writer value it feeds.
+    pub block_restart_interval: usize,
     /// Byte ceiling on a decoded vlog value the block cache may hold. `0`
     /// (the default) disables vlog value caching entirely.
     ///
@@ -776,6 +802,8 @@ impl Default for ColumnFamilyConfig {
             dividing_level_offset: 1,
             klog_value_threshold: 512, // WiscKey separation threshold
             data_block_size: crate::column_family::DEFAULT_DATA_BLOCK_SIZE,
+            enable_prefix_delta_keys: false, // legacy full-key blocks
+            block_restart_interval: crate::sst::RESTART_INTERVAL,
             max_cached_vlog_value_bytes: 0, // vlog value caching off
             compression: Compression::None,
             compression_per_level: Vec::new(),
@@ -1145,6 +1173,13 @@ impl ColumnFamilyConfig {
         if self.data_block_size == 0 {
             return Err("data_block_size must be non-zero".to_string());
         }
+        if !(1..=1024).contains(&self.block_restart_interval) {
+            return Err(format!(
+                "block_restart_interval ({}) must be in [1, 1024]; 0 is not \
+                 'the default', it is the writer-level 'no restart trailer'",
+                self.block_restart_interval
+            ));
+        }
         // A limit under the separation threshold is indistinguishable from
         // "off" at runtime but reads as "on" in the config — reject it rather
         // than let it look like a tuning that did nothing.
@@ -1212,6 +1247,7 @@ impl ColumnFamilyConfig {
         encode_vlog_cache(&mut b, self);
         encode_bloom_policy(&mut b, self);
         encode_periodic_interval(&mut b, self);
+        encode_prefix_delta(&mut b, self);
         b
     }
 
@@ -1251,6 +1287,8 @@ const CONFIG_VLOG_CACHE_MAGIC: &[u8; 8] = b"ONDAVVC1";
 const CONFIG_BLOOM_POLICY_MAGIC: &[u8; 8] = b"ONDABLM1";
 /// Tag introducing the periodic-compaction interval tail (0.3).
 const CONFIG_PERIODIC_MAGIC: &[u8; 8] = b"ONDAPRD1";
+/// Tag introducing the prefix-delta key-encoding tail (2.1).
+const CONFIG_PREFIX_DELTA_MAGIC: &[u8; 8] = b"ONDAPFX1";
 /// Reserved for a future geometric (Monkey-style) auto-allocation policy. It is
 /// mutually exclusive with the explicit `bloom_fpr_per_level` vector, so the tag
 /// is claimed here to keep the two from ever sharing one; nothing writes or
@@ -1532,7 +1570,8 @@ fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     let p = read_block_size_tail(p, cfg);
     let p = read_vlog_cache_tail(p, cfg);
     let p = read_bloom_policy_tail(p, cfg);
-    read_periodic_interval_tail(p, cfg);
+    let p = read_periodic_interval_tail(p, cfg);
+    read_prefix_delta_tail(p, cfg);
     Some(())
 }
 
@@ -1838,20 +1877,160 @@ fn encode_periodic_interval(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
 /// Consume the periodic-compaction tail if present. Absent (every blob written
 /// before 0.3, and any family that left the option at zero), the default stands
 /// — `Duration::ZERO`, which disables the trigger.
-fn read_periodic_interval_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+/// Returns the unconsumed remainder so later tails can be chained behind it.
+fn read_periodic_interval_tail<'a>(
+    p: &'a [u8],
+    cfg: &mut ColumnFamilyConfig,
+) -> &'a [u8] {
     let Some(rest) = p.strip_prefix(CONFIG_PERIODIC_MAGIC) else {
-        return;
+        return p;
     };
     if rest.len() < 8 {
-        return;
+        return p;
     }
     cfg.periodic_compaction_interval =
         std::time::Duration::from_micros(crate::encoding::read_u64(rest));
+    &rest[8..]
+}
+
+/// The 2.1 prefix-delta tail: `enabled u8 | block_restart_interval u64 LE`.
+/// Elided when both fields are at their defaults, so a family that never sets
+/// them encodes byte-for-byte as earlier releases wrote it.
+fn encode_prefix_delta(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_u64;
+
+    let default = ColumnFamilyConfig::default();
+    if !cfg.enable_prefix_delta_keys
+        && cfg.block_restart_interval == default.block_restart_interval
+    {
+        return;
+    }
+    b.extend_from_slice(CONFIG_PREFIX_DELTA_MAGIC);
+    b.push(u8::from(cfg.enable_prefix_delta_keys));
+    append_u64(b, cfg.block_restart_interval as u64);
+}
+
+/// Consume the prefix-delta tail if present. All-or-nothing, like the tails
+/// before it: a truncated or out-of-range tail leaves both fields at their
+/// defaults rather than applying half a policy — and an interval outside
+/// `[1, 1024]` would not survive `validate`, so it is not made valid by having
+/// been written.
+fn read_prefix_delta_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    let Some(rest) = p.strip_prefix(CONFIG_PREFIX_DELTA_MAGIC) else {
+        return;
+    };
+    if rest.len() < 9 {
+        return;
+    }
+    let interval = crate::encoding::read_u64(&rest[1..]) as usize;
+    if !(1..=1024).contains(&interval) {
+        return;
+    }
+    cfg.enable_prefix_delta_keys = rest[0] != 0;
+    cfg.block_restart_interval = interval;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_default_config_emits_no_prefix_delta_tail() {
+        let blob = ColumnFamilyConfig::default().encode();
+        assert!(
+            !blob
+                .windows(CONFIG_PREFIX_DELTA_MAGIC.len())
+                .any(|w| w == CONFIG_PREFIX_DELTA_MAGIC),
+            "a family at the defaults must encode as earlier releases wrote it"
+        );
+        let decoded = ColumnFamilyConfig::decode(&blob);
+        assert!(!decoded.enable_prefix_delta_keys);
+        assert_eq!(decoded.block_restart_interval, crate::sst::RESTART_INTERVAL);
+    }
+
+    #[test]
+    fn prefix_delta_settings_round_trip() {
+        for (enabled, interval) in [(true, 8usize), (false, 32), (true, 1), (true, 1024)] {
+            let config = ColumnFamilyConfig {
+                enable_prefix_delta_keys: enabled,
+                block_restart_interval: interval,
+                ..Default::default()
+            };
+            config.validate().unwrap();
+            let decoded = ColumnFamilyConfig::decode(&config.encode());
+            assert_eq!(decoded.enable_prefix_delta_keys, enabled);
+            assert_eq!(decoded.block_restart_interval, interval);
+        }
+    }
+
+    /// The blob tails are positional, so the new one must survive behind every
+    /// tail that already existed — including the two it directly follows.
+    #[test]
+    fn the_prefix_delta_tail_coexists_with_preceding_tails() {
+        let config = ColumnFamilyConfig {
+            data_block_size: 16 << 10,
+            max_cached_vlog_value_bytes: 1 << 20,
+            bloom_fpr_per_level: vec![0.02, 0.05],
+            optimize_filters_for_hits: true,
+            periodic_compaction_interval: std::time::Duration::from_secs(3600),
+            enable_prefix_delta_keys: true,
+            block_restart_interval: 16,
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        let blob = config.encode();
+        let block_at = blob
+            .windows(8)
+            .position(|w| w == CONFIG_BLOCK_SIZE_MAGIC)
+            .expect("block-size tail");
+        let delta_at = blob
+            .windows(8)
+            .position(|w| w == CONFIG_PREFIX_DELTA_MAGIC)
+            .expect("prefix-delta tail");
+        assert!(block_at < delta_at, "the new tail must come last");
+        let decoded = ColumnFamilyConfig::decode(&blob);
+        assert_eq!(decoded.data_block_size, 16 << 10);
+        assert_eq!(decoded.max_cached_vlog_value_bytes, 1 << 20);
+        assert_eq!(decoded.bloom_fpr_per_level, vec![0.02, 0.05]);
+        assert!(decoded.optimize_filters_for_hits);
+        assert_eq!(
+            decoded.periodic_compaction_interval,
+            std::time::Duration::from_secs(3600)
+        );
+        assert!(decoded.enable_prefix_delta_keys);
+        assert_eq!(decoded.block_restart_interval, 16);
+    }
+
+    /// `0` is the writer-level "no restart trailer at all", which a config
+    /// value must not be able to mean.
+    #[test]
+    fn a_zero_restart_interval_is_rejected() {
+        let error = ColumnFamilyConfig {
+            block_restart_interval: 0,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("zero must be rejected");
+        assert!(error.contains("block_restart_interval"), "{error}");
+    }
+
+    #[test]
+    fn a_restart_interval_above_1024_is_rejected() {
+        let error = ColumnFamilyConfig {
+            block_restart_interval: 1025,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("above the bound must be rejected");
+        assert!(error.contains("block_restart_interval"), "{error}");
+        // The bound itself is accepted.
+        ColumnFamilyConfig {
+            block_restart_interval: 1024,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
 
     #[test]
     fn config_cursor_reads_checked_little_endian_values() {

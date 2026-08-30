@@ -15,6 +15,10 @@
 //! flags(1) | key_len uvarint | val_len uvarint | seq uvarint |
 //! ttl varint(if HAS_TTL) | key | (value | vlog_off u64 LE if HAS_VLOG)
 //! ```
+//!
+//! Tables written with [`FOOTER_PREFIX_DELTA`] replace `key_len | key` with
+//! `shared_len | suffix_len | ... | suffix`, storing only the bytes a key does
+//! not share with its predecessor (see [`encode_entry_delta`]).
 
 mod iter;
 mod reader;
@@ -61,13 +65,32 @@ pub(crate) const FOOTER_VLOG_V2: u8 = 0x08;
 /// come from `decode_entry`'s returned `next`, which is why the restart
 /// trailer, the B+tree index and the block CRC all keep working unchanged.
 pub(crate) const FOOTER_EXTENDED_BLOCK: u8 = 0x10;
-/// Mask of every footer flag bit this binary implements (`0x1F`).
+/// Footer flag: **every** data-block entry in this table is prefix-delta
+/// encoded — `key_len | key` is replaced by `shared_len | suffix_len | suffix`
+/// and the user key is `prev_key[..shared_len] ++ suffix` (2.1).
+///
+/// Table-level for the same reason [`FOOTER_EXTENDED_BLOCK`] is: the block
+/// cache is keyed `(file_id, offset)` and stores bytes only, so a cache hit
+/// returns a payload with no envelope to re-parse. Reading the encoding off the
+/// footer also keeps a detached/frozen/mounted table self-describing without
+/// its source manifest.
+///
+/// Requires both [`FOOTER_EXTENDED_BLOCK`] (the delta layout is defined only
+/// over the extended entry) and [`FOOTER_RESTARTS`] (without anchors a delta
+/// block is decodable only from offset 0 — no seek, no reverse iteration).
+/// `Reader::open` rejects either combination as `Corruption`.
+pub(crate) const FOOTER_PREFIX_DELTA: u8 = 0x20;
+/// Mask of every footer flag bit this binary implements (`0x3F`).
 ///
 /// A file setting a bit outside this mask was written by a newer binary and
 /// names a feature we do not implement — [`OndaError::UnsupportedFormat`], not
 /// `Corruption`.
-pub(crate) const KNOWN_FOOTER_FLAGS: u8 =
-    FOOTER_HAS_BLOOM | FOOTER_BTREE | FOOTER_RESTARTS | FOOTER_VLOG_V2 | FOOTER_EXTENDED_BLOCK;
+pub(crate) const KNOWN_FOOTER_FLAGS: u8 = FOOTER_HAS_BLOOM
+    | FOOTER_BTREE
+    | FOOTER_RESTARTS
+    | FOOTER_VLOG_V2
+    | FOOTER_EXTENDED_BLOCK
+    | FOOTER_PREFIX_DELTA;
 /// Width of the aux-block handle written immediately before the footer of an
 /// extended table: `aux_off u64 LE | aux_len u64 LE`, both `0` when absent.
 ///
@@ -205,8 +228,17 @@ pub(crate) struct IndexEntry {
 /// A decoded data-block entry, with slices addressed by offset into the block.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DecEntry {
+    /// Start of the key bytes stored *in this entry*: the whole user key for a
+    /// legacy/extended entry, the suffix for a prefix-delta one.
     pub key_start: usize,
+    /// Length of the key bytes stored in this entry (see [`Self::key_start`]).
     pub key_len: usize,
+    /// Bytes this entry's user key shares with its predecessor's; always `0`
+    /// outside a prefix-delta block, and `0` at every restart anchor inside
+    /// one. When non-zero the user key is not contiguous in the block, so
+    /// [`Self::user_key`] must not be used — the caller holds the
+    /// reconstructed key instead (see [`decode_entry_delta`]).
+    pub key_shared: usize,
     pub val_start: usize,
     pub val_len: usize, // logical value length (also for vlog values)
     pub seq: u64,
@@ -225,7 +257,18 @@ impl DecEntry {
     pub fn has_vlog(&self) -> bool {
         self.flags & flags::HAS_VLOG != 0
     }
+    /// The entry's user key, borrowed from the block.
+    ///
+    /// Only valid when [`key_shared`](Self::key_shared) is zero: a delta entry
+    /// that shares bytes with its predecessor has no contiguous key anywhere in
+    /// the block, and this would return only its suffix. Restart anchors always
+    /// qualify, which is what lets the anchor binary search run with no
+    /// materialization at all.
     pub fn user_key<'a>(&self, raw: &'a [u8]) -> &'a [u8] {
+        debug_assert_eq!(
+            self.key_shared, 0,
+            "user_key() on a delta entry that shares a prefix"
+        );
         &raw[self.key_start..self.key_start + self.key_len]
     }
     pub fn inline_value<'a>(&self, raw: &'a [u8]) -> &'a [u8] {
@@ -367,6 +410,7 @@ pub(crate) fn decode_entry(
         DecEntry {
             key_start,
             key_len: klen,
+            key_shared: 0,
             val_start,
             val_len,
             seq,
@@ -376,6 +420,273 @@ pub(crate) fn decode_entry(
         },
         next,
     ))
+}
+
+/// Length of the longest common prefix of `a` and `b`.
+#[inline]
+fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Append one prefix-delta data-block entry to `dst`, returning the number of
+/// leading bytes it shares with `prev_key` (`0` at a restart anchor, where the
+/// caller passes an empty `prev_key`).
+///
+/// ```text
+/// kind uv | modifiers uv | shared_len uv | suffix_len uv | val_len uv |
+/// seq uv | ttl varint(if HAS_TTL) | suffix | (value | vlog_off u64 LE)
+/// ```
+///
+/// This is the extended layout with `key_len` split in two; nothing else moves.
+/// The order matters twice: `kind`/`modifiers` stay first so `HAS_TTL` is known
+/// before the `ttl` slot is reached, and every varint precedes every
+/// variable-length field so a decoder can bounds-check `shared_len`,
+/// `suffix_len` and `val_len` *before* any memcpy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_entry_delta(
+    dst: &mut Vec<u8>,
+    prev_key: &[u8],
+    user_key: &[u8],
+    value: &[u8],
+    seq: u64,
+    ttl: i64,
+    tombstone: bool,
+    single_delete: bool,
+    has_vlog: bool,
+    vlog_off: u64,
+) -> usize {
+    crate::format::debug_check_entry_flags(tombstone, single_delete, has_vlog);
+    let fl = crate::format::normalized_entry_flags(tombstone, single_delete, ttl != 0, has_vlog);
+    // Normalization may have cleared HAS_VLOG (a tombstone has no separated
+    // value); the layout below must follow the bits that were actually written.
+    let has_vlog = fl & flags::HAS_VLOG != 0;
+    let kind = crate::format::point_kind(
+        fl & flags::TOMBSTONE != 0,
+        fl & flags::SINGLE_DELETE != 0,
+    );
+    let mods = u64::from(fl) & crate::format::modifiers::KNOWN;
+    let shared = shared_prefix_len(prev_key, user_key);
+    append_uvarint(dst, kind);
+    append_uvarint(dst, mods);
+    append_uvarint(dst, shared as u64);
+    append_uvarint(dst, (user_key.len() - shared) as u64);
+    append_uvarint(dst, value.len() as u64);
+    append_uvarint(dst, seq);
+    if ttl != 0 {
+        append_varint(dst, ttl);
+    }
+    dst.extend_from_slice(&user_key[shared..]);
+    if has_vlog {
+        append_u64(dst, vlog_off);
+    } else {
+        dst.extend_from_slice(value);
+    }
+    shared
+}
+
+/// Decode a prefix-delta entry's fields at `raw[off..]` **without**
+/// reconstructing its key: the returned [`DecEntry`] addresses the stored
+/// suffix and carries its `shared_len`.
+///
+/// Every length is bounds-checked against `raw` before it is trusted, so the
+/// caller can reconstruct with an unchecked copy afterwards. `raw` is the
+/// entries region only (the restart trailer is already split off), which is
+/// what makes "an entry may not run past the last one" a bounds check rather
+/// than a separate rule.
+pub(crate) fn decode_delta_header(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> {
+    let corrupt = || OndaError::Corruption("sst: malformed delta entry".into());
+    if off >= raw.len() {
+        return Err(corrupt());
+    }
+    let (kind, n) = uvarint(&raw[off..]).ok_or_else(corrupt)?;
+    crate::format::check_kind(kind)?;
+    let mut p = off + n;
+    let (mods, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
+    crate::format::check_modifiers(mods)?;
+    p += n;
+    // Folded back into the legacy flags byte, exactly as `decode_entry` does:
+    // every consumer of `DecEntry` reads that one representation.
+    let mut fl = mods as u8;
+    if kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE {
+        fl |= flags::TOMBSTONE;
+    }
+    if kind == crate::format::KIND_SINGLE_DELETE {
+        fl |= flags::SINGLE_DELETE;
+    }
+    crate::format::check_entry_flags(fl)?;
+    let (shared, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
+    p += n;
+    let (suffix_len, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
+    p += n;
+    let (vlen, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
+    p += n;
+    let (seq, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
+    p += n;
+    let mut ttl = 0i64;
+    if fl & flags::HAS_TTL != 0 {
+        let (t, n) = varint(&raw[p..]).ok_or_else(corrupt)?;
+        p += n;
+        ttl = t;
+    }
+    let shared = usize::try_from(shared).map_err(|_| corrupt())?;
+    let suffix_len = usize::try_from(suffix_len).map_err(|_| corrupt())?;
+    if suffix_len.checked_add(p).ok_or_else(corrupt)? > raw.len() {
+        return Err(corrupt());
+    }
+    let key_start = p;
+    p += suffix_len;
+    let has_vlog = fl & flags::HAS_VLOG != 0;
+    let (val_start, val_len, vlog_off, next) = if has_vlog {
+        if p + 8 > raw.len() {
+            return Err(corrupt());
+        }
+        let off = crate::encoding::read_u64(&raw[p..]);
+        (p, vlen as usize, off, p + 8)
+    } else {
+        let vl = vlen as usize;
+        if vl.checked_add(p).ok_or_else(corrupt)? > raw.len() {
+            return Err(corrupt());
+        }
+        (p, vl, 0u64, p + vl)
+    };
+    Ok((
+        DecEntry {
+            key_start,
+            key_len: suffix_len,
+            key_shared: shared,
+            val_start,
+            val_len,
+            seq,
+            ttl,
+            flags: fl,
+            vlog_off,
+        },
+        next,
+    ))
+}
+
+/// Decode the restart-anchor entry at `raw[off..]`.
+///
+/// Anchors are self-contained (`shared_len == 0`), which is what lets the
+/// anchor binary search run with no key materialization; a non-zero
+/// `shared_len` at an offset the restart array names is decoder validation
+/// rule 2 and is `Corruption`. [`DecEntry::user_key`] is valid on the result.
+pub(crate) fn decode_delta_anchor(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> {
+    let (entry, next) = decode_delta_header(raw, off)?;
+    if entry.key_shared != 0 {
+        return Err(OndaError::Corruption(
+            "sst: restart anchor shares a key prefix".into(),
+        ));
+    }
+    Ok((entry, next))
+}
+
+/// Decode the prefix-delta entry at `raw[off..]`, advancing `key` from the
+/// previous entry's user key to this one's.
+///
+/// `key` carries the running previous key: empty at the start of a block, and
+/// otherwise whatever the last call left there. A restart anchor's
+/// `shared_len == 0` truncates it away by itself, so a forward walk never has
+/// to know where the anchors are.
+///
+/// `bytewise` enables decoder validation rule 7 — reconstructed keys are
+/// non-decreasing within a block — which is exact only under byte-wise
+/// ordering (AGENTS.md invariant 7). Under a custom comparator the check is
+/// skipped rather than approximated: ordering is the comparator's to define,
+/// and threading a `ComparatorRef` vtable call into the per-entry decode would
+/// cost every scan for a case the layer above already orders.
+pub(crate) fn decode_entry_delta(
+    raw: &[u8],
+    off: usize,
+    key: &mut Vec<u8>,
+    bytewise: bool,
+) -> Result<(DecEntry, usize)> {
+    let (entry, next) = decode_delta_header(raw, off)?;
+    // Rule 1, checked before the reconstruction memcpy.
+    if entry.key_shared > key.len() {
+        return Err(OndaError::Corruption(
+            "sst: delta shared_len exceeds the previous key".into(),
+        ));
+    }
+    let suffix = &raw[entry.key_start..entry.key_start + entry.key_len];
+    // Rule 7. The two keys agree on `key[..shared]` by construction, so
+    // comparing the suffix against the rest of the previous key is the whole
+    // comparison — and it runs before `key` is disturbed.
+    if bytewise && suffix < &key[entry.key_shared..] {
+        return Err(OndaError::Corruption(
+            "sst: delta block keys are not in order".into(),
+        ));
+    }
+    key.truncate(entry.key_shared);
+    key.extend_from_slice(suffix);
+    Ok((entry, next))
+}
+
+/// Validate a prefix-delta block's restart array (decoder validation rule 3):
+/// a non-empty block has at least one anchor, the first is at offset 0, and
+/// the offsets strictly increase and stay inside the entries region.
+///
+/// Cheap enough to run on every block load: `restarts` holds one `u32` per
+/// `restart_interval` entries — ten of them in a 4 KiB block at the default.
+pub(crate) fn validate_delta_restarts(entries_len: usize, restarts: &[u8]) -> Result<()> {
+    let corrupt = |what: &str| OndaError::Corruption(format!("sst: delta block {what}"));
+    let count = restarts.len() / 4;
+    if entries_len == 0 {
+        // No writer emits an empty data block, but a truncated one must not
+        // become "a block with anchors pointing at nothing".
+        return if count == 0 {
+            Ok(())
+        } else {
+            Err(corrupt("is empty but has restart anchors"))
+        };
+    }
+    if count == 0 {
+        return Err(corrupt("has no restart anchors"));
+    }
+    let mut previous: Option<usize> = None;
+    for i in 0..count {
+        let off = crate::encoding::read_u32(&restarts[i * 4..]) as usize;
+        if i == 0 && off != 0 {
+            return Err(corrupt("does not start with an anchor at offset 0"));
+        }
+        if off >= entries_len {
+            return Err(corrupt("has a restart offset past its entries"));
+        }
+        if previous.is_some_and(|p| off <= p) {
+            return Err(corrupt("has non-increasing restart offsets"));
+        }
+        previous = Some(off);
+    }
+    Ok(())
+}
+
+/// Binary-search a block's restart array, returning how many leading anchors
+/// sort **strictly before** the target. The entry to start scanning from is the
+/// anchor just below that (index `n - 1`, or offset 0 when `n == 0`), so the
+/// target cannot lie in a skipped interval.
+///
+/// `anchor_is_lt` decodes the anchor at a restart *index* and reports the
+/// comparison; taking it as a closure is what lets the legacy reader, the delta
+/// reader and the iterator share one search over three different decoders.
+pub(crate) fn restart_lower_bound(
+    count: usize,
+    mut anchor_is_lt: impl FnMut(usize) -> Result<bool>,
+) -> Result<usize> {
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if anchor_is_lt(mid)? {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
 }
 
 /// Decode the aux block's tagged section list, returning `(tag, payload)` pairs.
@@ -560,6 +871,200 @@ mod tests {
         let (dec, next) = decode_entry(&buf, EntryLayout::Legacy, 0).unwrap();
         assert!(dec.tombstone() && dec.single_delete() && !dec.has_vlog());
         assert_eq!(next, buf.len());
+    }
+
+    /// Encode one delta entry against `prev` and decode it back.
+    fn delta_round_trip(prev: &[u8], key: &[u8], value: &[u8], ttl: i64) -> (Vec<u8>, usize) {
+        let mut buf = Vec::new();
+        let shared = encode_entry_delta(&mut buf, prev, key, value, 7, ttl, false, false, false, 0);
+        let mut out = prev.to_vec();
+        let (dec, next) = decode_entry_delta(&buf, 0, &mut out, true).unwrap();
+        assert_eq!(next, buf.len(), "decode must consume the entry exactly");
+        assert_eq!(out, key, "reconstructed key");
+        assert_eq!(dec.key_shared, shared);
+        assert_eq!(dec.seq, 7);
+        assert_eq!(dec.ttl, ttl);
+        assert_eq!(dec.inline_value(&buf), value);
+        (buf, shared)
+    }
+
+    #[test]
+    fn delta_entry_round_trips_with_shared_prefix() {
+        let (buf, shared) = delta_round_trip(b"tenant/a/cluster/1", b"tenant/a/cluster/2", b"v", 0);
+        assert_eq!(shared, 17, "only the final byte differs");
+        // The suffix is the only key byte stored.
+        assert!(
+            buf.len() < 17,
+            "a 1-byte suffix must not carry the whole key: {buf:?}"
+        );
+        // A TTL entry takes the same path with one extra field.
+        delta_round_trip(b"tenant/a", b"tenant/ab", b"vv", 1_700_000_000);
+    }
+
+    #[test]
+    fn delta_entry_round_trips_with_zero_shared() {
+        let (_, shared) = delta_round_trip(b"", b"anchor-key", b"value", 0);
+        assert_eq!(shared, 0, "an anchor stores its whole key");
+        let (_, shared) = delta_round_trip(b"aaa", b"zzz", b"value", 0);
+        assert_eq!(shared, 0, "nothing shared with an unrelated predecessor");
+        // Keys shorter than the 8-byte `key_prefix8` window, and an empty key.
+        delta_round_trip(b"ab", b"abc", b"v", 0);
+        delta_round_trip(b"", b"", b"v", 0);
+    }
+
+    #[test]
+    fn delta_entry_rejects_shared_longer_than_prev() {
+        let mut buf = Vec::new();
+        encode_entry_delta(&mut buf, b"abcdef", b"abcdefgh", b"v", 1, 0, false, false, false, 0);
+        // The predecessor is shorter than the recorded shared_len (6).
+        let mut out = b"abc".to_vec();
+        let err = decode_entry_delta(&buf, 0, &mut out, true)
+            .expect_err("shared_len past the previous key must be rejected");
+        assert_eq!(err.kind(), "corruption");
+        assert!(err.to_string().contains("shared_len"), "{err}");
+        // The header alone decodes: the bound is a property of the pair, and
+        // checking it needs the predecessor.
+        assert_eq!(decode_delta_header(&buf, 0).unwrap().0.key_shared, 6);
+    }
+
+    #[test]
+    fn delta_entry_rejects_truncated_suffix() {
+        let mut buf = Vec::new();
+        encode_entry_delta(&mut buf, b"ab", b"abcdefgh", b"v", 1, 0, false, false, false, 0);
+        // Drop the value and part of the suffix.
+        buf.truncate(buf.len() - 4);
+        let mut out = b"ab".to_vec();
+        let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("truncated suffix");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn delta_entry_rejects_truncated_value() {
+        let mut buf = Vec::new();
+        encode_entry_delta(&mut buf, b"ab", b"abc", b"a-long-value", 1, 0, false, false, false, 0);
+        buf.truncate(buf.len() - 3);
+        let mut out = b"ab".to_vec();
+        let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("truncated value");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn delta_vlog_entry_carries_eight_offset_bytes() {
+        let mut buf = Vec::new();
+        // `val_len` stays the LOGICAL value length; the entry stores the
+        // 8-byte offset instead of the bytes.
+        encode_entry_delta(
+            &mut buf,
+            b"key0",
+            b"key1",
+            &vec![b'x'; 4096],
+            9,
+            0,
+            false,
+            false,
+            true,
+            0x1234_5678_9abc_def0,
+        );
+        let mut out = b"key0".to_vec();
+        let (dec, next) = decode_entry_delta(&buf, 0, &mut out, true).unwrap();
+        assert_eq!(out, b"key1");
+        assert!(dec.has_vlog());
+        assert_eq!(dec.vlog_off, 0x1234_5678_9abc_def0);
+        assert_eq!(dec.val_len, 4096, "logical length, not the stored 8 bytes");
+        assert_eq!(next, buf.len());
+        assert_eq!(next - dec.val_start, 8);
+    }
+
+    #[test]
+    fn delta_entry_rejects_out_of_order_keys_under_bytewise_order() {
+        let mut buf = Vec::new();
+        encode_entry_delta(&mut buf, b"", b"aaa", b"v", 1, 0, false, false, false, 0);
+        let mut out = b"zzz".to_vec();
+        let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("descending keys");
+        assert_eq!(err.kind(), "corruption");
+        // A custom comparator defines its own order, so the check is skipped.
+        let mut out = b"zzz".to_vec();
+        assert!(decode_entry_delta(&buf, 0, &mut out, false).is_ok());
+        // Equal keys are legal: the same user key at a lower sequence.
+        let mut buf = Vec::new();
+        encode_entry_delta(&mut buf, b"aaa", b"aaa", b"v", 1, 0, false, false, false, 0);
+        let mut out = b"aaa".to_vec();
+        assert!(decode_entry_delta(&buf, 0, &mut out, true).is_ok());
+    }
+
+    #[test]
+    fn delta_restart_validation_rejects_a_malformed_anchor_array() {
+        let ok = [0u8, 0, 0, 0, 16, 0, 0, 0];
+        assert!(validate_delta_restarts(64, &ok).is_ok());
+        // First anchor not at offset 0.
+        assert!(validate_delta_restarts(64, &[4u8, 0, 0, 0]).is_err());
+        // Non-increasing.
+        assert!(validate_delta_restarts(64, &[0u8, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        // Past the entries region.
+        assert!(validate_delta_restarts(8, &[0u8, 0, 0, 0, 16, 0, 0, 0]).is_err());
+        // Non-empty block with no anchors.
+        assert!(validate_delta_restarts(64, &[]).is_err());
+        assert!(validate_delta_restarts(0, &[]).is_ok());
+    }
+
+    /// The delta decoder must be total over arbitrary bytes: a `Result`, never
+    /// a panic, at any offset, with any predecessor. Runs before the writer
+    /// gains a delta path anywhere in the engine.
+    #[test]
+    fn delta_decoder_never_panics_on_arbitrary_bytes() {
+        // A well-formed delta run, so mutations start from valid framing.
+        let mut buf = Vec::new();
+        let keys: [&[u8]; 6] = [b"", b"a", b"tenant/a/1", b"tenant/a/2", b"tenant/b", b"z"];
+        let mut prev: &[u8] = b"";
+        for (i, k) in keys.iter().enumerate() {
+            encode_entry_delta(
+                &mut buf,
+                prev,
+                k,
+                b"value",
+                i as u64 + 1,
+                if i % 2 == 0 { 0 } else { 1_700_000_000 },
+                i == 3,
+                i == 3,
+                false,
+                0,
+            );
+            prev = k;
+        }
+        let mut seeds = vec![buf];
+        for name in [
+            "klog_legacy_flat_restarts_bloom.klog",
+            "klog_extended.klog",
+        ] {
+            seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
+        }
+
+        let mut rng = crate::util::FuzzRng::new(0x51E7_9C42_0AB3_1DD7);
+        for seed in &seeds {
+            for _ in 0..2000 {
+                let case = crate::util::fuzz_mutate(&mut rng, seed);
+                let at = rng.below(case.len().max(1));
+                let _ = decode_delta_header(&case, at);
+                let _ = decode_delta_header(&case, 0);
+                let _ = decode_delta_anchor(&case, at);
+                for prev in [&b""[..], &b"tenant/a/1"[..]] {
+                    let mut key = prev.to_vec();
+                    let _ = decode_entry_delta(&case, at, &mut key, true);
+                    let mut key = prev.to_vec();
+                    let _ = decode_entry_delta(&case, 0, &mut key, false);
+                }
+                // Walk the whole case forward, the way a block scan would.
+                let mut key = Vec::new();
+                let mut off = 0usize;
+                for _ in 0..64 {
+                    match decode_entry_delta(&case, off, &mut key, true) {
+                        Ok((_, next)) if next > off => off = next,
+                        _ => break,
+                    }
+                }
+                let _ = validate_delta_restarts(case.len(), &case[..case.len() & !3]);
+            }
+        }
     }
 
     #[test]

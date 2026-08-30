@@ -362,6 +362,53 @@ has always given. The first read of every frame still verifies, and a frame that
 fails verification is never marked, so corruption is reported on every read
 (`tests/sst.rs::corrupt_vlog_value_is_detected_on_every_read`).
 
+## Prefix-delta data blocks: why they are opt-in (2.1)
+
+`ColumnFamilyConfig::enable_prefix_delta_keys` (default `false`) stores each
+data-block key as the bytes it does not share with its predecessor. The sweep
+that decided the default is `bench-results/2.1/2026-08-30/` — 5 runs per cell,
+`block_restart_interval ∈ {4, 8, 16, 32}` × `data_block_size ∈ {4, 8, 16, 64}
+KiB`, lz4 blocks, legacy and delta twins written from identical entries and
+compared as same-run ratios.
+
+At the 4 KiB / interval-8 default:
+
+| metric (delta / legacy) | prefix-heavy keys | random keys |
+|---|---:|---:|
+| decompressed cache bytes | **0.53×** | 1.010× |
+| on-disk data bytes (lz4) | **0.75×** | 0.986× |
+| index-block bytes | **0.52×** | 1.017× |
+| forward decode CPU / entry | 1.46× | 2.22× |
+| reverse decode CPU / entry | 0.92× | 1.46× |
+| reverse-scan p99 | 708 → 375 ns | 750 → 417 ns |
+| merge-scan wall time | **1.152×** | **1.137×** |
+
+The size hypothesis holds, and larger than expected: block compression does
+**not** already recover it, and the *index* halves too — denser entries mean
+fewer blocks per table at a fixed `data_block_size`, not more. Interval, not
+block size, is what moves every size ratio; the two do not interact.
+
+It stays opt-in because decode CPU goes the wrong way. The acceptance criterion
+asked for decode CPU per scanned entry to drop on prefix-heavy keys; it rises
+1.46× forward, and roughly doubles on random keys for no size benefit. Reverse
+iteration improves — legacy `prev` rebuilds a whole block's offset vector on
+every block underflow, and the bounded run cursor is cheaper than that — but
+forward is the common case.
+
+**The buffered-key cost is measured, not argued.** A delta key exists
+contiguously nowhere in the block, so `SstIterator::key_block_ref` returns
+`None` and the merge iterator copies the key into `CurKey::Buffered` (invariant
+8). End to end that is **+15 %** on a four-child merge scan. That is the same
+class of change as the per-entry `Arc` clone that cost 3× in the regression
+history below — an order of magnitude smaller, and still not free, which is
+exactly why it is published here rather than absorbed.
+
+Guidance: enable it where decompressed block-cache residency or index memory
+binds and keys share deep prefixes (the `tenant/cluster/segment` shape) — it
+roughly doubles the tables that fit a given cache. Keep
+`block_restart_interval` at 8 or below for reverse-heavy scans: 32 costs 2.4×
+the reverse p99 for another 4–8 % of size.
+
 ## Open performance items
 
 1. Reads with 1–2 KiB keys (0.5–0.7× of C): block-level entry-offset restarts

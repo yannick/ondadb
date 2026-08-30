@@ -36,6 +36,7 @@ fn opts(n: usize) -> WriterOptions {
         use_btree: false,
         restart_interval: 8,
         extended_entries: false,
+        prefix_delta: false,
     }
 }
 

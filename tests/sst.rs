@@ -21,6 +21,7 @@ fn opts(alg: Compression, n: usize, klog_threshold: usize, block_size: usize) ->
         use_btree: false,
         restart_interval: 8,
         extended_entries: false,
+        prefix_delta: false,
     }
 }
 
@@ -580,9 +581,10 @@ fn footer_unknown_flag_bit_is_unsupported_format() {
         .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
     let mut bytes = std::fs::read(&src).unwrap();
     let flags_at = bytes.len() - FOOTER_SIZE + 48;
-    // 0x20 is above every assigned footer bit (0x10 is reserved for 1.0B's
-    // extended-block flag), and the footer carries no checksum of its own.
-    bytes[flags_at] |= 0x20;
+    // 0x40 is above every assigned footer bit (0x10 is 1.0B's extended-block
+    // flag, 0x20 is 2.1's prefix-delta flag), and the footer carries no
+    // checksum of its own.
+    bytes[flags_at] |= 0x40;
 
     let dir = tempfile::tempdir().unwrap();
     let klog = dir.path().join("1.klog");
@@ -1224,6 +1226,7 @@ fn extended_opts(use_btree: bool, restarts: bool) -> WriterOptions {
         use_btree,
         restart_interval: if restarts { 8 } else { 0 },
         extended_entries: true,
+        prefix_delta: false,
     }
 }
 
@@ -1299,6 +1302,7 @@ fn extended_footer_prefix_is_16_bytes() {
         &legacy,
         WriterOptions {
             extended_entries: false,
+            prefix_delta: false,
             ..extended_opts(false, true)
         },
     );

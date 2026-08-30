@@ -8,6 +8,14 @@
 //! [`regenerate_phase1_fixtures`] is `#[ignore]`d on purpose — it is run by
 //! hand, only for an explicit and reviewed format change. Every other test in
 //! the corpus *reads* the committed files and never writes them.
+//!
+//! **The klog regenerator no longer reproduces the committed `*_restarts_*`
+//! bytes.** Feature 2.1 made block-size accounting trailer-inclusive
+//! (`src/sst/writer.rs`), which moves where a restart-bearing block is cut. The
+//! committed bytes stay the record of what 0.8.2 wrote — and are still the gate
+//! for "every valid legacy fixture decodes unchanged" — but running the
+//! regenerator would silently replace them with 2.1's boundaries. The frozen
+//! record of 2.1's own output lives in `tests/golden_blocks.rs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -130,6 +138,7 @@ fn klog_options(use_btree: bool, restarts: bool, bloom: bool) -> WriterOptions {
         use_btree,
         restart_interval: if restarts { 8 } else { 0 },
         extended_entries: false,
+        prefix_delta: false,
     }
 }
 
@@ -419,6 +428,7 @@ fn envelope_schema2_records() -> Vec<Record> {
 fn klog_extended_options() -> WriterOptions {
     WriterOptions {
         extended_entries: true,
+        prefix_delta: false,
         ..klog_options(false, true, true)
     }
 }

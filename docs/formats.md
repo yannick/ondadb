@@ -230,9 +230,12 @@ Every block (data/bloom/index) is framed by `block.rs`:
 
 `alg` is the `Compression` enum; if compression does not shrink a block it is
 stored with `alg = None`. The CRC covers the compressed payload. Data blocks
-target `ColumnFamilyConfig::data_block_size` raw bytes (default 4 KiB). Block
-handles make each file self-describing, so changing the policy does not affect
-reads of existing tables.
+target `ColumnFamilyConfig::data_block_size` raw bytes (default 4 KiB), counting
+the restart trailer the block will carry — it rides inside the framed payload,
+so a block cut on its entries alone overshoots the target by `4 * R + 4`. (Before
+2.1 the cut ignored the trailer; existing files are unaffected, because block
+boundaries are self-describing.) Block handles make each file self-describing, so
+changing the policy does not affect reads of existing tables.
 
 Data-block entry (`sst::encode_entry` / `decode_entry`):
 
@@ -290,6 +293,72 @@ than surfacing later as a silently missing section. 1.0 defines the container
 and writes `aux_off = aux_len = 0`; 1.2 is the first producer. A legacy table
 has no prefix at all (`Reader::aux_block_handle()` returns `None`).
 
+#### Prefix-delta entry layout (`FOOTER_PREFIX_DELTA = 0x20`)
+
+When the footer sets `FOOTER_PREFIX_DELTA`, **every** data-block entry stores
+only the key bytes it does not share with its predecessor
+(`sst::encode_entry_delta` / `decode_entry_delta`):
+
+```
+kind uvarint | modifiers uvarint | shared_len uvarint | suffix_len uvarint
+| val_len uvarint | seq uvarint | ttl varint (if modifiers & HAS_TTL)
+| suffix bytes
+| value bytes | vlog_off u64   (as above, on modifiers & HAS_VLOG)
+```
+
+The user key is `prev_key[..shared_len] ++ suffix`. This is the extended layout
+with `key_len` split into `shared_len | suffix_len`; nothing else moves, and
+that order is load-bearing twice: `kind`/`modifiers` stay first so `HAS_TTL` is
+resolved before the `ttl` slot, and every varint precedes every
+variable-length field so a decoder can bounds-check `shared_len`, `suffix_len`
+and `val_len` **before** any memcpy.
+
+`prev_key` is reset to empty at the start of every block *and* at every restart
+anchor, so **every offset the restart array names decodes with
+`shared_len = 0`** and is self-contained. That is what keeps the anchor binary
+search free of materialization, and what makes bidirectional iteration
+possible at all. Sharing never crosses a block boundary or an anchor.
+
+The flag requires both `FOOTER_EXTENDED_BLOCK` (the layout is defined only over
+the extended entry) and `FOOTER_RESTARTS` (without anchors a delta block is
+decodable only from offset 0). `Reader::open` rejects either combination as
+`Corruption` — no writer can produce it. Nothing else changes: the restart
+trailer, the index block, the B+tree index, the bloom block, block framing and
+the vlog are untouched.
+
+Decoder validation rules, each with its own corruption test
+(`tests/prefix_delta.rs`):
+
+1. `shared_len <= prev_key.len()`, checked before the reconstruction memcpy.
+2. `shared_len == 0` at every offset the restart array names.
+3. A non-empty block has at least one anchor; the first is at offset 0; the
+   offsets strictly increase and stay inside the entries region.
+4. `suffix_len` and `val_len` fit the remaining entries-region bytes.
+5. A restart run's walk lands exactly on the next anchor — and the last run's
+   on the end of the entries region, so nothing sits between the last entry and
+   the trailer.
+6. `FOOTER_PREFIX_DELTA` without `FOOTER_EXTENDED_BLOCK` or without
+   `FOOTER_RESTARTS`.
+7. Reconstructed keys are non-decreasing within a block. Exact under byte-wise
+   ordering, which is where it is enforced; a custom comparator defines its own
+   order, and threading a `ComparatorRef` vtable call into the per-entry decode
+   would cost every scan (AGENTS.md invariant 7).
+
+**Reading a delta table.** A key exists contiguously nowhere in the block, so
+`SstIterator::key_block_ref` returns `None` and the merge iterator copies the
+key into `CurKey::Buffered` — the path memtable children already take. Values
+are unaffected: an inline value is still one contiguous run of block bytes and
+keeps its pin (AGENTS.md invariant 8). Positioning enters through the restart
+array (`restart_lower_bound`) and one materialized run; forward stepping needs
+only a running previous-key buffer, since an anchor's `shared_len = 0` truncates
+it away by itself.
+
+Writing is gated on **both** `CAP_EXTENDED_RECORDS` and `CAP_PREFIX_DELTA` plus
+`ColumnFamilyConfig::enable_prefix_delta_keys`. Turning the option off stops new
+delta blocks; tables already written stay readable, in any level, part,
+checkpoint or attach — a footer flag is read from the artifact, never from the
+manifest.
+
 ### vlog layout
 
 Concatenated per-value frames, addressed by `vlog_off` (frame start). Two frame
@@ -346,12 +415,12 @@ offset  field
 40..48  max_seq
 48      flags: FOOTER_HAS_BLOOM=0x01, FOOTER_BTREE=0x02,
                FOOTER_RESTARTS=0x04, FOOTER_VLOG_V2=0x08,
-               FOOTER_EXTENDED_BLOCK=0x10
+               FOOTER_EXTENDED_BLOCK=0x10, FOOTER_PREFIX_DELTA=0x20
 49..56  unused
 56..64  FOOTER_MAGIC = 0x5741_5645_5353_5431
 ```
 
-`KNOWN_FOOTER_FLAGS = 0x1F`. A bit outside that mask was written by a newer
+`KNOWN_FOOTER_FLAGS = 0x3F`. A bit outside that mask was written by a newer
 binary and names a feature this one does not implement, so `Reader::open`
 refuses the file with `OndaError::UnsupportedFormat` (code `-16`) rather than
 `Corruption` — the file is intact, this binary is simply too old.
@@ -495,7 +564,16 @@ ONDAVVC1 | max_cached_vlog_value_bytes u64      per-CF vlog value cache limit
 ONDABLM1 | count u64 | fpr f64-bits x count
           | optimize_filters_for_hits u8        per-level bloom policy
 ONDAPRD1 | periodic_compaction_interval u64     microseconds; 0 = disabled (0.3)
+ONDAPFX1 | enable_prefix_delta_keys u8
+          | block_restart_interval u64           prefix-delta key encoding (2.1)
 ```
+
+`ONDAPFX1` is elided when both fields are at their defaults (`false` and 8), and
+is all-or-nothing on read: a truncated tail, or an interval outside `[1, 1024]`,
+leaves both at their defaults. `0` is deliberately **not** a legal config
+interval even though `WriterOptions::restart_interval` takes it — there it means
+"emit no restart trailer at all", which stays reachable only by constructing
+`WriterOptions` directly.
 
 `ONDAPRD1` is elided at the default (zero, disabled), so a family that never
 sets it encodes byte-for-byte as earlier releases wrote it; it is refused by

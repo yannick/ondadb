@@ -6,9 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{
-    data_block_alg, encode_entry, vlog_path_for, BlockHandle, EntryLayout, FileMeta, IndexEntry,
-    AUX_HANDLE_LEN, DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK, FOOTER_HAS_BLOOM,
-    FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
+    data_block_alg, encode_entry, encode_entry_delta, vlog_path_for, BlockHandle, EntryLayout,
+    FileMeta, IndexEntry, AUX_HANDLE_LEN, DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK,
+    FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_PREFIX_DELTA, FOOTER_RESTARTS, FOOTER_SIZE,
+    FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
 };
 use crate::block::write_block;
 use crate::bloom::Bloom;
@@ -50,6 +51,15 @@ pub struct WriterOptions {
     /// nothing in the engine enables it yet, and a table written this way is
     /// unreadable by binaries older than 1.0.
     pub extended_entries: bool,
+    /// Store each user key as `shared_len | suffix` against its predecessor
+    /// ([`FOOTER_PREFIX_DELTA`]). Table-level, like `extended_entries`, which
+    /// it implies — the delta layout is defined only over the extended entry,
+    /// so `finish` sets both footer flags.
+    ///
+    /// Requires `restart_interval > 0`: sharing is reset at every anchor, and
+    /// without a restart trailer a delta block would be decodable only from
+    /// offset 0. [`Writer::new`] refuses the combination.
+    pub prefix_delta: bool,
 }
 
 /// Fan-out (entries per node) for the B+tree index.
@@ -102,6 +112,9 @@ pub struct Writer {
     /// Restart offsets (entry starts) of the block being built, one per
     /// `restart_interval` entries; empty when the trailer is disabled.
     cur_restarts: Vec<u32>,
+    /// Previous entry's user key, for prefix-delta output. Cleared at every
+    /// block start and every restart anchor, so sharing never crosses either.
+    prev_key: Vec<u8>,
     /// Entries appended to the block being built.
     cur_entries: usize,
     index: Vec<IndexEntry>,
@@ -169,6 +182,13 @@ impl Writer {
     }
 
     pub fn new(klog_path: &str, mut opts: WriterOptions) -> Result<Writer> {
+        if opts.prefix_delta && opts.restart_interval == 0 {
+            return Err(OndaError::InvalidArgs(
+                "prefix_delta requires restart_interval > 0: a delta block \
+                 without restart anchors is decodable only from offset 0"
+                    .into(),
+            ));
+        }
         if opts.block_size == 0 {
             opts.block_size = DEFAULT_BLOCK_SIZE;
         }
@@ -203,6 +223,7 @@ impl Writer {
             cur_block: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
             cur_block_alg: default_alg,
             cur_restarts: Vec::new(),
+            prev_key: Vec::new(),
             cur_entries: 0,
             index: Vec::new(),
             pending_index: None,
@@ -249,10 +270,32 @@ impl Writer {
     /// Entry layout this table's data blocks use, fixed for its lifetime — the
     /// footer flag describes the whole file.
     fn entry_layout(&self) -> EntryLayout {
-        if self.opts.extended_entries {
+        if self.extended() {
             EntryLayout::Extended
         } else {
             EntryLayout::Legacy
+        }
+    }
+
+    /// Whether this table's entries carry the extended (kind-bearing) envelope
+    /// — either asked for directly, or implied by prefix-delta output.
+    #[inline]
+    fn extended(&self) -> bool {
+        self.opts.extended_entries || self.opts.prefix_delta
+    }
+
+    /// Bytes the restart trailer will add to the block being built.
+    ///
+    /// Block-size accounting includes it: the trailer rides inside the framed
+    /// payload, so a block cut on the entries alone overshoots its target by
+    /// `4 * R + 4`. Delta encoding raises entry density, and therefore `R`, so
+    /// the overshoot grows exactly where blocks are meant to get denser.
+    #[inline]
+    fn pending_trailer_len(&self) -> usize {
+        if self.opts.restart_interval == 0 {
+            0
+        } else {
+            4 * self.cur_restarts.len() + 4
         }
     }
 
@@ -295,25 +338,45 @@ impl Writer {
             has_vlog = true;
         }
 
-        if self.opts.restart_interval > 0
-            && self.cur_entries.is_multiple_of(self.opts.restart_interval)
-        {
+        let anchor = self.opts.restart_interval > 0
+            && self.cur_entries.is_multiple_of(self.opts.restart_interval);
+        if anchor {
             self.cur_restarts.push(self.cur_block.len() as u32);
+            // An anchor is self-contained: reset the predecessor so its
+            // `shared_len` is 0 and the entry decodes with no history.
+            self.prev_key.clear();
         }
         self.cur_entries += 1;
-        let layout = self.entry_layout();
-        encode_entry(
-            &mut self.cur_block,
-            layout,
-            user_key,
-            value,
-            seq,
-            ttl,
-            tombstone,
-            single_delete,
-            has_vlog,
-            vlog_off,
-        );
+        if self.opts.prefix_delta {
+            encode_entry_delta(
+                &mut self.cur_block,
+                &self.prev_key,
+                user_key,
+                value,
+                seq,
+                ttl,
+                tombstone,
+                single_delete,
+                has_vlog,
+                vlog_off,
+            );
+            self.prev_key.clear();
+            self.prev_key.extend_from_slice(user_key);
+        } else {
+            let layout = self.entry_layout();
+            encode_entry(
+                &mut self.cur_block,
+                layout,
+                user_key,
+                value,
+                seq,
+                ttl,
+                tombstone,
+                single_delete,
+                has_vlog,
+                vlog_off,
+            );
+        }
         self.num_entries += 1;
         if tombstone {
             self.num_tombstones += 1;
@@ -326,7 +389,7 @@ impl Writer {
         self.last_seq = seq;
         self.pending_block = true;
 
-        if self.cur_block.len() >= self.opts.block_size {
+        if self.cur_block.len() + self.pending_trailer_len() >= self.opts.block_size {
             self.flush_block()?;
         }
         Ok(())
@@ -393,6 +456,9 @@ impl Writer {
         }
         self.cur_restarts.clear();
         self.cur_entries = 0;
+        // Sharing never crosses a block boundary: the next block's first entry
+        // is an anchor, and its predecessor is nothing.
+        self.prev_key.clear();
         let mut framed = Vec::new();
         let n = write_block(
             &mut framed,
@@ -526,8 +592,11 @@ impl Writer {
         if self.opts.restart_interval > 0 {
             footer_flags |= FOOTER_RESTARTS;
         }
-        if self.opts.extended_entries {
+        if self.extended() {
             footer_flags |= FOOTER_EXTENDED_BLOCK;
+        }
+        if self.opts.prefix_delta {
+            footer_flags |= FOOTER_PREFIX_DELTA;
         }
         let mut bloom_handle = BlockHandle::default();
         // Size the filter from the keys actually written, not from a hint. Both
@@ -562,7 +631,7 @@ impl Writer {
         put_u64(&mut footer[56..64], FOOTER_MAGIC);
 
         let mut klog = self.klog.take().unwrap();
-        if self.opts.extended_entries {
+        if self.extended() {
             // Aux-block handle, immediately before the footer. 1.0 defines the
             // container and produces no sections, so both fields are zero; 1.2
             // is the first writer to fill them in.
@@ -670,6 +739,135 @@ mod tests {
         );
     }
 
+    fn opts(restart_interval: usize, prefix_delta: bool, block_size: usize) -> WriterOptions {
+        WriterOptions {
+            compression: Compression::None,
+            compression_rules: Vec::new(),
+            cmp: default_comparator(),
+            enable_bloom: false,
+            bloom_fpr: None,
+            klog_value_threshold: 1 << 20,
+            block_size,
+            expected_entries: 256,
+            use_btree: false,
+            restart_interval,
+            extended_entries: false,
+            prefix_delta,
+        }
+    }
+
+    /// Every offset the restart array names must decode with `shared_len == 0`
+    /// — that is what makes the anchor binary search work with no
+    /// materialization, and it is decoder validation rule 2.
+    #[test]
+    fn delta_writer_emits_zero_shared_at_every_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("d.klog");
+        let klog = klog.to_str().unwrap();
+        let mut w = Writer::new(klog, opts(4, true, 512)).unwrap();
+        for i in 0..200u64 {
+            // Long shared prefix, so a non-anchor entry always shares bytes.
+            let k = format!("tenant/alpha/cluster/{i:04}");
+            w.add(k.as_bytes(), b"v", i + 1, 0, false, false).unwrap();
+        }
+        w.finish().unwrap();
+        let r = Reader::open(
+            klog,
+            LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+            Arc::new(BlockCache::new(1 << 20)),
+            3,
+            default_comparator(),
+            0,
+        )
+        .unwrap();
+        assert!(r.index.len() > 3, "several blocks");
+        let mut anchors = 0usize;
+        let mut shared_entries = 0usize;
+        for bi in 0..r.index.len() {
+            let block = r.read_data_block_local(bi).unwrap();
+            let (entries, restarts) = r.split_block(block.bytes()).unwrap();
+            for chunk in restarts.chunks_exact(4) {
+                let off = crate::encoding::read_u32(chunk) as usize;
+                let (e, _) = crate::sst::decode_delta_header(entries, off).unwrap();
+                assert_eq!(e.key_shared, 0, "restart anchor at {off} shares a prefix");
+                anchors += 1;
+            }
+            // ...and the entries between anchors do share, or the encoding
+            // would be doing nothing.
+            let mut key = Vec::new();
+            let mut off = 0usize;
+            while off < entries.len() {
+                let (e, next) = crate::sst::decode_entry_delta(entries, off, &mut key, true).unwrap();
+                if e.key_shared > 0 {
+                    shared_entries += 1;
+                }
+                off = next;
+            }
+        }
+        assert!(anchors >= 4, "expected several anchors, got {anchors}");
+        assert!(
+            shared_entries > 100,
+            "prefix sharing did nothing: {shared_entries} entries shared"
+        );
+    }
+
+    /// Sharing is reset at every anchor, so a delta table without a restart
+    /// trailer would be decodable only from offset 0.
+    #[test]
+    fn delta_writer_refuses_zero_restart_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("no.klog");
+        let err = Writer::new(klog.to_str().unwrap(), opts(0, true, 512))
+            .expect_err("prefix_delta with no restart trailer must be refused");
+        assert_eq!(err.kind(), "invalid_args", "{err}");
+        assert!(err.to_string().contains("restart_interval"), "{err}");
+    }
+
+    /// The restart trailer rides inside the framed payload, so a block cut on
+    /// the entries alone overshoots `block_size` by `4 * R + 4`.
+    #[test]
+    fn block_cut_accounts_for_the_restart_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, delta) in [("legacy.klog", false), ("delta.klog", true)] {
+            let klog = dir.path().join(name);
+            let klog = klog.to_str().unwrap();
+            let mut w = Writer::new(klog, opts(4, delta, 1024)).unwrap();
+            for i in 0..400u64 {
+                let k = format!("tenant/alpha/{i:04}");
+                w.add(k.as_bytes(), b"payload-payload", i + 1, 0, false, false)
+                    .unwrap();
+            }
+            w.finish().unwrap();
+            let r = Reader::open(
+                klog,
+                LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+                Arc::new(BlockCache::new(1 << 20)),
+                4,
+                default_comparator(),
+                0,
+            )
+            .unwrap();
+            assert!(r.index.len() > 4, "{name}: several blocks");
+            for bi in 0..r.index.len() - 1 {
+                let block = r.read_data_block_local(bi).unwrap();
+                let raw = block.bytes();
+                // Entries + trailer, i.e. the whole decompressed block, is what
+                // the cut is measured against — the last block is exempt.
+                assert!(
+                    raw.len() < 1024 + 64,
+                    "{name}: block {bi} is {} bytes, past its 1024-byte target \
+                     plus one entry",
+                    raw.len()
+                );
+                let (entries, restarts) = r.split_block(raw).unwrap();
+                assert!(
+                    entries.len() + restarts.len() + 4 >= 1024,
+                    "{name}: block {bi} was cut early"
+                );
+            }
+        }
+    }
+
     #[test]
     fn separator_properties() {
         // Deterministic cases.
@@ -731,6 +929,7 @@ mod tests {
                 use_btree: false,
                 restart_interval: 8,
                 extended_entries: false,
+                prefix_delta: false,
             },
         )
         .unwrap();
