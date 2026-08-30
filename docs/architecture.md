@@ -228,6 +228,27 @@ and operands cannot share a sequence that way because they compose. Pre-folding
 costs one point read per merged key and keeps the merge iterator free of any
 overlay special case.
 
+**Composed with a range delete (1.2), a span is a deleted base at its own
+sequence.** That one sentence is the whole rule, and it is implemented as that
+sentence in all three read paths rather than as a second set of conditions:
+`fold_point_chain` pushes the covering sequence into the chain as a
+`ChainVersion { merge: false, value: None }` and lets the existing "stop at the
+first base" ordering do the rest, so operands above the span fold onto nothing
+and operands at or below it — with the base under them — vanish. The merge
+iterator drops operands at or below the span, nulls a base at or below it, and
+re-seats the folded group's sequence at its **newest surviving operand**, which
+is what stops `masked_by_range` from hiding a chain that sits entirely above the
+span. Compaction ends a pending fold on a key change *before* the range-mask
+drop, so a fully masked key cannot strand the previous key's operand suffix.
+`tests/composition.rs` requires the point, batch and both scan directions to
+agree on all of it, in the memtable, after a flush and after a compaction.
+
+**Composed with a prepared transaction (3.2)**, an operand is an ordinary
+one-key write: a prepare frame carries kind 4 in its writeset and recovery folds
+it on `commit_prepared`. A range delete cannot be prepared — two keys and no
+value have no shape in that frame — and `Txn::prepare` refuses it at the API
+rather than letting replay discover it.
+
 **The block cache holds two key domains.** A `Reader` owns two files under one
 `file_id` — the klog and the vlog — and their offset spaces are independent and
 both start at zero, so `(file_id, 0)` names both the first data block and the

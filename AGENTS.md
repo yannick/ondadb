@@ -123,12 +123,63 @@ ratios between engines, not absolute numbers across sessions. See
   regresses. Both previous regressions in this repo's history were caught
   this way.
 
+## Optional format capabilities
+
+Seven `CAP_*` bits in the manifest's capability word gate every format that is
+not 0.8.2's. Each is **opt-in and one-way**: `DB::enable_format_capabilities`
+persists the bit before the first byte using it exists, and from then on the
+database is unreadable by a binary that does not implement it. Nothing is
+enabled by default, so an upgraded database writes 0.8.2 bytes until an
+operator asks otherwise — that is what makes every feature here rollback-safe.
+
+| Bit | Capability | Turns on |
+|---|---|---|
+| `1<<0` | `CAP_EXTENDED_RECORDS` | Kind-bearing WAL envelopes and SSTable entries (1.0) |
+| `1<<1` | `CAP_MERGE_OPERANDS` | Kind 4, merge operands (1.1); taken automatically when a family with a merge operator is created |
+| `1<<2` | `CAP_RANGE_DELETES` | Kind 5, range tombstones and the SSTable aux fragment section (1.2); implies `CAP_EXTENDED_RECORDS` |
+| `1<<3` | `CAP_PREFIX_DELTA` | Prefix-delta data blocks (2.1) |
+| `1<<4` | `CAP_MANIFEST_EDITS` | The `MANIFEST-EDITS` log (2.2) |
+| `1<<5` | `CAP_PERIODIC_AGE` | Durable `last_compaction_time` (0.3) |
+| `1<<6` | `CAP_TXN_DECISIONS` | Kinds 16-18, prepared transactions (3.2); implies `CAP_EXTENDED_RECORDS` |
+
+The values are **pinned for wavesdb compatibility** and never reused, as are
+the record kinds (1 put, 2 delete, 3 single-delete, 4 merge, 5 range delete,
+6-15 reserved data kinds, 16-31 transaction control, 32-63 reserved,
+`> 63` never assigned). A kind above 63 is `Corruption` — no writer of any
+vintage produces it; an assigned kind this binary does not implement is
+`UnsupportedFormat`. That split is the whole point of the reservation, and
+`src/format.rs` is where it is enforced.
+
+## Where the newer features live
+
+| Feature | Module | Notes |
+|---|---|---|
+| Merge operators (1.1) | `column_family.rs` (`fold_point_chain`), `iterator.rs` (`resolve_merging_group`), `compaction.rs` (`PendingFold`) | Folding is a space/read optimization, never a correctness requirement; `Options::enable_merge_folding` is its rollout switch |
+| Range tombstones (1.2) | `range_tombstone.rs`, `span_index.rs` | A commit holding a span takes `commit_mu` at every isolation level |
+| Delete-only excise (1.2) | `excise.rs` | Retires a whole table by catalog edit without reading it |
+| Prepared transactions (3.2) | `prepared.rs`, `txn.rs`, `db.rs` | Unified layout only |
+| Prefix-delta blocks (2.1) | `sst/mod.rs` (`encode_entry_delta`) | |
+| Manifest edit log (2.2) | `manifest_edit.rs` | See invariants 1 and 2 |
+| PerfContext (0.10) | `perf.rs` | |
+| IO classes / rate limiter (0.6) | `ioctrl.rs` | |
+| Tailing iterators (0.9) | `tailing.rs` | |
+
+**Cross-feature rules live in `tests/composition.rs`**, not in either feature's
+own file: a range delete is, for one key, a *deleted base at its sequence* (so a
+merge chain's operands above the span survive and fold onto nothing), and a
+prepare frame carries a merge operand but never a range delete. Adding a
+feature that interacts with an existing one belongs there.
+
 ## Known non-goals / out of scope (documented, not missing by accident)
 
 Read replicas, Spooky compaction + Dynamic Capacity Adaptation (classic leveled
 is implemented), range compaction, `Serializable` phantom protection (point-read
 validation only — documented on `IsolationLevel::Serializable`),
-rename/hot-reconfig of column families, write-amp statistics.
+rename/hot-reconfig of column families, write-amp statistics. Also: coordinator
+election, consensus and automatic abort for prepared transactions (3.2 is a
+*participant* only), span locks and phantom protection for pessimistic
+transactions, managed sequence mode, large-transaction private spill, and
+tiered/lazy-leveling compaction.
 
 **Two-phase commit (3.2) is implemented** and is no longer a non-goal:
 `Txn::prepare` / `DB::commit_prepared` / `abort_prepared` / `list_prepared`,

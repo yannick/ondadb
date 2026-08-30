@@ -1204,7 +1204,7 @@ impl crate::db::DbInner {
                     Ok(()) => moved += 1,
                     // A part that vanished (compacted/detached) between snapshot
                     // and move is a benign miss; a genuine durability failure has
-                    // already poisoned the DB via persist_manifest.
+                    // already poisoned the DB inside `catalog_txn`.
                     Err(OndaError::NotFound) => {}
                     Err(e) => return Err(e),
                 }
@@ -1381,8 +1381,8 @@ impl DB {
     /// The rule is validated with the same check applied at CF creation
     /// ([`ColumnFamilyConfig::validate`](crate::ColumnFamilyConfig::validate)): an
     /// exact-duplicate prefix is rejected with [`OndaError::InvalidArgs`]. Nested
-    /// prefixes are legal (longest-prefix-wins). The new rule set is persisted via
-    /// the standard manifest rewrite ([`DbInner::persist_manifest`]), so it
+    /// prefixes are legal (longest-prefix-wins). The new rule set is persisted
+    /// through [`DbInner::catalog_txn`] like every other catalog mutation, so it
     /// survives reopen; a compaction already in flight finishes on the rules it
     /// snapshotted at its start.
     ///
