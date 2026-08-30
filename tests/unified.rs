@@ -400,3 +400,152 @@ fn tailing_iterator_works_in_unified_mode() {
     assert!(!tail.valid());
     db.close().unwrap();
 }
+
+// ---- range deletes under schema 2 (1.2) -------------------------------------
+
+/// Both bounds carry the 8-byte big-endian cf-id prefix, exactly as point keys
+/// do — so one column family's span can never reach into another's keyspace,
+/// even when the two use identical user keys.
+#[test]
+fn unified_range_record_prefixes_both_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_unified(dir.path().to_str().unwrap());
+    db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
+        .unwrap();
+    let a = db
+        .create_column_family("a", ColumnFamilyConfig::default())
+        .unwrap();
+    let b = db
+        .create_column_family("b", ColumnFamilyConfig::default())
+        .unwrap();
+
+    for cf in [&a, &b] {
+        for k in [&b"k1"[..], b"k5", b"k9"] {
+            db.put(cf, k, b"v", Duration::ZERO).unwrap();
+        }
+    }
+    // A span that would swallow everything if the prefix were dropped.
+    db.delete_range(&a, b"k0", b"z").unwrap();
+    for k in [&b"k1"[..], b"k5", b"k9"] {
+        assert!(db.get(&a, k).is_err(), "a/{:?} is deleted", k);
+        assert_eq!(db.get(&b, k).unwrap(), b"v", "b/{:?} is untouched", k);
+    }
+    db.close().unwrap();
+}
+
+/// Replay carries the prefixed bounds through unchanged, so a recovered
+/// database masks the same keys — and only those.
+///
+/// The `LOCK` file makes in-process crash simulation impossible by design, so
+/// the writer half runs in a child process that exits without closing (the
+/// pattern `tests/engine_regressions.rs` established).
+const RANGE_CRASH_DIR_ENV: &str = "ONDA_UNIFIED_RANGE_CRASH_DIR";
+
+/// Not a real test: the child half of the crash simulation above.
+#[test]
+fn unified_range_crash_helper() {
+    let Ok(dir) = std::env::var(RANGE_CRASH_DIR_ENV) else {
+        return;
+    };
+    let db = open_unified(&dir);
+    db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
+        .unwrap();
+    let a = db
+        .create_column_family("a", ColumnFamilyConfig::default())
+        .unwrap();
+    let b = db
+        .create_column_family("b", ColumnFamilyConfig::default())
+        .unwrap();
+    for cf in [&a, &b] {
+        for i in 0..6u32 {
+            db.put(cf, format!("k{i}").as_bytes(), b"v", Duration::ZERO)
+                .unwrap();
+        }
+    }
+    db.delete_range(&a, b"k2", b"k5").unwrap();
+    // Simulated crash: no close(), no Drop, nothing flushed.
+    std::process::exit(0);
+}
+
+#[test]
+fn unified_range_replay_strips_prefix_from_both_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["unified_range_crash_helper", "--exact", "--nocapture"])
+        .env(RANGE_CRASH_DIR_ENV, dir.path().to_str().unwrap())
+        .status()
+        .expect("spawn the crash helper");
+    assert!(status.success(), "crash helper child failed");
+
+    let db = open_unified(dir.path().to_str().unwrap());
+    let a = db.get_column_family("a").expect("a recovered");
+    let b = db.get_column_family("b").expect("b recovered");
+    for i in 0..6u32 {
+        let k = format!("k{i}");
+        assert_eq!(
+            db.get(&a, k.as_bytes()).is_ok(),
+            !(2..5).contains(&i),
+            "a/{k} after replay"
+        );
+        assert!(db.get(&b, k.as_bytes()).is_ok(), "b/{k} after replay");
+    }
+    // And the same after a flush, from the durable fragments alone.
+    db.flush_memtable(&a).unwrap();
+    for i in 0..6u32 {
+        let k = format!("k{i}");
+        assert_eq!(
+            db.get(&a, k.as_bytes()).is_ok(),
+            !(2..5).contains(&i),
+            "{k}"
+        );
+    }
+    db.close().unwrap();
+}
+
+/// A span can never cross a cf-id boundary: both bounds come from one
+/// `delete_range` call on one column family, so they share a prefix by
+/// construction. Asserted here for adversarial bounds — a start that IS a
+/// neighbouring family's id, and a span that reaches to the end of the
+/// keyspace.
+#[test]
+fn unified_range_span_never_crosses_cf_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_unified(dir.path().to_str().unwrap());
+    db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
+        .unwrap();
+    let names = ["cf-a", "cf-b", "cf-c"];
+    let cfs: Vec<_> = names
+        .iter()
+        .map(|n| {
+            db.create_column_family(n, ColumnFamilyConfig::default())
+                .unwrap()
+        })
+        .collect();
+    // Keys chosen to look like cf-id prefixes if the prefix were mishandled.
+    let keys: Vec<Vec<u8>> = (0..4u64)
+        .map(|i| i.to_be_bytes().to_vec())
+        .chain([vec![0xFF; 8], b"zzzzzzzzzzzz".to_vec()])
+        .collect();
+    for cf in &cfs {
+        for k in &keys {
+            db.put(cf, k, b"v", Duration::ZERO).unwrap();
+        }
+    }
+    // The widest legal span in the middle family.
+    db.delete_range(&cfs[1], &[0u8], &[0xFFu8; 16]).unwrap();
+    for k in &keys {
+        assert!(db.get(&cfs[0], k).is_ok(), "cf-a untouched");
+        assert!(db.get(&cfs[1], k).is_err(), "cf-b fully deleted");
+        assert!(db.get(&cfs[2], k).is_ok(), "cf-c untouched");
+    }
+    // Flush splits the shared memtable's spans back by cf id; the answer holds.
+    for cf in &cfs {
+        db.flush_memtable(cf).unwrap();
+    }
+    for k in &keys {
+        assert!(db.get(&cfs[0], k).is_ok(), "cf-a after flush");
+        assert!(db.get(&cfs[1], k).is_err(), "cf-b after flush");
+        assert!(db.get(&cfs[2], k).is_ok(), "cf-c after flush");
+    }
+    db.close().unwrap();
+}

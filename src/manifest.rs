@@ -36,6 +36,14 @@ const FORMAT_CAPS_TAG: &[u8; 8] = b"ONDACAP1";
 /// Per-table periodic-compaction age state (0.3), written only by a database
 /// that has enabled [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE).
 const LAST_COMPACTION_TAG: &[u8; 8] = b"ONDAAGE1";
+/// Per-table range-tombstone summary (1.2), written only by a database that has
+/// enabled [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES).
+///
+/// A **tagged** tail, never appended to the positional `SstMeta` body:
+/// [`decode_sstable`] initializes optional fields to `None` and relies on tails
+/// to fill them, and appending to the body would break both VERSION-1 readers
+/// and the append-tolerant decode.
+const RANGE_TAG: &[u8; 8] = b"ONDARNG1";
 /// Edit-log bookkeeping (2.2): `generation | applied_through | next_edit_id`,
 /// three `u64` LE. Emitted only once a database has an edit log, so a legacy
 /// database's bytes are unchanged.
@@ -109,9 +117,67 @@ pub struct SstMeta {
     /// does not own. Persisted only behind
     /// [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE).
     pub last_compaction_time: Option<i64>,
+
+    /// Range-tombstone fragments this table's aux section carries (1.2).
+    ///
+    /// `0` for every legacy table and for every table written before
+    /// [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES) was enabled —
+    /// which is exactly what makes the read path's gate free: one comparison
+    /// against zero skips the whole feature for a point-only table.
+    pub range_count: u64,
+    /// Lowest sequence in any of this table's fragment stacks; `0` when
+    /// `range_count == 0`.
+    pub range_min_seq: u64,
+    /// Highest sequence in any of this table's fragment stacks; `0` when
+    /// `range_count == 0`.
+    pub range_max_seq: u64,
+    /// Lowest fragment `start` in this table, or `None` when it carries none.
+    ///
+    /// May sort **below** [`min_key`](Self::min_key): fragments are clipped to
+    /// the *output interval* a compaction assigns, and the first output of a
+    /// job owns everything from the job span's lower edge — including the gap
+    /// between that edge and its own first point key.
+    pub range_min_key: Option<Vec<u8>>,
+    /// Highest fragment `end` in this table (exclusive), or `None`.
+    ///
+    /// May sort **above** [`max_key`](Self::max_key), by the mirror of the rule
+    /// above. The read path's gap-owner rule reads exactly this field.
+    pub range_max_key: Option<Vec<u8>>,
 }
 
-/// Persisted state of one column family.
+impl SstMeta {
+    /// Whether this table carries range-tombstone fragments.
+    #[inline]
+    pub fn has_ranges(&self) -> bool {
+        self.range_count > 0
+    }
+
+    /// Lowest key this table has anything to say about — its point minimum, or
+    /// the fragment minimum when that sorts lower.
+    pub fn span_min<'a>(&'a self, cmp: &crate::comparator::ComparatorRef) -> &'a [u8] {
+        match &self.range_min_key {
+            Some(k) if cmp.compare(k, &self.min_key).is_lt() => k,
+            _ => &self.min_key,
+        }
+    }
+
+    /// Highest key this table has anything to say about.
+    ///
+    /// Inclusive, like [`max_key`](Self::max_key): a fragment's `end` is
+    /// exclusive, so the last key it can cover is strictly below it and
+    /// `range_max_key` is a safe inclusive upper bound.
+    pub fn span_max<'a>(&'a self, cmp: &crate::comparator::ComparatorRef) -> &'a [u8] {
+        match &self.range_max_key {
+            Some(k) if cmp.compare(k, &self.max_key).is_gt() => k,
+            _ => &self.max_key,
+        }
+    }
+
+    /// Does this table's **span** (points plus fragments) contain `key`?
+    pub fn span_contains(&self, cmp: &crate::comparator::ComparatorRef, key: &[u8]) -> bool {
+        cmp.compare(key, self.span_min(cmp)).is_ge() && cmp.compare(key, self.span_max(cmp)).is_le()
+    }
+}
 #[derive(Debug, Clone, Default)]
 pub struct CfManifest {
     pub name: String,
@@ -242,6 +308,13 @@ impl Manifest {
         if tags.last_compaction && tags.caps & crate::format::CAP_PERIODIC_AGE == 0 {
             return Err(corrupt_manifest());
         }
+        // And once more for the range summary: fragments exist only in a
+        // database that holds CAP_RANGE_DELETES, so a summary without the bit
+        // was truncated, hand-edited, or produced by a writer that skipped the
+        // enable.
+        if tags.range && tags.caps & crate::format::CAP_RANGE_DELETES == 0 {
+            return Err(corrupt_manifest());
+        }
         crate::format::check_caps(tags.caps)?;
         // A manifest with no edit-log tail is one that has never had a log:
         // generation 0, nothing applied, and the next id is the first one.
@@ -283,6 +356,8 @@ struct ManifestTailPresence {
     nonce: bool,
     caps: bool,
     last_compaction: bool,
+    /// Whether the [`RANGE_TAG`] section is emitted.
+    range: bool,
     edits: bool,
     layout: bool,
 }
@@ -305,6 +380,13 @@ impl ManifestTailPresence {
             // conjunction never silently drops a stamp.
             last_compaction: manifest.caps & crate::format::CAP_PERIODIC_AGE != 0
                 && has(|sst| sst.last_compaction_time.is_some()),
+            // Same conjunction, for the same reason: a range summary is a
+            // capability-bearing artifact, so a manifest carrying one must also
+            // carry the bit that tells an older binary to refuse the file.
+            // Nothing writes a fragment before the bit is durable, so this
+            // never silently drops a summary.
+            range: manifest.caps & crate::format::CAP_RANGE_DELETES != 0
+                && has(|sst| sst.range_count > 0),
             edits: manifest.generation != 0
                 || manifest.applied_through != 0
                 || manifest.next_edit_id != 1,
@@ -319,7 +401,7 @@ impl ManifestTailPresence {
     /// read as a partition name section — silent corruption rather than
     /// rejection. Every new tag must be added here as well as to the encoder.
     fn tagged(self) -> bool {
-        self.object || self.nonce || self.caps || self.last_compaction || self.edits
+        self.object || self.nonce || self.caps || self.last_compaction || self.range || self.edits
     }
 }
 
@@ -386,6 +468,10 @@ fn encode_tagged_tails(b: &mut Vec<u8>, manifest: &Manifest, presence: ManifestT
     if presence.caps {
         b.extend_from_slice(FORMAT_CAPS_TAG);
         append_u64(b, manifest.caps);
+    }
+    if presence.range {
+        b.extend_from_slice(RANGE_TAG);
+        encode_range_section(b, &manifest.cfs);
     }
     if presence.last_compaction {
         b.extend_from_slice(LAST_COMPACTION_TAG);
@@ -527,6 +613,11 @@ fn decode_sstable(cursor: &mut ManifestCursor<'_>) -> Result<SstMeta> {
         max_entry_time: None,
         object: None,
         last_compaction_time: None,
+        range_count: 0,
+        range_min_seq: 0,
+        range_max_seq: 0,
+        range_min_key: None,
+        range_max_key: None,
     })
 }
 
@@ -552,6 +643,8 @@ struct TaggedTails {
     /// Whether [`LAST_COMPACTION_TAG`] was present, checked against `caps`
     /// after the loop — the tag may legally precede or follow the caps word.
     last_compaction: bool,
+    /// Whether [`RANGE_TAG`] was present, checked against `caps` the same way.
+    range: bool,
     edits: Option<EditLogTail>,
 }
 
@@ -613,6 +706,11 @@ fn decode_tagged_tails(mut p: &[u8], cfs: &mut [CfManifest]) -> Result<TaggedTai
             decode_u64_section(rest, cfs, |sst, value| {
                 sst.last_compaction_time = Some(value as i64)
             })?
+        } else if tag == RANGE_TAG {
+            if std::mem::replace(&mut out.range, true) {
+                return Err(corrupt_manifest());
+            }
+            decode_range_section(rest, cfs)?
         } else if tag == MANIFEST_EDITS_TAG {
             if out.edits.is_some() {
                 return Err(corrupt_manifest());
@@ -735,6 +833,74 @@ fn decode_u64_section<'a>(
     Ok(p)
 }
 
+/// Encode the [`RANGE_TAG`] section: for each CF in order, a uvarint count of
+/// tables carrying fragments, then one record per such table.
+///
+/// ```text
+/// per CF: count uvarint
+///         { table_index uvarint | range_count uvarint
+///           | range_min_seq uvarint | range_max_seq uvarint
+///           | min_key bytes | max_key bytes } x count
+/// ```
+///
+/// The bounds are unconditional rather than optional: a table with
+/// `range_count > 0` has both by construction (a fragment has two bounds), so
+/// an optional tag would encode a state no writer can produce.
+fn encode_range_section(b: &mut Vec<u8>, cfs: &[CfManifest]) {
+    for cf in cfs {
+        let with_ranges: Vec<(usize, &SstMeta)> = cf
+            .sstables
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.range_count > 0)
+            .collect();
+        append_uvarint(b, with_ranges.len() as u64);
+        for (i, sst) in with_ranges {
+            append_uvarint(b, i as u64);
+            append_uvarint(b, sst.range_count);
+            append_uvarint(b, sst.range_min_seq);
+            append_uvarint(b, sst.range_max_seq);
+            append_bytes(b, sst.range_min_key.as_deref().unwrap_or_default());
+            append_bytes(b, sst.range_max_key.as_deref().unwrap_or_default());
+        }
+    }
+}
+
+/// Decode the section written by [`encode_range_section`]. Returns the
+/// unconsumed remainder.
+fn decode_range_section<'a>(mut p: &'a [u8], cfs: &mut [CfManifest]) -> Result<&'a [u8]> {
+    let bad = corrupt_manifest;
+    for cf in cfs.iter_mut() {
+        let (count, n) = uvarint(p).ok_or_else(bad)?;
+        p = &p[n..];
+        for _ in 0..count {
+            let (idx, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let (range_count, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let (min_seq, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let (max_seq, n) = uvarint(p).ok_or_else(bad)?;
+            p = &p[n..];
+            let (min_key, rest) = take_bytes(p).ok_or_else(bad)?;
+            let (max_key, rest) = take_bytes(rest).ok_or_else(bad)?;
+            p = rest;
+            // A record naming zero fragments, or an empty bound, is a state the
+            // encoder never emits: it would be indistinguishable from absence.
+            if range_count == 0 || min_key.is_empty() || max_key.is_empty() || min_seq > max_seq {
+                return Err(bad());
+            }
+            let sst = cf.sstables.get_mut(idx as usize).ok_or_else(bad)?;
+            sst.range_count = range_count;
+            sst.range_min_seq = min_seq;
+            sst.range_max_seq = max_seq;
+            sst.range_min_key = Some(min_key);
+            sst.range_max_key = Some(max_key);
+        }
+    }
+    Ok(p)
+}
+
 fn append_bytes(dst: &mut Vec<u8>, b: &[u8]) {
     append_uvarint(dst, b.len() as u64);
     dst.extend_from_slice(b);
@@ -851,6 +1017,150 @@ mod tests {
     /// Byte offset of `tag` inside an encoded manifest.
     fn tag_offset(bytes: &[u8], tag: &[u8; 8]) -> Option<usize> {
         bytes.windows(TAG_LEN).position(|w| w == tag)
+    }
+
+    // ---- range summary (ONDARNG1, 1.2) ------------------------------------
+
+    /// A `sample()` whose second table carries range fragments.
+    fn sample_with_ranges() -> Manifest {
+        let mut m = sample();
+        m.caps = crate::format::CAP_RANGE_DELETES | crate::format::CAP_EXTENDED_RECORDS;
+        let t = &mut m.cfs[0].sstables[1];
+        t.range_count = 3;
+        t.range_min_seq = 17;
+        t.range_max_seq = 42;
+        // Deliberately OUTSIDE the point bounds in both directions: fragments
+        // are clipped to the output *interval*, which reaches past the first
+        // and last point key of the table that owns it.
+        t.range_min_key = Some(b"aa".to_vec());
+        t.range_max_key = Some(b"nnn".to_vec());
+        m
+    }
+
+    #[test]
+    fn sst_meta_range_tail_round_trips() {
+        let m = sample_with_ranges();
+        let enc = m.encode();
+        assert_eq!(encoded_version(&enc), VERSION_V2);
+        let d = Manifest::decode(&enc).unwrap();
+        let t = &d.cfs[0].sstables[1];
+        assert_eq!(t.range_count, 3);
+        assert_eq!(t.range_min_seq, 17);
+        assert_eq!(t.range_max_seq, 42);
+        assert_eq!(t.range_min_key.as_deref(), Some(&b"aa"[..]));
+        assert_eq!(t.range_max_key.as_deref(), Some(&b"nnn"[..]));
+        // The table with no fragments stays entirely at its defaults.
+        let t0 = &d.cfs[0].sstables[0];
+        assert_eq!(t0.range_count, 0);
+        assert_eq!(t0.range_min_key, None);
+        assert_eq!(d.encode(), enc, "re-encode must be byte-identical");
+        // Position: after ONDACAP1, before ONDAWAL1.
+        let caps = tag_offset(&enc, FORMAT_CAPS_TAG).expect("caps tag");
+        let range = tag_offset(&enc, RANGE_TAG).expect("range tag");
+        assert!(caps < range, "ONDARNG1 must follow ONDACAP1");
+    }
+
+    /// The `ManifestTailPresence::tagged()` hazard, mirroring 1.0's caps test:
+    /// a manifest whose ONLY tail is the range summary must still emit the
+    /// three positional sections ahead of it, or a positional decoder reads
+    /// `ONDARNG1` as a partition name section.
+    #[test]
+    fn range_tail_only_manifest_emits_all_positional_sections() {
+        let m = sample_with_ranges();
+        assert_eq!(m.wal_layout, WalLayout::PerColumnFamily, "no layout tail");
+        assert!(m.instance_nonce.is_none(), "no nonce tail");
+        let enc = m.encode();
+        let range = tag_offset(&enc, RANGE_TAG).expect("range tag");
+        // Everything between the CF bodies and the first tag is positional, and
+        // the tag must not be the first thing after them.
+        let presence = ManifestTailPresence::detect(&m);
+        assert!(presence.range && presence.tagged());
+        let mut positional = Vec::new();
+        encode_positional_tails(&mut positional, &m.cfs, presence);
+        assert!(
+            !positional.is_empty(),
+            "a tag-only manifest must still carry the three positional sections"
+        );
+        assert!(
+            enc[..range]
+                .windows(positional.len())
+                .any(|w| w == positional.as_slice()),
+            "the positional sections must appear ahead of ONDARNG1"
+        );
+        // And it round-trips through the real decoder.
+        assert_eq!(Manifest::decode(&enc).unwrap().encode(), enc);
+    }
+
+    /// Every table of every frozen legacy fixture decodes to "no fragments",
+    /// and the field never appears in the bytes.
+    #[test]
+    fn legacy_table_reports_range_count_zero() {
+        for name in V1_FIXTURES.iter().chain([V2_FIXTURE].iter()) {
+            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(tag_offset(&bytes, RANGE_TAG).is_none(), "{name}");
+            for cf in &m.cfs {
+                for t in &cf.sstables {
+                    assert_eq!(t.range_count, 0, "{name} table {}", t.id);
+                    assert_eq!(t.range_min_key, None, "{name} table {}", t.id);
+                    assert_eq!(t.range_max_key, None, "{name} table {}", t.id);
+                    assert!(!t.has_ranges(), "{name} table {}", t.id);
+                }
+            }
+        }
+    }
+
+    /// The summary is a capability-bearing artifact: bytes carrying it without
+    /// `CAP_RANGE_DELETES` were truncated or hand-edited.
+    #[test]
+    fn range_tail_without_the_capability_is_corruption() {
+        let mut m = sample_with_ranges();
+        let enc = m.encode();
+        // Rewrite the caps word in place, clearing only CAP_RANGE_DELETES.
+        let caps_at = tag_offset(&enc, FORMAT_CAPS_TAG).unwrap() + TAG_LEN;
+        let mut bad = enc.clone();
+        let stripped = m.caps & !crate::format::CAP_RANGE_DELETES;
+        bad[caps_at..caps_at + 8].copy_from_slice(&stripped.to_le_bytes());
+        let crc_at = bad.len() - 4;
+        let crc = checksum(&bad[..crc_at]);
+        bad[crc_at..].copy_from_slice(&crc.to_le_bytes());
+        let err = Manifest::decode(&bad).expect_err("a summary without the bit must fail closed");
+        assert_eq!(err.kind(), "corruption");
+        // And with the bit cleared at the source, the summary is simply not
+        // emitted — the encoder never writes an unauthorized artifact.
+        m.caps = stripped;
+        assert!(tag_offset(&m.encode(), RANGE_TAG).is_none());
+    }
+
+    /// A record naming zero fragments, or an empty bound, is a state the
+    /// encoder cannot produce.
+    #[test]
+    fn range_section_rejects_unwritable_records() {
+        let mut cfs = vec![CfManifest {
+            name: "x".into(),
+            config: Vec::new(),
+            sstables: vec![SstMeta::default()],
+        }];
+        // count = 1, index = 0, range_count = 0 -> refused.
+        let mut p = Vec::new();
+        append_uvarint(&mut p, 1);
+        append_uvarint(&mut p, 0);
+        append_uvarint(&mut p, 0);
+        append_uvarint(&mut p, 1);
+        append_uvarint(&mut p, 2);
+        append_bytes(&mut p, b"a");
+        append_bytes(&mut p, b"z");
+        assert!(decode_range_section(&p, &mut cfs).is_err());
+        // A table index past the end of the CF.
+        let mut p = Vec::new();
+        append_uvarint(&mut p, 1);
+        append_uvarint(&mut p, 9);
+        append_uvarint(&mut p, 1);
+        append_uvarint(&mut p, 1);
+        append_uvarint(&mut p, 2);
+        append_bytes(&mut p, b"a");
+        append_bytes(&mut p, b"z");
+        assert!(decode_range_section(&p, &mut cfs).is_err());
     }
 
     #[test]
@@ -1186,6 +1496,7 @@ mod tests {
                         max_entry_time: None,
                         object: None,
                         last_compaction_time: None,
+                        ..Default::default()
                     },
                     SstMeta {
                         id: 2,
@@ -1202,6 +1513,7 @@ mod tests {
                         max_entry_time: None,
                         object: None,
                         last_compaction_time: None,
+                        ..Default::default()
                     },
                 ],
             }],
@@ -1550,6 +1862,7 @@ mod tests {
                     max_entry_time: Some(1_700_000_000_000_000),
                     object: None,
                     last_compaction_time: Some(1_700_000_000_000_000),
+                    ..Default::default()
                 })
                 .collect();
             let m = Manifest {

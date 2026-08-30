@@ -1,0 +1,104 @@
+# ondaDB 1.2 — range-delete acceptance harness
+
+host:    Apple M2 Max
+os:      Darwin 25.5.0
+rustc:   rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)
+commit:  1232e48 + working tree (feature 1.2)
+build:   cargo test --release --features unsafe-fastpath --test range_delete_bench -- --ignored --nocapture
+date:    2026-08-30T18:03:54Z
+
+
+running 4 tests
+test range_delete_commit_latency ... 
+== 2. delete-commit latency (the RV-M3 baseline) ==
+  200 commits each; median of 5 runs
+  0 concurrent point writers: range p50      7.9 us  p99  11857.8 us   (point commit p99   7011.0 us)
+  4 concurrent point writers: range p50     44.2 us  p99  22667.0 us   (point commit p99  28499.1 us)
+ok
+test range_delete_coverage_bytes ... 
+== 1. bulk delete: bytes to reclaim ==
+(60k keys, 100-byte values; median of 5 runs)
+  delete + flush + compact   point   14578.5 ms   range     166.1 ms   (87.8x)
+  bytes the delete WROTE     point   1010178 B    range       152 B    (6646x)
+  bytes resident afterwards  point         0 B    range         0 B
+ok
+test range_delete_read_latency_by_fragment_count ... 
+== 3. read p99 vs published fragment count ==
+  40k keys; the deleted spans are disjoint and narrow, so the
+  surviving key set is the same in every column; median of 5 runs
+     0 fragments:  get p99    0.96 us   full scan      1.6 ms
+    10 fragments:  get p99    1.08 us   full scan      2.7 ms
+  1000 fragments:  get p99    1.12 us   full scan      2.7 ms
+ok
+test range_delete_time_to_space_reclaim ... 
+== 4. time to space reclaim ==
+  delete -> zero resident bytes:  point    9658.0 ms   range     148.1 ms
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 670.13s
+
+BENCH_EXIT=0
+
+
+================================================================================
+GATE DECISION
+================================================================================
+
+PASS, on three of the four acceptance criteria outright and on the fourth with a
+stated caveat.
+
+1. Categorical reduction on full coverage — PASS, by a wide margin.
+   Deleting 60k keys key-by-key writes 1,010,178 bytes of tombstone debris and
+   takes 14.6 s end to end. One `delete_range` covering the same keys writes 152
+   bytes (three fragments plus framing) and takes 166 ms: 6,646x fewer bytes and
+   87.8x less wall time. Both end at zero resident bytes, so this is the same
+   work done, not less work done.
+
+2. Delete latency p50/p99, with and without concurrent point writers — RECORDED,
+   and it is the RV-M3 baseline the design asked for.
+   Uncontended, a range commit costs 7.9 us at p50. With four threads writing
+   points as fast as they can, that rises to 44.2 us — the `commit_mu`
+   acquisition a range commit now takes at every isolation level, which is
+   exactly the cost M3 names. It is worth being precise about what the p99
+   column is NOT: at 11.9 ms (0 writers) and 22.7 ms (4 writers) it is dominated
+   by flush and compaction stalls, not by the lock — the ordinary POINT commits
+   measured in the same runs show a p99 of 7.0 ms and 28.5 ms respectively. Under
+   load the range commit's p99 is BELOW the point commit's. So the honest
+   statement is: range commits pay a real, measurable p50 penalty for the lock
+   (5.6x under contention), and are not the tail-latency bottleneck.
+
+3. Point/scan p99 with 0/10/1000 fragments — PASS.
+       fragments   get p99    full scan
+               0    0.96 us      1.6 ms
+              10    1.08 us      2.7 ms
+            1000    1.12 us      2.7 ms
+   The claim that matters is 10 -> 1000: a hundredfold increase in fragments
+   moves get p99 by 0.04 us and the scan not at all. That is the monotonic
+   cursor and the one-fragment binary search behaving as designed; a per-key
+   linear walk would have shown up here as a hundredfold difference.
+
+   CAVEAT, stated rather than smoothed over: the 0-fragment column is not a
+   clean control. It is a database that never enabled the capability, so its
+   tables also use the LEGACY entry layout, while the 10- and 1000-fragment
+   columns use the extended (kind-bearing) one. The 1.6 -> 2.7 ms scan step
+   therefore mixes "no range mask" with "one extra uvarint per entry" — and the
+   latter is 1.0-B's cost, not 1.2's. What 1.2 does own is proven separately and
+   more strictly by `no_range_cf_allocates_nothing_on_read`, which asserts that a
+   point-only column family materializes ZERO range-mask sources across 200
+   gets, a forward scan, a reverse scan and a 200-key `multi_get`. Isolating the
+   mask cost from the layout cost needs a fourth column (capability on, zero
+   spans) and is left for the surfaces pass.
+
+4. Time to space reclaim — PASS.
+   9.66 s key-by-key versus 148 ms for the range delete, both to zero resident
+   bytes: 65x.
+
+Zero failed invariant or fault tests: `tests/range_delete.rs` (36 tests,
+including the oracle over random histories and the level->=1 disjointness
+property test) is green in both feature configurations, as is the rest of the
+suite.
+
+Methodology. Medians of 5 runs on an idle Apple M2 Max. This machine is
+thermally noisy (+/-15-20% run to run, worse after sustained load — see
+`docs/performance.md`), so only same-run ratios are interpreted above; the
+absolute millisecond figures are not comparable across sessions.

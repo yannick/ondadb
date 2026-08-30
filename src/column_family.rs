@@ -150,6 +150,9 @@ pub(crate) struct CfCtx {
     /// The database's injectable clock (0.3) — read here only to stamp
     /// [`SstMeta::last_compaction_time`](crate::manifest::SstMeta::last_compaction_time).
     pub clock: Arc<crate::util::Clock>,
+    /// The same committed-span index `DbInner` holds (1.2), so per-family stats
+    /// can report its size without reaching for the whole database.
+    pub span_index: Arc<crate::span_index::SpanIndex>,
 }
 
 impl std::fmt::Debug for CfCtx {
@@ -211,6 +214,24 @@ impl PointReadCandidate {
         self.consider(value, lookup.seq, lookup.found, lookup.deleted);
     }
 
+    /// Apply range-delete coverage.
+    ///
+    /// Deleted iff the covering sequence is **above** the surviving point
+    /// version's, or there is no point version at all. Sequences within a
+    /// commit are distinct by construction (`apply_prepared` assigns
+    /// `start + slot`) and own-write overlap is rejected, so the comparison is
+    /// total — no tie can arise for it to resolve.
+    fn mask(&mut self, covering: Option<u64>) {
+        if let Some(seq) = covering {
+            if !self.found || seq > self.seq {
+                self.value = None;
+                self.seq = seq;
+                self.found = true;
+                self.deleted = true;
+            }
+        }
+    }
+
     fn finish(self) -> Result<Vec<u8>> {
         if self.found && !self.deleted {
             Ok(self.value.unwrap_or_default())
@@ -224,6 +245,33 @@ struct PointReadSources {
     mem: Arc<Memtable>,
     imms: Vec<Arc<ImmMemtable>>,
     tables: SmallVec<[Arc<SstHandle>; 4]>,
+    /// Tables consulted for **range coverage only** (1.2): an L0 table whose
+    /// point bounds exclude the key but whose fragment span contains it, and
+    /// per level >= 1 the *gap owner* — the table left of the point candidate,
+    /// which owns the interval between its own last point key and the next
+    /// table's first one.
+    ///
+    /// Kept apart from `tables` so a gap owner never costs a bloom probe or a
+    /// point lookup: it has nothing to say about the key except whether a
+    /// tombstone covers it. Empty for every point-only column family.
+    range_tables: SmallVec<[Arc<SstHandle>; 2]>,
+}
+
+impl PointReadSources {
+    /// Whether any source *this struct holds* could contribute range coverage.
+    ///
+    /// One relaxed load per memtable and one `range_count == 0` comparison per
+    /// candidate table. The shared unified store is checked by the caller,
+    /// which is the only one that knows whether the family is in unified mode
+    /// — leaving it out here is what made a unified range delete invisible in
+    /// the first version of this gate.
+    #[inline]
+    fn has_ranges(&self) -> bool {
+        !self.range_tables.is_empty()
+            || !self.mem.ranges().is_empty()
+            || self.imms.iter().any(|i| !i.mem.ranges().is_empty())
+            || self.tables.iter().any(|t| t.meta.has_ranges())
+    }
 }
 
 /// One state snapshot covering a whole batch of point reads.
@@ -243,6 +291,10 @@ struct BatchReadSources {
     mem: Arc<Memtable>,
     imms: Vec<Arc<ImmMemtable>>,
     tables: BatchTables,
+    /// Tables consulted for range coverage only, in the same shape as
+    /// `tables` — see [`PointReadSources::range_tables`]. Empty for every
+    /// point-only column family.
+    range_tables: BatchTables,
 }
 
 /// One candidate table plus the result indices of the batch whose keys it
@@ -328,6 +380,9 @@ pub struct ColumnFamily {
 
     // Read-path counters (relaxed; observability only).
     pub(crate) point_reads: AtomicU64,
+    /// Range-delete records committed to this family since it was opened
+    /// (1.2). Zero for every family that never uses the feature.
+    range_deletes: AtomicU64,
     pub(crate) bloom_skips: AtomicU64,
     pub(crate) sst_probes: AtomicU64,
     /// `state` acquisitions made by the point-read planners
@@ -489,6 +544,7 @@ impl ColumnFamily {
             compaction_failures: AtomicU64::new(0),
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
+            range_deletes: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             #[cfg(test)]
             point_state_reads: AtomicU64::new(0),
@@ -565,8 +621,15 @@ impl ColumnFamily {
             let p = format!("{dir}/wal-{g}.log");
             replay_paths.push(p.clone());
             let last = Wal::replay(&p, |rec| {
-                let crate::wal::ReplayRecord::Point(r) = rec;
-                mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+                match rec {
+                    crate::wal::ReplayRecord::Point(r) => {
+                        mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+                    }
+                    // Schema 1: both bounds are user keys already.
+                    crate::wal::ReplayRecord::RangeDelete { start, end, seq } => {
+                        mem.add_range(&start, &end, seq);
+                    }
+                }
                 Ok(())
             })?;
             max_seq = max_seq.max(last);
@@ -626,6 +689,7 @@ impl ColumnFamily {
             compaction_failures: AtomicU64::new(0),
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
+            range_deletes: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             #[cfg(test)]
             point_state_reads: AtomicU64::new(0),
@@ -727,7 +791,17 @@ impl ColumnFamily {
     /// Apply a committed batch: append to the WAL and insert into the memtable,
     /// then rotate if the memtable is full. Records borrow the transaction's
     /// buffer; both the WAL and the memtable copy what they need.
-    pub(crate) fn apply_commit(self: &Arc<Self>, recs: &[wal::RecordRef<'_>]) -> Result<()> {
+    ///
+    /// The WAL form is chosen per batch: a point-only batch keeps writing the
+    /// legacy record stream (unchanged bytes, unchanged size), while a batch
+    /// holding a range delete (1.2) writes **one** envelope frame carrying both
+    /// kinds. One frame, because WAL batch atomicity (invariant 3) is per
+    /// frame: two frames could replay half a commit.
+    pub(crate) fn apply_commit_with_ranges(
+        self: &Arc<Self>,
+        recs: &[wal::RecordRef<'_>],
+        ranges: &[wal::RangeRef<'_>],
+    ) -> Result<()> {
         self.ctx.poison.check()?;
         // Soft pacing happens before the lock is taken: the point is to slow
         // this writer down, not to hold anyone else up while it waits.
@@ -755,12 +829,23 @@ impl ColumnFamily {
         };
 
         let res = (|| {
-            if let Some(w) = &wal {
+            let Some(w) = &wal else {
+                return Err(OndaError::ReadOnly("wal unavailable".into()));
+            };
+            if ranges.is_empty() {
                 w.append_batch(recs)?;
             } else {
-                return Err(OndaError::ReadOnly("wal unavailable".into()));
+                let mut batch: Vec<wal::EnvelopeRecord<'_>> =
+                    Vec::with_capacity(recs.len() + ranges.len());
+                batch.extend(recs.iter().copied().map(wal::EnvelopeRecord::Point));
+                batch.extend(ranges.iter().copied().map(wal::EnvelopeRecord::Range));
+                w.append_batch_envelope(wal::ENVELOPE_SCHEMA_PER_CF, &batch)?;
             }
             mem.put_batch(recs);
+            for r in ranges {
+                mem.add_range(r.start, r.end, r.seq);
+            }
+            self.note_range_delete(ranges.len() as u64);
             Ok(())
         })();
 
@@ -796,7 +881,9 @@ impl ColumnFamily {
             }
             {
                 let s = self.state.read();
-                if s.mem.is_empty() {
+                // Range tombstones alone are enough to rotate: they are not
+                // point entries, so `is_empty` would drop them on the floor.
+                if s.mem.is_empty_including_ranges() {
                     return;
                 }
                 if !force && s.mem.approx_size() < self.opts.write_buffer_size as i64 {
@@ -885,14 +972,20 @@ impl ColumnFamily {
     }
 
     fn flush_imm_inner(&self, imm: &Arc<ImmMemtable>, file_id: u64) -> Result<FlushOutput> {
+        // The sealed memtable's range tombstones become this table's fragments.
+        // Unclipped: a flush writes ONE L0 file covering the whole memtable, so
+        // its owned interval is the memtable's whole keyspace. (Clipping starts
+        // at compaction, where a job has several outputs to divide.)
+        let fragments: Vec<crate::range_tombstone::Fragment> =
+            imm.mem.ranges().fragments(None, None).collect();
         // Fast path: stream entries straight out of the sealed memtable's arena
         // nodes through a k-way merge — no per-entry allocation, no sort.
         #[cfg(feature = "arena-memtable")]
-        let table = self.write_l0_streaming(&imm.mem, file_id)?;
+        let table = self.write_l0_streaming(&imm.mem, fragments, file_id)?;
         #[cfg(not(feature = "arena-memtable"))]
         let table = {
             let entries = imm.mem.snapshot();
-            self.write_l0(&entries, file_id)?
+            self.write_l0(&entries, fragments, file_id)?
         };
         self.flush_count.fetch_add(1, Ordering::Relaxed);
         Ok(FlushOutput {
@@ -964,13 +1057,21 @@ impl ColumnFamily {
     /// Stream a sealed memtable to a new L0 SSTable without materializing
     /// entries (keys/values borrowed from the arena through the merge).
     #[cfg(feature = "arena-memtable")]
-    fn write_l0_streaming(&self, mem: &Memtable, file_id: u64) -> Result<Option<Arc<SstHandle>>> {
+    fn write_l0_streaming(
+        &self,
+        mem: &Memtable,
+        fragments: Vec<crate::range_tombstone::Fragment>,
+        file_id: u64,
+    ) -> Result<Option<Arc<SstHandle>>> {
         let mut m = mem.flush_merge();
-        if !m.valid() {
+        // A memtable holding only range tombstones still has to produce a
+        // table: dropping it would lose the deletes it recorded.
+        if !m.valid() && fragments.is_empty() {
             return Ok(None);
         }
         let klog = self.klog_path(file_id);
         let mut w = self.new_writer(&klog, mem.num_entries().max(0) as usize)?;
+        w.set_range_fragments(fragments);
         while m.valid() {
             let c = m.top();
             w.add(
@@ -986,17 +1087,20 @@ impl ColumnFamily {
         self.finish_writer_to_handle(w, file_id).map(Some)
     }
 
-    /// Write `entries` (already in this CF's internal order) to a new L0 SSTable.
+    /// Write `entries` (already in this CF's internal order) plus `fragments`
+    /// to a new L0 SSTable.
     fn write_l0(
         &self,
         entries: &[crate::memtable::Entry],
+        fragments: Vec<crate::range_tombstone::Fragment>,
         file_id: u64,
     ) -> Result<Option<Arc<SstHandle>>> {
-        if entries.is_empty() {
+        if entries.is_empty() && fragments.is_empty() {
             return Ok(None);
         }
         let klog = self.klog_path(file_id);
         let mut w = self.new_writer(&klog, entries.len())?;
+        w.set_range_fragments(fragments);
         for e in entries {
             w.add(
                 &e.user_key,
@@ -1012,23 +1116,45 @@ impl ColumnFamily {
 
     /// Ingest a CF's slice of a split unified memtable: sort by this CF's
     /// comparator, then write an L0 SSTable.
+    /// Also takes that family's slice of the shared store's range tombstones.
+    ///
     /// Returns the finished, fsynced table without publishing it: the caller
     /// installs it inside a `catalog_txn`.
+    ///
+    /// Fragments are refused unless the database holds
+    /// [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES): the aux block
+    /// only exists on an extended table, and a table this database is not
+    /// authorized to write is one a reopen could not attribute. This is also
+    /// what keeps externally ingested files point-only — nothing outside the
+    /// unified flush ever hands fragments in.
     pub(crate) fn ingest_l0(
         &self,
         mut entries: Vec<crate::memtable::Entry>,
+        fragments: Vec<crate::range_tombstone::Fragment>,
         file_id: u64,
     ) -> Result<Option<Arc<SstHandle>>> {
+        if !fragments.is_empty() && !self.range_deletes_enabled() {
+            return Err(OndaError::InvalidArgs(
+                "range fragments require the CAP_RANGE_DELETES format capability;                  ingested files are point-only"
+                    .into(),
+            ));
+        }
         entries.sort_by(|a, b| {
             self.cmp
                 .compare(&a.user_key, &b.user_key)
                 .then_with(|| b.seq.cmp(&a.seq))
         });
         self.flushing.store(true, Ordering::Relaxed);
-        let r = self.write_l0(&entries, file_id);
+        let r = self.write_l0(&entries, fragments, file_id);
         self.flushing.store(false, Ordering::Relaxed);
         self.flush_count.fetch_add(1, Ordering::Relaxed);
         r
+    }
+
+    /// Whether this database may write range-delete artifacts.
+    #[inline]
+    pub(crate) fn range_deletes_enabled(&self) -> bool {
+        self.ctx.caps.load(Ordering::SeqCst) & crate::format::CAP_RANGE_DELETES != 0
     }
 
     /// Stable column-family id (used by unified-memtable key prefixing).
@@ -1042,8 +1168,7 @@ impl ColumnFamily {
         // binary too old to decode the footer flag refuses the whole database
         // rather than reading delta bytes as legacy ones.
         let prefix_delta = self.opts.enable_prefix_delta_keys
-            && self.ctx.caps.load(Ordering::SeqCst)
-                & crate::format::CAPS_PREFIX_DELTA_WRITE
+            && self.ctx.caps.load(Ordering::SeqCst) & crate::format::CAPS_PREFIX_DELTA_WRITE
                 == crate::format::CAPS_PREFIX_DELTA_WRITE;
         WriterOptions {
             // Flush and ingestion always write L0.
@@ -1062,10 +1187,15 @@ impl ColumnFamily {
             expected_entries: expected,
             use_btree: self.opts.use_btree,
             restart_interval: self.opts.block_restart_interval,
-            // No engine path writes extended entries on their own yet (1.0-B
-            // ships the codec; 1.1/1.2 are the first producers) — but a delta
-            // table is an extended table, and `Writer` sets both footer flags.
-            extended_entries: false,
+            // Extended (kind-bearing) entries are a table-level property fixed
+            // at writer construction, and the aux block that carries range
+            // fragments only exists on an extended table. A database holding
+            // CAP_RANGE_DELETES therefore writes every new table extended,
+            // whether or not this particular one ends up with a fragment — the
+            // alternative is knowing the answer before the merge has run. A
+            // delta table is an extended table too, and `Writer` sets both
+            // footer flags.
+            extended_entries: self.range_deletes_enabled(),
             prefix_delta,
         }
     }
@@ -1105,6 +1235,65 @@ impl ColumnFamily {
         }
     }
 
+    /// The **gap owner** at `user_key` in a sorted level: the table whose
+    /// fragment interval may contain the key even though its point bounds do
+    /// not.
+    ///
+    /// Fragments are clipped at write time to the interval each output owns —
+    /// `[o_i.min_key, o_{i+1}.min_key)` — so at level >= 1 the intervals are
+    /// disjoint and ordered exactly as the point bounds are. That leaves one
+    /// table [`find_overlapping`] can miss: the one *left* of the key, which
+    /// owns everything from its own first point key up to the next table's.
+    /// Consulting it (and only it) is what makes the read path complete without
+    /// weakening the binary search every other caller relies on.
+    ///
+    /// `point` is the index [`find_overlapping`] returned, and `lo` its
+    /// internal landing position (the first table with `max_key >= user_key`).
+    fn gap_owner(
+        level: &[Arc<SstHandle>],
+        cmp: &ComparatorRef,
+        user_key: &[u8],
+        point: Option<usize>,
+        lo: usize,
+    ) -> Option<usize> {
+        let candidate = match point {
+            Some(i) => i.checked_sub(1)?,
+            // `find_overlapping` found nothing: either the key is past every
+            // table (`lo == len`) or it fell in the gap ahead of `lo`. Both
+            // make `lo - 1` the last table whose `max_key` is below the key.
+            None => lo.checked_sub(1)?,
+        };
+        let meta = &level[candidate].meta;
+        // One comparison against zero for every legacy or point-only table.
+        if !meta.has_ranges() {
+            return None;
+        }
+        // `range_max_key` is a fragment `end`, and ends are exclusive.
+        let end = meta.range_max_key.as_deref()?;
+        cmp.compare(user_key, end).is_lt().then_some(candidate)
+    }
+
+    /// [`find_overlapping`], also returning the binary search's landing
+    /// position so [`gap_owner`](Self::gap_owner) can use it.
+    fn find_overlapping_at(
+        level: &[Arc<SstHandle>],
+        cmp: &ComparatorRef,
+        user_key: &[u8],
+    ) -> (Option<usize>, usize) {
+        let (mut lo, mut hi) = (0, level.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if cmp.compare(&level[mid].meta.max_key, user_key).is_lt() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let hit = (lo < level.len() && cmp.compare(user_key, &level[lo].meta.min_key).is_ge())
+            .then_some(lo);
+        (hit, lo)
+    }
+
     /// `state.read()` for the point-read planners, counted under `cfg(test)`
     /// so a test can pin how many snapshots a batch takes.
     #[inline]
@@ -1123,21 +1312,75 @@ impl ColumnFamily {
     fn point_read_sources(&self, user_key: &[u8]) -> PointReadSources {
         let s = self.read_point_state();
         let mut tables = SmallVec::new();
+        let mut range_tables: SmallVec<[Arc<SstHandle>; 2]> = SmallVec::new();
         for th in &s.levels[0] {
             if Self::key_in_range(th, &self.cmp, user_key) {
                 tables.push(th.clone());
+            } else if th.meta.has_ranges() && th.meta.span_contains(&self.cmp, user_key) {
+                // L0 tables overlap each other, so there is no gap-owner rule
+                // here: every table whose SPAN contains the key contributes.
+                range_tables.push(th.clone());
             }
         }
         for lvl in s.levels.iter().skip(1) {
-            if let Some(i) = Self::find_overlapping(lvl, &self.cmp, user_key) {
+            let (hit, lo) = Self::find_overlapping_at(lvl, &self.cmp, user_key);
+            if let Some(i) = hit {
                 tables.push(lvl[i].clone());
+            }
+            if let Some(g) = Self::gap_owner(lvl, &self.cmp, user_key, hit, lo) {
+                range_tables.push(lvl[g].clone());
             }
         }
         PointReadSources {
             mem: s.mem.clone(),
             imms: s.imm.clone(),
             tables,
+            range_tables,
         }
+    }
+
+    /// Whether the shared unified store holds a range tombstone. `false` — and
+    /// free — for a family not in unified mode.
+    #[inline]
+    fn unified_has_ranges(&self) -> bool {
+        self.ctx.unified.as_ref().is_some_and(|u| u.has_ranges())
+    }
+
+    /// Greatest range-delete sequence at or below `read_seq` covering
+    /// `user_key`, across every source of this read.
+    ///
+    /// Max-over-sources, not a heap: only the greatest sequence decides whether
+    /// the point version survives, so there is nothing to order. Returns
+    /// `None` immediately when no source carries a fragment.
+    fn covering_range_seq(
+        &self,
+        sources: &PointReadSources,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Result<Option<u64>> {
+        if !sources.has_ranges() && !self.unified_has_ranges() {
+            return Ok(None);
+        }
+        let mut best: Option<u64> = None;
+        let mut take = |seq: Option<u64>| {
+            if let Some(s) = seq {
+                best = Some(best.map_or(s, |b: u64| b.max(s)));
+            }
+        };
+        if let Some(u) = &self.ctx.unified {
+            take(u.covering_seq(self.id, user_key, read_seq));
+        }
+        take(sources.mem.ranges().covering_seq(user_key, read_seq));
+        for imm in &sources.imms {
+            take(imm.mem.ranges().covering_seq(user_key, read_seq));
+        }
+        for th in sources.tables.iter().chain(sources.range_tables.iter()) {
+            if !th.meta.has_ranges() {
+                continue;
+            }
+            take(th.reader()?.covering_seq(user_key, read_seq));
+        }
+        Ok(best)
     }
 
     fn consider_sstables(
@@ -1189,6 +1432,7 @@ impl ColumnFamily {
             candidate.consider_memtable(imm.mem.get(user_key, read_seq, now));
         }
         self.consider_sstables(&mut candidate, &sources.tables, user_key, read_seq, now)?;
+        candidate.mask(self.covering_range_seq(&sources, user_key, read_seq)?);
         candidate.finish()
     }
 
@@ -1205,15 +1449,22 @@ impl ColumnFamily {
 
         // L0 is unsorted and overlapping: every table is a candidate for every
         // key in its range, and the stored order is newest-first.
+        let mut range_tables: BatchTables = SmallVec::new();
         for th in &s.levels[0] {
             let mut idxs: SmallVec<[usize; 8]> = SmallVec::new();
+            let mut range_idxs: SmallVec<[usize; 8]> = SmallVec::new();
             for (i, key) in keys.iter().enumerate() {
                 if Self::key_in_range(th, &self.cmp, key) {
                     idxs.push(i);
+                } else if th.meta.has_ranges() && th.meta.span_contains(&self.cmp, key) {
+                    range_idxs.push(i);
                 }
             }
             if !idxs.is_empty() {
                 tables.push((th.clone(), idxs));
+            }
+            if !range_idxs.is_empty() {
+                range_tables.push((th.clone(), range_idxs));
             }
         }
 
@@ -1227,21 +1478,21 @@ impl ColumnFamily {
                 continue;
             }
             hits.clear();
+            let mut gaps: SmallVec<[(usize, usize); 16]> = SmallVec::new();
             for (i, key) in keys.iter().enumerate() {
-                if let Some(t) = Self::find_overlapping(lvl, &self.cmp, key) {
+                let (hit, lo) = Self::find_overlapping_at(lvl, &self.cmp, key);
+                if let Some(t) = hit {
                     hits.push((t, i));
+                }
+                if let Some(g) = Self::gap_owner(lvl, &self.cmp, key, hit, lo) {
+                    gaps.push((g, i));
                 }
             }
             hits.sort_unstable();
-            let mut pos = 0;
-            while pos < hits.len() {
-                let t = hits[pos].0;
-                let mut idxs: SmallVec<[usize; 8]> = SmallVec::new();
-                while pos < hits.len() && hits[pos].0 == t {
-                    idxs.push(hits[pos].1);
-                    pos += 1;
-                }
-                tables.push((lvl[t].clone(), idxs));
+            group_level_hits(&mut tables, lvl, &hits);
+            if !gaps.is_empty() {
+                gaps.sort_unstable();
+                group_level_hits(&mut range_tables, lvl, &gaps);
             }
         }
 
@@ -1249,6 +1500,78 @@ impl ColumnFamily {
             mem: s.mem.clone(),
             imms: s.imm.clone(),
             tables,
+            range_tables,
+        }
+    }
+
+    /// Greatest range-delete sequence covering each key of the batch, or
+    /// `None` for the whole batch when no source carries a fragment.
+    ///
+    /// Shaped like the point pass: one reader opened per candidate table,
+    /// then every key that table covers answered from it.
+    fn batch_covering_range_seqs(
+        &self,
+        sources: &BatchReadSources,
+        keys: &[&[u8]],
+        read_seq: u64,
+        cands: &mut [PointReadCandidate],
+        errs: &mut [Option<OndaError>],
+    ) {
+        let any = !sources.range_tables.is_empty()
+            || !sources.mem.ranges().is_empty()
+            || sources.imms.iter().any(|i| !i.mem.ranges().is_empty())
+            || sources.tables.iter().any(|(t, _)| t.meta.has_ranges())
+            || self.unified_has_ranges();
+        if !any {
+            return;
+        }
+        let mut covering: Vec<Option<u64>> = vec![None; keys.len()];
+        let take = |cover: &mut Vec<Option<u64>>, i: usize, seq: Option<u64>| {
+            if let Some(s) = seq {
+                cover[i] = Some(cover[i].map_or(s, |b: u64| b.max(s)));
+            }
+        };
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(u) = &self.ctx.unified {
+                take(&mut covering, i, u.covering_seq(self.id, key, read_seq));
+            }
+            take(
+                &mut covering,
+                i,
+                sources.mem.ranges().covering_seq(key, read_seq),
+            );
+            for imm in &sources.imms {
+                take(
+                    &mut covering,
+                    i,
+                    imm.mem.ranges().covering_seq(key, read_seq),
+                );
+            }
+        }
+        for (th, idxs) in sources.tables.iter().chain(sources.range_tables.iter()) {
+            if !th.meta.has_ranges() {
+                continue;
+            }
+            match th.reader() {
+                Ok(rd) => {
+                    for &i in idxs.iter() {
+                        take(&mut covering, i, rd.covering_seq(keys[i], read_seq));
+                    }
+                }
+                // A fragment source that cannot be opened is a source that
+                // might have deleted the key: failing the affected results is
+                // the only answer that is not a short answer looking complete.
+                Err(e) => {
+                    for &i in idxs.iter() {
+                        if errs[i].is_none() {
+                            errs[i] = Some(e.duplicate());
+                        }
+                    }
+                }
+            }
+        }
+        for (c, seq) in cands.iter_mut().zip(covering) {
+            c.mask(seq);
         }
     }
 
@@ -1415,6 +1738,7 @@ impl ColumnFamily {
             }
         }
 
+        self.batch_covering_range_seqs(&sources, keys, read_seq, &mut cands, &mut errs);
         let mut scratch: SmallVec<[(usize, usize); 16]> = SmallVec::new();
         for (th, idxs) in &sources.tables {
             match th.reader() {
@@ -1615,6 +1939,79 @@ impl ColumnFamily {
         Ok(children)
     }
 
+    /// Collect the range-delete coverage a scan over `bounds` must honor.
+    ///
+    /// Every source that could hide a key inside the bounds contributes its
+    /// fragments, **owned**: the cursors outlive any pinned data block, so
+    /// invariant 8's key/value pin lifetimes are untouched.
+    ///
+    /// A table is consulted whenever its fragment span reaches into the
+    /// bounds, which is a wider test than the point-bounds pruning
+    /// `iterator_children` uses — a table whose points sort entirely below the
+    /// scan can still own a fragment that reaches into it (the gap-owner rule,
+    /// in its scan form).
+    fn iterator_range_mask(
+        &self,
+        state: &CfState,
+        extra: Option<&Arc<Memtable>>,
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> Result<crate::range_tombstone::RangeMask> {
+        let mut mask = crate::range_tombstone::RangeMask::default();
+        // Fragmentation clips to a half-open interval, so an inclusive upper
+        // bound has to be widened to "everything at or below it" — which is
+        // what `None` means here. Over-wide is harmless: a fragment outside the
+        // bounds is never consulted, because the iterator stops at them.
+        let lower = match bounds.0 {
+            Bound::Unbounded => None,
+            Bound::Included(k) | Bound::Excluded(k) => Some(k),
+        };
+        let upper = match bounds.1 {
+            Bound::Included(_) | Bound::Unbounded => None,
+            Bound::Excluded(k) => Some(k),
+        };
+        if let Some(extra) = extra {
+            if !extra.ranges().is_empty() {
+                mask.push(extra.ranges().fragments(lower, upper).collect());
+            }
+        }
+        if let Some(u) = &self.ctx.unified {
+            if u.has_ranges() {
+                mask.push(u.fragments_for(self.id, lower, upper));
+            }
+        }
+        for mem in std::iter::once(&state.mem).chain(state.imm.iter().map(|i| &i.mem)) {
+            if !mem.ranges().is_empty() {
+                mask.push(mem.ranges().fragments(lower, upper).collect());
+            }
+        }
+        for level in state.levels.iter() {
+            for th in level {
+                if !th.meta.has_ranges() || !self.span_in_bounds(&th.meta, bounds) {
+                    continue;
+                }
+                mask.push(th.reader()?.range_fragments().to_vec());
+            }
+        }
+        Ok(mask)
+    }
+
+    /// Does this table's **span** (points plus fragments) reach into `bounds`?
+    fn span_in_bounds(&self, meta: &SstMeta, bounds: &(Bound<&[u8]>, Bound<&[u8]>)) -> bool {
+        let cmp = &self.cmp;
+        let (lo, hi) = (meta.span_min(cmp), meta.span_max(cmp));
+        let above_lower = match bounds.0 {
+            Bound::Unbounded => true,
+            Bound::Included(l) => cmp.compare(hi, l).is_ge(),
+            Bound::Excluded(l) => cmp.compare(hi, l).is_gt(),
+        };
+        let below_upper = match bounds.1 {
+            Bound::Unbounded => true,
+            Bound::Included(u) => cmp.compare(lo, u).is_le(),
+            Bound::Excluded(u) => cmp.compare(lo, u).is_lt(),
+        };
+        above_lower && below_upper
+    }
+
     /// Build a snapshot iterator. `extra` is an optional transaction overlay
     /// memtable consulted as the newest source. `bounds` are the caller's
     /// declared key bounds: SSTables whose `[min_key, max_key]` lies entirely
@@ -1627,6 +2024,13 @@ impl ColumnFamily {
         bounds: (Bound<&[u8]>, Bound<&[u8]>),
     ) -> Iterator {
         let s = self.state.read();
+        // The mask is built from the SAME state snapshot as the children, so a
+        // flush landing mid-construction cannot leave a scan reading points
+        // whose covering fragments it never collected.
+        let mask = match self.iterator_range_mask(&s, extra.as_ref(), &bounds) {
+            Ok(mask) => mask,
+            Err(error) => return Iterator::failed(self.cmp.clone(), error),
+        };
         let children = match self.iterator_children(&s, extra, &bounds) {
             Ok(children) => children,
             // Omitting a table would return a short answer that looks
@@ -1641,7 +2045,39 @@ impl ColumnFamily {
             read_seq,
             coarse_now_nanos(),
             owned,
+            mask,
         )
+    }
+
+    /// Catalogued table metadata, level by level, in the order each level
+    /// stores it (L0 newest-first; levels below sorted by `min_key`).
+    ///
+    /// The operator-facing view of what the catalog holds — including each
+    /// table's range-tombstone summary
+    /// ([`SstMeta::range_count`](crate::manifest::SstMeta::range_count) and
+    /// friends), which is otherwise invisible from outside the engine.
+    pub fn table_metadata(&self) -> Vec<Vec<SstMeta>> {
+        let s = self.state.read();
+        s.levels
+            .iter()
+            .map(|lvl| lvl.iter().map(|th| th.meta.clone()).collect())
+            .collect()
+    }
+
+    /// Markers the database-wide committed-span index currently holds.
+    pub(crate) fn span_marker_count(&self) -> usize {
+        self.ctx.span_index.len()
+    }
+
+    /// Range deletes committed to this column family since it was opened.
+    pub(crate) fn range_deletes(&self) -> u64 {
+        self.range_deletes.load(Ordering::Relaxed)
+    }
+
+    /// Count one committed range delete.
+    #[inline]
+    pub(crate) fn note_range_delete(&self, n: u64) {
+        self.range_deletes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Snapshot the SSTable metadata for the manifest.
@@ -2137,6 +2573,21 @@ fn existing_wal_gens(dir: &str) -> Result<Vec<u64>> {
 }
 
 /// Convert a borrowed key bound to an owned one (for storage in the iterator).
+/// Collapse a sorted `(table position, key index)` list into one entry per
+/// table, preserving key order within each.
+fn group_level_hits(out: &mut BatchTables, level: &[Arc<SstHandle>], sorted: &[(usize, usize)]) {
+    let mut pos = 0;
+    while pos < sorted.len() {
+        let t = sorted[pos].0;
+        let mut idxs: SmallVec<[usize; 8]> = SmallVec::new();
+        while pos < sorted.len() && sorted[pos].0 == t {
+            idxs.push(sorted[pos].1);
+            pos += 1;
+        }
+        out.push((level[t].clone(), idxs));
+    }
+}
+
 fn bound_to_owned(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
     match b {
         Bound::Unbounded => Bound::Unbounded,

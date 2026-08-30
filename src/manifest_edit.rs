@@ -253,6 +253,16 @@ fn append_opt_str(b: &mut Vec<u8>, v: Option<&str>) {
     }
 }
 
+fn append_opt_bytes(b: &mut Vec<u8>, v: Option<&[u8]>) {
+    match v {
+        None => b.push(0),
+        Some(x) => {
+            b.push(1);
+            append_bytes(b, x);
+        }
+    }
+}
+
 fn append_opt_varint(b: &mut Vec<u8>, v: Option<i64>) {
     match v {
         None => b.push(0),
@@ -280,6 +290,16 @@ fn append_sst_meta(b: &mut Vec<u8>, m: &SstMeta) {
     append_opt_varint(b, m.max_entry_time);
     append_opt_str(b, m.object.as_deref());
     append_opt_varint(b, m.last_compaction_time);
+    // 1.2's range summary. Encoded unconditionally rather than behind a
+    // presence byte: the edit log is a private, versioned artifact of this
+    // database (unlike the manifest, which must stay VERSION-1-shaped for a
+    // legacy-only catalog), and five more fields per table cost less than a
+    // branch each would.
+    append_uvarint(b, m.range_count);
+    append_uvarint(b, m.range_min_seq);
+    append_uvarint(b, m.range_max_seq);
+    append_opt_bytes(b, m.range_min_key.as_deref());
+    append_opt_bytes(b, m.range_max_key.as_deref());
 }
 
 /// Encode one op, op code first.
@@ -472,6 +492,17 @@ impl<'a> Cur<'a> {
         }
     }
 
+    fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.bytes()?)),
+            other => Err(corrupt(format!(
+                "manifest edit: op index {}: optional-bytes tag {other} is not 0 or 1",
+                self.op_index
+            ))),
+        }
+    }
+
     fn opt_varint(&mut self) -> Result<Option<i64>> {
         match self.byte()? {
             0 => Ok(None),
@@ -503,6 +534,11 @@ impl<'a> Cur<'a> {
             max_entry_time: self.opt_varint()?,
             object: self.opt_string()?,
             last_compaction_time: self.opt_varint()?,
+            range_count: self.uvar()?,
+            range_min_seq: self.uvar()?,
+            range_max_seq: self.uvar()?,
+            range_min_key: self.opt_bytes()?,
+            range_max_key: self.opt_bytes()?,
         })
     }
 
@@ -1439,6 +1475,11 @@ mod tests {
             max_entry_time: Some(-1_700_000_000_000_000_001),
             object: Some("cf-x/deadbeef-9".into()),
             last_compaction_time: Some(-1_700_000_000_000_000_002),
+            range_count: 3,
+            range_min_seq: 11,
+            range_max_seq: 42,
+            range_min_key: Some(b"r-min".to_vec()),
+            range_max_key: Some(b"r-max".to_vec()),
         }
     }
 
@@ -1458,6 +1499,11 @@ mod tests {
             max_entry_time: None,
             object: None,
             last_compaction_time: None,
+            range_count: 0,
+            range_min_seq: 0,
+            range_max_seq: 0,
+            range_min_key: None,
+            range_max_key: None,
         }
     }
 

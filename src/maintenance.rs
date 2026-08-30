@@ -81,6 +81,20 @@ pub struct CfStats {
     pub bloom_skips: u64,
     /// SSTable probes actually issued.
     pub sst_probes: u64,
+    /// Range-delete records (1.2) committed to this family since it was
+    /// opened. Zero for every family that never calls `delete_range`.
+    pub range_deletes: u64,
+    /// Range-tombstone *fragments* across every catalogued table of this
+    /// family — the durable cost of the deletes above, after flush and
+    /// compaction have merged and clipped them.
+    pub range_fragments: u64,
+    /// Markers the database-wide committed-span index currently holds.
+    ///
+    /// A database-wide number reported per family because that is where an
+    /// operator looks: it grows with commit rate while a long-lived snapshot
+    /// holds the prune floor down, and range commits wait when it reaches
+    /// [`Options::span_index_capacity`](crate::config::Options::span_index_capacity).
+    pub span_markers: usize,
     /// Bytes by which the levels exceed their capacities — the backlog
     /// compaction still owes. Writers pace against this once it passes
     /// `soft_pending_compaction_bytes` and block at
@@ -146,6 +160,14 @@ impl ColumnFamily {
             point_reads: self.point_reads.load(std::sync::atomic::Ordering::Relaxed),
             bloom_skips: self.bloom_skips.load(std::sync::atomic::Ordering::Relaxed),
             sst_probes: self.sst_probes.load(std::sync::atomic::Ordering::Relaxed),
+            range_deletes: self.range_deletes(),
+            range_fragments: self
+                .table_metadata()
+                .iter()
+                .flatten()
+                .map(|m| m.range_count)
+                .sum(),
+            span_markers: self.span_marker_count(),
             compaction_debt: self
                 .compaction_debt
                 .load(std::sync::atomic::Ordering::Relaxed),

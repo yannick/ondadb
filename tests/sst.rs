@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ondadb::cache::{BlockCache, FileCache};
 use ondadb::comparator::default_comparator;
 use ondadb::config::Compression;
+use ondadb::range_tombstone::{decode_fragments, encode_fragments, Fragment};
 use ondadb::sst::{Reader, Writer, WriterOptions};
 use ondadb::storage::LocalStorage;
 
@@ -1420,4 +1421,180 @@ fn legacy_table_still_decodes_with_extended_support_compiled() {
         }
         assert_eq!(n, r.num_entries(), "{name}");
     }
+}
+
+// ---- range-fragment aux section (tag 1, 1.2) --------------------------------
+
+fn frag(start: &str, end: &str, seqs: &[u64]) -> Fragment {
+    Fragment {
+        start: start.as_bytes().to_vec(),
+        end: end.as_bytes().to_vec(),
+        seqs: seqs.to_vec(),
+    }
+}
+
+/// The fragments the section tests share: three disjoint intervals, one with a
+/// stack of three sequences.
+fn sample_fragments() -> Vec<Fragment> {
+    vec![
+        frag("k02", "k07", &[901, 800, 42]),
+        frag("k07", "k12", &[800]),
+        frag("k20", "k99", &[1_000_000]),
+    ]
+}
+
+fn write_with_fragments(klog: &std::path::Path, frags: Vec<Fragment>) -> ondadb::sst::FileMeta {
+    let mut w = Writer::new(klog.to_str().unwrap(), extended_opts(false, true)).unwrap();
+    for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
+        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+    }
+    w.set_range_fragments(frags);
+    w.finish().unwrap()
+}
+
+#[test]
+fn range_section_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("frag.klog");
+    let want = sample_fragments();
+    let meta = write_with_fragments(&klog, want.clone());
+
+    // The writer summarizes what it wrote, for the catalog.
+    assert_eq!(meta.range_count, 3);
+    assert_eq!(meta.range_min_seq, 42);
+    assert_eq!(meta.range_max_seq, 1_000_000);
+    assert_eq!(meta.range_min_key.as_deref(), Some(&b"k02"[..]));
+    assert_eq!(meta.range_max_key.as_deref(), Some(&b"k99"[..]));
+
+    let r = open_klog(&klog).unwrap();
+    assert_eq!(r.range_fragments(), want.as_slice());
+    // The aux handle now addresses a real block.
+    let (off, len) = r.aux_block_handle().expect("an extended table");
+    assert!(off > 0 && len > 0, "aux handle {off}/{len}");
+
+    // Coverage answers, including the exclusive end and the read-sequence walk.
+    assert_eq!(r.covering_seq(b"k01", u64::MAX), None);
+    assert_eq!(r.covering_seq(b"k02", u64::MAX), Some(901));
+    assert_eq!(r.covering_seq(b"k02", 850), Some(800));
+    assert_eq!(r.covering_seq(b"k02", 41), None);
+    assert_eq!(r.covering_seq(b"k12", u64::MAX), None, "end is exclusive");
+    assert_eq!(r.covering_seq(b"k50", u64::MAX), Some(1_000_000));
+
+    // And the point stream is untouched by the section's presence.
+    let mut it = r.iter();
+    it.seek_to_first();
+    let mut n = 0;
+    while it.valid() {
+        n += 1;
+        it.next();
+    }
+    assert_eq!(n, extended_entries().len());
+}
+
+/// The section's bytes are the interoperability contract, so they are asserted
+/// literally rather than through the round trip above.
+#[test]
+fn range_section_golden_bytes() {
+    let payload = encode_fragments(&sample_fragments());
+    // count=3 | (slen "k02" elen "k07" nseq 901 800 42) | ...
+    #[rustfmt::skip]
+    let want: Vec<u8> = vec![
+        0x03,
+        0x03, b'k', b'0', b'2', 0x03, b'k', b'0', b'7', 0x03, 0x85, 0x07, 0xA0, 0x06, 0x2A,
+        0x03, b'k', b'0', b'7', 0x03, b'k', b'1', b'2', 0x01, 0xA0, 0x06,
+        0x03, b'k', b'2', b'0', 0x03, b'k', b'9', b'9', 0x01, 0xC0, 0x84, 0x3D,
+    ];
+    assert_eq!(payload, want, "the section payload is frozen");
+    assert_eq!(decode_fragments(&payload).unwrap(), sample_fragments());
+
+    // An empty list is a valid payload, and the writer never emits a section
+    // for one — the aux handle stays zero.
+    assert_eq!(encode_fragments(&[]), vec![0x00]);
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("none.klog");
+    let meta = write_with_fragments(&klog, Vec::new());
+    assert_eq!(meta.range_count, 0);
+    assert_eq!(open_klog(&klog).unwrap().aux_block_handle(), Some((0, 0)));
+}
+
+/// The section is CRC-covered by the enclosing block frame (invariant 4), so a
+/// flipped byte inside it fails the OPEN — not a later, silently missing
+/// range delete.
+#[test]
+fn range_section_bad_crc_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("frag.klog");
+    write_with_fragments(&klog, sample_fragments());
+    let (off, len) = open_klog(&klog).unwrap().aux_block_handle().unwrap();
+
+    let mut bytes = std::fs::read(&klog).unwrap();
+    // Flip a byte inside the aux block's payload, past its frame header.
+    let at = off as usize + (len as usize / 2);
+    bytes[at] ^= 0xFF;
+    let bad = dir.path().join("bad.klog");
+    std::fs::write(&bad, &bytes).unwrap();
+    std::fs::copy(klog.with_extension("vlog"), bad.with_extension("vlog")).unwrap();
+
+    let err = open_klog(&bad).expect_err("a torn aux block must fail the open");
+    assert_eq!(err.kind(), "corruption", "{err}");
+}
+
+/// Section tags this binary does not implement fail the open as
+/// `UnsupportedFormat`: the bytes are intact and name a newer feature.
+#[test]
+fn unknown_aux_section_is_unsupported_format() {
+    use ondadb::encoding::append_uvarint;
+    let mut payload = Vec::new();
+    append_uvarint(&mut payload, 1);
+    payload.push(9); // tag 9 is not assigned
+    append_uvarint(&mut payload, 0);
+    let err = ondadb::sst::decode_aux_sections_for_test(&payload)
+        .expect_err("an unknown section tag must fail closed");
+    assert_eq!(err.kind(), "unsupported_format");
+}
+
+/// A legacy table reports no fragments and no coverage, without opening
+/// anything it would not have opened before.
+#[test]
+fn legacy_table_reports_no_fragments() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("legacy.klog");
+    let mut w = Writer::new(
+        klog.to_str().unwrap(),
+        WriterOptions {
+            extended_entries: false,
+            ..extended_opts(false, true)
+        },
+    )
+    .unwrap();
+    for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
+        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+    }
+    let meta = w.finish().unwrap();
+    assert_eq!(meta.range_count, 0);
+    let r = open_klog(&klog).unwrap();
+    assert!(r.range_fragments().is_empty());
+    assert_eq!(r.covering_seq(b"k05", u64::MAX), None);
+}
+
+/// Fragments are refused on a legacy table: the aux handle only exists on an
+/// extended one, so writing them would silently drop them.
+#[test]
+fn fragments_require_an_extended_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("legacy.klog");
+    let mut w = Writer::new(
+        klog.to_str().unwrap(),
+        WriterOptions {
+            extended_entries: false,
+            ..extended_opts(false, true)
+        },
+    )
+    .unwrap();
+    w.add(b"k01", b"v", 1, 0, false, false).unwrap();
+    w.set_range_fragments(sample_fragments());
+    let err = w
+        .finish()
+        .expect_err("a legacy table cannot carry fragments");
+    assert_eq!(err.kind(), "invalid_args");
 }

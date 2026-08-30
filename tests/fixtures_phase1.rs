@@ -28,7 +28,10 @@ use ondadb::encoding::{checksum, put_u32};
 use ondadb::manifest::{CfManifest, Manifest, SstMeta, WalLayout};
 use ondadb::sst::{Reader, Writer, WriterOptions};
 use ondadb::storage::LocalStorage;
-use ondadb::wal::{Record, ReplayRecord, Wal, ENVELOPE_SCHEMA_PER_CF, ENVELOPE_SCHEMA_UNIFIED};
+use ondadb::wal::{
+    EnvelopeRecord, RangeRef, Record, ReplayRecord, Wal, ENVELOPE_SCHEMA_PER_CF,
+    ENVELOPE_SCHEMA_UNIFIED,
+};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase1")
@@ -49,10 +52,23 @@ fn replay_fixture(dir: &Path, name: &str) -> ondadb::Result<Vec<Record>> {
     Wal::replay(&path, |rec| {
         match rec {
             ReplayRecord::Point(r) => out.push(r),
+            ReplayRecord::RangeDelete { start, end, seq } => {
+                panic!("legacy fixture yielded a range delete {start:?}..{end:?}@{seq}")
+            }
         }
         Ok(())
     })?;
     Ok(out)
+}
+
+/// The 1.2 range-delete records frozen in `wal_v2_range_schema1.bin`, mirroring
+/// `wal::tests::range_records`.
+fn range_delete_records() -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+    vec![
+        (b"alpha".to_vec(), b"omega".to_vec(), 11),
+        (b"a".to_vec(), b"b".to_vec(), 12),
+        (b"b".to_vec(), b"b\0".to_vec(), 13),
+    ]
 }
 
 // ---- generator --------------------------------------------------------------
@@ -461,6 +477,24 @@ fn regenerate_phase1b_fixtures() {
         });
         write(name, &bytes);
     }
+
+    // --- WAL range deletes (kind 5, schema 1) ---
+    let ranges = range_delete_records();
+    let bytes = wal_bytes(|w| {
+        let recs: Vec<EnvelopeRecord<'_>> = ranges
+            .iter()
+            .map(|(start, end, seq)| {
+                EnvelopeRecord::Range(RangeRef {
+                    start,
+                    end,
+                    seq: *seq,
+                })
+            })
+            .collect();
+        w.append_batch_envelope(ENVELOPE_SCHEMA_PER_CF, &recs)
+            .unwrap();
+    });
+    write("wal_v2_range_schema1.bin", &bytes);
 
     // --- manifest v2: caps and nothing else ---
     let tmp = tempfile::tempdir().unwrap();

@@ -89,6 +89,51 @@ impl Record {
 pub enum ReplayRecord {
     /// A put, delete or single-delete.
     Point(Record),
+    /// A range delete (kind 5): `[start, end)` is deleted at `seq`.
+    ///
+    /// Under [`ENVELOPE_SCHEMA_UNIFIED`] **both** bounds still carry the 8-byte
+    /// CF-id prefix, exactly as a point record's key does; the unified store
+    /// strips them at replay.
+    RangeDelete {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        seq: u64,
+    },
+}
+
+/// A range delete as the commit path hands it to the WAL: bounds borrowed from
+/// the transaction's write buffer.
+///
+/// The bounds occupy the same `a`/`b` slots a point record uses for key and
+/// value, so the exact frame-size precompute is one more arm rather than a
+/// second code path.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeRef<'a> {
+    pub start: &'a [u8],
+    pub end: &'a [u8],
+    pub seq: u64,
+}
+
+/// One record of an envelope batch.
+///
+/// A commit containing a range delete writes its **whole** batch as one
+/// envelope frame — points and ranges together — because WAL batch atomicity
+/// (invariant 3) is per frame: splitting the commit across a legacy frame and
+/// an envelope frame would let replay surface half of it.
+#[derive(Debug, Clone, Copy)]
+pub enum EnvelopeRecord<'a> {
+    Point(RecordRef<'a>),
+    Range(RangeRef<'a>),
+}
+
+impl EnvelopeRecord<'_> {
+    /// Sequence number this record commits at.
+    pub fn seq(&self) -> u64 {
+        match self {
+            EnvelopeRecord::Point(r) => r.seq,
+            EnvelopeRecord::Range(r) => r.seq,
+        }
+    }
 }
 
 /// First payload byte of an **envelope** frame (`CAP_EXTENDED_RECORDS`).
@@ -107,27 +152,66 @@ pub const ENVELOPE_SCHEMA_PER_CF: u64 = 1;
 /// detached artifact without consulting options.
 pub const ENVELOPE_SCHEMA_UNIFIED: u64 = 2;
 
+/// The point record inside `rec`, for the legacy (kind-less) frame form.
+///
+/// A range delete cannot be expressed without a kind field, so a caller that
+/// reaches here with one has mixed the two forms — a bug in this crate, not
+/// input a database can be handed. The commit path chooses the envelope form
+/// for the whole batch the moment it holds a range delete.
+fn legacy_point<'a>(rec: &EnvelopeRecord<'a>) -> RecordRef<'a> {
+    match rec {
+        EnvelopeRecord::Point(r) => *r,
+        EnvelopeRecord::Range(_) => {
+            unreachable!("a range delete requires an envelope frame (kind 5)")
+        }
+    }
+}
+
+/// Wrap a point-only batch as envelope records.
+///
+/// One small allocation per frame on a path that already builds the frame
+/// buffer; it keeps `encode_frame` single-shaped instead of generic over the
+/// record form.
+fn point_envelope<'a>(recs: &[RecordRef<'a>]) -> Vec<EnvelopeRecord<'a>> {
+    recs.iter().copied().map(EnvelopeRecord::Point).collect()
+}
+
 /// Encoded length of one envelope record, matching [`encode_envelope_record`]
 /// byte for byte.
 ///
 /// The exact frame-size precompute is not an optimization detail: growth
 /// reallocations re-copy the whole payload and dominated large-value commits
 /// (see [`Wal::append_batch`]).
-fn envelope_record_len(r: RecordRef<'_>) -> usize {
-    let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
-    let mods = if r.ttl != 0 {
-        crate::format::modifiers::HAS_TTL
-    } else {
-        0
-    };
-    uvarint_len(kind)
-        + uvarint_len(mods)
-        + uvarint_len(r.key.len() as u64)
-        + uvarint_len(r.value.len() as u64)
-        + uvarint_len(r.seq)
-        + if r.ttl != 0 { varint_len(r.ttl) } else { 0 }
-        + r.key.len()
-        + r.value.len()
+fn envelope_record_len(rec: EnvelopeRecord<'_>) -> usize {
+    match rec {
+        EnvelopeRecord::Point(r) => {
+            let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
+            let mods = if r.ttl != 0 {
+                crate::format::modifiers::HAS_TTL
+            } else {
+                0
+            };
+            uvarint_len(kind)
+                + uvarint_len(mods)
+                + uvarint_len(r.key.len() as u64)
+                + uvarint_len(r.value.len() as u64)
+                + uvarint_len(r.seq)
+                + if r.ttl != 0 { varint_len(r.ttl) } else { 0 }
+                + r.key.len()
+                + r.value.len()
+        }
+        // Kind 5 carries no value and no modifiers: the `a`/`b` slots hold the
+        // two bounds, so its shape is the point one with the TTL removed.
+        EnvelopeRecord::Range(r) => {
+            uvarint_len(crate::format::KIND_RANGE_DELETE)
+                + uvarint_len(0)
+                + uvarint_len(r.start.len() as u64)
+                + uvarint_len(r.end.len() as u64)
+                + uvarint_len(r.seq)
+                + r.start.len()
+                + r.end.len()
+        }
+    }
 }
 
 /// Append one envelope record to `dst`.
@@ -136,24 +220,37 @@ fn envelope_record_len(r: RecordRef<'_>) -> usize {
 /// a, b`), so the size precompute above stays a one-line variation on the
 /// legacy one. The `a`/`b` slots are named generically because kind 5 (1.2)
 /// puts a range's `(start, end)` in them rather than `(key, value)`.
-fn encode_envelope_record(dst: &mut Vec<u8>, r: RecordRef<'_>) {
-    crate::format::debug_check_entry_flags(r.tombstone, r.single_delete, false);
-    let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
-    let mods = if r.ttl != 0 {
-        crate::format::modifiers::HAS_TTL
-    } else {
-        0
-    };
-    append_uvarint(dst, kind);
-    append_uvarint(dst, mods);
-    append_uvarint(dst, r.key.len() as u64);
-    append_uvarint(dst, r.value.len() as u64);
-    append_uvarint(dst, r.seq);
-    if r.ttl != 0 {
-        append_varint(dst, r.ttl);
+fn encode_envelope_record(dst: &mut Vec<u8>, rec: EnvelopeRecord<'_>) {
+    match rec {
+        EnvelopeRecord::Point(r) => {
+            crate::format::debug_check_entry_flags(r.tombstone, r.single_delete, false);
+            let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
+            let mods = if r.ttl != 0 {
+                crate::format::modifiers::HAS_TTL
+            } else {
+                0
+            };
+            append_uvarint(dst, kind);
+            append_uvarint(dst, mods);
+            append_uvarint(dst, r.key.len() as u64);
+            append_uvarint(dst, r.value.len() as u64);
+            append_uvarint(dst, r.seq);
+            if r.ttl != 0 {
+                append_varint(dst, r.ttl);
+            }
+            dst.extend_from_slice(r.key);
+            dst.extend_from_slice(r.value);
+        }
+        EnvelopeRecord::Range(r) => {
+            append_uvarint(dst, crate::format::KIND_RANGE_DELETE);
+            append_uvarint(dst, 0); // no modifiers: a range delete has no TTL
+            append_uvarint(dst, r.start.len() as u64);
+            append_uvarint(dst, r.end.len() as u64);
+            append_uvarint(dst, r.seq);
+            dst.extend_from_slice(r.start);
+            dst.extend_from_slice(r.end);
+        }
     }
-    dst.extend_from_slice(r.key);
-    dst.extend_from_slice(r.value);
 }
 
 /// Decode one envelope record from the front of `p`, returning it and the bytes
@@ -189,6 +286,30 @@ fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
     let need = alen.checked_add(blen).ok_or_else(corrupt)?;
     if p.len() - off < need {
         return Err(corrupt());
+    }
+    if kind == crate::format::KIND_RANGE_DELETE {
+        // No value to separate and no TTL, so any modifier here is bytes no
+        // writer produces.
+        if mods != 0 {
+            return Err(OndaError::Corruption(
+                "wal: range-delete record carries modifiers".into(),
+            ));
+        }
+        // Empty bounds are refused at the API: an empty `end` would delete
+        // nothing, and an empty `start` is indistinguishable from "absent".
+        if alen == 0 || blen == 0 {
+            return Err(OndaError::Corruption(
+                "wal: range-delete record has an empty bound".into(),
+            ));
+        }
+        return Ok((
+            ReplayRecord::RangeDelete {
+                start: p[off..off + alen].to_vec(),
+                end: p[off + alen..off + need].to_vec(),
+                seq,
+            },
+            off + need,
+        ));
     }
     let rec = Record {
         key: p[off..off + alen].to_vec(),
@@ -296,11 +417,14 @@ fn decode_record(p: &[u8]) -> Result<(Record, usize)> {
 ///
 /// Kept beside [`encode_frame`] because the two must agree exactly: growth
 /// reallocations re-copy the whole payload and dominated large-value commits.
-fn frame_payload_len(schema: Option<u64>, recs: &[RecordRef<'_>]) -> usize {
+fn frame_payload_len(schema: Option<u64>, recs: &[EnvelopeRecord<'_>]) -> usize {
     match schema {
+        // The legacy stream has no record kind, so it can only carry points;
+        // `encode_frame` panics on a range record here for the same reason.
         None => recs
             .iter()
-            .map(|r| {
+            .map(|rec| {
+                let r = legacy_point(rec);
                 1 + uvarint_len(r.key.len() as u64)
                     + uvarint_len(r.value.len() as u64)
                     + uvarint_len(r.seq)
@@ -323,14 +447,14 @@ fn frame_payload_len(schema: Option<u64>, recs: &[RecordRef<'_>]) -> usize {
 /// `Some(schema)` an envelope. (A lock-free pwrite append was tried on the
 /// write side and reverted: on macOS/APFS positional writes to one file
 /// serialize in the kernel anyway and lose the O_APPEND fast path.)
-fn encode_frame(schema: Option<u64>, recs: &[RecordRef<'_>]) -> Vec<u8> {
+fn encode_frame(schema: Option<u64>, recs: &[EnvelopeRecord<'_>]) -> Vec<u8> {
     let body = frame_payload_len(schema, recs);
     let mut buf = Vec::with_capacity(HEADER_SIZE + body);
     buf.extend_from_slice(&[0u8; HEADER_SIZE]);
     match schema {
         None => {
             for r in recs {
-                encode_record_body(&mut buf, *r);
+                encode_record_body(&mut buf, legacy_point(r));
             }
         }
         Some(schema) => {
@@ -519,7 +643,8 @@ impl Wal {
     /// thread): a single header + CRC per commit, and the whole batch replays
     /// atomically — a torn tail can never resurrect half a transaction.
     pub fn append_batch(&self, recs: &[RecordRef<'_>]) -> Result<()> {
-        self.submit_frame(encode_frame(None, recs))
+        let recs = point_envelope(recs);
+        self.submit_frame(encode_frame(None, &recs))
     }
 
     /// Like [`append_batch`](Self::append_batch), but writes the batch as an
@@ -532,6 +657,12 @@ impl Wal {
     /// decision, never a per-frame one. Replay accepts both forms forever, so
     /// a WAL written across an enable replays whole.
     pub fn append_batch_enveloped(&self, schema: u64, recs: &[RecordRef<'_>]) -> Result<()> {
+        self.append_batch_envelope(schema, &point_envelope(recs))
+    }
+
+    /// [`append_batch_enveloped`](Self::append_batch_enveloped) for a batch
+    /// that mixes point writes and range deletes (1.2).
+    pub fn append_batch_envelope(&self, schema: u64, recs: &[EnvelopeRecord<'_>]) -> Result<()> {
         self.submit_frame(encode_frame(Some(schema), recs))
     }
 
@@ -726,8 +857,12 @@ impl Wal {
             // what is already there.
             if payload.first() == Some(&ENVELOPE_TAG) {
                 let seq = decode_envelope(&payload, |rec| {
+                    // `last_seq` accounting covers range records too: a WAL
+                    // whose newest record is a range delete must still restore
+                    // the sequence it committed at.
                     let seq = match &rec {
                         ReplayRecord::Point(r) => r.seq,
+                        ReplayRecord::RangeDelete { seq, .. } => *seq,
                     };
                     f(rec)?;
                     Ok(seq)
@@ -909,8 +1044,7 @@ mod tests {
         std::fs::copy(crate::util::phase1_fixture(name), &path).unwrap();
         let mut got = Vec::new();
         let res = Wal::replay(&path, |r| {
-            let ReplayRecord::Point(r) = r;
-            got.push(r);
+            got.push(point(r));
             Ok(())
         })
         .map(|last| (got, last));
@@ -1019,11 +1153,30 @@ mod tests {
         ]
     }
 
+    /// The point record inside a replayed record; panics on a range delete, so
+    /// a test that accidentally produces one fails loudly instead of silently
+    /// dropping it.
+    fn point(rec: ReplayRecord) -> Record {
+        match rec {
+            ReplayRecord::Point(r) => r,
+            ReplayRecord::RangeDelete { start, end, seq } => {
+                panic!("unexpected range delete {start:?}..{end:?}@{seq}")
+            }
+        }
+    }
+
+    /// Point records as envelope records.
+    fn env(recs: &[Record]) -> Vec<EnvelopeRecord<'_>> {
+        recs.iter()
+            .map(|r| EnvelopeRecord::Point(r.as_ref()))
+            .collect()
+    }
+
     /// Decode a hand-built envelope payload into its records.
     fn decode_envelope_payload(payload: &[u8]) -> Result<Vec<Record>> {
         let mut out = Vec::new();
         decode_envelope(payload, |rec| {
-            let ReplayRecord::Point(r) = rec;
+            let r = point(rec);
             let seq = r.seq;
             out.push(r);
             Ok(seq)
@@ -1031,10 +1184,23 @@ mod tests {
         Ok(out)
     }
 
+    /// Decode a hand-built envelope payload into replay records of any kind.
+    fn decode_envelope_any(payload: &[u8]) -> Result<Vec<ReplayRecord>> {
+        let mut out = Vec::new();
+        decode_envelope(payload, |rec| {
+            let seq = match &rec {
+                ReplayRecord::Point(r) => r.seq,
+                ReplayRecord::RangeDelete { seq, .. } => *seq,
+            };
+            out.push(rec);
+            Ok(seq)
+        })?;
+        Ok(out)
+    }
+
     /// One envelope frame's payload, as `append_batch_enveloped` would write it.
     fn envelope_payload(schema: u64, recs: &[Record]) -> Vec<u8> {
-        let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
-        encode_frame(Some(schema), &refs)[HEADER_SIZE..].to_vec()
+        encode_frame(Some(schema), &env(recs))[HEADER_SIZE..].to_vec()
     }
 
     #[test]
@@ -1093,8 +1259,7 @@ mod tests {
         }
         let mut keys = Vec::new();
         let last = Wal::replay(&path, |r| {
-            let ReplayRecord::Point(r) = r;
-            keys.push(String::from_utf8(r.key).unwrap());
+            keys.push(String::from_utf8(point(r).key).unwrap());
             Ok(())
         })
         .unwrap();
@@ -1123,14 +1288,156 @@ mod tests {
         b
     }
 
-    /// Kind 5 is assigned (1.2's range delete) but not implemented here: the
+    /// Kind 4 is assigned (1.1's merge operand) but not implemented here: the
     /// bytes are intact and name a real feature, so this binary is the one at
-    /// fault.
+    /// fault. (Kind 5 *is* implemented as of 1.2 — see
+    /// `range_record_round_trips`.)
     #[test]
     fn envelope_unknown_kind_is_unsupported_format() {
-        let p = envelope_with_body(&envelope_body(crate::format::KIND_RANGE_DELETE, 0));
-        let err = decode_envelope_payload(&p).expect_err("kind 5 is not implemented here");
+        let p = envelope_with_body(&envelope_body(crate::format::KIND_MERGE, 0));
+        let err = decode_envelope_payload(&p).expect_err("kind 4 is not implemented here");
         assert_eq!(err.kind(), "unsupported_format");
+    }
+
+    // ---- range deletes (kind 5, 1.2) ---------------------------------------
+
+    /// The three range records the schema-1 fixture and the round-trip test
+    /// share: a plain span, a one-byte-bound span, and a span whose bounds sort
+    /// adjacent (`b`/`b\0`) — the tightest non-empty interval there is.
+    fn range_records() -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+        vec![
+            (b"alpha".to_vec(), b"omega".to_vec(), 11),
+            (b"a".to_vec(), b"b".to_vec(), 12),
+            (b"b".to_vec(), b"b\0".to_vec(), 13),
+        ]
+    }
+
+    fn range_envelope(recs: &[(Vec<u8>, Vec<u8>, u64)]) -> Vec<EnvelopeRecord<'_>> {
+        recs.iter()
+            .map(|(start, end, seq)| {
+                EnvelopeRecord::Range(RangeRef {
+                    start,
+                    end,
+                    seq: *seq,
+                })
+            })
+            .collect()
+    }
+
+    /// Kind 5 uses the same `a`/`b` slots a put uses for key and value, so the
+    /// exact frame-size precompute needs no special case — assert that as well
+    /// as the round trip.
+    #[test]
+    fn range_record_round_trips() {
+        let want = range_records();
+        let recs = range_envelope(&want);
+        for schema in [ENVELOPE_SCHEMA_PER_CF, ENVELOPE_SCHEMA_UNIFIED] {
+            let predicted = frame_payload_len(Some(schema), &recs);
+            let frame = encode_frame(Some(schema), &recs);
+            assert_eq!(frame.len(), HEADER_SIZE + predicted, "size precompute");
+            let got = decode_envelope_any(&frame[HEADER_SIZE..]).unwrap();
+            assert_eq!(got.len(), want.len());
+            for (g, (s, e, q)) in got.iter().zip(&want) {
+                match g {
+                    ReplayRecord::RangeDelete { start, end, seq } => {
+                        assert_eq!(start, s);
+                        assert_eq!(end, e);
+                        assert_eq!(seq, q);
+                    }
+                    other => panic!("expected a range delete, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// One frame may mix point writes and range deletes: a commit that does
+    /// both must replay atomically, which is only true if it is ONE frame.
+    #[test]
+    fn range_and_point_records_share_one_frame() {
+        let points = envelope_point_records();
+        let ranges = range_records();
+        let mut recs = env(&points);
+        recs.extend(range_envelope(&ranges));
+        let frame = encode_frame(Some(ENVELOPE_SCHEMA_PER_CF), &recs);
+        let got = decode_envelope_any(&frame[HEADER_SIZE..]).unwrap();
+        assert_eq!(got.len(), points.len() + ranges.len());
+        assert!(matches!(got[0], ReplayRecord::Point(_)));
+        assert!(matches!(
+            got[points.len()],
+            ReplayRecord::RangeDelete { .. }
+        ));
+    }
+
+    /// The committed schema-1 range fixture pins the wire bytes.
+    #[test]
+    fn range_record_golden_bytes() {
+        let bytes = std::fs::read(crate::util::phase1_fixture("wal_v2_range_schema1.bin")).unwrap();
+        let recs = range_records();
+        assert_eq!(
+            encode_frame(ENVELOPE_SCHEMA_PER_CF.into(), &range_envelope(&recs)),
+            bytes
+        );
+        let got = decode_envelope_any(&bytes[HEADER_SIZE..]).unwrap();
+        assert_eq!(got.len(), recs.len());
+    }
+
+    /// A range record carrying a modifier, or an empty bound, is bytes no
+    /// writer produces — `Corruption`, not a newer format.
+    #[test]
+    fn range_record_rejects_modifiers_and_empty_bounds() {
+        let p = envelope_with_body(&envelope_body(crate::format::KIND_RANGE_DELETE, 0x02));
+        assert_eq!(
+            decode_envelope_any(&p).unwrap_err().kind(),
+            "corruption",
+            "a range delete has no TTL"
+        );
+        // `envelope_body` writes alen = blen = 0.
+        let p = envelope_with_body(&envelope_body(crate::format::KIND_RANGE_DELETE, 0));
+        assert_eq!(decode_envelope_any(&p).unwrap_err().kind(), "corruption");
+    }
+
+    /// A torn frame containing a range record is dropped whole, exactly as a
+    /// torn point frame is: the frame CRC covers the payload (invariant 3), so
+    /// replay ends cleanly at the tear rather than surfacing half a commit.
+    #[test]
+    fn range_torn_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        {
+            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            wal.append(rec("kept", "v", 1)).unwrap();
+            let ranges = range_records();
+            wal.append_batch_envelope(ENVELOPE_SCHEMA_PER_CF, &range_envelope(&ranges))
+                .unwrap();
+        }
+        // Truncate into the middle of the range frame's payload. Which stripe
+        // file the two appends landed in is thread-dependent, so tear the one
+        // that actually holds them.
+        let stripe = (0..WAL_STRIPES)
+            .map(|k| stripe_path(&path, k))
+            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+            .expect("one stripe holds the appends");
+        let full = std::fs::metadata(&stripe).unwrap().len();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stripe)
+            .unwrap();
+        f.set_len(full - 4).unwrap();
+        drop(f);
+
+        let mut points = Vec::new();
+        let mut ranges = 0usize;
+        let last = Wal::replay(&path, |rec| {
+            match rec {
+                ReplayRecord::Point(r) => points.push(r.seq),
+                ReplayRecord::RangeDelete { .. } => ranges += 1,
+            }
+            Ok(())
+        })
+        .expect("a torn tail must not fail replay");
+        assert_eq!(points, vec![1], "the intact frame still replays");
+        assert_eq!(ranges, 0, "the torn frame is dropped WHOLE");
+        assert_eq!(last, 1);
     }
 
     /// Kinds above 63 are never assigned to anything, so they cannot have come
@@ -1183,7 +1490,7 @@ mod tests {
     #[test]
     fn envelope_frame_size_precompute_is_exact() {
         let recs = envelope_point_records();
-        let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+        let refs = env(&recs);
         for schema in [
             None,
             Some(ENVELOPE_SCHEMA_PER_CF),
@@ -1235,8 +1542,7 @@ mod tests {
             }),
         ] {
             let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
-            let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
-            assert_eq!(encode_frame(Some(schema), &refs), bytes, "{name}");
+            assert_eq!(encode_frame(Some(schema), &env(&recs)), bytes, "{name}");
             // And the committed bytes decode back to the same records.
             let got = decode_envelope_payload(&bytes[HEADER_SIZE..]).unwrap();
             assert_eq!(got.len(), recs.len(), "{name}");
@@ -1269,7 +1575,7 @@ mod tests {
                     case.push(ENVELOPE_TAG);
                 }
                 case[0] = ENVELOPE_TAG;
-                let _ = decode_envelope_payload(&case);
+                let _ = decode_envelope_any(&case);
             }
         }
     }
@@ -1349,7 +1655,7 @@ mod tests {
         let mut seen = vec![false; total + 1];
         let mut count = 0usize;
         let last = Wal::replay(&path, |rec| {
-            let ReplayRecord::Point(r) = rec;
+            let r = point(rec);
             assert!(!seen[r.seq as usize], "duplicate seq {}", r.seq);
             seen[r.seq as usize] = true;
             count += 1;
@@ -1381,7 +1687,7 @@ mod tests {
         }
         let mut got = Vec::new();
         let last = Wal::replay(&path, |rec| {
-            let ReplayRecord::Point(r) = rec;
+            let r = point(rec);
             got.push((String::from_utf8(r.key).unwrap(), r.seq));
             Ok(())
         })
@@ -1416,7 +1722,7 @@ mod tests {
         }
         let mut recs = Vec::new();
         Wal::replay(&path, |rec| {
-            let ReplayRecord::Point(r) = rec;
+            let r = point(rec);
             recs.push(r);
             Ok(())
         })
@@ -1473,7 +1779,7 @@ mod tests {
         }
         let mut keys = Vec::new();
         Wal::replay(&path, |rec| {
-            let ReplayRecord::Point(r) = rec;
+            let r = point(rec);
             keys.push(r.key);
             Ok(())
         })

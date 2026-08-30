@@ -226,8 +226,18 @@ impl UnifiedStore {
             let p = wal_path(dir, *g);
             replay_paths.push(p.clone());
             let last = Wal::replay(&p, |rec| {
-                let crate::wal::ReplayRecord::Point(r) = rec;
-                mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+                match rec {
+                    crate::wal::ReplayRecord::Point(r) => {
+                        mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+                    }
+                    // Schema 2: both bounds carry the 8-byte cf-id prefix and
+                    // are stored prefixed, exactly as point keys are — the
+                    // unified memtable is keyed that way end to end, so
+                    // nothing is stripped here.
+                    crate::wal::ReplayRecord::RangeDelete { start, end, seq } => {
+                        mem.add_range(&start, &end, seq);
+                    }
+                }
                 Ok(())
             })?;
             max_seq = max_seq.max(last);
@@ -284,7 +294,17 @@ impl UnifiedStore {
 
     /// Apply a committed batch (records carry their CF id) to the WAL + memtable.
     /// Records borrow the transaction's buffer.
-    pub(crate) fn apply(self: &Arc<Self>, items: &[(u64, wal::RecordRef<'_>)]) -> Result<()> {
+    ///
+    /// Under schema 2 **both** bounds carry the 8-byte big-endian cf-id prefix,
+    /// exactly as point keys do. A span can never cross a cf-id boundary — both
+    /// bounds come from one `delete_range` call on one column family, so they
+    /// share a prefix by construction — and that is asserted at encode rather
+    /// than assumed, because a crossing span would delete another family's keys.
+    pub(crate) fn apply_with_ranges(
+        self: &Arc<Self>,
+        items: &[(u64, wal::RecordRef<'_>)],
+        ranges: &[(u64, wal::RangeRef<'_>)],
+    ) -> Result<()> {
         {
             let mut g = self.rot.lock();
             loop {
@@ -323,10 +343,56 @@ impl UnifiedStore {
                 });
                 start = end;
             }
+            // Range bounds are prefixed in their own scratch buffer, so the
+            // point scratch above keeps its exact-size single allocation.
+            let range_total: usize = ranges
+                .iter()
+                .map(|(_, r)| 16 + r.start.len() + r.end.len())
+                .sum();
+            let mut rscratch = Vec::with_capacity(range_total);
+            let mut rends = Vec::with_capacity(ranges.len() * 2);
+            for (id, r) in ranges {
+                let prefix = id.to_be_bytes();
+                rscratch.extend_from_slice(&prefix);
+                rscratch.extend_from_slice(r.start);
+                rends.push(rscratch.len());
+                rscratch.extend_from_slice(&prefix);
+                rscratch.extend_from_slice(r.end);
+                rends.push(rscratch.len());
+            }
+            let mut prefixed = Vec::with_capacity(ranges.len());
+            let mut start = 0usize;
+            for ((_, r), pair) in ranges.iter().zip(rends.chunks(2)) {
+                let (mid, end) = (pair[0], pair[1]);
+                let range = wal::RangeRef {
+                    start: &rscratch[start..mid],
+                    end: &rscratch[mid..end],
+                    seq: r.seq,
+                };
+                debug_assert_eq!(
+                    range.start[..8],
+                    range.end[..8],
+                    "a range delete may never cross a cf-id prefix"
+                );
+                prefixed.push(range);
+                start = end;
+            }
+
             if let Some(w) = &wal {
-                w.append_batch(&recs)?;
+                if prefixed.is_empty() {
+                    w.append_batch(&recs)?;
+                } else {
+                    let mut batch: Vec<wal::EnvelopeRecord<'_>> =
+                        Vec::with_capacity(recs.len() + prefixed.len());
+                    batch.extend(recs.iter().copied().map(wal::EnvelopeRecord::Point));
+                    batch.extend(prefixed.iter().copied().map(wal::EnvelopeRecord::Range));
+                    w.append_batch_envelope(wal::ENVELOPE_SCHEMA_UNIFIED, &batch)?;
+                }
             }
             mem.put_batch(&recs);
+            for r in &prefixed {
+                mem.add_range(r.start, r.end, r.seq);
+            }
             Ok(())
         })();
         {
@@ -356,6 +422,75 @@ impl UnifiedStore {
             }
         }
         Lookup::default()
+    }
+
+    /// Whether the shared store holds any range tombstone.
+    ///
+    /// One relaxed load per memtable — the unified half of the read path's
+    /// zero-cost gate.
+    pub(crate) fn has_ranges(&self) -> bool {
+        let s = self.state.read();
+        !s.mem.ranges().is_empty() || s.imm.iter().any(|i| !i.mem.ranges().is_empty())
+    }
+
+    /// Newest range-delete sequence at or below `read_seq` covering
+    /// `(id, user_key)` in the shared store, or `None`.
+    ///
+    /// The store's spans are keyed exactly as its point entries are — cf-id
+    /// prefix included — so one prefixed probe answers for the right family
+    /// and a span can never reach across the prefix boundary into another.
+    pub(crate) fn covering_seq(&self, id: u64, user_key: &[u8], read_seq: u64) -> Option<u64> {
+        let s = self.state.read();
+        // One relaxed load per memtable when the feature is unused.
+        if s.mem.ranges().is_empty() && s.imm.iter().all(|i| i.mem.ranges().is_empty()) {
+            return None;
+        }
+        let pk = prefixed(id, user_key);
+        let mut best = s.mem.ranges().covering_seq(&pk, read_seq);
+        for imm in &s.imm {
+            if let Some(seq) = imm.mem.ranges().covering_seq(&pk, read_seq) {
+                best = Some(best.map_or(seq, |b: u64| b.max(seq)));
+            }
+        }
+        best
+    }
+
+    /// Fragments of the shared store's spans that fall inside `[lower, upper)`
+    /// for column family `id`, with the cf-id prefix stripped.
+    ///
+    /// Used to build a scan's range mask. The bounds handed in are user keys;
+    /// the whole family's keyspace is `[id, id+1)` in prefixed order, which is
+    /// what an unbounded scan clips to.
+    pub(crate) fn fragments_for(
+        &self,
+        id: u64,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Vec<crate::range_tombstone::Fragment> {
+        let s = self.state.read();
+        let lo = prefixed(id, lower.unwrap_or_default());
+        // The exclusive top of this family's keyspace is the next cf id; a
+        // family with id `u64::MAX` has no successor, so it clips at nothing.
+        let hi = match upper {
+            Some(u) => Some(prefixed(id, u)),
+            None => id.checked_add(1).map(|next| next.to_be_bytes().to_vec()),
+        };
+        let mut out = Vec::new();
+        for mem in std::iter::once(&s.mem).chain(s.imm.iter().map(|i| &i.mem)) {
+            if mem.ranges().is_empty() {
+                continue;
+            }
+            out.extend(
+                mem.ranges()
+                    .fragments(Some(&lo), hi.as_deref())
+                    .map(|mut f| {
+                        f.start.drain(..8);
+                        f.end.drain(..8);
+                        f
+                    }),
+            );
+        }
+        out
     }
 
     /// Extract a column family's entries (prefix stripped) for an iterator
@@ -405,7 +540,9 @@ impl UnifiedStore {
             }
             {
                 let s = self.state.read();
-                if s.mem.is_empty() {
+                // Range tombstones alone are enough to rotate: they are not
+                // point entries, so `is_empty` would drop them on the floor.
+                if s.mem.is_empty_including_ranges() {
                     return;
                 }
                 if !force && s.mem.approx_size() < self.write_buffer_size as i64 {
@@ -508,6 +645,38 @@ pub(crate) fn split_by_cf(imm: &UnifiedImm) -> Vec<(u64, Vec<Entry>)> {
     groups
 }
 
+/// Split a sealed unified memtable's **range tombstones** by column-family id,
+/// already fragmented and with the 8-byte prefix stripped.
+///
+/// A span never crosses a cf-id boundary (asserted at encode), so every
+/// fragment belongs to exactly one family and the split is a partition.
+pub(crate) fn split_ranges_by_cf(
+    imm: &UnifiedImm,
+) -> Vec<(u64, Vec<crate::range_tombstone::Fragment>)> {
+    if imm.mem.ranges().is_empty() {
+        return Vec::new();
+    }
+    let mut groups: Vec<(u64, Vec<crate::range_tombstone::Fragment>)> = Vec::new();
+    for mut f in imm.mem.ranges().fragments(None, None) {
+        if f.start.len() < 8 {
+            continue;
+        }
+        let id = u64::from_be_bytes(f.start[..8].try_into().unwrap());
+        debug_assert_eq!(
+            f.start[..8],
+            f.end[..8],
+            "a range fragment may never cross a cf-id prefix"
+        );
+        f.start.drain(..8);
+        f.end.drain(..8);
+        match groups.last_mut() {
+            Some((gid, v)) if *gid == id => v.push(f),
+            _ => groups.push((id, vec![f])),
+        }
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,13 +767,15 @@ mod tests {
 
         for seq in 1..=6 {
             let key = format!("key-{seq}");
-            store.apply(&[(7, record(key.as_bytes(), seq))]).unwrap();
+            store
+                .apply_with_ranges(&[(7, record(key.as_bytes(), seq))], &[])
+                .unwrap();
         }
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let writer = store.clone();
         let join = std::thread::spawn(move || {
-            let result = writer.apply(&[(7, record(b"blocked", 7))]);
+            let result = writer.apply_with_ranges(&[(7, record(b"blocked", 7))], &[]);
             done_tx.send(result).unwrap();
         });
         assert!(

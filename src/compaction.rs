@@ -554,7 +554,16 @@ fn gather_target(
             return false;
         };
         for th in lvl {
-            if ranges_overlap(&cmp, &th.meta.min_key, &th.meta.max_key, min_key, max_key) {
+            // Span bounds on both sides: a target table whose *fragments*
+            // reach into the job must be an input, or the job's outputs would
+            // sit under a tombstone the job never saw.
+            if ranges_overlap(
+                &cmp,
+                th.meta.span_min(&cmp),
+                th.meta.span_max(&cmp),
+                min_key,
+                max_key,
+            ) {
                 if is_foreign_mount(db, &th.meta) {
                     return true;
                 }
@@ -716,12 +725,11 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
         // by the transaction, after its edit record's fsync, and only then may
         // a file be unlinked (AGENTS.md invariant 1).
         let ids: Vec<u64> = victims.iter().map(|t| t.meta.id).collect();
-        let edit = crate::manifest_edit::VersionEdit::new(vec![
-            crate::manifest_edit::Op::RemoveTables {
+        let edit =
+            crate::manifest_edit::VersionEdit::new(vec![crate::manifest_edit::Op::RemoveTables {
                 cf: cf.name().to_string(),
                 ids: ids.clone(),
-            },
-        ]);
+            }]);
         db.catalog_txn(edit, |p| cf.remove_l0_tables(&ids, p))?;
         for t in &victims {
             db.remove_sst_file(&cf.klog_path(t.meta.id), t.meta.klog_size);
@@ -920,6 +928,32 @@ struct CompactionOutputBuilder<'a> {
     #[cfg(debug_assertions)]
     finalized_boundaries: std::collections::HashSet<Vec<u8>>,
     finished: bool,
+    /// The span's retained range fragments, sorted and disjoint, before
+    /// clipping. Each output takes the slice that falls in the interval it
+    /// owns.
+    fragments: Vec<crate::range_tombstone::Fragment>,
+    /// Lower edge of the interval the current output owns; `None` means the
+    /// span's own lower edge.
+    ///
+    /// **This is the clipping rule.** Output `o_i` owns
+    /// `[o_i.min_key, o_{i+1}.min_key)`, with the first extended down to the
+    /// span's lower edge and the last up to its upper edge. The intervals are
+    /// disjoint and ordered by `min_key`, which is exactly what level->=1 point
+    /// disjointness already guarantees — so `find_overlapping`'s binary search,
+    /// `bottom_overlaps` and `insert_bottom_sorted` all stay valid. Unclipped
+    /// bounds would let two adjacent level->=1 tables both cover a key, and the
+    /// search returns at most one of them: a covering tombstone would be missed
+    /// and deleted data would resurrect.
+    interval_lower: Option<Vec<u8>>,
+    /// The span's upper edge, closing the last output's interval.
+    span_upper: Option<Vec<u8>>,
+    /// A size-triggered cut waiting for the next key.
+    ///
+    /// Deferred on purpose: an output's interval ends where the *next* output
+    /// begins, so the cut cannot be finalized until that key is in hand. Before
+    /// 1.2 the size cut closed the file immediately, which is equivalent for a
+    /// point-only table and wrong for a fragment.
+    pending_cut: bool,
 }
 
 impl<'a> CompactionOutputBuilder<'a> {
@@ -949,20 +983,48 @@ impl<'a> CompactionOutputBuilder<'a> {
             #[cfg(debug_assertions)]
             finalized_boundaries: std::collections::HashSet::new(),
             finished: false,
+            fragments: Vec::new(),
+            interval_lower: None,
+            span_upper: None,
+            pending_cut: false,
         }
     }
 
-    fn finish_current(&mut self) -> Result<()> {
+    /// Install this span's retained fragments and its upper edge.
+    fn with_fragments(
+        mut self,
+        fragments: Vec<crate::range_tombstone::Fragment>,
+        span_upper: Option<Vec<u8>>,
+    ) -> Self {
+        self.fragments = fragments;
+        self.span_upper = span_upper;
+        self
+    }
+
+    /// Close the current output, whose owned interval ends at `upper`
+    /// (`None` = the span's upper edge).
+    fn finish_current(&mut self, upper: Option<&[u8]>) -> Result<()> {
         let Some(current) = self.current.take() else {
             return Ok(());
         };
         let CurrentOutput {
-            writer,
+            mut writer,
             klog,
             id,
             partition,
             ..
         } = current;
+        if !self.fragments.is_empty() {
+            let hi = upper.or(self.span_upper.as_deref());
+            let clipped = clip_fragments(
+                self.cmp,
+                &self.fragments,
+                self.interval_lower.as_deref(),
+                hi,
+            );
+            writer.set_range_fragments(clipped);
+        }
+        self.interval_lower = upper.map(<[u8]>::to_vec);
         let file_meta = match writer.finish() {
             Ok(meta) => meta,
             Err(error) => {
@@ -972,6 +1034,14 @@ impl<'a> CompactionOutputBuilder<'a> {
             }
         };
         let mut meta = file_meta.to_sst_meta(id, self.target as u32);
+        // A table with fragments but no point entry (a span covered entirely by
+        // a range delete) has empty point bounds, which `find_overlapping`'s
+        // binary search cannot order. Give it the fragments' own bounds: it has
+        // no point versions, so being selected costs one lookup that misses.
+        if meta.num_entries == 0 && meta.range_count > 0 {
+            meta.min_key = meta.range_min_key.clone().unwrap_or_default();
+            meta.max_key = meta.range_max_key.clone().unwrap_or_default();
+        }
         meta.partition = partition;
         meta.max_entry_time = self.carry_entry_time;
         meta.last_compaction_time = self.last_compaction_time;
@@ -1045,12 +1115,16 @@ impl<'a> CompactionOutputBuilder<'a> {
     ) -> Result<()> {
         let partition = self.partitioner.as_ref().and_then(|p| p.name_of(key));
         let (cut, _boundary_changed) = self.output_boundary_change(key, &partition);
-        if cut {
+        if cut || (self.pending_cut && self.current.is_some()) {
             #[cfg(debug_assertions)]
             if _boundary_changed {
                 self.record_boundary_crossing(key);
             }
-            self.finish_current()?;
+            // This key opens the next output, so it closes the current one's
+            // interval — including the gap between the previous output's last
+            // point key and this one.
+            self.finish_current(Some(key))?;
+            self.pending_cut = false;
         }
         self.last_boundary = self
             .partitioner
@@ -1066,13 +1140,20 @@ impl<'a> CompactionOutputBuilder<'a> {
             .add(key, value, seq, ttl, tombstone, single_delete)?;
         current.bytes += (key.len() + value.len()) as u64;
         if current.bytes >= self.target_bytes {
-            self.finish_current()?;
+            // Deferred: the interval's upper edge is the next key.
+            self.pending_cut = true;
         }
         Ok(())
     }
 
     fn finish(mut self) -> Result<Vec<SstMeta>> {
-        self.finish_current()?;
+        // A span whose whole content is a range delete produces no point entry
+        // and therefore no output — but the fragments still have to land
+        // somewhere, or the delete is lost the moment its inputs are unlinked.
+        if self.current.is_none() && self.outputs.is_empty() && !self.fragments.is_empty() {
+            self.open_output(None)?;
+        }
+        self.finish_current(None)?;
         self.finished = true;
         Ok(std::mem::take(&mut self.outputs))
     }
@@ -1092,6 +1173,101 @@ impl Drop for CompactionOutputBuilder<'_> {
             let _ = std::fs::remove_file(crate::sst::vlog_path_for(&klog));
         }
     }
+}
+
+/// Every input table's fragments, exploded into one span per covering
+/// sequence.
+///
+/// Opening a reader per input is free here: the merge is about to open all of
+/// them anyway, and a table with no fragments contributes nothing but the
+/// `range_count == 0` test.
+fn collect_input_ranges(inputs: &[Arc<SstHandle>]) -> Result<Vec<crate::range_tombstone::Span>> {
+    if !inputs.iter().any(|t| t.meta.has_ranges()) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for table in inputs {
+        if !table.meta.has_ranges() {
+            continue;
+        }
+        out.extend(crate::range_tombstone::spans_of_fragments(
+            table.reader()?.range_fragments(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Which sequences of one fragment stack survive this job.
+///
+/// Mirrors [`VersionRetention`] for the point stream, and for the same reason:
+/// every sequence above `oldest_snapshot` is still needed by some live reader,
+/// and exactly one at or below it is needed to keep masking older data. That
+/// last one is dropped only at the bottom, where nothing older can resurface —
+/// and never over a foreign mount, whose bytes this database did not publish.
+fn retained_fragment_seqs(seqs: &[u64], oldest_snapshot: u64, droppable: bool) -> Vec<u64> {
+    let mut out: Vec<u64> = seqs
+        .iter()
+        .copied()
+        .filter(|s| *s > oldest_snapshot)
+        .collect();
+    if let Some(&newest_old) = seqs.iter().find(|s| **s <= oldest_snapshot) {
+        if !droppable {
+            out.push(newest_old);
+        }
+    }
+    out
+}
+
+/// Clip already-disjoint, sorted fragments to `[lower, upper)`.
+///
+/// No re-fragmentation: the input is disjoint, so intersecting each fragment
+/// with the interval preserves both properties.
+fn clip_fragments(
+    cmp: &ComparatorRef,
+    frags: &[crate::range_tombstone::Fragment],
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> Vec<crate::range_tombstone::Fragment> {
+    let mut out = Vec::new();
+    for f in frags {
+        let start = match lower {
+            Some(l) if cmp.compare(&f.start, l).is_lt() => l.to_vec(),
+            _ => f.start.clone(),
+        };
+        let end = match upper {
+            Some(u) if cmp.compare(&f.end, u).is_gt() => u.to_vec(),
+            _ => f.end.clone(),
+        };
+        if cmp.compare(&start, &end).is_ge() {
+            continue;
+        }
+        out.push(crate::range_tombstone::Fragment {
+            start,
+            end,
+            seqs: f.seqs.clone(),
+        });
+    }
+    out
+}
+
+/// A span's fragment-clipping edges as `(lower, upper)` user keys.
+///
+/// Fragmentation works on half-open intervals, so an `Excluded` upper bound is
+/// the interval's own edge and an `Included` one (or `Unbounded`) means "no
+/// clip at the top" — the job span already bounds what the inputs contributed.
+fn span_edges<'a>(
+    lower: Bound<&'a [u8]>,
+    upper: Bound<&'a [u8]>,
+) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    let lo = match lower {
+        Bound::Unbounded => None,
+        Bound::Included(k) | Bound::Excluded(k) => Some(k),
+    };
+    let hi = match upper {
+        Bound::Excluded(k) => Some(k),
+        Bound::Included(_) | Bound::Unbounded => None,
+    };
+    (lo, hi)
 }
 
 fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Option<usize> {
@@ -1139,6 +1315,16 @@ struct FrozenJob {
     /// here because it is the one piece of per-job state every span shares,
     /// and `run_span` already takes the job by reference.
     cancel: std::sync::atomic::AtomicBool,
+    /// Every range tombstone the inputs carry, exploded back into one span per
+    /// `(interval, sequence)` pair so the whole job can be re-fragmented over
+    /// its own boundaries. Empty for every job whose inputs are point-only.
+    ranges: Vec<crate::range_tombstone::Span>,
+    /// Key ranges of foreign mounts in this column family.
+    ///
+    /// A fragment overlapping one may never be dropped, however old: this
+    /// database did not publish the mounted bytes and cannot prove that
+    /// nothing under the tombstone survives there.
+    foreign_spans: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl FrozenJob {
@@ -1170,7 +1356,29 @@ impl FrozenJob {
             },
             filter: cf.compaction_filter(),
             cancel: std::sync::atomic::AtomicBool::new(false),
+            ranges: collect_input_ranges(inputs)?,
+            foreign_spans: cf.with_levels(|levels| {
+                levels
+                    .iter()
+                    .flatten()
+                    .filter(|t| is_foreign_mount(db, &t.meta))
+                    .map(|t| {
+                        let cmp = cf.cmp();
+                        (
+                            t.meta.span_min(&cmp).to_vec(),
+                            t.meta.span_max(&cmp).to_vec(),
+                        )
+                    })
+                    .collect()
+            }),
         })
+    }
+
+    /// Does a foreign mount overlap `[start, end)`?
+    fn mount_overlaps(&self, cmp: &ComparatorRef, start: &[u8], end: &[u8]) -> bool {
+        self.foreign_spans
+            .iter()
+            .any(|(lo, hi)| cmp.compare(lo, end).is_lt() && cmp.compare(start, hi).is_le())
     }
 
     fn cancelled(&self) -> bool {
@@ -1235,6 +1443,33 @@ fn run_span(
         frozen.now,
         cmp.clone(),
     );
+    // Re-fragment every input's range tombstones over THIS span's bounds, then
+    // decide what survives. Two passes over the same data:
+    //
+    //  * `covering` (pre-drop) filters the point stream — a point hidden by a
+    //    tombstone at or below `oldest_snapshot` is dropped *before*
+    //    `VersionRetention::decide` sees it, so it is never counted as "the one
+    //    version at or below the snapshot";
+    //  * `retained` is what is written back out, clipped per output.
+    let (span_lo, span_hi) = span_edges(lower, upper);
+    let covering = if frozen.ranges.is_empty() {
+        Vec::new()
+    } else {
+        crate::range_tombstone::fragment_spans(cmp, &frozen.ranges, span_lo, span_hi)
+    };
+    let retained: Vec<crate::range_tombstone::Fragment> = covering
+        .iter()
+        .filter_map(|f| {
+            let droppable = frozen.bottom && !frozen.mount_overlaps(cmp, &f.start, &f.end);
+            let seqs = retained_fragment_seqs(&f.seqs, frozen.oldest_snapshot, droppable);
+            (!seqs.is_empty()).then(|| crate::range_tombstone::Fragment {
+                start: f.start.clone(),
+                end: f.end.clone(),
+                seqs,
+            })
+        })
+        .collect();
+
     let mut outputs = CompactionOutputBuilder::new(
         db,
         cf,
@@ -1243,7 +1478,8 @@ fn run_span(
         frozen.bottom,
         frozen.carry_entry_time,
         frozen.partitioner.clone(),
-    );
+    )
+    .with_fragments(retained, span_hi.map(<[u8]>::to_vec));
     while let Some(index) = smallest_input(&iterators, cmp) {
         let (key, seq, tombstone, ttl, single_delete) = {
             let iterator = &iterators[index];
@@ -1264,6 +1500,17 @@ fn run_span(
             return Err(crate::error::OndaError::Unknown(
                 "compaction span cancelled by a failing sibling span".to_string(),
             ));
+        }
+        // Range-delete masking, ahead of `decide`. Only a tombstone at or
+        // below `oldest_snapshot` may drop a point: a newer one still has to
+        // let snapshots between the two sequences see the value, and those
+        // snapshots read the fragment, not the absence of the point.
+        if !covering.is_empty()
+            && crate::range_tombstone::covering_seq_in(cmp, &covering, &key, frozen.oldest_snapshot)
+                .is_some_and(|c| c > seq)
+        {
+            iterators[index].next();
+            continue;
         }
         if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl) {
             let value = iterators[index].value()?;
@@ -1618,42 +1865,45 @@ fn install_compaction_outputs(
 ) {
     let input_ids: std::collections::HashSet<u64> =
         inputs.iter().map(|table| table.meta.id).collect();
-    cf.update_levels(|levels| {
-        let needed = (target + 1).max(levels.len());
-        let mut updated = Vec::with_capacity(needed);
-        for index in 0..needed {
-            let mut tables: Vec<Arc<SstHandle>> = levels
-                .get(index)
-                .map(|tables| {
-                    tables
-                        .iter()
-                        .filter(|table| !input_ids.contains(&table.meta.id))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            if index == target {
-                tables.extend(new_handles.iter().cloned());
-                tables.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+    cf.update_levels(
+        |levels| {
+            let needed = (target + 1).max(levels.len());
+            let mut updated = Vec::with_capacity(needed);
+            for index in 0..needed {
+                let mut tables: Vec<Arc<SstHandle>> = levels
+                    .get(index)
+                    .map(|tables| {
+                        tables
+                            .iter()
+                            .filter(|table| !input_ids.contains(&table.meta.id))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if index == target {
+                    tables.extend(new_handles.iter().cloned());
+                    tables.sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+                }
+                updated.push(tables);
             }
-            updated.push(tables);
-        }
-        debug_assert!(
-            {
-                let before: std::collections::HashSet<u64> =
-                    levels.iter().flatten().map(|table| table.meta.id).collect();
-                let after: std::collections::HashSet<u64> = updated
-                    .iter()
-                    .flatten()
-                    .map(|table| table.meta.id)
-                    .collect();
-                before.difference(&after).all(|id| input_ids.contains(id))
-            },
-            "compaction dropped a table that was not one of its inputs — that \
+            debug_assert!(
+                {
+                    let before: std::collections::HashSet<u64> =
+                        levels.iter().flatten().map(|table| table.meta.id).collect();
+                    let after: std::collections::HashSet<u64> = updated
+                        .iter()
+                        .flatten()
+                        .map(|table| table.meta.id)
+                        .collect();
+                    before.difference(&after).all(|id| input_ids.contains(id))
+                },
+                "compaction dropped a table that was not one of its inputs — that \
              is committed data becoming unreachable (level={level} target={target})"
-        );
-        updated
-    }, p);
+            );
+            updated
+        },
+        p,
+    );
 }
 
 /// Undo [`install_compaction_outputs`] after a failed snapshot write.
@@ -1675,37 +1925,40 @@ fn rollback_compaction_outputs(
 ) {
     let output_ids: std::collections::HashSet<u64> =
         installed.iter().map(|table| table.meta.id).collect();
-    cf.update_levels(|levels| {
-        let mut updated: Vec<Vec<Arc<SstHandle>>> = levels
-            .iter()
-            .map(|tables| {
-                tables
-                    .iter()
-                    .filter(|table| !output_ids.contains(&table.meta.id))
-                    .cloned()
-                    .collect()
-            })
-            .collect();
-        for input in inputs {
-            let level = input.meta.level as usize;
-            if level >= updated.len() {
-                updated.resize(level + 1, Vec::new());
-            }
-            if updated[level]
+    cf.update_levels(
+        |levels| {
+            let mut updated: Vec<Vec<Arc<SstHandle>>> = levels
                 .iter()
-                .any(|table| table.meta.id == input.meta.id)
-            {
-                continue;
+                .map(|tables| {
+                    tables
+                        .iter()
+                        .filter(|table| !output_ids.contains(&table.meta.id))
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+            for input in inputs {
+                let level = input.meta.level as usize;
+                if level >= updated.len() {
+                    updated.resize(level + 1, Vec::new());
+                }
+                if updated[level]
+                    .iter()
+                    .any(|table| table.meta.id == input.meta.id)
+                {
+                    continue;
+                }
+                updated[level].push(input.clone());
+                // L0 is newest-first and the inputs were its OLDEST files, so
+                // appending restores the order; every deeper level is sorted.
+                if level > 0 {
+                    updated[level].sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+                }
             }
-            updated[level].push(input.clone());
-            // L0 is newest-first and the inputs were its OLDEST files, so
-            // appending restores the order; every deeper level is sorted.
-            if level > 0 {
-                updated[level].sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
-            }
-        }
-        updated
-    }, p);
+            updated
+        },
+        p,
+    );
     for table in installed {
         table.close();
     }
@@ -1948,7 +2201,13 @@ fn cf_writer_opts(
         expected_entries: 4096,
         use_btree: cf.opts.use_btree,
         restart_interval: cf.opts.block_restart_interval,
-        extended_entries: false,
+        // Extended (kind-bearing) entries are a table-level property fixed at
+        // writer construction, and the aux block that carries range fragments
+        // only exists on an extended table. A database holding
+        // CAP_RANGE_DELETES therefore writes every new table extended, whether
+        // or not this particular one ends up with a fragment — the alternative
+        // is knowing the answer before the merge has run.
+        extended_entries: cf.range_deletes_enabled(),
         prefix_delta,
     }
 }
@@ -1957,13 +2216,19 @@ fn key_span(tables: &[Arc<SstHandle>], cmp: &ComparatorRef) -> (Vec<u8>, Vec<u8>
     let mut min: Option<&[u8]> = None;
     let mut max: Option<&[u8]> = None;
     for t in tables {
+        // SPAN bounds, not point bounds: a table's range fragments can reach
+        // past its first and last point key (they are clipped to the *output
+        // interval*, which extends into the gaps between outputs). A job span
+        // built from point bounds alone would leave an input fragment outside
+        // it, and that fragment would be lost the moment its owner is dropped.
+        let (tmin, tmax) = (t.meta.span_min(cmp), t.meta.span_max(cmp));
         min = Some(match min {
-            Some(m) if cmp.compare(m, &t.meta.min_key).is_le() => m,
-            _ => &t.meta.min_key,
+            Some(m) if cmp.compare(m, tmin).is_le() => m,
+            _ => tmin,
         });
         max = Some(match max {
-            Some(m) if cmp.compare(m, &t.meta.max_key).is_ge() => m,
-            _ => &t.meta.max_key,
+            Some(m) if cmp.compare(m, tmax).is_ge() => m,
+            _ => tmax,
         });
     }
     (

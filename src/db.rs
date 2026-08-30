@@ -283,6 +283,13 @@ pub struct DbInner {
     publish: Mutex<PublishState>,
     snapshots: Mutex<BTreeMap<u64, usize>>,
     pub(crate) commit_mu: Mutex<()>,
+    /// Committed-span index (1.2), or `None` when the build never needs one.
+    ///
+    /// Its lock sits immediately **after** `commit_mu` and **before**
+    /// `manifest_mu` (see `docs/concurrency-and-safety.md`). Always present, but
+    /// only touched once `CAP_RANGE_DELETES` is active, so a database that
+    /// never issues a range delete pays one relaxed capability load per commit.
+    pub(crate) span_index: Arc<crate::span_index::SpanIndex>,
 
     next_file_id: AtomicU64,
     pub(crate) closing: Arc<AtomicBool>,
@@ -398,6 +405,69 @@ pub struct DbInner {
     /// DB has opened (per-CF, unified, and post-rotation). Observability/test
     /// hook (see [`DB::wal_sync_count`]); relaxed increments on an fsync-bound path.
     pub(crate) wal_syncs: Arc<AtomicU64>,
+}
+
+/// Test-only rendezvous **inside** the `commit_mu` critical section (1.2).
+///
+/// The commit guard is a claim about a lock, and a lock is not directly
+/// observable — so the claim is tested by *interleaving*: a commit that reaches
+/// this point parks until the test releases it, and the test then checks
+/// whether another commit that takes `commit_mu` can proceed meanwhile. The
+/// park sits inside the guard's scope, so if the guard were not taken the
+/// concurrent commit would complete and the test would fail.
+///
+/// Debug builds only, armed explicitly, fires once. Mirrors
+/// [`crate::memtable::snapshot_calls`] as a test hook that lives in the code it
+/// measures rather than in a parallel copy of it.
+#[cfg(debug_assertions)]
+pub mod commit_park {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{Receiver, SyncSender};
+
+    /// Instance id of the database whose commits may park, or `0` for none.
+    ///
+    /// Scoped to one database because the hook is a process-global static and
+    /// the test binary runs tests in parallel: without it, an unrelated test's
+    /// range commit would trip the arm.
+    static ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CHANNELS: parking_lot::Mutex<Option<(SyncSender<()>, Receiver<()>)>> =
+        parking_lot::Mutex::new(None);
+
+    /// Arm the park for the next range commit on the database `instance`.
+    ///
+    /// Returns `(entered, release)`: `entered.recv()` blocks until a commit is
+    /// parked inside `commit_mu`, and `release.send(())` lets it out.
+    #[doc(hidden)]
+    pub fn arm(instance: u64) -> (Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *CHANNELS.lock() = Some((entered_tx, release_rx));
+        ARMED.store(instance, Ordering::SeqCst);
+        (entered_rx, release_tx)
+    }
+
+    /// Disarm, whether or not the park fired.
+    #[doc(hidden)]
+    pub fn disarm() {
+        ARMED.store(0, Ordering::SeqCst);
+        *CHANNELS.lock() = None;
+    }
+
+    /// Park if armed for `instance`. Called with `commit_mu` held.
+    pub(crate) fn park_if_armed(instance: u64) {
+        if ARMED.load(Ordering::SeqCst) != instance
+            || ARMED
+                .compare_exchange(instance, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let taken = CHANNELS.lock().take();
+        if let Some((entered, release)) = taken {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
 }
 
 /// DB-wide budget for parallel compaction **span workers** (0.8).
@@ -854,6 +924,48 @@ impl DbInner {
     }
 
     /// Format capabilities this database may use right now.
+    /// The committed-span index, or `None` while range deletes are not enabled.
+    ///
+    /// Returning `None` rather than an empty index is what makes the gate
+    /// *provable*: a caller cannot accidentally consult the index on a database
+    /// that has never enabled the capability.
+    #[inline]
+    pub(crate) fn span_index(&self) -> Option<&crate::span_index::SpanIndex> {
+        (self.caps() & crate::format::CAP_RANGE_DELETES != 0).then_some(&self.span_index)
+    }
+
+    /// Reserve `n` span-index slots ahead of `commit_mu`.
+    ///
+    /// `blocking` splits the two commit kinds, and the split is the whole
+    /// policy: a **range** commit waits for room, because dropping one of its
+    /// markers would blind every later point writer; a **point** commit never
+    /// waits — the write path must not stall behind a bookkeeping structure —
+    /// and gives up its marker instead, raising the index's overflow watermark
+    /// so range writers stay conservative. `n == 0` is free either way.
+    pub(crate) fn reserve_span_markers(
+        &self,
+        n: usize,
+        blocking: bool,
+        own_snapshot: Option<u64>,
+    ) -> Result<Option<crate::span_index::SpanReservation<'_>>> {
+        if !blocking {
+            return Ok(self.span_index.try_reserve(n));
+        }
+        self.span_index.reserve(
+            n,
+            || self.oldest_snapshot(),
+            || self.closing.load(Ordering::Relaxed),
+            // Waiting is futile when the caller's OWN snapshot is the prune
+            // floor: nothing it waits for can happen until it commits.
+            || own_snapshot.is_some_and(|seq| self.oldest_snapshot() >= seq),
+        )
+    }
+
+    /// Drop span markers no live transaction can still conflict against.
+    pub(crate) fn prune_span_markers(&self) {
+        self.span_index.prune(self.oldest_snapshot());
+    }
+
     pub(crate) fn caps(&self) -> u64 {
         self.caps.load(Ordering::SeqCst)
     }
@@ -939,6 +1051,16 @@ impl DbInner {
                 crate::format::KNOWN_CAPS
             )));
         }
+        // Implied capabilities: a range delete is written as a kind-bearing
+        // envelope record, so enabling it without CAP_EXTENDED_RECORDS would
+        // let a writer produce bytes the manifest does not authorize. Expanding
+        // here keeps the caller's contract simple (`enable(CAP_RANGE_DELETES)`)
+        // and the durability rule exact (both bits land in one manifest write).
+        let bits = if bits & crate::format::CAP_RANGE_DELETES != 0 {
+            bits | crate::format::CAP_EXTENDED_RECORDS
+        } else {
+            bits
+        };
         let _mu = self.enable_mu.lock();
         let active = self.caps.load(Ordering::SeqCst);
         if active & bits == bits {
@@ -1163,21 +1285,21 @@ fn restamp(
     let token = Publish::for_snapshot_rewrite();
     cf.update_levels(
         |levels| {
-        levels
-            .iter()
-            .map(|level| {
-                level
-                    .iter()
-                    .map(|table| match pick(table) {
-                        Some(stamp) => {
-                            changed.insert(table.meta.id);
-                            let mut meta = table.meta.clone();
-                            meta.last_compaction_time = stamp;
-                            cf.handle_for(meta)
-                        }
-                        None => table.clone(),
-                    })
-                    .collect()
+            levels
+                .iter()
+                .map(|level| {
+                    level
+                        .iter()
+                        .map(|table| match pick(table) {
+                            Some(stamp) => {
+                                changed.insert(table.meta.id);
+                                let mut meta = table.meta.clone();
+                                meta.last_compaction_time = stamp;
+                                cf.handle_for(meta)
+                            }
+                            None => table.clone(),
+                        })
+                        .collect()
                 })
                 .collect()
         },
@@ -1353,6 +1475,9 @@ fn build_db_inner(
     // `enable_capability` flipping the bit must be looking at the same words.
     let caps: Arc<AtomicU64> = Arc::new(AtomicU64::new(manifest.caps));
     let clock = Arc::new(crate::util::Clock::new());
+    // One index for the whole database, shared with every column family so
+    // per-family stats can report its size (1.2).
+    let span_index = Arc::new(crate::span_index::SpanIndex::new(opts.span_index_capacity));
     let ctx = Arc::new(CfCtx {
         tiers,
         bc: block_cache,
@@ -1368,6 +1493,7 @@ fn build_db_inner(
         wal_syncs: wal_syncs.clone(),
         caps: caps.clone(),
         clock: clock.clone(),
+        span_index: span_index.clone(),
     });
     let inner = Arc::new(DbInner {
         opts: opts.clone(),
@@ -1386,6 +1512,7 @@ fn build_db_inner(
         }),
         snapshots: Mutex::new(BTreeMap::new()),
         commit_mu: Mutex::new(()),
+        span_index: span_index.clone(),
         next_file_id: AtomicU64::new(manifest.next_file_id.max(1)),
         closing,
         stop,
@@ -1846,10 +1973,9 @@ impl DB {
         // naming a directory that no longer existed; this is the same shape as
         // invariant 1, applied to a drop.
         let edit = VersionEdit::new(drop_cf_ops(name, &cf));
-        self.inner
-            .catalog_txn(edit, |p| {
-                self.inner.unregister_cf(name, p);
-            })?;
+        self.inner.catalog_txn(edit, |p| {
+            self.inner.unregister_cf(name, p);
+        })?;
         cf.close_resources();
         let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
         Ok(())
@@ -1979,6 +2105,15 @@ impl DB {
     /// reopen sees the pre-enable state.
     pub fn enable_format_capabilities(&self, bits: u64) -> Result<()> {
         self.inner.enable_capability(bits)
+    }
+
+    /// This handle's process-unique database instance id.
+    ///
+    /// A test lever — it exists so the debug-only commit rendezvous can be
+    /// scoped to one database while the test binary runs tests in parallel.
+    #[doc(hidden)]
+    pub fn instance_id(&self) -> u64 {
+        self.inner.instance_id
     }
 
     /// Format capabilities this database has durably enabled (a mask of
@@ -2350,12 +2485,27 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
     let mut all_slices_flushed = true;
     let mut edit = VersionEdit::default();
     let mut staged: Vec<(Arc<ColumnFamily>, Arc<SstHandle>)> = Vec::new();
-    for (cf_id, entries) in crate::unified::split_by_cf(&imm) {
+    // Range tombstones are split by the same cf-id prefix the point entries
+    // carry. A family that has spans but no point entry in this memtable still
+    // gets a table: `slices` is the union of both splits.
+    let mut ranges = crate::unified::split_ranges_by_cf(&imm);
+    let mut slices: Vec<(u64, Vec<crate::memtable::Entry>)> = crate::unified::split_by_cf(&imm);
+    for (cf_id, _) in &ranges {
+        if !slices.iter().any(|(id, _)| id == cf_id) {
+            slices.push((*cf_id, Vec::new()));
+        }
+    }
+    for (cf_id, entries) in slices {
         let cf = db.cf_by_id.read().get(&cf_id).cloned();
         let Some(cf) = cf else {
             continue;
         };
-        match cf.ingest_l0(entries, db.next_file_id()) {
+        let frags = ranges
+            .iter_mut()
+            .find(|(id, _)| *id == cf_id)
+            .map(|(_, f)| std::mem::take(f))
+            .unwrap_or_default();
+        match cf.ingest_l0(entries, frags, db.next_file_id()) {
             Ok(Some(handle)) => {
                 edit.push(crate::manifest_edit::Op::AddTable {
                     cf: cf.name().to_string(),

@@ -28,7 +28,13 @@ use crate::wal::RecordRef;
 /// Per-column-family commit group: handle, WAL records (borrowing the txn
 /// buffer), hook ops, and whether the CF has a commit hook installed (hook ops
 /// are only built when it does).
-type CfGroup<'a> = (Arc<ColumnFamily>, Vec<RecordRef<'a>>, Vec<CommitOp>, bool);
+type CfGroup<'a> = (
+    Arc<ColumnFamily>,
+    Vec<RecordRef<'a>>,
+    Vec<crate::wal::RangeRef<'a>>,
+    Vec<CommitOp>,
+    bool,
+);
 
 /// `(offset, len)` range into the transaction's write buffer.
 type BufRange = (usize, usize);
@@ -56,6 +62,23 @@ struct WriteEntry {
     ttl: i64,
     tombstone: bool,
     single_delete: bool,
+    /// This entry is a **range delete** (1.2): `key` holds `start` and `value`
+    /// holds `end`, reusing the same two arena slots the wire format's generic
+    /// `a`/`b` slots use. `tombstone`/`single_delete`/`ttl` are meaningless and
+    /// left at their defaults.
+    range: bool,
+}
+
+/// The range deletes this transaction has buffered, as `(cf, start, end)`
+/// borrowed from the arena.
+fn buffered_ranges<'a>(
+    buf: &'a [u8],
+    writes: &'a [WriteEntry],
+) -> impl std::iter::Iterator<Item = (&'a Arc<ColumnFamily>, &'a [u8], &'a [u8])> {
+    writes
+        .iter()
+        .filter(|w| w.range)
+        .map(move |w| (&w.cf, buf_slice(buf, w.key), buf_slice(buf, w.value)))
 }
 
 /// A multi-operation transaction.
@@ -130,6 +153,38 @@ fn put_buf(buf: Vec<u8>) {
             g.push(buf);
         }
     });
+}
+
+/// Validate one `delete_range` call: capability, non-nil bounds, and
+/// `start < end` under the column family's comparator.
+///
+/// The comparator matters: `start >= end` is asked of the CF's order, not of
+/// the byte order, so a reversed-collation family accepts exactly the intervals
+/// its own iterators would walk.
+fn validate_range_bounds(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    start: &[u8],
+    end: &[u8],
+) -> Result<()> {
+    if db.caps() & crate::format::CAP_RANGE_DELETES == 0 {
+        return Err(OndaError::InvalidArgs(
+            "range deletes require the CAP_RANGE_DELETES format capability;              call DB::enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)              once, before the first delete_range"
+                .into(),
+        ));
+    }
+    if start.is_empty() || end.is_empty() {
+        return Err(OndaError::InvalidArgs(
+            "delete_range bounds must be non-empty: an empty end would delete              nothing and an empty start is indistinguishable from absent"
+                .into(),
+        ));
+    }
+    if !cf.comparator().compare(start, end).is_lt() {
+        return Err(OndaError::InvalidArgs(format!(
+            "delete_range start {start:?} must sort strictly before end {end:?}              under this column family's comparator (the interval is half-open)"
+        )));
+    }
+    Ok(())
 }
 
 fn ttl_to_abs(ttl: Duration) -> i64 {
@@ -278,6 +333,34 @@ impl DB {
         t.delete(cf, key)?;
         t.commit()
     }
+
+    /// Delete every key in the half-open comparator interval `[start, end)`
+    /// (auto-committed at ReadCommitted).
+    ///
+    /// One record, whatever the interval covers — the point of the feature. The
+    /// deletion is recorded at a single sequence number and masks every key in
+    /// the range written **at or below** it; a later write to a covered key is
+    /// visible again, exactly as it would be after a point tombstone.
+    ///
+    /// `end` is never itself deleted. Both bounds must be non-empty and
+    /// `start` must sort strictly before `end` under `cf`'s comparator;
+    /// anything else is [`OndaError::InvalidArgs`].
+    ///
+    /// The database must have durably enabled
+    /// [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES) — see
+    /// [`DB::enable_format_capabilities`] — before the first call. Enabling it
+    /// is one-way and makes the database unreadable by binaries older than 1.2.
+    ///
+    /// A commit containing a range delete takes the database-wide commit lock
+    /// even at [`IsolationLevel::ReadCommitted`], so its span check and its
+    /// installation are atomic against every conflict-checking commit. Range
+    /// commits are therefore measurably more expensive than point commits; they
+    /// are meant to be rare and bulk.
+    pub fn delete_range(&self, cf: &Arc<ColumnFamily>, start: &[u8], end: &[u8]) -> Result<()> {
+        let mut t = self.begin_with_isolation(IsolationLevel::ReadCommitted);
+        t.delete_range(cf, start, end)?;
+        t.commit()
+    }
 }
 
 impl Txn {
@@ -301,7 +384,85 @@ impl Txn {
             ttl,
             tombstone,
             single_delete,
+            range: false,
         });
+    }
+
+    /// Buffer a range delete of `[start, end)`.
+    ///
+    /// Validation is here rather than at commit because every failure mode is a
+    /// property of the call alone: reversed or empty bounds, and the capability.
+    /// The one check that *cannot* live here — a point write of this
+    /// transaction landing inside this span — needs the whole write set and is
+    /// made at commit ([`Txn::check_own_range_overlap`]).
+    pub fn delete_range(&mut self, cf: &Arc<ColumnFamily>, start: &[u8], end: &[u8]) -> Result<()> {
+        if self.done {
+            return Err(OndaError::InvalidArgs(
+                "transaction already finished".into(),
+            ));
+        }
+        validate_range_bounds(&self.db, cf, start, end)?;
+        let soff = self.buf.len();
+        self.buf.extend_from_slice(start);
+        let eoff = self.buf.len();
+        self.buf.extend_from_slice(end);
+        self.writes.push(WriteEntry {
+            cf: cf.clone(),
+            key: (soff, start.len()),
+            value: (eoff, end.len()),
+            ttl: 0,
+            tombstone: false,
+            single_delete: false,
+            range: true,
+        });
+        Ok(())
+    }
+
+    /// Newest buffered range delete covering `key` in `cf`, if any.
+    ///
+    /// Read-your-writes for range deletes: a key covered by a span this
+    /// transaction has buffered reads as absent, exactly as a buffered point
+    /// tombstone does. One `any` over a list that is empty for every
+    /// transaction that never called `delete_range`.
+    fn own_range_covers(&self, cf: &Arc<ColumnFamily>, key: &[u8]) -> bool {
+        let id = cf_id(cf);
+        let cmp = cf.comparator();
+        buffered_ranges(&self.buf, &self.writes).any(|(c, start, end)| {
+            cf_id(c) == id && cmp.compare(start, key).is_le() && cmp.compare(end, key).is_gt()
+        })
+    }
+
+    /// Reject a buffered point write that falls inside one of this
+    /// transaction's own range spans.
+    ///
+    /// **Precise, not conservative**: `put(a)` beside `delete_range(m..z)` is
+    /// accepted; only an actual containment is refused.
+    ///
+    /// The reason is write *ordering*, not ties.
+    /// [`deduplicated_write_order`](Self::deduplicated_write_order) gives a key
+    /// the slot of its **first** insertion while taking its **last** value, so
+    /// `put(k,v1); delete_range(k..z); put(k,v2)` would put the range at a
+    /// higher sequence than the put and mask `v2` — a value the caller wrote
+    /// *after* the range delete. Sequences inside one commit are distinct by
+    /// construction (`apply_prepared` assigns `start + slot`), so this is the
+    /// only hazard, and v1 refuses it outright.
+    fn check_own_range_overlap(&self) -> Result<()> {
+        for w in self.writes.iter().filter(|w| !w.range) {
+            let key = buf_slice(&self.buf, w.key);
+            let id = cf_id(&w.cf);
+            let cmp = w.cf.comparator();
+            for (c, start, end) in buffered_ranges(&self.buf, &self.writes) {
+                if cf_id(c) == id
+                    && cmp.compare(start, key).is_le()
+                    && cmp.compare(end, key).is_gt()
+                {
+                    return Err(OndaError::InvalidArgs(format!(
+                        "write to key {key:?} falls inside this transaction's own                          range delete [{start:?}, {end:?}); v1 rejects the                          combination because the range would be ordered after                          the key's first write and could mask a later one"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Buffer a put.
@@ -350,12 +511,18 @@ impl Txn {
         let id = cf_id(cf);
         // Read-your-writes: scan the buffer backward for the latest write.
         for w in self.writes.iter().rev() {
-            if cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key {
+            if !w.range && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key {
                 if w.tombstone {
                     return Err(OndaError::NotFound);
                 }
                 return Ok(buf_slice(&self.buf, w.value).to_vec());
             }
+        }
+        // Read-your-writes for range deletes. Reached only when no buffered
+        // point write matched: own-write overlap is rejected at commit, so the
+        // two can never both apply to one key.
+        if self.own_range_covers(cf, key) {
+            return Err(OndaError::NotFound);
         }
         if self.isolation == IsolationLevel::Serializable {
             let read = (id, key.to_vec());
@@ -403,17 +570,20 @@ impl Txn {
 
         for (i, key) in keys.iter().enumerate() {
             // Read-your-writes: scan the buffer backward for the latest write.
-            let buffered = self
-                .writes
-                .iter()
-                .rev()
-                .find(|w| cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == *key);
+            let buffered =
+                self.writes.iter().rev().find(|w| {
+                    !w.range && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == *key
+                });
             if let Some(w) = buffered {
                 out[i] = Some(if w.tombstone {
                     Err(OndaError::NotFound)
                 } else {
                     Ok(buf_slice(&self.buf, w.value).to_vec())
                 });
+                continue;
+            }
+            if self.own_range_covers(cf, key) {
+                out[i] = Some(Err(OndaError::NotFound));
                 continue;
             }
             if self.isolation == IsolationLevel::Serializable {
@@ -487,7 +657,18 @@ impl Txn {
             let mem = Memtable::new(cf.comparator().clone());
             let mut any = false;
             for w in &self.writes {
-                if cf_id(&w.cf) == id {
+                if cf_id(&w.cf) != id {
+                    continue;
+                }
+                if w.range {
+                    // At `rs`, so the overlay's spans mask exactly what the
+                    // transaction can already see plus its own writes.
+                    mem.add_range(
+                        buf_slice(&self.buf, w.key),
+                        buf_slice(&self.buf, w.value),
+                        rs,
+                    );
+                } else {
                     mem.put_ref(
                         buf_slice(&self.buf, w.key),
                         buf_slice(&self.buf, w.value),
@@ -496,8 +677,8 @@ impl Txn {
                         w.tombstone,
                         w.single_delete,
                     );
-                    any = true;
                 }
+                any = true;
             }
             if any {
                 Some(mem)
@@ -563,6 +744,14 @@ impl Txn {
             );
         let mut order = Vec::with_capacity(self.writes.len());
         for (index, write) in self.writes.iter().enumerate() {
+            // Two range deletes sharing a start bound are distinct records, and
+            // a range delete must never collapse into a point write whose key
+            // happens to equal its start bound: both take their own slot, and
+            // therefore their own sequence.
+            if write.range {
+                order.push(index);
+                continue;
+            }
             match slot_of.entry((cf_id(&write.cf), buf_slice(&self.buf, write.key))) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(order.len());
@@ -608,6 +797,68 @@ impl Txn {
         Ok(())
     }
 
+    /// Conflict checks the span index owns, under `commit_mu`.
+    ///
+    /// A **range** writer conflicts with any overlapping marker newer than its
+    /// read sequence — the only way to learn that something in the interval
+    /// changed, since there is no key to `peek_seq`. A **point** writer
+    /// additionally checks newer *covering range* markers; point-vs-point stays
+    /// with `peek_seq`, which sees the maximum sequence at a key whatever wrote
+    /// it.
+    fn validate_span_conflicts(&self, prepared: &PreparedCommit) -> Result<()> {
+        let Some(index) = self.db.span_index() else {
+            return Ok(());
+        };
+        for &i in &prepared.order {
+            let w = &self.writes[i];
+            let cf = w.cf.id();
+            let cmp = w.cf.comparator();
+            let a = buf_slice(&self.buf, w.key);
+            if w.range {
+                let b = buf_slice(&self.buf, w.value);
+                if let Some(seq) = index.range_conflict(cf, cmp, a, b, self.read_seq) {
+                    return Err(OndaError::Conflict(format!(
+                        "range delete [{a:?}, {b:?}) overlaps a write committed at                          sequence {seq}, after this transaction's snapshot"
+                    )));
+                }
+            } else if let Some(seq) = index.point_conflict(cf, cmp, a, self.read_seq) {
+                return Err(OndaError::Conflict(format!(
+                    "write to key {a:?} is covered by a range delete committed at                      sequence {seq}, after this transaction's snapshot"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record this commit's writes in the span index. Called under `commit_mu`,
+    /// after every record is installed.
+    fn insert_span_markers(
+        &self,
+        prepared: &PreparedCommit,
+        start: u64,
+        reservation: &mut crate::span_index::SpanReservation<'_>,
+    ) {
+        let Some(index) = self.db.span_index() else {
+            return;
+        };
+        for (slot, &i) in prepared.order.iter().enumerate() {
+            let w = &self.writes[i];
+            let seq = start + slot as u64;
+            let a = buf_slice(&self.buf, w.key);
+            if w.range {
+                index.insert_range(
+                    reservation,
+                    w.cf.id(),
+                    a,
+                    buf_slice(&self.buf, w.value),
+                    seq,
+                );
+            } else {
+                index.insert_point(reservation, w.cf.id(), a, seq);
+            }
+        }
+    }
+
     fn validate_commit(&self, prepared: &PreparedCommit, needs_write_check: bool) -> Result<()> {
         if needs_write_check {
             self.validate_write_conflicts(prepared)?;
@@ -627,12 +878,30 @@ impl Txn {
             let id = cf_id(&write.cf);
             let group = groups.entry(id).or_insert_with(|| {
                 let has_hook = write.cf.has_commit_hook();
-                (write.cf.clone(), Vec::new(), Vec::new(), has_hook)
+                (
+                    write.cf.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    has_hook,
+                )
             });
             let key = buf_slice(&self.buf, write.key);
             let value = buf_slice(&self.buf, write.value);
-            if group.3 {
-                group.2.push(CommitOp {
+            if write.range {
+                // Commit hooks describe point writes (`CommitOp` has one key
+                // and one value); a range delete has two keys and no value, so
+                // v1 does not surface it to hooks rather than inventing a
+                // shape a hook could misread as a put.
+                group.2.push(crate::wal::RangeRef {
+                    start: key,
+                    end: value,
+                    seq,
+                });
+                continue;
+            }
+            if group.4 {
+                group.3.push(CommitOp {
                     key: key.to_vec(),
                     value: value.to_vec(),
                     tombstone: write.tombstone,
@@ -663,25 +932,31 @@ impl Txn {
     ) -> Option<OndaError> {
         let item_count: usize = groups
             .values()
-            .map(|(_, records, _, _)| records.len())
+            .map(|(_, records, _, _, _)| records.len())
+            .sum();
+        let range_count: usize = groups
+            .values()
+            .map(|(_, _, ranges, _, _)| ranges.len())
             .sum();
         let mut items = Vec::with_capacity(item_count);
-        for (_, (cf, records, ops, has_hook)) in groups {
+        let mut ranges = Vec::with_capacity(range_count);
+        for (_, (cf, records, cf_ranges, ops, has_hook)) in groups {
             let cf_id = cf.id();
             items.extend(records.into_iter().map(|record| (cf_id, record)));
+            ranges.extend(cf_ranges.into_iter().map(|range| (cf_id, range)));
             if has_hook {
                 hooks.push((cf, ops));
             }
         }
-        unified.apply(&items).err()
+        unified.apply_with_ranges(&items, &ranges).err()
     }
 
     fn apply_per_cf_groups(
         groups: HashMap<usize, CfGroup<'_>>,
         hooks: &mut Vec<(Arc<ColumnFamily>, Vec<CommitOp>)>,
     ) -> Option<OndaError> {
-        for (_, (cf, records, ops, has_hook)) in groups {
-            if let Err(error) = cf.apply_commit(&records) {
+        for (_, (cf, records, ranges, ops, has_hook)) in groups {
+            if let Err(error) = cf.apply_commit_with_ranges(&records, &ranges) {
                 return Some(error);
             }
             if has_hook {
@@ -732,8 +1007,40 @@ impl Txn {
                 ));
             }
         }
+        let has_range = self.writes.iter().any(|w| w.range);
+        if has_range {
+            if let Err(error) = self.check_own_range_overlap() {
+                self.release();
+                return Err(error);
+            }
+        }
         let db = self.db.clone();
-        let _guard = if needs_check || self.isolation == IsolationLevel::Serializable {
+
+        // The span index is inert until CAP_RANGE_DELETES is enabled, so a
+        // database that never issues a range delete reserves nothing, takes no
+        // lock here, and reaches `commit_mu` exactly as before.
+        let tracked = db.caps() & crate::format::CAP_RANGE_DELETES != 0;
+        // Capacity FIRST, with no other lock held: waiting for span-index room
+        // under `commit_mu` would stall every Snapshot/Serializable commit in
+        // the database behind one range writer, and could convoy against the
+        // pruner.
+        let mut reservation = match db.reserve_span_markers(
+            if tracked { prepared.order.len() } else { 0 },
+            has_range,
+            self.snapshot_held.then_some(self.read_seq),
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.release();
+                return Err(error);
+            }
+        };
+
+        // A commit containing a range delete takes `commit_mu` even at
+        // ReadCommitted: its span check and its marker insert must be atomic
+        // against every other conflict-checking commit. Point-only commits keep
+        // today's behavior exactly.
+        let _guard = if needs_check || self.isolation == IsolationLevel::Serializable || has_range {
             Some(db.commit_mu.lock())
         } else {
             None
@@ -741,6 +1048,12 @@ impl Txn {
         if let Err(error) = self.validate_commit(&prepared, needs_check) {
             self.release();
             return Err(error);
+        }
+        if needs_check {
+            if let Err(error) = self.validate_span_conflicts(&prepared) {
+                self.release();
+                return Err(error);
+            }
         }
 
         let n = prepared.order.len() as u64;
@@ -761,8 +1074,35 @@ impl Txn {
             self.release();
             return Err(error);
         }
+        // Markers go in only after full installation, and still under
+        // `commit_mu`, so a concurrent range writer either sees this commit or
+        // is serialized behind it.
+        match (tracked, &mut reservation) {
+            (true, Some(reservation)) => self.insert_span_markers(&prepared, start, reservation),
+            // A point-only commit that found the index full: it commits, but
+            // the window it opened is no longer describable, so range writers
+            // reading at or below `commit_seq` must conflict.
+            (true, None) => {
+                if let Some(index) = self.db.span_index() {
+                    index.note_overflow(commit_seq);
+                }
+            }
+            (false, _) => {}
+        }
+        // Test-only rendezvous, still under `commit_mu` (debug builds only).
+        #[cfg(debug_assertions)]
+        if has_range {
+            crate::db::commit_park::park_if_armed(self.db.instance_id);
+        }
         self.db.note_thread_commit(commit_seq);
         drop(_guard);
+        // Unconsumed slots go back here as well as on the error paths; the
+        // reservation's `Drop` is the backstop, this keeps the index from
+        // holding capacity across the commit hooks below.
+        drop(reservation);
+        if tracked {
+            self.db.prune_span_markers();
+        }
 
         for (cf, ops) in &application.hooks {
             cf.run_commit_hook(commit_seq, ops);

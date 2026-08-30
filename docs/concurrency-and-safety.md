@@ -100,7 +100,8 @@ the two unexamined candidates.
 
 | Lock | Guards | Held across |
 |---|---|---|
-| `DbInner::commit_mu` | Snapshot/Serializable validation + apply | conflict check → apply → publish |
+| `DbInner::commit_mu` | Snapshot/Serializable validation + apply, **and every commit containing a range delete** (1.2) | conflict check → apply → publish → span-marker insert |
+| `DbInner::span_index` (Mutex+Condvar) | committed-span markers (1.2) | one check, one insert, or one prune; **never held across IO**. Also taken alone, ahead of `commit_mu`, for the capacity reservation |
 | `DbInner::cf_lifecycle_mu` (2.2) | the catalog-shape changes that validate before they publish: CF create / create-many / drop / clear, partition-rule add/remove | validation → `catalog_txn` → publish. Taken **before** `manifest_mu`, never after |
 | `DbInner::manifest_mu` | manifest rebuild + save; under `CAP_MANIFEST_EDITS` also the edit append, the publish step and the snapshot-compaction trigger | whole `persist_manifest`, or a whole `catalog_txn` |
 | `DbInner::publish` (Mutex) | publish cursor | short |
@@ -126,6 +127,63 @@ the registry lock they used before 2.2.
 
 Other safe patterns used: rotation drops `rot` while opening the next WAL file;
 commit runs hooks after dropping `commit_mu`.
+
+### Range deletes and the committed-span index (1.2)
+
+The index answers the one question a range delete needs and `peek_seq` cannot:
+*did anything in `[start, end)` change since my snapshot?* It is **inert until
+`CAP_RANGE_DELETES` is enabled** — `DbInner::span_index()` returns `None`, and
+the commit path pays one relaxed load of the capability word.
+
+Three rules, in the order they matter:
+
+1. **`span_index` sits after `commit_mu` and before `manifest_mu`.** It is
+   acquired while `commit_mu` is held (the conflict check and the marker
+   insert, which is what makes them atomic against each other) and alone
+   (pruning, and the capacity reservation). It is never acquired before
+   `commit_mu` *on the commit path*.
+
+2. **The capacity wait happens BEFORE `commit_mu`, with no other lock held.**
+   Waiting under `commit_mu` would stall every Snapshot/Serializable commit in
+   the database behind one range writer, and could convoy against the pruner.
+   The reservation is an RAII guard: unconsumed slots go back on every exit
+   path, including a conflict, an apply failure and a panic.
+
+3. **A commit containing a range delete takes `commit_mu` even at
+   ReadCommitted.** Point-only commits keep today's behavior exactly. This
+   makes deferred review item **M3** (`commit_mu` latency) measurably worse for
+   range commits, and that is accepted: range commits are the rare, bulk
+   operation, and the alternative is a per-key conflict domain the engine does
+   not have. `bench-results/1.2/` carries the baseline M3's eventual fix will
+   be measured against.
+
+**Bounded, never blocking a point write.** Capacity is freed by pruning, pruning
+is driven by the oldest live snapshot, and nothing guarantees that snapshot ever
+advances — a Snapshot transaction can even be its own prune floor. So the wait
+is bounded three ways: it is skipped outright when the caller's own snapshot is
+the floor, it expires after `CAPACITY_WAIT`, and a **point** commit never waits
+at all. A commit that cannot be indexed raises an *overflow watermark* instead:
+both conflict checks report a conflict for any reader at or below it. That is
+conservative in exactly one direction — it can refuse a commit that would have
+been safe, never admit one that would not.
+
+The index holds no durable state. A reopen with no active transactions starts
+empty, which is correct: every marker described a window that no live
+transaction can still be reading in.
+
+### Range fragments and the read paths
+
+`RangeTombstoneSet` (`range_tombstone.rs`) sits beside the point shards in each
+`Memtable`, under its own `RwLock`, and is **never sharded by start key** — a
+lookup for `k` must find every covering span, and a hash on `start` scatters
+exactly the spans that could cover it. `is_empty()` is one relaxed load, which
+is the gate every read path checks first.
+
+Scan cursors (`RangeMask`) hold **owned** bounds copied out of their source, so
+invariant 8's pinned-block lifetimes are untouched: a fragment cursor never
+borrows from a `Block`. The mask is built from the **same** `state` snapshot as
+the iterator's children, so a flush landing mid-construction cannot leave a scan
+reading points whose covering fragments it never collected.
 
 ### Background-wait rule and its one exception (0.6)
 

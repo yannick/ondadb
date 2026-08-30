@@ -196,11 +196,28 @@ pub fn check_kind(kind: u64) -> crate::error::Result<()> {
         )));
     }
     match kind {
-        KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE => Ok(()),
+        KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE | KIND_RANGE_DELETE => Ok(()),
         _ => Err(crate::error::OndaError::UnsupportedFormat(format!(
             "record kind {kind} is not implemented by this binary"
         ))),
     }
+}
+
+/// Reject a record kind that may not appear in a data-block **point** stream.
+///
+/// Range deletes (kind 5) live in the aux block's fragment section, never
+/// between two point entries: a fragment has two keys and no value, so a
+/// decoder that accepted one here would have to invent a value slot. The bytes
+/// are intact and name a placement no writer produces, so this is `Corruption`
+/// rather than `UnsupportedFormat`.
+pub fn check_point_kind(kind: u64) -> crate::error::Result<()> {
+    check_kind(kind)?;
+    if kind == KIND_RANGE_DELETE {
+        return Err(crate::error::OndaError::Corruption(
+            "sst: range-delete kind in the point-entry stream".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reject a modifier word naming a bit this binary does not implement.
@@ -305,15 +322,32 @@ mod tests {
     /// (`Corruption`).
     #[test]
     fn kind_check_splits_unsupported_from_corruption() {
-        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE] {
+        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE, KIND_RANGE_DELETE] {
             assert!(check_kind(k).is_ok());
         }
-        for k in [0, KIND_MERGE, KIND_RANGE_DELETE, 16, 63] {
+        for k in [0, KIND_MERGE, 16, 63] {
             assert_eq!(check_kind(k).unwrap_err().kind(), "unsupported_format");
         }
         for k in [64u64, 1000] {
             assert_eq!(check_kind(k).unwrap_err().kind(), "corruption");
         }
+    }
+
+    /// Kind 5 is implemented, but only in the WAL envelope and the aux section:
+    /// a data-block point entry naming it is corruption, not a newer format.
+    #[test]
+    fn range_delete_kind_is_refused_in_the_point_stream() {
+        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE] {
+            assert!(check_point_kind(k).is_ok());
+        }
+        assert_eq!(
+            check_point_kind(KIND_RANGE_DELETE).unwrap_err().kind(),
+            "corruption"
+        );
+        assert_eq!(
+            check_point_kind(KIND_MERGE).unwrap_err().kind(),
+            "unsupported_format"
+        );
     }
 
     /// An extended entry and a legacy entry must describe the same thing with

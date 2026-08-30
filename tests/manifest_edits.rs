@@ -31,6 +31,11 @@ fn distinguishable_table() -> SstMeta {
         max_entry_time: Some(1_700_000_000_000_000_001),
         object: Some("cf-default/00000000deadbeef-7".into()),
         last_compaction_time: Some(1_700_000_000_000_000_002),
+        range_count: 4,
+        range_min_seq: 101,
+        range_max_seq: 202,
+        range_min_key: Some(b"rng-min".to_vec()),
+        range_max_key: Some(b"rng-max".to_vec()),
     }
 }
 
@@ -46,7 +51,14 @@ fn distinguishable_manifest() -> Manifest {
         }],
         wal_layout: WalLayout::Unified,
         instance_nonce: Some(0xDEAD_BEEF_CAFE_F00D),
-        caps: ondadb::format::CAP_MANIFEST_EDITS | ondadb::format::CAP_EXTENDED_RECORDS,
+        // CAP_RANGE_DELETES is load-bearing here, not decoration: the manifest
+        // encoder only emits the ONDARNG1 tail for a database that holds the
+        // bit, so without it the range fields would round-trip through the
+        // edit log but vanish from the encoded catalog — and the byte-identity
+        // assertion at the end of the guard would pass while losing data.
+        caps: ondadb::format::CAP_MANIFEST_EDITS
+            | ondadb::format::CAP_EXTENDED_RECORDS
+            | ondadb::format::CAP_RANGE_DELETES,
         // The three edit-log bookkeeping fields are the log's own cursor, not
         // catalog content: they are written by snapshot compaction and can never
         // be changed by an edit (an edit lives *inside* the log it would name).
@@ -58,7 +70,7 @@ fn distinguishable_manifest() -> Manifest {
     }
 }
 
-/// The inventory guard: 5 `Manifest` fields + 3 `CfManifest` fields + 14
+/// The inventory guard: 5 `Manifest` fields + 3 `CfManifest` fields + 19
 /// `SstMeta` fields, each reachable through an op, verified by rebuilding the
 /// whole catalog from `Manifest::default()` with edits alone.
 ///
@@ -81,7 +93,7 @@ fn every_manifest_field_is_covered_by_an_op() {
             name: cf.name.clone(),
             config: cf.config.clone(),
         },
-        // CfManifest.sstables, and all 13 SstMeta fields
+        // CfManifest.sstables, and all 19 SstMeta fields
         Op::AddTable {
             cf: cf.name.clone(),
             meta: table.clone(),
@@ -127,7 +139,7 @@ fn every_manifest_field_is_covered_by_an_op() {
     assert_eq!(g.config, cf.config, "CfManifest.config");
     assert_eq!(g.sstables.len(), 1, "CfManifest.sstables");
 
-    // SstMeta: 13 fields, compared field by field so a failure names the field.
+    // SstMeta: 19 fields, compared field by field so a failure names the field.
     let t = &g.sstables[0];
     assert_eq!(t.id, table.id, "SstMeta.id");
     assert_eq!(t.level, table.level, "SstMeta.level");
@@ -148,6 +160,27 @@ fn every_manifest_field_is_covered_by_an_op() {
         "SstMeta.max_entry_time"
     );
     assert_eq!(t.object, table.object, "SstMeta.object");
+    assert_eq!(
+        t.last_compaction_time, table.last_compaction_time,
+        "SstMeta.last_compaction_time"
+    );
+    assert_eq!(t.range_count, table.range_count, "SstMeta.range_count");
+    assert_eq!(
+        t.range_min_seq, table.range_min_seq,
+        "SstMeta.range_min_seq"
+    );
+    assert_eq!(
+        t.range_max_seq, table.range_max_seq,
+        "SstMeta.range_max_seq"
+    );
+    assert_eq!(
+        t.range_min_key, table.range_min_key,
+        "SstMeta.range_min_key"
+    );
+    assert_eq!(
+        t.range_max_key, table.range_max_key,
+        "SstMeta.range_max_key"
+    );
 
     // And the whole catalog, encoded, is byte-identical to the target.
     assert_eq!(
@@ -792,6 +825,7 @@ fn big_catalog(n: u64) -> Manifest {
                 max_entry_time: Some(1_700_000_000_000_000_000 + id as i64),
                 object: Some(format!("cf-t_post/00000000deadbeef-{id}")),
                 last_compaction_time: Some(1_700_000_000_000_000_000 + id as i64),
+                ..Default::default()
             },
         });
     }
@@ -1163,7 +1197,10 @@ fn crash_between_edit_fsync_and_wal_delete_replays_cleanly() {
             "row {i} did not survive the replay"
         );
     }
-    assert!(cf.approximate_len() >= 64, "the replay must not have dropped rows");
+    assert!(
+        cf.approximate_len() >= 64,
+        "the replay must not have dropped rows"
+    );
     db.close().unwrap();
 }
 
@@ -1183,19 +1220,26 @@ fn unified_flush_writes_one_edit_for_every_cf_slice() {
     };
     let db = DB::open(opts).unwrap();
     let cfs = db
-        .create_column_families(&[
-            ("a", quiet_cfg()),
-            ("b", quiet_cfg()),
-        ])
+        .create_column_families(&[("a", quiet_cfg()), ("b", quiet_cfg())])
         .unwrap();
     db.enable_format_capabilities(ondadb::format::CAP_MANIFEST_EDITS)
         .unwrap();
     let before = records(dir.path()).len();
     for i in 0..4_000u32 {
-        db.put(&cfs[0], format!("a{i:06}").as_bytes(), b"VA", Duration::ZERO)
-            .unwrap();
-        db.put(&cfs[1], format!("b{i:06}").as_bytes(), b"VB", Duration::ZERO)
-            .unwrap();
+        db.put(
+            &cfs[0],
+            format!("a{i:06}").as_bytes(),
+            b"VA",
+            Duration::ZERO,
+        )
+        .unwrap();
+        db.put(
+            &cfs[1],
+            format!("b{i:06}").as_bytes(),
+            b"VB",
+            Duration::ZERO,
+        )
+        .unwrap();
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while records(dir.path()).len() == before && std::time::Instant::now() < deadline {
@@ -1246,8 +1290,14 @@ fn ingest_finish_writes_one_edit_for_all_tables() {
     let after = records(dir.path());
     assert_eq!(after.len(), before + 1, "one ingestion, one record");
     let ops = shape(&after[before]);
-    assert!(ops.len() > 1, "the roll size should have produced several tables: {ops:?}");
-    assert!(ops.iter().all(|o| o.starts_with("AddTable(default,")), "{ops:?}");
+    assert!(
+        ops.len() > 1,
+        "the roll size should have produced several tables: {ops:?}"
+    );
+    assert!(
+        ops.iter().all(|o| o.starts_with("AddTable(default,")),
+        "{ops:?}"
+    );
     db.close().unwrap();
 }
 
@@ -1483,7 +1533,10 @@ fn create_column_families_writes_one_edit_for_the_batch() {
     );
     // A colliding batch creates nothing and writes nothing.
     let err = db
-        .create_column_families(&[("d", ColumnFamilyConfig::default()), ("a", ColumnFamilyConfig::default())])
+        .create_column_families(&[
+            ("d", ColumnFamilyConfig::default()),
+            ("a", ColumnFamilyConfig::default()),
+        ])
         .expect_err("a colliding name fails the batch");
     assert!(matches!(err, ondadb::OndaError::Exists(_)), "{err:?}");
     assert_eq!(records(dir.path()).len(), before + 1);
@@ -1540,7 +1593,10 @@ fn clear_cf_is_one_drop_plus_create_edit() {
     assert_eq!(ops[1], "DropCf(default)");
     assert_eq!(ops[2], "CreateCf(default)");
     assert!(db.get(&fresh, b"k").is_err(), "the family is empty");
-    assert!(db.get_column_family("default").is_some(), "and still registered");
+    assert!(
+        db.get_column_family("default").is_some(),
+        "and still registered"
+    );
     db.close().unwrap();
 }
 
@@ -1567,7 +1623,10 @@ fn clone_cf_is_one_create_plus_add_table_edit() {
     let ops = shape(&after[before]);
     assert_eq!(ops[0], "CreateCf(dst)");
     assert!(ops.len() > 1, "the tables ride the same record: {ops:?}");
-    assert!(ops[1..].iter().all(|o| o.starts_with("AddTable(dst,")), "{ops:?}");
+    assert!(
+        ops[1..].iter().all(|o| o.starts_with("AddTable(dst,")),
+        "{ops:?}"
+    );
     assert_eq!(db.get(&dst, b"k0000").unwrap(), b"v");
     db.close().unwrap();
 }
@@ -1600,7 +1659,9 @@ fn close_compacts_the_log_and_reports_failure() {
     let cf = db.get_column_family("default").unwrap();
     assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
     std::fs::create_dir(manifest_path(dir.path()).with_extension("tmp")).unwrap();
-    let err = db.close().expect_err("close must report its persist failure");
+    let err = db
+        .close()
+        .expect_err("close must report its persist failure");
     assert_eq!(err.kind(), "io", "{err:?}");
     std::fs::remove_dir(manifest_path(dir.path()).with_extension("tmp")).unwrap();
 }
@@ -1796,7 +1857,11 @@ fn structural_op_latency_probe() {
         std::fs::create_dir_all(dir.join("cf-hot")).unwrap();
         let mut ssts = Vec::with_capacity(tables);
         for id in 1..=tables as u64 {
-            std::fs::write(dir.join("cf-bulk").join(format!("{id}.klog")), b"placeholder").unwrap();
+            std::fs::write(
+                dir.join("cf-bulk").join(format!("{id}.klog")),
+                b"placeholder",
+            )
+            .unwrap();
             ssts.push(SstMeta {
                 id,
                 level: 6,

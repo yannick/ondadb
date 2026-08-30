@@ -156,6 +156,9 @@ pub struct Writer {
     last_seq: u64,
     pending_block: bool,
     finished: bool,
+    /// Range-tombstone fragments to write into this table's aux section (1.2),
+    /// sorted by `start` and disjoint. Set once, before [`finish`](Self::finish).
+    range_fragments: Vec<crate::range_tombstone::Fragment>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -179,6 +182,30 @@ impl Writer {
     pub fn with_limiter(mut self, limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>) -> Writer {
         self.limiter = limiter;
         self
+    }
+
+    /// Attach the range-tombstone fragments this table publishes (1.2).
+    ///
+    /// Fragments must be sorted by `start`, disjoint, and already clipped to
+    /// the interval this output owns — clipping is the caller's job because
+    /// only the flush or compaction job knows the output boundaries, and it is
+    /// what keeps level->=1 span disjointness true (see `docs/formats.md`).
+    ///
+    /// The aux block only exists on an extended table, so
+    /// [`WriterOptions::extended_entries`] (or the prefix-delta layout, which
+    /// implies it) must be set; [`finish`](Self::finish) refuses the
+    /// combination otherwise rather than silently dropping the fragments.
+    pub fn set_range_fragments(&mut self, frags: Vec<crate::range_tombstone::Fragment>) {
+        debug_assert!(
+            frags.windows(2).all(|w| w[0].end <= w[1].start),
+            "range fragments must be sorted and disjoint"
+        );
+        self.range_fragments = frags;
+    }
+
+    /// Fragments attached so far.
+    pub fn range_fragments(&self) -> &[crate::range_tombstone::Fragment] {
+        &self.range_fragments
     }
 
     pub fn new(klog_path: &str, mut opts: WriterOptions) -> Result<Writer> {
@@ -238,6 +265,7 @@ impl Writer {
             last_user_key: Vec::new(),
             last_seq: 0,
             pending_block: false,
+            range_fragments: Vec::new(),
             finished: false,
         })
     }
@@ -612,6 +640,23 @@ impl Writer {
             footer_flags |= FOOTER_HAS_BLOOM;
         }
 
+        // The aux block goes out before the index so the handle written just
+        // ahead of the footer addresses bytes that already exist.
+        let mut aux_handle = BlockHandle::default();
+        if !self.range_fragments.is_empty() {
+            if !self.extended() {
+                return Err(OndaError::InvalidArgs(
+                    "range fragments require an extended table: the aux-block                      handle only exists when FOOTER_EXTENDED_BLOCK is set"
+                        .into(),
+                ));
+            }
+            let payload = crate::sst::encode_aux_sections(&[(
+                crate::sst::AUX_SECTION_RANGE,
+                crate::range_tombstone::encode_fragments(&self.range_fragments),
+            )]);
+            aux_handle = self.write_meta_block(&payload)?;
+        }
+
         let index_handle = if self.opts.use_btree {
             footer_flags |= FOOTER_BTREE;
             self.write_btree_index()?
@@ -633,11 +678,12 @@ impl Writer {
         let mut klog = self.klog.take().unwrap();
         if self.extended() {
             // Aux-block handle, immediately before the footer. 1.0 defines the
-            // container and produces no sections, so both fields are zero; 1.2
-            // is the first writer to fill them in.
+            // container and produces no sections, so both fields are zero,
+            // which is every table of a database that has not enabled
+            // CAP_RANGE_DELETES; 1.2 is the first writer to fill them in.
             let mut aux = [0u8; AUX_HANDLE_LEN];
-            put_u64(&mut aux[0..8], 0);
-            put_u64(&mut aux[8..16], 0);
+            put_u64(&mut aux[0..8], aux_handle.offset);
+            put_u64(&mut aux[8..16], aux_handle.length);
             klog.write_all(&aux)?;
         }
         klog.write_all(&footer)?;
@@ -661,7 +707,27 @@ impl Writer {
         crate::util::sync_parent_dir(Path::new(&self.klog_path))?;
 
         self.finished = true;
+        let (range_min_key, range_max_key) =
+            match (self.range_fragments.first(), self.range_fragments.last()) {
+                (Some(first), Some(last)) => (Some(first.start.clone()), Some(last.end.clone())),
+                _ => (None, None),
+            };
         Ok(FileMeta {
+            range_count: self.range_fragments.len() as u64,
+            range_min_seq: self
+                .range_fragments
+                .iter()
+                .map(|f| f.min_seq())
+                .min()
+                .unwrap_or(0),
+            range_max_seq: self
+                .range_fragments
+                .iter()
+                .map(|f| f.max_seq())
+                .max()
+                .unwrap_or(0),
+            range_min_key,
+            range_max_key,
             id: 0,
             min_key: self.min_key.take().unwrap_or_default(),
             max_key: std::mem::take(&mut self.last_user_key),
@@ -797,7 +863,8 @@ mod tests {
             let mut key = Vec::new();
             let mut off = 0usize;
             while off < entries.len() {
-                let (e, next) = crate::sst::decode_entry_delta(entries, off, &mut key, true).unwrap();
+                let (e, next) =
+                    crate::sst::decode_entry_delta(entries, off, &mut key, true).unwrap();
                 if e.key_shared > 0 {
                     shared_entries += 1;
                 }

@@ -61,6 +61,8 @@ pub mod memtable_arena;
 pub mod parts;
 pub mod perf;
 pub(crate) mod range_lock;
+pub mod range_tombstone;
+pub(crate) mod span_index;
 pub mod sst;
 pub mod storage;
 #[cfg(feature = "s3")]

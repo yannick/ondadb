@@ -36,6 +36,24 @@ use crate::config::TierRule;
 use crate::db::DB;
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
+
+/// Refuse a table that carries range-tombstone fragments (1.2).
+///
+/// Both attach paths rebuild `SstMeta` from the reader, so an incoming table's
+/// range summary would decode as "no fragments" while its aux section still
+/// held them — and the read path gates on `range_count`, so the tombstones
+/// would be silently invisible and the data they hide would resurrect.
+/// Validating and adopting a foreign range section is its own change (feature
+/// 1.2, slice 11); until then the only safe answer is to say no.
+fn reject_range_fragments(reader: &crate::sst::Reader, name: &str) -> Result<()> {
+    if reader.range_fragments().is_empty() {
+        return Ok(());
+    }
+    Err(OndaError::InvalidArgs(format!(
+        "attach rejected: table {name} carries {} range-delete fragment(s);          attaching a table with range tombstones is not supported in this          release (its summary cannot be re-derived, and an unrecorded fragment          would silently stop masking)",
+        reader.range_fragments().len()
+    )))
+}
 use crate::range_lock::{KeyRange, RangeGuard};
 use crate::sst::vlog_path_for;
 
@@ -338,16 +356,14 @@ impl DB {
         //    them. A crash after the fsync leaves the files in place but out of
         //    the catalog: harmless orphans, and a clean reopen. A crash before
         //    it leaves the part attached and every file where it was.
-        let edit = crate::manifest_edit::VersionEdit::new(vec![
-            crate::manifest_edit::Op::RemoveTables {
+        let edit =
+            crate::manifest_edit::VersionEdit::new(vec![crate::manifest_edit::Op::RemoveTables {
                 cf: cf.name().to_string(),
                 ids: ids.clone(),
-            },
-        ]);
-        self.inner
-            .catalog_txn(edit, |p| {
-                cf.remove_bottom_tables(&ids, p);
-            })?;
+            }]);
+        self.inner.catalog_txn(edit, |p| {
+            cf.remove_bottom_tables(&ids, p);
+        })?;
 
         // 3. Move the file pairs aside. Existing readers hold their own open
         //    descriptors/mmaps, so the moves don't disturb them.
@@ -443,6 +459,7 @@ impl DB {
                     ..Default::default()
                 };
                 let reader = cf.open_reader_for(&meta)?;
+                reject_range_fragments(&reader, &src_klog)?;
                 if reader.max_seq() > visible {
                     return Err(OndaError::InvalidArgs(format!(
                         "attach rejected: table max_seq {} exceeds visible sequence {} \
@@ -609,6 +626,7 @@ impl DB {
             // Opens through the tier's backend and CRC-verifies footer,
             // index and bloom — the same validation every reader open does.
             let reader = cf.open_reader_for(&meta)?;
+            reject_range_fragments(&reader, t.object.as_deref().unwrap_or("<unnamed>"))?;
             if reader.num_entries() != t.num_entries
                 || reader.max_seq() != t.max_seq
                 || reader.min_key() != t.min_key.as_slice()
@@ -1340,12 +1358,11 @@ impl DB {
         // which is what the old single-lock validate-and-append gave.
         let _lifecycle = self.inner.cf_lifecycle_mu.lock();
         let candidate = cf.plan_partition_rule_addition(&rule)?;
-        let edit = crate::manifest_edit::VersionEdit::new(vec![
-            crate::manifest_edit::Op::SetCfConfig {
+        let edit =
+            crate::manifest_edit::VersionEdit::new(vec![crate::manifest_edit::Op::SetCfConfig {
                 name: cf.name().to_string(),
                 config: candidate.encode(),
-            },
-        ]);
+            }]);
         self.inner
             .catalog_txn(edit, |p| cf.append_partition_rule(rule, p))?;
         Ok(())
@@ -1367,12 +1384,11 @@ impl DB {
         self.inner.poison.check()?;
         let _lifecycle = self.inner.cf_lifecycle_mu.lock();
         let candidate = cf.plan_partition_rule_removal(prefix)?;
-        let edit = crate::manifest_edit::VersionEdit::new(vec![
-            crate::manifest_edit::Op::SetCfConfig {
+        let edit =
+            crate::manifest_edit::VersionEdit::new(vec![crate::manifest_edit::Op::SetCfConfig {
                 name: cf.name().to_string(),
                 config: candidate.encode(),
-            },
-        ]);
+            }]);
         self.inner
             .catalog_txn(edit, |p| cf.remove_partition_rule(prefix, p))?;
         Ok(())

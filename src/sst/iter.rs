@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use super::{
-    cmp_internal, decode_delta_anchor, decode_entry, decode_entry_delta, decode_delta_header,
+    cmp_internal, decode_delta_anchor, decode_delta_header, decode_entry, decode_entry_delta,
     restart_lower_bound, Block, DecEntry, Reader,
 };
 use crate::error::Result;
@@ -609,7 +609,11 @@ impl SstIterator {
     /// First entry of run `r` that sorts `>= (user_key, seq)`, or `None` when
     /// every entry of the run sorts before it.
     fn find_in_run(&mut self, r: usize, user_key: &[u8], seq: u64) -> Option<usize> {
-        debug_assert_eq!(self.run.at, Some((self.block_idx, r)), "run not materialized");
+        debug_assert_eq!(
+            self.run.at,
+            Some((self.block_idx, r)),
+            "run not materialized"
+        );
         let cmp = self.r.comparator().clone();
         let n = self.run.len();
         if self.run.overflowed {
@@ -943,7 +947,8 @@ mod tests {
             let mut w = Writer::new(path.to_str().unwrap(), opts(4, 512, is_delta)).unwrap();
             for i in 0..100u64 {
                 let k = format!("tenant/alpha/{i:04}");
-                w.add(k.as_bytes(), b"value", i + 1, 0, false, false).unwrap();
+                w.add(k.as_bytes(), b"value", i + 1, 0, false, false)
+                    .unwrap();
             }
             w.finish().unwrap();
         }

@@ -177,6 +177,13 @@ pub struct Memtable {
     /// per-iterator transaction overlay) must not pay the 512 KiB
     /// alloc+zero — that showed up as a large per-scan cost.
     filter: std::sync::OnceLock<MemFilter>,
+    /// Range tombstones (1.2), beside the point shards rather than inside
+    /// them: a lookup for `k` must find *every* covering span, and sharding by
+    /// start key scatters exactly the spans that could cover a given key.
+    ///
+    /// Empty until the first `delete_range`, and `is_empty` is one relaxed load
+    /// — the zero-cost gate a family that never uses the feature pays.
+    ranges: crate::range_tombstone::RangeTombstoneSet,
 }
 
 /// Bits set per key within its filter word.
@@ -269,6 +276,7 @@ impl Memtable {
         let shards = (0..NUM_SHARDS)
             .map(|_| ArenaShard::new(cmp.clone()))
             .collect();
+        let cmp_for_ranges = cmp.clone();
         Arc::new(Memtable {
             shards,
             cmp,
@@ -276,7 +284,26 @@ impl Memtable {
             num_entries: AtomicI64::new(0),
             max_seq: AtomicU64::new(0),
             filter: std::sync::OnceLock::new(),
+            ranges: crate::range_tombstone::RangeTombstoneSet::new(cmp_for_ranges),
         })
+    }
+
+    /// This memtable's range tombstones.
+    #[inline]
+    pub fn ranges(&self) -> &crate::range_tombstone::RangeTombstoneSet {
+        &self.ranges
+    }
+
+    /// Record a range delete of `[start, end)` at `seq`.
+    ///
+    /// Deliberately not routed through `after_insert`: a span is not an entry,
+    /// it does not enlarge the point stream, and counting it toward
+    /// `approx_size` would make a handful of bulk deletes rotate a nearly
+    /// empty memtable. It does advance `max_seq`, which flush and recovery
+    /// read as "the newest thing in here".
+    pub fn add_range(&self, start: &[u8], end: &[u8], seq: u64) {
+        self.ranges.add(start, end, seq);
+        self.max_seq.fetch_max(seq, AtOrd::Relaxed);
     }
 
     /// The comparator used by this memtable.
@@ -522,6 +549,13 @@ impl Memtable {
     }
 
     /// Whether the memtable holds no entries.
+    /// Whether this memtable holds neither a point entry nor a range
+    /// tombstone. Rotation and flush use it, so a memtable holding only range
+    /// deletes must not report empty — its spans would be dropped.
+    pub fn is_empty_including_ranges(&self) -> bool {
+        self.is_empty() && self.ranges.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.num_entries.load(AtOrd::Relaxed) == 0
     }

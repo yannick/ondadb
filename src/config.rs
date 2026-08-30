@@ -220,6 +220,26 @@ pub struct Options {
     /// writers stall. Bounds recovery/WAL-backed memory when flush falls
     /// behind; one flush completion wakes the blocked writers.
     pub unified_memtable_stall_threshold: usize,
+    /// Maximum number of markers the committed-span index (1.2) holds at once.
+    ///
+    /// The index records recent commits so a range delete can ask "did anything
+    /// in `[start, end)` change since my snapshot" — a question the LSM cannot
+    /// answer without scanning the span. Markers are pruned below the oldest
+    /// live snapshot; when a long-lived snapshot keeps them alive and the index
+    /// fills, further **range** commits *wait* rather than silently dropping a
+    /// marker (a dropped marker would blind every later point writer), and they
+    /// wait *before* taking `commit_mu` so nothing else stalls behind them.
+    ///
+    /// Point commits never wait — the write path must not stall behind a
+    /// bookkeeping structure. A point commit that finds the index full gives up
+    /// its marker and raises an overflow watermark instead; range writers
+    /// reading at or below that watermark then conflict unconditionally, which
+    /// can refuse a range commit that would have been safe but never admits one
+    /// that would not.
+    ///
+    /// Unused until [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES) is
+    /// enabled; no allocation happens before the first marker.
+    pub span_index_capacity: usize,
     /// Explicitly migrate an existing per-column-family database to the
     /// unified WAL layout during open. The migration flushes all recovered
     /// per-CF WAL state before atomically flipping the manifest layout.
@@ -523,6 +543,7 @@ impl Default for Options {
             unified_memtable_sync_mode: SyncMode::None,
             unified_memtable_sync_interval: Duration::from_micros(128_000),
             unified_memtable_stall_threshold: 6,
+            span_index_capacity: 16 << 10,
             migrate_to_unified: false,
             tiers: Vec::new(),
             part_mover_interval: Duration::from_secs(30),
@@ -1878,10 +1899,7 @@ fn encode_periodic_interval(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
 /// before 0.3, and any family that left the option at zero), the default stands
 /// — `Duration::ZERO`, which disables the trigger.
 /// Returns the unconsumed remainder so later tails can be chained behind it.
-fn read_periodic_interval_tail<'a>(
-    p: &'a [u8],
-    cfg: &mut ColumnFamilyConfig,
-) -> &'a [u8] {
+fn read_periodic_interval_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     let Some(rest) = p.strip_prefix(CONFIG_PERIODIC_MAGIC) else {
         return p;
     };
@@ -1900,8 +1918,7 @@ fn encode_prefix_delta(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
     use crate::encoding::append_u64;
 
     let default = ColumnFamilyConfig::default();
-    if !cfg.enable_prefix_delta_keys
-        && cfg.block_restart_interval == default.block_restart_interval
+    if !cfg.enable_prefix_delta_keys && cfg.block_restart_interval == default.block_restart_interval
     {
         return;
     }

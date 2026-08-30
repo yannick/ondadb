@@ -122,6 +122,15 @@ pub struct FileMeta {
     pub max_seq: u64,
     pub klog_size: u64,
     pub vlog_size: u64,
+    /// Range-tombstone fragments written into this file's aux section (1.2),
+    /// summarized for the catalog. All zero/`None` when the writer was handed
+    /// no fragments — which is every table of a database that has not enabled
+    /// [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES).
+    pub range_count: u64,
+    pub range_min_seq: u64,
+    pub range_max_seq: u64,
+    pub range_min_key: Option<Vec<u8>>,
+    pub range_max_key: Option<Vec<u8>>,
 }
 
 impl FileMeta {
@@ -152,6 +161,12 @@ impl FileMeta {
             // CAP_PERIODIC_AGE may set it, and only flush/ingest and compaction
             // output know which clock reading applies.
             last_compaction_time: None,
+            // Range summary, straight from the fragments the writer was given.
+            range_count: self.range_count,
+            range_min_seq: self.range_min_seq,
+            range_max_seq: self.range_max_seq,
+            range_min_key: self.range_min_key.clone(),
+            range_max_key: self.range_max_key.clone(),
         }
     }
 }
@@ -355,7 +370,9 @@ pub(crate) fn decode_entry(
         }
         EntryLayout::Extended => {
             let (kind, n) = uvarint(&raw[off..]).ok_or_else(corrupt)?;
-            crate::format::check_kind(kind)?;
+            // A point stream, so kind 5 is refused here even though the binary
+            // implements it: range fragments live in the aux section.
+            crate::format::check_point_kind(kind)?;
             let mut p = off + n;
             let (mods, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
             crate::format::check_modifiers(mods)?;
@@ -465,10 +482,8 @@ pub(crate) fn encode_entry_delta(
     // Normalization may have cleared HAS_VLOG (a tombstone has no separated
     // value); the layout below must follow the bits that were actually written.
     let has_vlog = fl & flags::HAS_VLOG != 0;
-    let kind = crate::format::point_kind(
-        fl & flags::TOMBSTONE != 0,
-        fl & flags::SINGLE_DELETE != 0,
-    );
+    let kind =
+        crate::format::point_kind(fl & flags::TOMBSTONE != 0, fl & flags::SINGLE_DELETE != 0);
     let mods = u64::from(fl) & crate::format::modifiers::KNOWN;
     let shared = shared_prefix_len(prev_key, user_key);
     append_uvarint(dst, kind);
@@ -729,9 +744,38 @@ pub(crate) fn decode_aux_sections(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
     Ok(out)
 }
 
-/// Highest aux section tag this binary knows. `0` because 1.0 defines only the
-/// container; 1.2 raises it to `1` when it adds range-delete fragments.
-const MAX_KNOWN_AUX_SECTION: u8 = 0;
+/// [`decode_aux_sections`] for tests outside this crate.
+///
+/// The aux container is a format contract, and the refusal of an unknown
+/// section tag is part of it — but the decoder itself is an internal detail, so
+/// only this thin, documented wrapper is exported.
+#[doc(hidden)]
+pub fn decode_aux_sections_for_test(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
+    decode_aux_sections(payload)
+}
+
+/// Highest aux section tag this binary knows. `1` since 1.2 defined the
+/// range-delete fragment section.
+const MAX_KNOWN_AUX_SECTION: u8 = 1;
+
+/// Aux section tag 1: range-delete fragments (1.2). See
+/// [`crate::range_tombstone::encode_fragments`] for the payload.
+pub(crate) const AUX_SECTION_RANGE: u8 = 1;
+
+/// Encode an aux block from its `(tag, payload)` sections, in tag order.
+///
+/// The inverse of [`decode_aux_sections`]; the enclosing `block.rs` frame
+/// supplies the CRC (invariant 4).
+pub(crate) fn encode_aux_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    append_uvarint(&mut b, sections.len() as u64);
+    for (tag, payload) in sections {
+        b.push(*tag);
+        append_uvarint(&mut b, payload.len() as u64);
+        b.extend_from_slice(payload);
+    }
+    b
+}
 
 /// Order `(user_key, seq)` pairs: user key ascending (via `cmp`), seq descending.
 pub(crate) fn cmp_internal(
@@ -915,7 +959,18 @@ mod tests {
     #[test]
     fn delta_entry_rejects_shared_longer_than_prev() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"abcdef", b"abcdefgh", b"v", 1, 0, false, false, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"abcdef",
+            b"abcdefgh",
+            b"v",
+            1,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
         // The predecessor is shorter than the recorded shared_len (6).
         let mut out = b"abc".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true)
@@ -930,7 +985,18 @@ mod tests {
     #[test]
     fn delta_entry_rejects_truncated_suffix() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"ab", b"abcdefgh", b"v", 1, 0, false, false, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"ab",
+            b"abcdefgh",
+            b"v",
+            1,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
         // Drop the value and part of the suffix.
         buf.truncate(buf.len() - 4);
         let mut out = b"ab".to_vec();
@@ -941,7 +1007,18 @@ mod tests {
     #[test]
     fn delta_entry_rejects_truncated_value() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"ab", b"abc", b"a-long-value", 1, 0, false, false, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"ab",
+            b"abc",
+            b"a-long-value",
+            1,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
         buf.truncate(buf.len() - 3);
         let mut out = b"ab".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("truncated value");
@@ -1032,10 +1109,7 @@ mod tests {
             prev = k;
         }
         let mut seeds = vec![buf];
-        for name in [
-            "klog_legacy_flat_restarts_bloom.klog",
-            "klog_extended.klog",
-        ] {
+        for name in ["klog_legacy_flat_restarts_bloom.klog", "klog_extended.klog"] {
             seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
         }
 

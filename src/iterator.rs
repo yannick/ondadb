@@ -393,6 +393,13 @@ pub struct Iterator {
     /// memory-safe) completeness.
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
+    /// Range-delete coverage (1.2) across every source of this scan.
+    ///
+    /// Consulted once per surfaced group, after the group's visible point
+    /// version is known — the same comparison a point read makes. Empty for
+    /// every column family that has never issued a range delete, and the
+    /// emptiness check is what keeps a plain scan at exactly its old cost.
+    mask: crate::range_tombstone::RangeMask,
 }
 
 impl std::fmt::Debug for Iterator {
@@ -451,6 +458,7 @@ impl Iterator {
         read_seq: u64,
         now: i64,
         bounds: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+        mask: crate::range_tombstone::RangeMask,
     ) -> Iterator {
         let n = children.len();
         Iterator {
@@ -468,6 +476,31 @@ impl Iterator {
             err: None,
             lower: bounds.0,
             upper: bounds.1,
+            mask,
+        }
+    }
+
+    /// Is the group just resolved hidden by a range delete?
+    ///
+    /// The cursor walks with the scan, so this is amortized O(1) per key in
+    /// either direction; an empty mask returns immediately.
+    #[inline]
+    fn masked_by_range(&mut self, visible: &VisibleVersion) -> bool {
+        if self.mask.is_empty() {
+            return false;
+        }
+        // Moved out and back rather than cloning the group key: the key may be
+        // a slice borrowed from a pinned block, and taking the mask is what
+        // lets it be read immutably while the cursors advance. A per-group key
+        // copy here would be a real cost on a long scan.
+        let mut mask = std::mem::take(&mut self.mask);
+        let covering = mask.covering_seq(&self.m.cmp, self.key(), self.read_seq);
+        self.mask = mask;
+        match covering {
+            // Strictly greater: a point version written after the tombstone is
+            // visible again, exactly as it would be after a point tombstone.
+            Some(seq) => seq > visible.seq,
+            None => false,
         }
     }
 
@@ -513,6 +546,7 @@ impl Iterator {
             0,
             0,
             (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+            crate::range_tombstone::RangeMask::default(),
         );
         it.err = Some(e);
         it.valid = false;
@@ -707,7 +741,7 @@ impl Iterator {
                     return;
                 }
             };
-            if visible.is_live(self.now) {
+            if visible.is_live(self.now) && !self.masked_by_range(&visible) {
                 self.valid = true;
                 // Terminate at the first group past the declared upper bound.
                 if self.past_upper() {
@@ -735,7 +769,7 @@ impl Iterator {
                     return;
                 }
             };
-            if visible.is_live(self.now) {
+            if visible.is_live(self.now) && !self.masked_by_range(&visible) {
                 self.valid = true;
                 // Terminate at the first group below the declared lower bound.
                 if self.below_lower() {
@@ -788,6 +822,7 @@ mod tests {
             7,
             0,
             (Bound::Unbounded, Bound::Unbounded),
+            crate::range_tombstone::RangeMask::default(),
         );
         iterator.seek_to_first();
         assert_eq!(iterator.value(), b"overlay");

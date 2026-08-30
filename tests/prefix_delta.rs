@@ -181,7 +181,13 @@ struct Twins {
 }
 
 fn twins(keys: &[Vec<u8>], restart_interval: usize, block_size: usize) -> Twins {
-    twins_with(keys, restart_interval, block_size, default_comparator(), true)
+    twins_with(
+        keys,
+        restart_interval,
+        block_size,
+        default_comparator(),
+        true,
+    )
 }
 
 fn twins_with(
@@ -290,7 +296,8 @@ fn delta_point_get_matches_legacy_twin() {
                     let want = t.legacy.get(k, seq, 0).unwrap();
                     let got = t.delta.get(k, seq, 0).unwrap();
                     assert_eq!(
-                        got, want,
+                        got,
+                        want,
                         "{name} r={interval} b={block_size}: get({:?}, {seq})",
                         String::from_utf8_lossy(k)
                     );
@@ -309,7 +316,11 @@ fn delta_point_get_finds_key_at_every_run_position() {
         let t = twins(&keys, interval, 1024);
         for (k, v, seq, ttl, tomb, _) in &t.entries {
             let (value, got_seq, found, deleted) = t.delta.get(k, u64::MAX, 0).unwrap();
-            assert!(found, "r={interval}: missing {:?}", String::from_utf8_lossy(k));
+            assert!(
+                found,
+                "r={interval}: missing {:?}",
+                String::from_utf8_lossy(k)
+            );
             assert_eq!(got_seq, *seq);
             // `now = 0` is before every TTL in the corpus, so only the
             // tombstones read as deleted.
@@ -397,7 +408,10 @@ fn delta_seek_past_block_end_advances_to_next_block() {
             crossings += 1;
         }
     }
-    assert!(crossings > 100, "the probes never crossed a key: {crossings}");
+    assert!(
+        crossings > 100,
+        "the probes never crossed a key: {crossings}"
+    );
     // Past the very last key: both go invalid.
     let mut past = keys.last().unwrap().clone();
     past.push(0xff);
@@ -559,7 +573,10 @@ fn delta_round_trips_under_a_non_bytewise_comparator() {
                 t.delta.get(k, u64::MAX, 0).unwrap(),
                 t.legacy.get(k, u64::MAX, 0).unwrap()
             );
-            assert_eq!(seek_at(&t.delta, k, u64::MAX), seek_at(&t.legacy, k, u64::MAX));
+            assert_eq!(
+                seek_at(&t.delta, k, u64::MAX),
+                seek_at(&t.legacy, k, u64::MAX)
+            );
         }
     }
 }
@@ -588,10 +605,7 @@ fn mutated_delta_error(mutate: impl FnOnce(&mut Vec<u8>, usize) -> usize) -> (St
         raw_len,
         "mutations keep the block length so the framing stays valid"
     );
-    file.splice(
-        BLOCK_HEADER..BLOCK_HEADER + raw_len,
-        block.iter().copied(),
-    );
+    file.splice(BLOCK_HEADER..BLOCK_HEADER + raw_len, block.iter().copied());
     // Re-checksum so the block framing accepts it and the entry decoder is
     // what refuses.
     let crc = ondadb::encoding::checksum(&file[BLOCK_HEADER..BLOCK_HEADER + raw_len]);
@@ -719,9 +733,7 @@ fn delta_rejects_trailing_bytes_before_trailer() {
         // so the entries region ends one byte short of the trailer. Keeping the
         // total length fixed is what isolates "trailing bytes" from "truncated".
         let mut anchors: Vec<u32> = (0..count)
-            .map(|i| {
-                u32::from_le_bytes(block[end + i * 4..end + i * 4 + 4].try_into().unwrap())
-            })
+            .map(|i| u32::from_le_bytes(block[end + i * 4..end + i * 4 + 4].try_into().unwrap()))
             .collect();
         // Point a new final anchor at the byte just before the trailer: the
         // walk from the previous anchor then cannot land on it.
@@ -877,8 +889,11 @@ fn fill(db: &DB, cf: &Arc<ondadb::ColumnFamily>, range: std::ops::Range<u32>) {
 fn check(db: &DB, cf: &Arc<ondadb::ColumnFamily>, range: std::ops::Range<u32>) {
     for i in range {
         assert_eq!(
-            db.get(cf, format!("tenant/0001/cluster/0002/segment/{i:06}").as_bytes())
-                .unwrap(),
+            db.get(
+                cf,
+                format!("tenant/0001/cluster/0002/segment/{i:06}").as_bytes()
+            )
+            .unwrap(),
             format!("value-{i:06}").into_bytes(),
             "key {i}"
         );
@@ -1027,7 +1042,11 @@ fn delta_writer_requires_the_capability() {
     fill(&db, &cf, 2000..4000);
     db.flush_memtable(&cf).unwrap();
     for (name, f) in klog_footer_flags(dir.path()) {
-        assert_eq!(f & FOOTER_PREFIX_DELTA, 0, "{name}: half a capability sufficed");
+        assert_eq!(
+            f & FOOTER_PREFIX_DELTA,
+            0,
+            "{name}: half a capability sufficed"
+        );
     }
     db.close().unwrap();
 }
@@ -1292,8 +1311,13 @@ fn attached_delta_part_reads_without_the_source_manifest() {
     // `attach_part` refuses a table whose max_seq is ahead of the destination's
     // visible sequence, so give the destination a lineage of its own first.
     for i in 0..1400u32 {
-        db.put(&cf, format!("zzz/{i:06}").as_bytes(), b"local", Duration::ZERO)
-            .unwrap();
+        db.put(
+            &cf,
+            format!("zzz/{i:06}").as_bytes(),
+            b"local",
+            Duration::ZERO,
+        )
+        .unwrap();
     }
     db.flush_memtable(&cf).unwrap();
     db.attach_part(&cf, &staging).unwrap();

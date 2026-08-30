@@ -12,7 +12,9 @@ type/function names — grep for them; line numbers rot.
 | `db.rs` | `DB`/`DbInner`: CF registry, global sequence + publish machinery, snapshot refcounts, background flush/compaction workers, recovery, manifest persistence, deferred SST deletion, `LOCK` file, fail-stop poisoning |
 | `column_family.rs` | `ColumnFamily`: per-CF memtable + WAL + LSM levels; commit application, memtable rotation, flush to L0, point reads, iterator construction |
 | `txn.rs` | `Txn`: arena-buffered writes, five isolation levels, conflict detection, savepoints; also the `DB::put/get/delete` single-op helpers |
-| `memtable.rs` | Sharded (16) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath) |
+| `memtable.rs` | Sharded (16) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath); the per-memtable `RangeTombstoneSet` |
+| `range_tombstone.rs` | Range deletes (1.2): the live `RangeTombstoneSet` beside the point shards, the durable `Fragment` form, the aux-section codec, and the `RangeMask` cursors the read paths apply |
+| `span_index.rs` | Committed-span index (1.2): the conflict domain a range delete needs, bounded by `Options::span_index_capacity` and pruned at the oldest live snapshot |
 | `memtable_arena.rs` | *(unsafe-fastpath only)* arena skip-list shard: single-allocation nodes with inline key prefix + seq; `ShardCursor` for zero-copy flush |
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
@@ -64,23 +66,42 @@ in the database directory; only bottom-level parts may live on a named tier
    per-op allocations at the API boundary.
 2. Dedup: last write per (cf, key) wins, sequenced in first-write order
    (`slot_of` map hashing key slices with xxh3; single-write txns skip it).
-3. Snapshot/Serializable only: take `DbInner::commit_mu`, run write-write
+3. A commit holding a range delete first rejects any of its **own** point
+   writes that fall inside one of its own spans (v1 restriction — see
+   `Txn::check_own_range_overlap`), then reserves span-index capacity **with no
+   lock held**.
+4. Snapshot/Serializable — **and every commit holding a range delete, at any
+   isolation level** — take `DbInner::commit_mu` and run the write-write
    conflict check via `ColumnFamily::peek_seq`; Serializable additionally
-   validates the point-read set (`read_cfs`).
-4. Reserve a contiguous seq block: `DbInner::reserve_seq(n)`.
-5. Build per-CF `Vec<RecordRef>` **borrowing the txn arena** (`CfGroup`);
-   `CommitOp` hook payloads are built only if `cf.has_commit_hook()`.
-6. `ColumnFamily::apply_commit(&recs)`:
+   validates the point-read set (`read_cfs`). Snapshot/Serializable also ask
+   the committed-span index: a range writer conflicts with any overlapping
+   marker newer than its snapshot, a point writer with any newer *covering
+   range* marker.
+5. Reserve a contiguous seq block: `DbInner::reserve_seq(n)`. Range deletes
+   take their own slot in the dedup order — never collapsed into a point write
+   whose key equals their start bound — so their sequence is distinct by
+   construction.
+6. Build per-CF `Vec<RecordRef>` **borrowing the txn arena** (`CfGroup`), plus a
+   `Vec<RangeRef>` of that CF's range deletes; `CommitOp` hook payloads are
+   built only if `cf.has_commit_hook()` (range deletes are not surfaced to
+   hooks in v1 — `CommitOp` describes one key and one value).
+7. `ColumnFamily::apply_commit_with_ranges(&recs, &ranges)`:
    - gate: wait while rotating or imm-queue ≥ `l0_queue_stall_threshold`;
      increment `active_writers`
    - `Wal::append_batch(&recs)` — encodes ONE frame in this thread, writes it
-     to this thread's WAL stripe (see `docs/formats.md`)
+     to this thread's WAL stripe (see `docs/formats.md`). A batch holding a
+     range delete instead writes one **envelope** frame carrying both kinds
+     (`append_batch_envelope`); one frame either way, because batch atomicity
+     is per frame
    - `Memtable::put_batch(&recs)` — counting-sorts into per-shard runs, one
      shard lock per batch, nodes prebuilt outside locks, counters updated once
+   - `Memtable::add_range` per range delete, into the `RangeTombstoneSet`
    - decrement `active_writers`; if memtable ≥ `write_buffer_size`, call
      `rotate_memtable(false)`
-7. `DbInner::publish_range(start, end)` — advances `visible` gap-free.
-8. Run commit hooks (outside `commit_mu`).
+8. `DbInner::publish_range(start, end)` — advances `visible` gap-free.
+9. Span markers are inserted, still under `commit_mu`, only after every record
+   is installed.
+10. Run commit hooks (outside `commit_mu`).
 
 Unified-memtable mode replaces step 6 with `UnifiedStore::apply` (records get
 an 8-byte big-endian CF-id key prefix, one shared WAL + memtable). Its sealed
@@ -96,7 +117,22 @@ supported atomic cross-CF layout.
 Point get (`ColumnFamily::get`): consult, newest-wins by seq —
 unified store (if enabled) → active memtable → immutable memtables (newest
 first) → L0 tables whose [min,max] covers the key (all of them; L0 overlaps) →
-one binary-searched table per level ≥ 1. SSTable get: bloom filter →
+one binary-searched table per level ≥ 1.
+
+**Range-delete masking (1.2)** runs beside that walk and is resolved against it
+at the end: the maximum *covering* sequence at or below `read_seq` is taken
+across the memtable sets, the unified set, every L0 table whose **span**
+contains the key, and per level ≥ 1 the point candidate plus its **gap owner**
+— the table to its left, consulted only when that table has `range_count > 0`
+and the key sorts below its `range_max_key`. The key is deleted iff the covering
+sequence is above the surviving point version's, or there is no point version.
+At most two tables per level, one binary search, and one `range_count == 0`
+branch for every legacy or point-only table; a column family that never issues a
+range delete allocates nothing (pinned by
+`no_range_cf_allocates_nothing_on_read`).
+
+Iterators apply the same rule per surfaced group, through a monotonic cursor per
+source that walks with the scan in either direction. SSTable get: bloom filter →
 `find_block` binary search on the in-memory index → linear entry scan inside
 the data block → inline value or vlog read (CRC-verified).
 
@@ -276,6 +312,11 @@ Flush worker (`db.rs::flush_worker`):
   no `Vec<Entry>` materialization, no sort. Safe build: `snapshot()` + sort.
   Nothing is published: `flush_imm` returns a `FlushOutput` holding the finished
   handle (`None` for an empty memtable) and the WAL paths.
+- The sealed memtable's `RangeTombstoneSet` is fragmented over the whole
+  keyspace and handed to the writer (`set_range_fragments`) — one L0 file, one
+  owned interval, so nothing is clipped. A memtable holding **only** range
+  tombstones still produces a table: dropping it as "empty" would lose the
+  deletes.
 - `Writer::finish` fsyncs klog+vlog and the CF directory.
 - `catalog_txn(AddTable, publish_flush)`: the record is appended and **fsynced**,
   and only then is the table installed in L0 and the sealed memtable retired,
@@ -292,7 +333,24 @@ overlapping next-level tables; keeps the newest version per key plus every
 version newer than `DbInner::oldest_snapshot()`; drops tombstones and expired
 TTL entries only at the bottom level. Output SSTs are split at
 `target_file_size` and, at the bottom level, additionally **cut at partition
-boundaries** (see § Partitions). Every output carries
+boundaries** (see § Partitions).
+
+**Range fragments (1.2)** are merged over the job span and re-fragmented over
+this span's boundaries, then each output takes the slice of them that falls in
+the interval it owns — `[o_i.min_key, o_{i+1}.min_key)`, with the first extended
+down to the job span and the last up to it. Clipping is what preserves level-≥1
+point disjointness, which `find_overlapping` and the read path's gap-owner rule
+depend on (`docs/formats.md` § Aux block). Consequences implemented explicitly:
+`gather_target` and `key_span` expand the job to the union of the inputs'
+**span** bounds, not their point bounds, so an input fragment reaching past the
+last point key is never left outside the job; the point stream is filtered
+against the pre-drop fragment stack **before** `VersionRetention::decide` sees
+it, so a shadowed point is dropped without being counted as the one version at
+or below `oldest_snapshot`; and a fragment sequence is itself dropped only at
+the bottom, only at or below `oldest_snapshot`, and never when a foreign mount
+overlaps its span. Because outputs are already cut at partition boundaries,
+clipping also gives "no fragment crosses a partition" for free. Every output
+carries
 `max_entry_time = max` over its inputs' stamps, so re-compacting cold data
 does not reset its age for the part mover. Ordering: outputs written and fsynced → ONE edit
 (`RemoveTables` for every input plus `AddTable` for every output) appended and

@@ -54,6 +54,16 @@ pub struct Reader {
     /// Aux-block handle of an extended table (`(0, 0)` when absent), `None` for
     /// a legacy table that has no such prefix at all.
     aux_handle: Option<BlockHandle>,
+    /// Range-tombstone fragments from aux section 1 (1.2), decoded once at
+    /// open: sorted by `start`, disjoint, each with its covering sequences
+    /// newest-first. Empty for every legacy and point-only table, which is what
+    /// makes the read path's gate a single `is_empty` test.
+    ///
+    /// Held as owned data rather than a borrowed block: the read path hands
+    /// bounds to cursors that outlive any pinned block (invariant 8), and one
+    /// table's fragment list is orders of magnitude smaller than its point
+    /// stream.
+    fragments: Vec<crate::range_tombstone::Fragment>,
 
     /// Background-IO admission, or `None` when unlimited. Charged on the paths
     /// that actually issue device IO — a cache hit and an already-faulted mmap
@@ -258,6 +268,7 @@ impl Reader {
             prefix_delta: false,
             bytewise: false,
             aux_handle: None,
+            fragments: Vec::new(),
             vlog_verified: OnceLock::new(),
             vlog_cache_limit,
             #[cfg(feature = "mmap-reads")]
@@ -331,11 +342,26 @@ impl Reader {
             }
             r.aux_handle = Some(handle);
             if handle.length > 0 {
-                // Validate at open: an aux block naming a section this binary
-                // does not implement must fail the open, not surface later as a
-                // silently missing range delete.
+                // Decoded at open, not lazily: an aux block naming a section
+                // this binary does not implement must fail the open, not
+                // surface later as a silently missing range delete.
                 let (payload, _) = read_block_at(&*f, handle.offset, handle.length)?;
-                decode_aux_sections(&payload)?;
+                for (tag, section) in decode_aux_sections(&payload)? {
+                    if tag == crate::sst::AUX_SECTION_RANGE {
+                        r.fragments = crate::range_tombstone::decode_fragments(section)?;
+                    }
+                }
+                // Fragments are written sorted and disjoint; the read path's
+                // binary search and its monotonic cursor both depend on it, so
+                // a file that claims otherwise is corrupt.
+                if r.fragments.windows(2).any(|w| {
+                    r.cmp.compare(&w[0].end, &w[1].start).is_gt()
+                        || r.cmp.compare(&w[1].start, &w[1].end).is_ge()
+                }) {
+                    return Err(OndaError::Corruption(
+                        "sst: range fragments are unsorted, overlapping or empty".into(),
+                    ));
+                }
             }
         }
 
@@ -541,6 +567,24 @@ impl Reader {
     /// This table's aux-block handle as `(offset, length)`, or `None` for a
     /// legacy table (one without [`FOOTER_EXTENDED_BLOCK`], which has no such
     /// prefix at all). `Some((0, 0))` means an extended table with no aux block.
+    /// This table's range-tombstone fragments (1.2); empty for a point-only or
+    /// legacy table.
+    pub fn range_fragments(&self) -> &[crate::range_tombstone::Fragment] {
+        &self.fragments
+    }
+
+    /// Newest sequence at or below `read_seq` of a fragment covering `key`.
+    ///
+    /// One binary search, and an immediate `None` for a table with no
+    /// fragments — the point-read shape of the zero-cost gate.
+    #[inline]
+    pub fn covering_seq(&self, key: &[u8], read_seq: u64) -> Option<u64> {
+        if self.fragments.is_empty() {
+            return None;
+        }
+        crate::range_tombstone::covering_seq_in(&self.cmp, &self.fragments, key, read_seq)
+    }
+
     pub fn aux_block_handle(&self) -> Option<(u64, u64)> {
         self.aux_handle.map(|h| (h.offset, h.length))
     }

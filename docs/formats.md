@@ -208,8 +208,31 @@ but unimplemented kind → `UnsupportedFormat`; unknown modifier bit →
 `Corruption`; a `count` that disagrees with the payload in either direction →
 `Corruption`, so an envelope frame can never deliver a partial batch.
 
-As of 1.0-B the engine enables no capability by default and therefore writes no
-envelopes; `Wal::append_batch_enveloped` is the codec entry point.
+The engine enables no capability by default and therefore writes no envelopes;
+`Wal::append_batch_enveloped` is the codec entry point.
+
+#### Kind 5 — range delete (1.2)
+
+```
+record := 5 | 0 (no modifiers) | alen uvarint | blen uvarint | seq uvarint
+        | a bytes (= start) | b bytes (= end)
+```
+
+No TTL and no vlog: a range tombstone has no value to expire or separate, so a
+non-zero modifier word here is `Corruption`, as is an empty bound (an empty
+`end` would delete nothing and an empty `start` is indistinguishable from
+absent). The interval is half-open — `end` is never itself deleted.
+
+**Schema 1** carries user keys. **Schema 2** carries the 8-byte big-endian
+cf-id prefix on **both** bounds, exactly as it does on a point key; a span can
+never cross a cf-id boundary, because both bounds come from one `delete_range`
+call on one column family, and that is asserted at encode rather than assumed.
+
+Emission is decided **per batch, not per database**: a point-only commit keeps
+writing the legacy record stream (unchanged bytes, unchanged size), and a commit
+holding a range delete writes **one** envelope frame carrying both kinds. One
+frame, because WAL batch atomicity (invariant 3) is per frame — two frames could
+replay half a commit.
 
 ## SSTable (`sst/`)
 
@@ -424,6 +447,68 @@ offset  field
 binary and names a feature this one does not implement, so `Reader::open`
 refuses the file with `OndaError::UnsupportedFormat` (code `-16`) rather than
 `Corruption` — the file is intact, this binary is simply too old.
+
+### Aux block and the range-fragment section (tag 1, 1.2)
+
+An **extended** table (`FOOTER_EXTENDED_BLOCK`) carries a 16-byte handle in the
+bytes immediately preceding the footer:
+
+```
+aux_off u64 LE | aux_len u64 LE      (both 0 when the table has no aux block)
+```
+
+It lives outside the footer because the fixed 64 bytes are full. The block it
+addresses is `block.rs`-framed like every other block, so its bytes are
+CRC-covered (invariant 4), and its payload is a tagged section list:
+
+```
+aux payload := section_count uvarint | section × count
+section     := tag u8 | len uvarint | payload[len]
+tag 1 = range-delete fragments (1.2)
+tag 2.. reserved
+```
+
+An unknown section tag fails the **open** with `UnsupportedFormat`: the block is
+intact and names a feature this binary does not implement, and a silently
+skipped section would be a silently missing range delete.
+
+Section 1's payload:
+
+```
+payload  := count uvarint | fragment × count            (sorted by start)
+fragment := slen uvarint | start | elen uvarint | end
+          | nseq uvarint | seq uvarint × nseq           (newest → oldest)
+```
+
+Fragments of one table are **disjoint, sorted by `start`, and non-empty**, with
+strictly descending sequence stacks — a file claiming otherwise is `Corruption`,
+because the read path's binary search and its monotonic scan cursor both depend
+on those properties. Legacy tables, and extended tables with no fragments, carry
+no aux block at all (`aux_off = aux_len = 0`).
+
+**Where fragments come from.** A flush emits its memtable's range tombstones
+fragmented over the whole keyspace — one L0 file, one owned interval. A
+compaction merges its inputs' fragments over the job span and **clips** each
+output's copy to the interval that output owns:
+
+```
+[ job.span_min , o_2.min_key )        for i = 1   (extended down to the job span)
+[ o_i.min_key  , o_{i+1}.min_key )    for 1 < i < n
+[ o_n.min_key  , job.span_max ]       for i = n   (extended up to the job span)
+```
+
+Clipping is not an optimization. Level-≥1 point disjointness is what lets
+`find_overlapping` binary-search `max_key`/`min_key` and return **at most one**
+table per level; unclipped fragment bounds would let two adjacent tables both
+cover a key, and the search would return one of them arbitrarily — a covering
+tombstone would be missed and deleted data would resurrect. Because outputs are
+already cut at partition boundaries, clipping also gives "no fragment crosses a
+partition" for free.
+
+The consequence to keep in mind when reading `SstMeta`: `range_min_key` may sort
+**below** `min_key` and `range_max_key` **above** `max_key` — the gap between an
+output's last point key and the next output's first belongs to the earlier
+output. Both stay inside the job span.
 
 ### Bloom filter (`bloom.rs`)
 
@@ -673,7 +758,8 @@ Decoded **after `ONDACAP1`, before `ONDAWAL1`**; the full emitted tail order is
 
 ```
 [positional: partition | tier | max_entry_time]
-[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDAAGE1 …] [ONDAWAL1 layout]
+[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDARNG1 …] [ONDAAGE1 …]
+[ONDAMED1 …] [ONDAWAL1 layout]
 [crc32c u32]
 ```
 
@@ -704,6 +790,53 @@ Who sets the field:
 The enable-time stamping is what makes the trigger restart-safe. "Eligible one
 interval after open" is not: open time is not durable, so a database restarted
 more often than its interval would never become eligible at all.
+## Range-summary tail tag (1.2)
+
+```
+ONDARNG1 | per CF, in manifest CF order:
+             count uvarint
+             { table_index uvarint | range_count uvarint
+               | range_min_seq uvarint | range_max_seq uvarint
+               | min_key bytes | max_key bytes } × count
+```
+
+The catalog's summary of each table's aux range section: how many fragments it
+holds, the lowest and highest sequence in any of its stacks, and the lowest
+`start` / highest `end` it owns. Tables not listed decode to `range_count = 0`
+and `None` bounds — which is every legacy table, and every table written before
+the capability was taken.
+
+A **tagged** tail, never appended to the positional `SstMeta` body:
+`decode_sstable` initializes optional fields to `None` and relies on tails to
+fill them, so appending to the body would break both VERSION-1 readers and the
+append-tolerant decode.
+
+The bounds are unconditional rather than optional because a table with
+`range_count > 0` has both by construction (a fragment has two bounds); a record
+naming zero fragments, an empty bound, or `min_seq > max_seq` is `Corruption` —
+bytes the encoder cannot produce.
+
+Decoded **after `ONDACAP1`, before `ONDAWAL1`**; order in the byte stream is a
+convention, since the tag dispatch loop is order-independent.
+`ManifestTailPresence::tagged()` includes this section, for the same
+load-bearing reason `ONDACAP1` does: a tag emitted without the three positional
+sections ahead of it would be read as a partition name section.
+
+Capability coupling, both directions, exactly as `ONDAAGE1`:
+
+- emitted **iff** `caps & CAP_RANGE_DELETES != 0` *and* some table carries a
+  fragment, so a database that has not taken the capability writes the bytes it
+  always did (and still writes VERSION 1);
+- `ONDARNG1` without `CAP_RANGE_DELETES` is `Corruption`;
+- a duplicate `ONDARNG1` is `Corruption`, like every other repeated tag.
+
+Why the summary is in the catalog at all: the read path's **gap-owner rule**
+needs `range_count` and `range_max_key` to decide whether to consult a table,
+and `gather_target` needs the span bounds to size a compaction job — both before
+any reader is opened. Keeping them in the manifest is what makes "one extra
+`range_count == 0` branch per point-only table" the whole cost of the feature
+for a database that does not use it.
+
 ## Edit-log tail tag and `MANIFEST-EDITS` (2.2)
 
 A full `MANIFEST` rewrite costs O(catalog) bytes and one fsync per structural
