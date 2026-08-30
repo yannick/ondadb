@@ -1407,3 +1407,589 @@ fn vlog_value_cache_limit_round_trips_through_reopen() {
         "a family that never set the field must recover the default"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.4 — MultiGet batched point lookups
+// ---------------------------------------------------------------------------
+
+/// The oracle every batch assertion is measured against: N sequential `get`s at
+/// one fixed read sequence. A `Snapshot` transaction pins that sequence, so the
+/// comparison is exact even if another thread commits between the two shapes.
+fn oracle_multi_get(
+    t: &mut ondadb::Txn,
+    cf: &Arc<ColumnFamily>,
+    keys: &[&[u8]],
+) -> Vec<ondadb::Result<Vec<u8>>> {
+    keys.iter().map(|k| t.get(cf, k)).collect()
+}
+
+fn assert_same_results(
+    got: &[ondadb::Result<Vec<u8>>],
+    want: &[ondadb::Result<Vec<u8>>],
+    keys: &[&[u8]],
+    ctx: &str,
+) {
+    assert_eq!(got.len(), want.len(), "{ctx}: result count");
+    assert_eq!(got.len(), keys.len(), "{ctx}: one result per key");
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        match (g, w) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{ctx}: value for key {:?} at {i}", keys[i]),
+            (Err(a), Err(b)) => assert_eq!(
+                std::mem::discriminant(a),
+                std::mem::discriminant(b),
+                "{ctx}: error for key {:?} at {i}: {a:?} vs {b:?}",
+                keys[i]
+            ),
+            _ => panic!(
+                "{ctx}: batch and sequential disagreed on key {:?} at {i}: {g:?} vs {w:?}",
+                keys[i]
+            ),
+        }
+    }
+}
+
+/// A CF that separates large values, so a batch resolves both inline and
+/// vlog-resident values.
+fn multiget_cf(db: &DB, name: &str, comparator: &str) -> Arc<ColumnFamily> {
+    db.create_column_family(
+        name,
+        ColumnFamilyConfig {
+            comparator_name: comparator.into(),
+            klog_value_threshold: 64, // exercise both inline and vlog values
+            ..ColumnFamilyConfig::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Wait for background compaction to create a level below L0. A level only
+/// exists once compaction has made it, so a fixture that wants L1 must let the
+/// worker run before asking the manual sweep to push into it.
+fn wait_for_deep_level(cf: &Arc<ColumnFamily>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while cf
+        .stats()
+        .levels
+        .iter()
+        .skip(1)
+        .all(|(files, _)| *files == 0)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "compaction never populated a level below L0"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Spread `n` keys over the memtable, L0 and — when `deep` — L1, with
+/// overwrites, tombstones, single-deletes, expired TTLs, and values on both
+/// sides of the vlog threshold. Returns every key that was ever written.
+///
+/// `deep` is off in unified-memtable mode: there the shared store decides when
+/// to split-flush, so a test cannot demand a level below L0 without racing it.
+fn seed_mixed_layout(db: &DB, cf: &Arc<ColumnFamily>, n: usize, deep: bool) -> Vec<Vec<u8>> {
+    let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let big = vec![b'B'; 512]; // above klog_value_threshold: lands in the vlog
+
+    // Round 1 -> L1: every key, half of them with separated values, flushed in
+    // enough chunks to pass `l1_file_count_trigger` so the background worker
+    // creates L1; the manual sweep then empties L0 into it.
+    let chunk = keys.len().div_ceil(5);
+    for (i, k) in keys.iter().enumerate() {
+        if i % 2 == 0 {
+            db.put(cf, k, &big, Duration::ZERO).unwrap();
+        } else {
+            db.put(cf, k, format!("v1-{i}").as_bytes(), Duration::ZERO)
+                .unwrap();
+        }
+        if (i + 1) % chunk == 0 {
+            db.flush_memtable(cf).unwrap();
+        }
+    }
+    db.flush_memtable(cf).unwrap();
+    if deep {
+        wait_for_deep_level(cf);
+        db.compact(cf).unwrap();
+        assert_eq!(cf.l0_file_count(), 0, "the sweep pushes all of L0 down");
+    }
+
+    // Round 2 -> L0: overwrites, deletes, single-deletes and short TTLs.
+    for (i, k) in keys.iter().enumerate() {
+        match i % 7 {
+            0 => db
+                .put(cf, k, format!("v2-{i}").as_bytes(), Duration::ZERO)
+                .unwrap(),
+            1 => db.delete(cf, k).unwrap(),
+            2 => {
+                let mut t = db.begin();
+                t.single_delete(cf, k).unwrap();
+                t.commit().unwrap();
+            }
+            3 => db
+                .put(
+                    cf,
+                    k,
+                    format!("ttl-{i}").as_bytes(),
+                    Duration::from_millis(20),
+                )
+                .unwrap(),
+            _ => {}
+        }
+    }
+    db.flush_memtable(cf).unwrap();
+
+    // Round 3 -> active memtable: a slice of the keys gets a newer version.
+    for (i, k) in keys.iter().enumerate() {
+        match i % 11 {
+            0 => db
+                .put(cf, k, format!("v3-{i}").as_bytes(), Duration::ZERO)
+                .unwrap(),
+            1 => db.delete(cf, k).unwrap(),
+            _ => {}
+        }
+    }
+    // Let every short TTL entry expire before anything reads, so a TTL result
+    // cannot flip between the batch and the oracle.
+    std::thread::sleep(Duration::from_millis(60));
+    keys
+}
+
+/// Deterministic PRNG (SplitMix64). Local, so the fixture is reproducible
+/// without pinning a `rand` version's stream behavior into the assertions.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+fn multi_get_oracle_case(unified: bool, comparator: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options {
+        unified_memtable: unified,
+        // Small enough that the shared store split-flushes into L0 rather than
+        // holding the whole fixture in memory.
+        unified_memtable_write_buffer_size: 32 * 1024,
+        ..Options::new(dir.path().to_str().unwrap())
+    })
+    .unwrap();
+    let cf = multiget_cf(&db, "m", comparator);
+    let written = seed_mixed_layout(&db, &cf, 240, !unified);
+    // Keys that were never written, so batches mix hits and misses.
+    let missing: Vec<Vec<u8>> = (0..40).map(|i| format!("z{i:05}").into_bytes()).collect();
+
+    let mut rng = Rng(0x0D4A_5EED);
+    for round in 0..24 {
+        let batch_len = 1 + rng.below(70);
+        let mut owned: Vec<Vec<u8>> = Vec::with_capacity(batch_len);
+        for j in 0..batch_len {
+            // A third of the slots repeat an earlier slot verbatim, so every
+            // batch carries duplicates that must keep their own positions.
+            if j > 0 && rng.below(3) == 0 {
+                owned.push(owned[rng.below(j)].clone());
+            } else if rng.below(5) == 0 {
+                owned.push(missing[rng.below(missing.len())].clone());
+            } else {
+                owned.push(written[rng.below(written.len())].clone());
+            }
+        }
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+        let mut t = db.begin_with_isolation(IsolationLevel::Snapshot);
+        let batched = t.multi_get(&cf, &keys);
+        let sequential = oracle_multi_get(&mut t, &cf, &keys);
+        t.rollback().unwrap();
+        assert_same_results(
+            &batched,
+            &sequential,
+            &keys,
+            &format!("unified={unified} cmp={comparator} round={round}"),
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn multi_get_matches_sequential_gets() {
+    for unified in [false, true] {
+        for comparator in ["memcmp", "reverse"] {
+            multi_get_oracle_case(unified, comparator);
+        }
+    }
+}
+
+#[test]
+fn multi_get_empty_and_single_key_match_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = multiget_cf(&db, "s", "memcmp");
+    db.put(&cf, b"a", b"1", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.put(&cf, b"b", b"2", Duration::ZERO).unwrap();
+
+    assert!(db.multi_get(&cf, &[]).is_empty(), "empty in, empty out");
+    for key in [b"a".as_slice(), b"b".as_slice(), b"missing".as_slice()] {
+        let one = db.multi_get(&cf, &[key]);
+        assert_eq!(one.len(), 1);
+        assert_same_results(&one, &[db.get(&cf, key)], &[key], "batch of one");
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn multi_get_reads_each_block_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    // One big block, so all 32 keys land in it.
+    let one_block = |name: &str| {
+        let cf = db
+            .create_column_family(
+                name,
+                ColumnFamilyConfig {
+                    data_block_size: 1 << 16,
+                    l1_file_count_trigger: 1 << 20,
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        for i in 0..32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v", Duration::ZERO)
+                .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        assert_eq!(cf.l0_file_count(), 1, "one table for the whole key set");
+        cf
+    };
+    // Two identical, equally cold column families: one measured as a batch, one
+    // as a single `get`, so the comparison is not spoiled by a warm cache.
+    let cf = one_block("b");
+    let solo_cf = one_block("b-solo");
+    let owned: Vec<Vec<u8>> = (0..32).map(|i| format!("k{i:04}").into_bytes()).collect();
+    let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+    let cold = ondadb::perf::enter();
+    let got = db.multi_get(&cf, &keys);
+    let cold = cold.finish();
+    assert!(got.iter().all(|r| r.is_ok()), "every key resolves");
+
+    // Whatever the config's block-read mechanism, exactly one data block was
+    // materialized for 32 keys, and 31 of the 32 lookups rode along on it.
+    assert_eq!(cold.multiget_blocks_deduped, 31);
+    assert_eq!(cold.index_seeks, 32, "the index search is still per key");
+    if cfg!(feature = "mmap-reads") {
+        assert_eq!(cold.block_misses, 0, "uncompressed mmap blocks are views");
+    } else {
+        assert_eq!(cold.block_misses, 1, "one physical read for 32 keys");
+        assert_eq!(cold.block_cache_hits, 0);
+    }
+
+    // The whole batch reads no more block bytes than a single `get` of one of
+    // its keys — the definition of "one read per distinct block".
+    let single = ondadb::perf::enter();
+    assert!(db.get(&solo_cf, &owned[0]).is_ok());
+    let single = single.finish();
+    assert_eq!(
+        cold.block_read_bytes, single.block_read_bytes,
+        "a cold 32-key batch must read exactly the block bytes one cold get reads"
+    );
+
+    // The second batch is served entirely from the cache (or the mmap).
+    let warm = ondadb::perf::enter();
+    let got = db.multi_get(&cf, &keys);
+    let warm = warm.finish();
+    assert!(got.iter().all(|r| r.is_ok()));
+    assert_eq!(warm.block_misses, 0, "the warm batch fetched nothing");
+    if !cfg!(feature = "mmap-reads") {
+        assert_eq!(warm.block_cache_hits, 1);
+        assert_eq!(warm.block_read_bytes, 0);
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn multiget_blocks_deduped_counts_savings() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    // Tiny blocks plus fat inline values: every key gets its own data block.
+    let cf = db
+        .create_column_family(
+            "d",
+            ColumnFamilyConfig {
+                data_block_size: 64,
+                klog_value_threshold: 1 << 20, // keep values inline, so blocks fill
+                l1_file_count_trigger: 1 << 20,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    let owned: Vec<Vec<u8>> = (0..8).map(|i| format!("k{i:04}").into_bytes()).collect();
+    for k in &owned {
+        db.put(&cf, k, &[b'v'; 200], Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+    let scope = ondadb::perf::enter();
+    let got = db.multi_get(&cf, &keys);
+    let spread = scope.finish();
+    assert!(got.iter().all(|r| r.is_ok()));
+    assert_eq!(
+        spread.multiget_blocks_deduped, 0,
+        "N keys in N distinct blocks share nothing"
+    );
+
+    // The same key eight times is eight lookups into one block.
+    let dup: Vec<&[u8]> = vec![keys[0]; 8];
+    let scope = ondadb::perf::enter();
+    let got = db.multi_get(&cf, &dup);
+    let shared = scope.finish();
+    assert!(got.iter().all(|r| r.is_ok()));
+    assert_eq!(shared.multiget_blocks_deduped, 7);
+    db.close().unwrap();
+}
+
+#[test]
+fn multi_get_respects_bloom_negatives() {
+    const TABLES: u64 = 3;
+    const ABSENT: u64 = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = perf_cf(&db, "bn");
+    // Every table spans the whole probed range, so all are position candidates
+    // and only the bloom filter can rule them out.
+    for i in 0..TABLES {
+        db.put(&cf, b"aaa", format!("{i}").as_bytes(), Duration::ZERO)
+            .unwrap();
+        db.put(&cf, b"zzz", format!("{i}").as_bytes(), Duration::ZERO)
+            .unwrap();
+        db.flush_memtable(&cf).unwrap();
+    }
+    let owned: Vec<Vec<u8>> = (0..ABSENT)
+        .map(|i| format!("mmm{i:04}").into_bytes())
+        .collect();
+    let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+    let before = cf.stats().bloom_skips;
+    let scope = ondadb::perf::enter();
+    let got = db.multi_get(&cf, &keys);
+    let p = scope.finish();
+    let after = cf.stats().bloom_skips;
+    assert!(got.iter().all(|r| r.is_err()), "no key exists");
+
+    assert_eq!(
+        p.bloom_probes,
+        ABSENT * TABLES,
+        "one filter consultation per (key, candidate table)"
+    );
+    assert_eq!(
+        p.sstable_probes,
+        p.bloom_probes - p.bloom_negatives,
+        "exactly what the filter admits gets probed"
+    );
+    assert_eq!(
+        after - before,
+        p.bloom_negatives,
+        "CfStats::bloom_skips grows by the batch's filter negatives"
+    );
+    assert!(
+        p.bloom_negatives >= ABSENT,
+        "a batch of absent keys must be mostly filtered out, saw {}",
+        p.bloom_negatives
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn multi_get_corrupt_table_errors_only_dependent_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let db = DB::open(Options::new(&path)).unwrap();
+    let cf = perf_cf(&db, "corrupt");
+    // One table holds every key...
+    for i in 0..8 {
+        db.put(&cf, format!("k{i}").as_bytes(), b"old", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let victim = std::fs::read_dir(dir.path().join("cf-corrupt"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "klog"))
+        .expect("the flushed table");
+    db.close().unwrap();
+
+    // ...and its data blocks are then corrupted on disk (the
+    // `corrupt_vlog_value_is_detected` pattern, applied to the klog).
+    let mut bytes = std::fs::read(&victim).unwrap();
+    for b in bytes.iter_mut().take(256).skip(8) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&victim, &bytes).unwrap();
+
+    let db = DB::open(Options::new(&path)).unwrap();
+    let cf = db.get_column_family("corrupt").unwrap();
+    // Half the keys get a newer version in the memtable, which shadows the
+    // corrupt table entirely.
+    for i in 0..4 {
+        db.put(&cf, format!("k{i}").as_bytes(), b"new", Duration::ZERO)
+            .unwrap();
+    }
+    let owned: Vec<Vec<u8>> = (0..8).map(|i| format!("k{i}").into_bytes()).collect();
+    let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+    let got = db.multi_get(&cf, &keys);
+
+    for (i, r) in got.iter().enumerate().take(4) {
+        match r {
+            Ok(v) => assert_eq!(v.as_slice(), b"new", "k{i}"),
+            Err(e) => panic!("k{i} must resolve from the memtable, got {e:?}"),
+        }
+    }
+    for (i, r) in got.iter().enumerate().skip(4) {
+        assert!(
+            matches!(r, Err(OndaError::Corruption(_))),
+            "k{i} needs the corrupt table and must report it, got {r:?}"
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn multi_get_is_snapshot_fixed_during_flush_and_compaction() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(DB::open(Options::new(dir.path().to_str().unwrap())).unwrap());
+    let cf = multiget_cf(&db, "snap", "memcmp");
+    let written = seed_mixed_layout(&db, &cf, 200, true);
+    let keys: Vec<&[u8]> = written.iter().map(|k| k.as_slice()).collect();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (db, cf, stop) = (db.clone(), cf.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let k = format!("k{:05}", n % 200);
+                db.put(
+                    &cf,
+                    k.as_bytes(),
+                    format!("live-{n}").as_bytes(),
+                    Duration::ZERO,
+                )
+                .unwrap();
+                if n.is_multiple_of(64) {
+                    db.flush_memtable(&cf).unwrap();
+                    db.compact(&cf).unwrap();
+                }
+                n += 1;
+            }
+        })
+    };
+
+    for _ in 0..8 {
+        let mut t = db.begin_with_isolation(IsolationLevel::Snapshot);
+        let batched = t.multi_get(&cf, &keys);
+        let sequential = oracle_multi_get(&mut t, &cf, &keys);
+        t.rollback().unwrap();
+        assert_same_results(&batched, &sequential, &keys, "concurrent flush/compaction");
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn txn_multi_get_sees_own_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = multiget_cf(&db, "own", "memcmp");
+    db.put(&cf, b"stored", b"disk", Duration::ZERO).unwrap();
+    db.put(&cf, b"shadowed", b"disk", Duration::ZERO).unwrap();
+    db.put(&cf, b"buried", b"disk", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let mut t = db.begin();
+    t.put(&cf, b"shadowed", b"first", Duration::ZERO).unwrap();
+    t.put(&cf, b"shadowed", b"last", Duration::ZERO).unwrap(); // last write wins
+    t.delete(&cf, b"buried").unwrap();
+    t.put(&cf, b"fresh", b"only-in-txn", Duration::ZERO)
+        .unwrap();
+
+    let keys: Vec<&[u8]> = vec![b"stored", b"shadowed", b"buried", b"fresh", b"absent"];
+    let got = t.multi_get(&cf, &keys);
+    let want = oracle_multi_get(&mut t, &cf, &keys);
+    assert_same_results(&got, &want, &keys, "txn overlay");
+    assert_eq!(got[0].as_deref().unwrap(), b"disk");
+    assert_eq!(got[1].as_deref().unwrap(), b"last");
+    assert!(matches!(got[2], Err(OndaError::NotFound)), "{:?}", got[2]);
+    assert_eq!(got[3].as_deref().unwrap(), b"only-in-txn");
+    assert!(matches!(got[4], Err(OndaError::NotFound)));
+    t.rollback().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn txn_multi_get_records_same_read_set_as_n_gets() {
+    // The read set is not observable directly, so it is asserted through the
+    // conflict it causes: a Serializable txn that read a key must abort when a
+    // concurrent writer changes it. Both shapes must abort identically.
+    fn conflicts(batched: bool) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = multiget_cf(&db, "rs", "memcmp");
+        for k in ["a", "b", "c"] {
+            db.put(&cf, k.as_bytes(), b"v0", Duration::ZERO).unwrap();
+        }
+        let keys: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+
+        let mut t = db.begin_with_isolation(IsolationLevel::Serializable);
+        if batched {
+            let r = t.multi_get(&cf, &keys);
+            assert!(r.iter().all(|v| v.is_ok()));
+        } else {
+            for k in &keys {
+                assert!(t.get(&cf, k).is_ok());
+            }
+        }
+        // A concurrent writer touches one of the keys that was read.
+        db.put(&cf, b"b", b"v1", Duration::ZERO).unwrap();
+        t.put(&cf, b"unrelated", b"w", Duration::ZERO).unwrap();
+        let outcome = t.commit();
+        db.close().unwrap();
+        matches!(outcome, Err(OndaError::Conflict(_)))
+    }
+
+    assert!(conflicts(false), "N gets must build a conflicting read set");
+    assert!(
+        conflicts(true),
+        "one multi_get must record the same read set as N gets"
+    );
+}
+
+#[test]
+fn multi_get_with_perf_matches_multi_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = multiget_cf(&db, "wp", "memcmp");
+    db.put(&cf, b"a", b"1", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.put(&cf, b"b", b"2", Duration::ZERO).unwrap();
+    let keys: Vec<&[u8]> = vec![b"a", b"b", b"missing"];
+
+    let plain = db.multi_get(&cf, &keys);
+    let (measured, perf) = db.multi_get_with_perf(&cf, &keys);
+    assert_same_results(&measured, &plain, &keys, "multi_get_with_perf");
+    assert!(perf.memtable_probes >= keys.len() as u64, "{perf:?}");
+    db.close().unwrap();
+}

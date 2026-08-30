@@ -209,6 +209,31 @@ struct PointReadSources {
     tables: SmallVec<[Arc<SstHandle>; 4]>,
 }
 
+/// One state snapshot covering a whole batch of point reads.
+///
+/// The single-key [`PointReadSources`] stays as it is: `get` is the hot path
+/// and must not grow a per-table index vector. This is its batched twin — the
+/// same sources, but with each candidate table carrying the *result indices*
+/// whose keys it covers, so the reader is opened, filtered and walked once per
+/// table instead of once per key.
+///
+/// `tables` is in the same source order [`PointReadSources`] produces: L0
+/// newest-first, then, per level below, the tables that level contributes.
+/// A key meets at most one table per level, so replaying a single key's table
+/// list out of this yields exactly the order `get` would have used — which is
+/// what makes equal-sequence ties resolve identically.
+struct BatchReadSources {
+    mem: Arc<Memtable>,
+    imms: Vec<Arc<ImmMemtable>>,
+    tables: BatchTables,
+}
+
+/// One candidate table plus the result indices of the batch whose keys it
+/// covers. Inline budgets mirror `PointReadSources`' `SmallVec<[_; 4]>`: a
+/// small batch over a shallow LSM must not cost more heap traffic than the N
+/// `get`s it replaces — that is what keeps a one-key batch honest.
+type BatchTables = SmallVec<[(Arc<SstHandle>, SmallVec<[usize; 8]>); 4]>;
+
 /// An isolated key-value store within a [`crate::DB`].
 pub struct ColumnFamily {
     pub(crate) ctx: Arc<CfCtx>,
@@ -277,6 +302,13 @@ pub struct ColumnFamily {
     pub(crate) point_reads: AtomicU64,
     pub(crate) bloom_skips: AtomicU64,
     pub(crate) sst_probes: AtomicU64,
+    /// `state` acquisitions made by the point-read planners
+    /// ([`point_read_sources`](Self::point_read_sources) and
+    /// [`batch_read_sources`](Self::batch_read_sources)). Test-only: the whole
+    /// point of the batch planner is that it snapshots once for N keys, and
+    /// nothing else can observe that.
+    #[cfg(test)]
+    point_state_reads: AtomicU64,
 }
 
 impl std::fmt::Debug for ColumnFamily {
@@ -427,6 +459,8 @@ impl ColumnFamily {
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
+            #[cfg(test)]
+            point_state_reads: AtomicU64::new(0),
             sst_probes: AtomicU64::new(0),
         });
         Ok(cf)
@@ -559,6 +593,8 @@ impl ColumnFamily {
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
+            #[cfg(test)]
+            point_state_reads: AtomicU64::new(0),
             sst_probes: AtomicU64::new(0),
         });
         Ok((cf, max_seq))
@@ -955,8 +991,10 @@ impl ColumnFamily {
     /// A writer for this CF's flush/ingest output, already carrying the
     /// database's IO limiter.
     fn new_writer(&self, klog: &str, expected: usize) -> Result<Writer> {
-        Ok(Writer::new(klog, self.writer_opts(expected))?
-            .with_limiter(self.ctx.io_limiter.clone()))
+        Ok(
+            Writer::new(klog, self.writer_opts(expected))?
+                .with_limiter(self.ctx.io_limiter.clone()),
+        )
     }
 
     fn key_in_range(th: &SstHandle, cmp: &ComparatorRef, user_key: &[u8]) -> bool {
@@ -985,8 +1023,23 @@ impl ColumnFamily {
         }
     }
 
+    /// `state.read()` for the point-read planners, counted under `cfg(test)`
+    /// so a test can pin how many snapshots a batch takes.
+    #[inline]
+    fn read_point_state(&self) -> parking_lot::RwLockReadGuard<'_, CfState> {
+        #[cfg(test)]
+        self.point_state_reads.fetch_add(1, Ordering::Relaxed);
+        self.state.read()
+    }
+
+    /// Point-read state acquisitions so far.
+    #[cfg(test)]
+    fn point_state_reads(&self) -> u64 {
+        self.point_state_reads.load(Ordering::Relaxed)
+    }
+
     fn point_read_sources(&self, user_key: &[u8]) -> PointReadSources {
-        let s = self.state.read();
+        let s = self.read_point_state();
         let mut tables = SmallVec::new();
         for th in &s.levels[0] {
             if Self::key_in_range(th, &self.cmp, user_key) {
@@ -1055,6 +1108,262 @@ impl ColumnFamily {
         }
         self.consider_sstables(&mut candidate, &sources.tables, user_key, read_seq, now)?;
         candidate.finish()
+    }
+
+    /// [`point_read_sources`](Self::point_read_sources) for a whole batch, in
+    /// **one** `state` acquisition.
+    ///
+    /// Grouping happens here rather than at read time because the candidate
+    /// set is a property of the level layout, and the layout must not change
+    /// underneath a batch: a flush or compaction landing between two keys of
+    /// the same call would otherwise let them see different table sets.
+    fn batch_read_sources(&self, keys: &[&[u8]]) -> BatchReadSources {
+        let s = self.read_point_state();
+        let mut tables = BatchTables::new();
+
+        // L0 is unsorted and overlapping: every table is a candidate for every
+        // key in its range, and the stored order is newest-first.
+        for th in &s.levels[0] {
+            let mut idxs: SmallVec<[usize; 8]> = SmallVec::new();
+            for (i, key) in keys.iter().enumerate() {
+                if Self::key_in_range(th, &self.cmp, key) {
+                    idxs.push(i);
+                }
+            }
+            if !idxs.is_empty() {
+                tables.push((th.clone(), idxs));
+            }
+        }
+
+        // Levels below L0 are sorted and disjoint, so each key selects at most
+        // one table per level. Collecting `(table position, key)` and sorting
+        // by position keeps the level's contribution in key order and, more
+        // importantly, deterministic.
+        let mut hits: SmallVec<[(usize, usize); 16]> = SmallVec::new();
+        for lvl in s.levels.iter().skip(1) {
+            if lvl.is_empty() {
+                continue;
+            }
+            hits.clear();
+            for (i, key) in keys.iter().enumerate() {
+                if let Some(t) = Self::find_overlapping(lvl, &self.cmp, key) {
+                    hits.push((t, i));
+                }
+            }
+            hits.sort_unstable();
+            let mut pos = 0;
+            while pos < hits.len() {
+                let t = hits[pos].0;
+                let mut idxs: SmallVec<[usize; 8]> = SmallVec::new();
+                while pos < hits.len() && hits[pos].0 == t {
+                    idxs.push(hits[pos].1);
+                    pos += 1;
+                }
+                tables.push((lvl[t].clone(), idxs));
+            }
+        }
+
+        BatchReadSources {
+            mem: s.mem.clone(),
+            imms: s.imm.clone(),
+            tables,
+        }
+    }
+
+    /// Resolve every key of `idxs` against one already-open table, fetching
+    /// each distinct data block once.
+    ///
+    /// `scratch` is the planner's only per-table allocation and is reused
+    /// across tables by the caller. Sorting it by block index makes the targets
+    /// of a block contiguous, so the block is materialized once and dropped
+    /// before the next one is read — the memory the walk holds live is one
+    /// block, not one per key.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_table_batch(
+        &self,
+        rd: &Reader,
+        keys: &[&[u8]],
+        idxs: &[usize],
+        read_seq: u64,
+        now: i64,
+        cands: &mut [PointReadCandidate],
+        errs: &mut [Option<OndaError>],
+        scratch: &mut SmallVec<[(usize, usize); 16]>,
+    ) {
+        scratch.clear();
+        for &i in idxs {
+            // One bloom hash + one check per (key, table), exactly as
+            // `consider_sstables` does — the counters must stay comparable
+            // between a batch and the N gets it replaces.
+            let h = rd.bloom_hash(keys[i]);
+            crate::perf::bump(|p| p.bloom_probes += 1);
+            if !rd.bloom_may_contain_hash(h) {
+                self.bloom_skips.fetch_add(1, Ordering::Relaxed);
+                crate::perf::bump(|p| p.bloom_negatives += 1);
+                continue;
+            }
+            self.sst_probes.fetch_add(1, Ordering::Relaxed);
+            crate::perf::bump(|p| p.sstable_probes += 1);
+            let bi = rd.find_block(keys[i], read_seq);
+            if bi >= rd.data_block_count() {
+                // Sorts past the last block: no version here, no block to read.
+                continue;
+            }
+            scratch.push((bi, i));
+        }
+        // By block first; the key index only breaks ties, so a duplicated key
+        // stays adjacent to its twin and both ride the same fetch.
+        scratch.sort_unstable();
+
+        let mut pos = 0;
+        while pos < scratch.len() {
+            let bi = scratch[pos].0;
+            let mut end = pos;
+            while end < scratch.len() && scratch[end].0 == bi {
+                end += 1;
+            }
+            let group = &scratch[pos..end];
+            pos = end;
+            // The whole point of the batch: one fetch, `group.len()` lookups.
+            crate::perf::bump(|p| p.multiget_blocks_deduped += (group.len() - 1) as u64);
+
+            let block = match rd.read_data_block_local(bi) {
+                Ok(b) => b,
+                Err(e) => {
+                    Self::fail_group(group, cands, errs, &e);
+                    continue;
+                }
+            };
+            let (raw, restarts) = match rd.split_block(block.bytes()) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    Self::fail_group(group, cands, errs, &e);
+                    continue;
+                }
+            };
+            for &(_, i) in group {
+                // The restart search stays per key: it is a binary search on
+                // `(user_key, seq)` and every key has a different target. Only
+                // the fetch and decompression above were shared.
+                let found = rd
+                    .restart_scan_offset(raw, restarts, keys[i], read_seq)
+                    .and_then(|off| rd.scan_point_entry(raw, off, keys[i], read_seq, now));
+                match found {
+                    Ok((value, seq, found, deleted)) => {
+                        cands[i].consider(value, seq, found, deleted)
+                    }
+                    Err(e) => Self::record_read_error(i, cands, errs, &e),
+                }
+            }
+        }
+    }
+
+    /// Attribute one source failure to every key of `group` that still needs
+    /// that source.
+    fn fail_group(
+        group: &[(usize, usize)],
+        cands: &[PointReadCandidate],
+        errs: &mut [Option<OndaError>],
+        e: &OndaError,
+    ) {
+        for &(_, i) in group {
+            Self::record_read_error(i, cands, errs, e);
+        }
+    }
+
+    /// Record a source failure against result `i` — unless a **strictly newer**
+    /// source has already resolved that key.
+    ///
+    /// Sources are consulted newest-first and a newer source always holds a
+    /// newer version of a key, so a key already resolved when an older source
+    /// fails did not need that source: failing it would report a corruption
+    /// that could not have changed the answer. This is the one place a batch
+    /// deliberately differs from N `get`s, which propagate the first error of
+    /// any candidate table regardless (documented on
+    /// [`crate::DB::multi_get`]). The first error for a key wins; later ones
+    /// cannot make the result any less erroneous.
+    fn record_read_error(
+        i: usize,
+        cands: &[PointReadCandidate],
+        errs: &mut [Option<OndaError>],
+        e: &OndaError,
+    ) {
+        if cands[i].found || errs[i].is_some() {
+            return;
+        }
+        errs[i] = Some(e.duplicate());
+    }
+
+    /// Resolve `keys` as of `read_seq`, one result per key in input order.
+    ///
+    /// The batch equivalent of [`get`](Self::get): one `now`, one source
+    /// snapshot, and one data-block fetch per distinct block, however many keys
+    /// of the batch land in it.
+    pub(crate) fn multi_get(&self, keys: &[&[u8]], read_seq: u64) -> Vec<Result<Vec<u8>>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        self.point_reads
+            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        // One clock reading for the batch: two keys of one call must not
+        // disagree about whether a TTL has expired.
+        let now = coarse_now_nanos();
+        let sources = self.batch_read_sources(keys);
+        let mut cands: SmallVec<[PointReadCandidate; 8]> = (0..keys.len())
+            .map(|_| PointReadCandidate::default())
+            .collect();
+        let mut errs: SmallVec<[Option<OndaError>; 8]> = (0..keys.len()).map(|_| None).collect();
+
+        // Memtable sources, in `get`'s order, so a per-key replay of this batch
+        // meets its sources in exactly the sequence `get` would have used.
+        if let Some(u) = &self.ctx.unified {
+            for (i, key) in keys.iter().enumerate() {
+                crate::perf::bump(|p| p.memtable_probes += 1);
+                cands[i].consider_memtable(u.get(self.id, key, read_seq, now));
+            }
+        }
+        for (i, key) in keys.iter().enumerate() {
+            crate::perf::bump(|p| p.memtable_probes += 1);
+            cands[i].consider_memtable(sources.mem.get(key, read_seq, now));
+        }
+        for imm in sources.imms.iter().rev() {
+            for (i, key) in keys.iter().enumerate() {
+                crate::perf::bump(|p| p.memtable_probes += 1);
+                cands[i].consider_memtable(imm.mem.get(key, read_seq, now));
+            }
+        }
+
+        let mut scratch: SmallVec<[(usize, usize); 16]> = SmallVec::new();
+        for (th, idxs) in &sources.tables {
+            match th.reader() {
+                Ok(rd) => self.resolve_table_batch(
+                    &rd,
+                    keys,
+                    idxs,
+                    read_seq,
+                    now,
+                    &mut cands,
+                    &mut errs,
+                    &mut scratch,
+                ),
+                // A table that cannot even be opened fails every key that had
+                // not already been resolved by a newer source.
+                Err(e) => {
+                    for &i in idxs.iter() {
+                        Self::record_read_error(i, &cands, &mut errs, &e);
+                    }
+                }
+            }
+        }
+
+        cands
+            .into_iter()
+            .zip(errs)
+            .map(|(c, e)| match e {
+                Some(e) => Err(e),
+                None => c.finish(),
+            })
+            .collect()
     }
 
     /// Newest committed sequence for `user_key` across all sources (ignoring
@@ -1765,5 +2074,226 @@ mod tests {
         assert!(!key_is_below_upper(&folded, b"B", Bound::Included(b"a")));
         assert!(key_is_below_upper(&folded, b"A", Bound::Included(b"a")));
         assert!(!key_is_below_upper(&folded, b"A", Bound::Excluded(b"a")));
+    }
+
+    /// Wait for background compaction to drain L0 into the levels below. A
+    /// level only exists once compaction has created it, so a fixture that
+    /// needs L1 has to let the worker run.
+    fn wait_for_deep_level(cf: &Arc<super::ColumnFamily>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let deep = cf.state.read().levels.iter().skip(1).any(|l| !l.is_empty());
+            if deep {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "compaction never populated a level below L0"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Open a database with one CF populated across L0 and the levels below,
+    /// so the batch planner has to group per level as well as within L0.
+    fn layered_cf(dir: &std::path::Path) -> (crate::DB, Arc<super::ColumnFamily>) {
+        let db = crate::DB::open(crate::config::Options::new(dir.to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("layered", crate::config::ColumnFamilyConfig::default())
+            .unwrap();
+        // Six disjoint runs: past `l1_file_count_trigger` (4), so background
+        // compaction pushes them down and a level >= 1 ends up holding several
+        // tables that `find_overlapping` has to choose between per key.
+        for run in 0..6u32 {
+            for i in 0..24u32 {
+                let k = format!("k{:03}", run * 24 + i);
+                db.put(&cf, k.as_bytes(), b"deep", std::time::Duration::ZERO)
+                    .unwrap();
+            }
+            db.flush_memtable(&cf).unwrap();
+        }
+        wait_for_deep_level(&cf);
+        // The manual sweep can only push levels that exist, so it runs after
+        // the background worker has created L1; it then empties L0.
+        db.compact(&cf).unwrap();
+        assert_eq!(cf.l0_file_count(), 0, "the sweep pushes all of L0 down");
+        // ...plus two overlapping L0 tables on top — below the trigger, so they
+        // stay where the test put them.
+        for run in 0..2u32 {
+            for i in 0..30u32 {
+                let k = format!("k{:03}", i * 4 + run);
+                db.put(&cf, k.as_bytes(), b"shallow", std::time::Duration::ZERO)
+                    .unwrap();
+            }
+            db.flush_memtable(&cf).unwrap();
+        }
+        assert!(
+            cf.l0_file_count() >= 2,
+            "fixture needs overlapping L0 files"
+        );
+        (db, cf)
+    }
+
+    #[test]
+    fn batch_read_sources_matches_per_key_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = layered_cf(dir.path());
+
+        let owned: Vec<Vec<u8>> = (0..140u32)
+            .map(|i| format!("k{i:03}").into_bytes())
+            .chain(std::iter::once(b"absent".to_vec()))
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let batch = cf.batch_read_sources(&keys);
+
+        // Every (table, key) pair the batch planner produced is a pair the
+        // per-key planner produces, and vice versa — including the order in
+        // which each key meets its tables.
+        for (i, key) in keys.iter().enumerate() {
+            let per_key = cf.point_read_sources(key);
+            let from_batch: Vec<u64> = batch
+                .tables
+                .iter()
+                .filter(|(_, idxs)| idxs.contains(&i))
+                .map(|(th, _)| th.meta.id)
+                .collect();
+            let expected: Vec<u64> = per_key.tables.iter().map(|th| th.meta.id).collect();
+            assert_eq!(
+                from_batch,
+                expected,
+                "table set/order for {}",
+                String::from_utf8_lossy(key)
+            );
+        }
+        // No table is carried without a key that needs it.
+        assert!(batch.tables.iter().all(|(_, idxs)| !idxs.is_empty()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn batch_read_sources_takes_one_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = layered_cf(dir.path());
+        let owned: Vec<Vec<u8>> = (0..64u32)
+            .map(|i| format!("k{i:03}").into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+        let before = cf.point_state_reads();
+        let _ = cf.batch_read_sources(&keys);
+        assert_eq!(
+            cf.point_state_reads() - before,
+            1,
+            "one snapshot for the whole batch"
+        );
+
+        // The per-key planner is what the batch replaces: 64 keys, 64 locks.
+        let before = cf.point_state_reads();
+        for key in &keys {
+            let _ = cf.point_read_sources(key);
+        }
+        assert_eq!(cf.point_state_reads() - before, 64);
+        db.close().unwrap();
+    }
+
+    /// The oracle the batch path is measured against: N sequential `get`s at
+    /// one fixed read sequence.
+    fn oracle_multi_get(
+        cf: &super::ColumnFamily,
+        keys: &[&[u8]],
+        read_seq: u64,
+    ) -> Vec<crate::error::Result<Vec<u8>>> {
+        keys.iter().map(|k| cf.get(k, read_seq)).collect()
+    }
+
+    fn same_results(
+        got: &[crate::error::Result<Vec<u8>>],
+        want: &[crate::error::Result<Vec<u8>>],
+    ) -> bool {
+        got.len() == want.len()
+            && got.iter().zip(want).all(|(g, w)| match (g, w) {
+                (Ok(a), Ok(b)) => a == b,
+                (Err(a), Err(b)) => std::mem::discriminant(a) == std::mem::discriminant(b),
+                _ => false,
+            })
+    }
+
+    #[test]
+    fn oracle_matches_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = layered_cf(dir.path());
+        // A quiescent database: every committed version is visible at MAX.
+        let read_seq = u64::MAX;
+        let owned: Vec<Vec<u8>> = ["k000", "k075", "k139", "absent", "k000"]
+            .iter()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+        let oracle = oracle_multi_get(&cf, &keys, read_seq);
+        for (r, key) in oracle.iter().zip(&keys) {
+            let direct = cf.get(key, read_seq);
+            assert!(same_results(
+                std::slice::from_ref(r),
+                std::slice::from_ref(&direct)
+            ));
+        }
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn multi_get_memtable_order_matches_get() {
+        // The same key in four memtable-shaped sources with different
+        // sequences: the batch must pick the winner `get` picks, whichever
+        // source holds it.
+        for unified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = crate::DB::open(crate::config::Options {
+                unified_memtable: unified,
+                ..crate::config::Options::new(dir.path().to_str().unwrap())
+            })
+            .unwrap();
+            let cf = db
+                .create_column_family("m", crate::config::ColumnFamilyConfig::default())
+                .unwrap();
+
+            // Two sealed memtables, then the active one, each carrying a newer
+            // version of the shared key plus one key of its own.
+            for round in 0..3u32 {
+                db.put(
+                    &cf,
+                    b"shared",
+                    format!("v{round}").as_bytes(),
+                    std::time::Duration::ZERO,
+                )
+                .unwrap();
+                db.put(
+                    &cf,
+                    format!("own{round}").as_bytes(),
+                    b"x",
+                    std::time::Duration::ZERO,
+                )
+                .unwrap();
+                if round < 2 {
+                    cf.rotate_memtable(true);
+                }
+            }
+
+            let owned: Vec<Vec<u8>> = ["shared", "own0", "own1", "own2", "nope", "shared"]
+                .iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
+            let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+            let read_seq = u64::MAX;
+
+            let batched = cf.multi_get(&keys, read_seq);
+            let sequential = oracle_multi_get(&cf, &keys, read_seq);
+            assert!(
+                same_results(&batched, &sequential),
+                "unified={unified}: {batched:?} vs {sequential:?}"
+            );
+            assert_eq!(batched[0].as_deref().unwrap(), b"v2", "newest wins");
+            db.close().unwrap();
+        }
     }
 }

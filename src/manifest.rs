@@ -617,7 +617,11 @@ mod tests {
         for name in V1_FIXTURES {
             let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
             let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(m.encode(), bytes, "{name}: re-encode must be byte-identical");
+            assert_eq!(
+                m.encode(),
+                bytes,
+                "{name}: re-encode must be byte-identical"
+            );
         }
     }
 

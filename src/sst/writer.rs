@@ -340,10 +340,7 @@ impl Writer {
         hdr[4] = used_alg as u8;
         put_u32(&mut hdr[5..9], stored_len);
         // The frame, header included, is what reaches the device.
-        crate::ioctrl::charge(
-            &self.limiter,
-            VLOG_V2_HDR_LEN as u64 + stored.len() as u64,
-        );
+        crate::ioctrl::charge(&self.limiter, VLOG_V2_HDR_LEN as u64 + stored.len() as u64);
         let w = self.vlog.as_mut().unwrap();
         w.write_all(&hdr)?;
         w.write_all(stored)?;

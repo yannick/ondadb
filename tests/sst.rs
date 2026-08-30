@@ -967,14 +967,20 @@ fn cached_block_reads_are_not_charged() {
     )
     .unwrap();
 
-    assert_eq!(r.get(b"key000000", u64::MAX, 0).unwrap().0.unwrap(), b"value");
+    assert_eq!(
+        r.get(b"key000000", u64::MAX, 0).unwrap().0.unwrap(),
+        b"value"
+    );
     let first = recorder.charges();
     assert_eq!(first.len(), 1, "the fetch is one charge: {first:?}");
     assert_eq!(first[0].0, IoClass::Foreground);
     assert!(first[0].1 > 0, "the framed block length must be charged");
 
     for _ in 0..8 {
-        assert_eq!(r.get(b"key000001", u64::MAX, 0).unwrap().0.unwrap(), b"value");
+        assert_eq!(
+            r.get(b"key000001", u64::MAX, 0).unwrap().0.unwrap(),
+            b"value"
+        );
     }
     assert_eq!(
         recorder.charges(),
@@ -993,8 +999,9 @@ fn written_bytes_are_charged_once() {
     let klog = klog.to_str().unwrap();
     let recorder = Arc::new(RecordingLimiter::default());
     let limiter: Option<Arc<dyn IoLimiter>> = Some(recorder.clone());
-    let mut w =
-        Writer::new(klog, opts(Compression::None, 2000, 64, 1024)).unwrap().with_limiter(limiter);
+    let mut w = Writer::new(klog, opts(Compression::None, 2000, 64, 1024))
+        .unwrap()
+        .with_limiter(limiter);
     let value = vec![b'v'; 200]; // over the klog threshold: every value goes to the vlog
     for i in 0..2000u32 {
         w.add(
@@ -1089,7 +1096,10 @@ fn vlog_reads_are_charged() {
         limiter,
     )
     .unwrap();
-    assert_eq!(r.get(b"key000003", u64::MAX, 0).unwrap().0.unwrap().len(), 4096);
+    assert_eq!(
+        r.get(b"key000003", u64::MAX, 0).unwrap().0.unwrap().len(),
+        4096
+    );
     let charged: u64 = recorder.charges().iter().map(|(_, b)| b).sum();
     assert!(
         charged >= 4096,

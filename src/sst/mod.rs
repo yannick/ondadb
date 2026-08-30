@@ -337,7 +337,17 @@ mod tests {
         let mut buf = Vec::new();
         encode_entry(&mut buf, b"k1", b"v", 1, 0, false, false, false, 0);
         encode_entry(&mut buf, b"k2", b"", 2, 0, true, true, false, 0);
-        encode_entry(&mut buf, b"k3", b"vvvv", 3, 1_700_000_000, false, false, true, 64);
+        encode_entry(
+            &mut buf,
+            b"k3",
+            b"vvvv",
+            3,
+            1_700_000_000,
+            false,
+            false,
+            true,
+            64,
+        );
         seeds.push(buf);
 
         let mut rng = crate::util::FuzzRng::new(0xD1B5_4A32_D192_ED03);

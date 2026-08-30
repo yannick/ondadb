@@ -358,7 +358,11 @@ impl RecordingLimiter {
 
     /// Number of charges recorded under `class`.
     pub fn count_for(&self, class: IoClass) -> usize {
-        self.charges.lock().iter().filter(|(c, _)| *c == class).count()
+        self.charges
+            .lock()
+            .iter()
+            .filter(|(c, _)| *c == class)
+            .count()
     }
 
     /// Forget everything recorded so far.
@@ -548,7 +552,9 @@ mod tests {
         let calls = rec.charges();
         assert_eq!(calls.len(), 4);
         assert!(calls.iter().all(|(_, b)| *b <= MAX_CHARGE_CHUNK));
-        assert_eq!(calls.iter().map(|(_, b)| b).sum::<u64>(), MAX_CHARGE_CHUNK * 3 + 7);
+        assert_eq!(
+            calls.iter().map(|(_, b)| b).sum::<u64>(),
+            MAX_CHARGE_CHUNK * 3 + 7
+        );
     }
-
 }

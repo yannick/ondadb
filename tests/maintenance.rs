@@ -526,7 +526,10 @@ fn level_fixture_is_deterministic() {
     // A different seed must actually move the geometry, or the determinism
     // above would be the trivial kind.
     let third = tempfile::tempdir().unwrap();
-    let other = geometry.clone().with_seed(0x5EED).materialize_quiescent(third.path());
+    let other = geometry
+        .clone()
+        .with_seed(0x5EED)
+        .materialize_quiescent(third.path());
     assert_ne!(levels::fingerprint(&a), levels::fingerprint(&other));
 }
 
@@ -797,8 +800,7 @@ fn limited_compaction_stretches_over_fake_clock() {
     // Work-conserving: one full burst is free, everything after it is paid at
     // the rate. That is an exact lower bound on the *total* simulated time,
     // whichever class happened to be the one parked when it elapsed.
-    let floor =
-        Duration::from_secs_f64(background_bytes.saturating_sub(rate) as f64 / rate as f64);
+    let floor = Duration::from_secs_f64(background_bytes.saturating_sub(rate) as f64 / rate as f64);
     assert!(
         simulated >= floor.mul_f64(0.75),
         "pacing should consume at least ~{floor:?} of simulated time, got \

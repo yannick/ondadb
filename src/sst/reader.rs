@@ -113,7 +113,10 @@ const VLOG_VERIFIED_SLOTS: usize = 1024;
 /// `u64::MAX` — the offset is a position in a file.
 const VLOG_SLOT_EMPTY: u64 = u64::MAX;
 
-type PointResult = (Option<Vec<u8>>, u64, bool, bool);
+/// `(value, seq, found, deleted)` for one key in one table. `pub(crate)` so
+/// the batched planner in `column_family.rs` can name what the block walk it
+/// drives by hand returns.
+pub(crate) type PointResult = (Option<Vec<u8>>, u64, bool, bool);
 
 fn append_vlog_payload(
     compression: Compression,
@@ -147,7 +150,7 @@ pub(crate) enum BlockRef<'a> {
 
 impl BlockRef<'_> {
     #[inline]
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             BlockRef::Owned(a) => a,
             BlockRef::Mapped(s) => s,
@@ -587,6 +590,13 @@ impl Reader {
         Ok((&raw[..entries_end], &raw[entries_end..raw.len() - 4]))
     }
 
+    /// Number of data blocks in this table. A [`find_block`](Self::find_block)
+    /// result at or above this means the key sorts past the last block.
+    #[inline]
+    pub(crate) fn data_block_count(&self) -> usize {
+        self.index.len()
+    }
+
     /// Index of the first data block whose last key is `>= (user_key, seq)`.
     pub(crate) fn find_block(&self, user_key: &[u8], seq: u64) -> usize {
         crate::perf::bump(|p| p.index_seeks += 1);
@@ -639,7 +649,13 @@ impl Reader {
         self.get_unfiltered(user_key, read_seq, now)
     }
 
-    fn restart_scan_offset(
+    /// Entry offset to start scanning from for `(user_key, read_seq)`.
+    ///
+    /// `pub(crate)`: the batch point-read path fetches a block once and then
+    /// runs this plus [`scan_point_entry`](Self::scan_point_entry) per key
+    /// against it, which is exactly the work
+    /// [`get_unfiltered`](Self::get_unfiltered) does for a single key.
+    pub(crate) fn restart_scan_offset(
         &self,
         raw: &[u8],
         restarts: &[u8],
@@ -673,7 +689,11 @@ impl Reader {
         Ok(if lo > 0 { restart_off(lo - 1) } else { 0 })
     }
 
-    fn scan_point_entry(
+    /// Walk a block's entries from `offset` for the newest version of
+    /// `user_key` visible at `read_seq`. See
+    /// [`restart_scan_offset`](Self::restart_scan_offset) for why this is
+    /// `pub(crate)`.
+    pub(crate) fn scan_point_entry(
         &self,
         raw: &[u8],
         mut offset: usize,
@@ -1111,5 +1131,79 @@ mod tests {
         let before = out.clone();
         assert!(append_vlog_payload(Compression::None, b"short", 7, &mut out).is_err());
         assert_eq!(out, before, "a corrupt frame must not append partial data");
+    }
+
+    /// The batch point-read planner in `column_family.rs` drives the reader's
+    /// block walk itself (one block fetch for many keys) instead of calling
+    /// `get_unfiltered` per key. This pins that the hand-driven sequence is
+    /// equivalent to the packaged one, so the two cannot drift.
+    #[test]
+    fn get_unfiltered_matches_manual_block_walk() {
+        const NOW: i64 = 1_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("walk.klog");
+        let klog = klog.to_str().unwrap();
+        let mut w = Writer::new(
+            klog,
+            WriterOptions {
+                compression: Compression::None,
+                compression_rules: Vec::new(),
+                cmp: default_comparator(),
+                enable_bloom: true,
+                bloom_fpr: 0.01,
+                klog_value_threshold: 512,
+                block_size: 256, // several blocks, so `find_block` matters
+                expected_entries: 200,
+                use_btree: false,
+                restart_interval: 4,
+            },
+        )
+        .unwrap();
+        for i in 0..200u64 {
+            let k = format!("key{i:04}");
+            let seq = i + 1;
+            match i % 4 {
+                // A tombstone, an expired-TTL entry, and two live values.
+                1 => w.add(k.as_bytes(), b"", seq, 0, true, false),
+                2 => w.add(k.as_bytes(), b"expired", seq, NOW - 1, false, false),
+                _ => w.add(k.as_bytes(), b"live", seq, 0, false, false),
+            }
+            .unwrap();
+        }
+        w.finish().unwrap();
+        let r = Reader::open(
+            klog,
+            local(),
+            Arc::new(BlockCache::new(1 << 20)),
+            1,
+            default_comparator(),
+            0,
+        )
+        .unwrap();
+
+        let mut probes: Vec<String> = (0..200u64).map(|i| format!("key{i:04}")).collect();
+        // Absent keys before, inside and after the table's range.
+        probes.extend(["aaa".into(), "key0000x".into(), "zzz".into()]);
+        for probe in &probes {
+            let probe = probe.as_bytes();
+            let want = r.get_unfiltered(probe, u64::MAX, NOW).unwrap();
+            let bi = r.find_block(probe, u64::MAX);
+            let got = if bi >= r.data_block_count() {
+                (None, 0, false, false)
+            } else {
+                let block = r.read_data_block_local(bi).unwrap();
+                let (raw, restarts) = r.split_block(block.bytes()).unwrap();
+                let off = r
+                    .restart_scan_offset(raw, restarts, probe, u64::MAX)
+                    .unwrap();
+                r.scan_point_entry(raw, off, probe, u64::MAX, NOW).unwrap()
+            };
+            assert_eq!(
+                got,
+                want,
+                "manual walk diverged for {}",
+                String::from_utf8_lossy(probe)
+            );
+        }
     }
 }

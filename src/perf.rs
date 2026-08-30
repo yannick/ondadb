@@ -51,6 +51,12 @@ pub struct PerfContext {
     pub iterator_seeks: u64,
     /// Key groups an iterator surfaced to its caller.
     pub iterator_steps: u64,
+    /// Data-block fetches [`crate::DB::multi_get`] avoided by resolving several
+    /// keys of one batch against a block it had already materialized: for each
+    /// distinct block a batch touches, the number of its target keys minus one.
+    /// Zero for a batch whose keys all land in different blocks, and zero for
+    /// every non-batched read.
+    pub multiget_blocks_deduped: u64,
 }
 
 impl PerfContext {
@@ -73,6 +79,7 @@ impl PerfContext {
             vlog_cache_hits: 0,
             iterator_seeks: 0,
             iterator_steps: 0,
+            multiget_blocks_deduped: 0,
         }
     }
 }

@@ -124,6 +124,23 @@ reuses an id, so a dead table's entries can never be mistaken for a live one's
 and simply age out under CLOCK. Explicit eviction there would be hygiene, not
 correctness, and is not done.
 
+Batched point get (`DB::multi_get` / `Txn::multi_get` →
+`ColumnFamily::multi_get`): the same sources in the same order, resolved for N
+keys in one pass. It captures **one** read sequence, **one** `coarse_now_nanos`
+and **one** state snapshot for the batch (`batch_read_sources`, a single
+`state.read()` that groups each candidate table with the result indices whose
+keys it covers), so a flush or compaction landing mid-batch cannot make two keys
+of the same call see different sources. Per table it bloom-filters and
+`find_block`s each assigned key — both are inherently per key — then groups the
+survivors by block index and does **one** `read_data_block_local` per distinct
+block, running `restart_scan_offset` + `scan_point_entry` per key against it.
+`PerfContext::multiget_blocks_deduped` counts the fetches that saved. Results go
+through the same `PointReadCandidate::consider`/`consider_memtable` entry points
+as `get`, so newest-wins (and equal-seq ties) resolve identically. One
+divergence from N `get`s, deliberate: a failing source errors only the keys
+whose resolution needed it — a key a strictly newer source already resolved
+keeps its value, where `get` propagates the error.
+
 Every SSTable touched by a read or scan resolves its reader through the shared
 `TableCache` (`table_cache.rs`), not by opening the file directly: `SstHandle`
 holds only the information to re-open a reader and asks the cache for one. A

@@ -220,6 +220,58 @@ impl DB {
         (r, scope.finish())
     }
 
+    /// Resolve many keys of one column family in a single pass.
+    ///
+    /// Returns one result per key, in input order, so `values.len() ==
+    /// keys.len()`; an empty input yields an empty output. Duplicate keys keep
+    /// their own positions and share the work underneath. Each result is what
+    /// [`get`](Self::get) would have returned for that key — including
+    /// [`OndaError::NotFound`] for a missing, deleted or TTL-expired key — with
+    /// two differences that only a batch can have:
+    ///
+    /// * **One snapshot.** The whole batch reads at one sequence, against one
+    ///   snapshot of the memtables and levels, with one clock reading for TTL.
+    ///   A flush or compaction running concurrently cannot make two keys of the
+    ///   same call disagree; N separate `get`s can.
+    /// * **Isolated failures.** A table that fails to open or whose block fails
+    ///   its checksum errors only the keys whose resolution needed it. A key a
+    ///   strictly newer source had already resolved still returns its value,
+    ///   where `get` would have propagated the error.
+    ///
+    /// The win is deduplicated IO: candidate tables are opened and filtered
+    /// once per table rather than once per key, and each distinct data block is
+    /// fetched and decompressed once however many of the batch's keys land in
+    /// it ([`PerfContext::multiget_blocks_deduped`] counts the savings). Bloom
+    /// membership and the index binary search are inherently per key and stay
+    /// per key.
+    ///
+    /// ```no_run
+    /// # use ondadb::{DB, Options, ColumnFamilyConfig};
+    /// # let db = DB::open(Options::new("/tmp/db")).unwrap();
+    /// # let cf = db.create_column_family("default", ColumnFamilyConfig::default()).unwrap();
+    /// for (key, value) in ["a".as_bytes(), b"b"].iter().zip(db.multi_get(&cf, &[b"a", b"b"])) {
+    ///     match value {
+    ///         Ok(v) => println!("{key:?} = {v:?}"),
+    ///         Err(e) => println!("{key:?}: {e}"),
+    ///     }
+    /// }
+    /// ```
+    pub fn multi_get(&self, cf: &Arc<ColumnFamily>, keys: &[&[u8]]) -> Vec<Result<Vec<u8>>> {
+        cf.multi_get(keys, self.inner.read_floor_seq())
+    }
+
+    /// [`multi_get`](Self::multi_get), with the read path's [`PerfContext`] for
+    /// the batch as a whole.
+    pub fn multi_get_with_perf(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        keys: &[&[u8]],
+    ) -> (Vec<Result<Vec<u8>>>, PerfContext) {
+        let scope = crate::perf::enter();
+        let r = self.multi_get(cf, keys);
+        (r, scope.finish())
+    }
+
     /// Delete a single key (auto-committed at ReadCommitted).
     pub fn delete(&self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<()> {
         let mut t = self.begin_with_isolation(IsolationLevel::ReadCommitted);
@@ -329,6 +381,74 @@ impl Txn {
     ) -> (Result<Vec<u8>>, PerfContext) {
         let scope = crate::perf::enter();
         let r = self.get(cf, key);
+        (r, scope.finish())
+    }
+
+    /// [`DB::multi_get`](crate::DB::multi_get), honoring this transaction's own
+    /// buffered writes.
+    ///
+    /// A key the transaction has written resolves from the buffer alone
+    /// (last write wins, as in [`get`](Self::get)) and never reaches the store;
+    /// the rest are resolved as one batch at the transaction's read sequence.
+    /// Under [`IsolationLevel::Serializable`] this records exactly the read-set
+    /// entries N [`get`](Self::get)s of the same keys would have — buffered
+    /// keys excluded, since reading one's own write is not a read of the store.
+    pub fn multi_get(&mut self, cf: &Arc<ColumnFamily>, keys: &[&[u8]]) -> Vec<Result<Vec<u8>>> {
+        let id = cf_id(cf);
+        let mut out: Vec<Option<Result<Vec<u8>>>> = (0..keys.len()).map(|_| None).collect();
+        // Indices still to resolve from the store, and their keys — built in
+        // input order so the batch's results scatter straight back.
+        let mut pending_idx: Vec<usize> = Vec::new();
+        let mut pending: Vec<&[u8]> = Vec::new();
+
+        for (i, key) in keys.iter().enumerate() {
+            // Read-your-writes: scan the buffer backward for the latest write.
+            let buffered = self
+                .writes
+                .iter()
+                .rev()
+                .find(|w| cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == *key);
+            if let Some(w) = buffered {
+                out[i] = Some(if w.tombstone {
+                    Err(OndaError::NotFound)
+                } else {
+                    Ok(buf_slice(&self.buf, w.value).to_vec())
+                });
+                continue;
+            }
+            if self.isolation == IsolationLevel::Serializable {
+                let read = (id, key.to_vec());
+                if self.read_set.insert(read.clone()) {
+                    self.read_log.push(read);
+                }
+                self.read_cfs.entry(id).or_insert_with(|| cf.clone());
+            }
+            pending_idx.push(i);
+            pending.push(key);
+        }
+
+        let rs = if self.fixed {
+            self.read_seq
+        } else {
+            self.db.read_floor_seq()
+        };
+        for (i, r) in pending_idx.into_iter().zip(cf.multi_get(&pending, rs)) {
+            out[i] = Some(r);
+        }
+        out.into_iter()
+            .map(|r| r.expect("every position is resolved from the buffer or the batch"))
+            .collect()
+    }
+
+    /// [`multi_get`](Self::multi_get), with the read path's [`PerfContext`] for
+    /// the batch as a whole.
+    pub fn multi_get_with_perf(
+        &mut self,
+        cf: &Arc<ColumnFamily>,
+        keys: &[&[u8]],
+    ) -> (Vec<Result<Vec<u8>>>, PerfContext) {
+        let scope = crate::perf::enter();
+        let r = self.multi_get(cf, keys);
         (r, scope.finish())
     }
 

@@ -74,6 +74,35 @@ impl OndaError {
         }
     }
 
+    /// An equivalent, independently owned copy of this error.
+    ///
+    /// `OndaError` is deliberately not `Clone` — it wraps [`std::io::Error`],
+    /// which is not — but a batched read has to hand *one* source failure to
+    /// *every* key whose resolution needed that source (see
+    /// [`crate::DB::multi_get`]). The variant, the message, and an I/O error's
+    /// kind survive; only an `io::Error`'s original payload type is flattened
+    /// to its string form.
+    pub(crate) fn duplicate(&self) -> OndaError {
+        match self {
+            OndaError::Memory(m) => OndaError::Memory(m.clone()),
+            OndaError::InvalidArgs(m) => OndaError::InvalidArgs(m.clone()),
+            OndaError::NotFound => OndaError::NotFound,
+            OndaError::Io(e) => OndaError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            OndaError::Corruption(m) => OndaError::Corruption(m.clone()),
+            OndaError::Exists(m) => OndaError::Exists(m.clone()),
+            OndaError::Conflict(m) => OndaError::Conflict(m.clone()),
+            OndaError::TooLarge(m) => OndaError::TooLarge(m.clone()),
+            OndaError::MemoryLimit(m) => OndaError::MemoryLimit(m.clone()),
+            OndaError::InvalidDb(m) => OndaError::InvalidDb(m.clone()),
+            OndaError::Locked(m) => OndaError::Locked(m.clone()),
+            OndaError::ReadOnly(m) => OndaError::ReadOnly(m.clone()),
+            OndaError::Busy(m) => OndaError::Busy(m.clone()),
+            OndaError::Poisoned(m) => OndaError::Poisoned(m.clone()),
+            OndaError::Unknown(m) => OndaError::Unknown(m.clone()),
+            OndaError::UnsupportedFormat(m) => OndaError::UnsupportedFormat(m.clone()),
+        }
+    }
+
     /// Reconstruct an error from a numeric code (used when a code is passed
     /// across threads, e.g. WAL group-commit follower results).  Detail is lost;
     /// `0` maps to [`OndaError::Unknown`] since it is not an error code.

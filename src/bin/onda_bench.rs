@@ -21,9 +21,16 @@ enum Phase {
     Forward,
     Backward,
     Delete,
+    /// Batched point lookups (0.4). Opt-in via `-phases multiget`: it prints a
+    /// *pair* of lines (sequential and batched over the same key plan), which
+    /// the cross-engine parser in `bench/` is not written for, so it stays out
+    /// of the default set.
+    MultiGet,
 }
 
 impl Phase {
+    /// The default phase set — the cross-engine workload. `MultiGet` is
+    /// deliberately absent; see its variant docs.
     const ALL: [Self; 5] = [
         Self::Put,
         Self::Get,
@@ -39,6 +46,7 @@ impl Phase {
             "forward" => Some(Self::Forward),
             "backward" => Some(Self::Backward),
             "delete" => Some(Self::Delete),
+            "multiget" => Some(Self::MultiGet),
             _ => None,
         }
     }
@@ -82,7 +90,8 @@ impl PhaseSet {
     }
 
     const fn needs_reopen(self) -> bool {
-        self.contains(Phase::Get)
+        self.contains(Phase::MultiGet)
+            || self.contains(Phase::Get)
             || self.contains(Phase::Forward)
             || self.contains(Phase::Backward)
             || self.contains(Phase::Delete)
@@ -109,6 +118,14 @@ struct Args {
     keep: bool,
     phases: PhaseSet,
     perf_scope: PerfScope,
+    /// Keys per `multi_get` call in the MultiGet phase.
+    mg_batch: usize,
+    /// Percent of a batch's slots that repeat an earlier slot of the same
+    /// batch — the duplicate-key ratio the batch path is supposed to absorb.
+    mg_dup_pct: usize,
+    /// Percent of a batch's slots drawn from the populated key set; the rest
+    /// are synthetic keys that miss.
+    mg_hit_pct: usize,
 }
 
 /// How the Get phase exercises [`ondadb::perf`]. The nil-path acceptance for
@@ -152,6 +169,9 @@ where
         keep: false,
         phases: PhaseSet::all(),
         perf_scope: PerfScope::Off,
+        mg_batch: 64,
+        mg_dup_pct: 0,
+        mg_hit_pct: 100,
     };
     let argv: Vec<String> = args
         .into_iter()
@@ -165,6 +185,15 @@ where
             argv.get(*i)
                 .cloned()
                 .ok_or_else(|| format!("{flag} requires a value"))
+        };
+        let percent = |name: &str, value: String| -> Result<usize, String> {
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| format!("{name} must be a percentage 0..=100: {value}"))?;
+            if parsed > 100 {
+                return Err(format!("{name} must be a percentage 0..=100: {parsed}"));
+            }
+            Ok(parsed)
         };
         let positive = |name: &str, value: String| -> Result<usize, String> {
             let parsed = value
@@ -186,6 +215,9 @@ where
             "-db" => a.db_path = val(&mut i)?,
             "-phases" => a.phases = PhaseSet::parse_list(&val(&mut i)?)?,
             "-perf_scope" => a.perf_scope = PerfScope::parse(&val(&mut i)?)?,
+            "-mg_batch" => a.mg_batch = positive("-mg_batch", val(&mut i)?)?,
+            "-mg_dup_ratio" => a.mg_dup_pct = percent("-mg_dup_ratio", val(&mut i)?)?,
+            "-mg_hit_ratio" => a.mg_hit_pct = percent("-mg_hit_ratio", val(&mut i)?)?,
             "-keep" => a.keep = true,
             "-engine" => {
                 let _ = val(&mut i)?; // accepted for CLI compatibility
@@ -359,6 +391,104 @@ fn main() {
         report("Get (cold)", a.ops, start.elapsed());
     }
 
+    // ---- MultiGet (0.4) ------------------------------------------------------
+    // Sequential `get`s and one `multi_get` over the *same* key plan, both
+    // measured warm, so the pair isolates batching from cache state.
+    if a.phases.contains(Phase::MultiGet) {
+        let batch = a.mg_batch;
+        let n_batches = a.ops.div_ceil(batch);
+        // Keys that are guaranteed to miss, for the hit-ratio knob.
+        let misses: Vec<Vec<u8>> = (0..a.ops.min(1 << 16))
+            .map(|i| {
+                let mut k = vec![0xFFu8; a.key_size];
+                let be = (i as u64).to_be_bytes();
+                let n = be.len().min(a.key_size);
+                k[..n].copy_from_slice(&be[..n]);
+                k
+            })
+            .collect();
+        // One deterministic slot plan for both passes: `Some(i)` picks
+        // `keys[i]`, `None(j)` picks `misses[j]`, and a slot may repeat the
+        // previous slot of its own batch.
+        let mut x: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut plan: Vec<&[u8]> = Vec::with_capacity(n_batches * batch);
+        for _ in 0..n_batches {
+            for slot in 0..batch {
+                let pick = if slot > 0 && (next() % 100) < a.mg_dup_pct as u64 {
+                    plan[plan.len() - 1]
+                } else if (next() % 100) < a.mg_hit_pct as u64 {
+                    keys[(next() % keys.len() as u64) as usize].as_slice()
+                } else {
+                    misses[(next() % misses.len() as u64) as usize].as_slice()
+                };
+                plan.push(pick);
+            }
+        }
+        let plan = &plan;
+        let slots = plan.len();
+
+        let sequential = || {
+            let db = &db;
+            let cf = &cf;
+            run_threaded(n_batches, a.threads, |lo, hi| {
+                for b in lo..hi {
+                    for k in &plan[b * batch..(b + 1) * batch] {
+                        std::hint::black_box(db.get(cf, k).is_ok());
+                    }
+                }
+            });
+        };
+        let batched = || {
+            let db = &db;
+            let cf = &cf;
+            run_threaded(n_batches, a.threads, |lo, hi| {
+                for b in lo..hi {
+                    let got = db.multi_get(cf, &plan[b * batch..(b + 1) * batch]);
+                    std::hint::black_box(got.iter().filter(|r| r.is_ok()).count());
+                }
+            });
+        };
+
+        // Warm both paths' caches before either is timed: the point of the
+        // comparison is batching, not who paid for the first read.
+        sequential();
+        batched();
+
+        let start = Instant::now();
+        sequential();
+        let seq_elapsed = start.elapsed();
+        let start = Instant::now();
+        batched();
+        let batch_elapsed = start.elapsed();
+
+        report(&format!("MultiGet seq b={batch}"), slots, seq_elapsed);
+        report(&format!("MultiGet batch b={batch}"), slots, batch_elapsed);
+        // The counter that says *why*: block fetches the batch path avoided.
+        let scope = ondadb::perf::enter();
+        let sample = std::cmp::min(n_batches, 256);
+        for b in 0..sample {
+            std::hint::black_box(db.multi_get(&cf, &plan[b * batch..(b + 1) * batch]).len());
+        }
+        let p = scope.finish();
+        eprintln!(
+            "multiget b={batch} dup={}% hit={}%: seq {:.3} us/op, batch {:.3} us/op, \
+             speedup {:.3}x, blocks_deduped {} over {} keys",
+            a.mg_dup_pct,
+            a.mg_hit_pct,
+            seq_elapsed.as_secs_f64() * 1e6 / slots as f64,
+            batch_elapsed.as_secs_f64() * 1e6 / slots as f64,
+            seq_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64().max(1e-9),
+            p.multiget_blocks_deduped,
+            sample * batch,
+        );
+    }
+
     // ---- Forward / Backward scan (threads concurrent full iterations) --------
     // Run BEFORE Delete and straight after the reopen, matching the Go/C harness
     // phase order — so scans read from SSTables (the on-disk path), not a hot
@@ -465,6 +595,41 @@ mod tests {
     }
 
     #[test]
+    fn multiget_knobs_default_and_validate() {
+        let args = parse_args_from(["onda_bench"]).unwrap();
+        assert_eq!(
+            (args.mg_batch, args.mg_dup_pct, args.mg_hit_pct),
+            (64, 0, 100)
+        );
+        let args = parse_args_from([
+            "onda_bench",
+            "-mg_batch",
+            "128",
+            "-mg_dup_ratio",
+            "25",
+            "-mg_hit_ratio",
+            "80",
+        ])
+        .unwrap();
+        assert_eq!(
+            (args.mg_batch, args.mg_dup_pct, args.mg_hit_pct),
+            (128, 25, 80)
+        );
+        // Ratios are percentages; a batch of zero keys is not a batch.
+        assert!(parse_args_from(["onda_bench", "-mg_hit_ratio", "101"]).is_err());
+        assert!(parse_args_from(["onda_bench", "-mg_batch", "0"]).is_err());
+        // The batched phase is opt-in, not part of the cross-engine default.
+        assert!(!parse_args_from(["onda_bench"])
+            .unwrap()
+            .phases
+            .contains(Phase::MultiGet));
+        assert!(parse_args_from(["onda_bench", "-phases", "multiget"])
+            .unwrap()
+            .phases
+            .contains(Phase::MultiGet));
+    }
+
+    #[test]
     fn phases_reject_unknown_and_empty_values() {
         assert!(parse_args_from(["onda_bench", "-phases", "bogus"]).is_err());
         assert!(parse_args_from(["onda_bench", "-phases", ""]).is_err());
@@ -515,6 +680,9 @@ mod tests {
             keep: false,
             phases: PhaseSet::all(),
             perf_scope: PerfScope::Off,
+            mg_batch: 64,
+            mg_dup_pct: 0,
+            mg_hit_pct: 100,
         };
 
         let _ = populate(&db, &cf, &keys, value, &args);

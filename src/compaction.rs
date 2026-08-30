@@ -395,8 +395,7 @@ static FIRST_FIT_ORDER: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Bytes of SSTable written by compaction since the last reset. See the
 /// accounting hook in [`compact_inputs`].
 #[cfg(test)]
-static COMPACTION_OUTPUT_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static COMPACTION_OUTPUT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bytes of `levels[target]` a compaction over `[min_key, max_key]` would have
 /// to rewrite: the **whole** size of every target table the span intersects.
@@ -798,7 +797,7 @@ impl<'a> CompactionOutputBuilder<'a> {
         let id = self.db.next_file_id();
         let klog = self.cf.klog_path(id);
         let writer = match Writer::new(&klog, cf_writer_opts(self.cf, self.cmp, self.target as u32))
-        .map(|w| w.with_limiter(self.cf.ctx.io_limiter.clone()))
+            .map(|w| w.with_limiter(self.cf.ctx.io_limiter.clone()))
         {
             Ok(writer) => writer,
             Err(error) => {
@@ -1388,7 +1387,10 @@ mod tests {
                 handle(&cf, 61, 2, b"e", b"g", big + 2, 0),
             ],
         ];
-        assert_eq!(rank_candidates(&levels, &cmp, 2, &candidates, 0), vec![1, 0]);
+        assert_eq!(
+            rank_candidates(&levels, &cmp, 2, &candidates, 0),
+            vec![1, 0]
+        );
 
         // Saturating sizes must not wrap or panic: klog + vlog saturates at
         // u64::MAX and the cross-multiplication stays inside u128.
@@ -1618,8 +1620,7 @@ mod tests {
                     // inputs: while the guard lives that exact span cannot be
                     // taken again, and it frees on drop.
                     let (min_key, max_key) = key_span(&job.inputs, &cmp);
-                    let span =
-                        crate::range_lock::KeyRange::new(min_key.clone(), max_key.clone());
+                    let span = crate::range_lock::KeyRange::new(min_key.clone(), max_key.clone());
                     assert!(
                         cf.range_locks.try_acquire(span).is_none(),
                         "seed {seed}: the job's span is not locked"

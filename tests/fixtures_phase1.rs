@@ -160,7 +160,14 @@ fn klog_entries() -> Vec<(String, Vec<u8>, u64, i64, bool, bool)> {
         ),
     ];
     for i in 7..40u64 {
-        v.push((format!("k{i:02}"), b"filler".to_vec(), 20 + i, 0, false, false));
+        v.push((
+            format!("k{i:02}"),
+            b"filler".to_vec(),
+            20 + i,
+            0,
+            false,
+            false,
+        ));
     }
     v
 }
