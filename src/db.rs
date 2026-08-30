@@ -32,14 +32,154 @@ struct PublishState {
     completed: HashMap<u64, u64>, // start -> end of completed-but-unpublished ranges
 }
 
-/// Deferred-deletion control for consistent checkpoints/backups. While
-/// `disabled > 0`, obsolete SSTable files are recorded in `pending` instead of
-/// being unlinked, so a snapshot can copy a self-consistent file set even while
-/// compaction runs.
-#[derive(Default)]
+/// Minimum charge for retiring one file, in bytes.
+///
+/// An unlink is metadata IO: it costs a directory update and an inode free even
+/// when the file itself is empty, and a column family with no separated values
+/// retires a zero-byte `<id>.vlog` at every compaction. Charging the literal
+/// size would make a storm of those free, and a storm of tiny deletions is
+/// precisely what saturates a device with metadata work. One filesystem block
+/// is the documented floor.
+pub const DELETE_METADATA_BYTES: u64 = 4096;
+
+/// One file to retire, and what its removal is charged.
+#[derive(Debug)]
+struct DeleteTask {
+    path: String,
+    /// The file's size, floored at [`DELETE_METADATA_BYTES`].
+    bytes: u64,
+}
+
+/// The thread that performs paced unlinks, present only when
+/// `Options::obsolete_delete_bytes_per_second` is non-zero.
+struct DeletionWorker {
+    /// FIFO queue to the worker. `None` after [`FileDeletionState::drain`] has
+    /// closed it (at `close`), from which point deletions unlink inline again —
+    /// there is no thread left to hand them to.
+    tx: Mutex<Option<Sender<DeleteTask>>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    /// Admission control for the unlinks. Its own bucket at the deletion rate,
+    /// unless the embedder injected a limiter — one supplied limiter means one
+    /// device budget covering every class.
+    limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+}
+
+/// Deferred-deletion control for consistent checkpoints/backups, plus the
+/// optional pacing worker.
+///
+/// While `paused.disabled > 0`, obsolete SSTable files are recorded in
+/// `paused.pending` instead of being unlinked or queued, so a snapshot can copy
+/// a self-consistent file set even while compaction runs. That path is
+/// unchanged by pacing: the pause is what backup correctness rests on, and the
+/// worker must not become a way around it.
 struct FileDeletionState {
+    paused: Mutex<PausedDeletions>,
+    /// `None` — the default — means unlink inline on the caller's thread, with
+    /// no channel and no thread, exactly as every release before 0.6.
+    worker: Option<DeletionWorker>,
+}
+
+#[derive(Default)]
+struct PausedDeletions {
     disabled: u32,
-    pending: Vec<String>,
+    pending: Vec<DeleteTask>,
+}
+
+impl FileDeletionState {
+    /// Build the deletion state for `opts`, spawning the worker only when a
+    /// rate is configured.
+    fn new(opts: &Options) -> FileDeletionState {
+        let rate = opts.obsolete_delete_bytes_per_second;
+        let worker = (rate > 0).then(|| {
+            // Same construction rule as the DB-wide limiter: an injected
+            // limiter wins outright, otherwise a bucket at the deletion rate.
+            let limiter = crate::ioctrl::limiter_for(
+                rate,
+                opts.background_io_burst_bytes,
+                opts.io_limiter.clone(),
+            );
+            let (tx, rx) = unbounded::<DeleteTask>();
+            let worker_limiter = limiter.clone();
+            let handle = std::thread::Builder::new()
+                .name("onda-delete".into())
+                .spawn(move || deletion_worker(rx, worker_limiter))
+                .expect("spawn deletion worker");
+            DeletionWorker {
+                tx: Mutex::new(Some(tx)),
+                handle: Mutex::new(Some(handle)),
+                limiter,
+            }
+        });
+        FileDeletionState {
+            paused: Mutex::new(PausedDeletions::default()),
+            worker,
+        }
+    }
+
+    /// Retire one file: hand it to the worker, or unlink it here.
+    ///
+    /// The inline case is not only the unpaced default — it is also the
+    /// fallback once the queue has been closed at `close`, so a late deletion
+    /// can never be silently dropped on the floor.
+    fn dispatch(&self, task: DeleteTask) {
+        let task = match &self.worker {
+            Some(worker) => {
+                let tx = worker.tx.lock();
+                match tx.as_ref() {
+                    Some(tx) => match tx.send(task) {
+                        Ok(()) => return,
+                        // The worker died; take the task back and do it here
+                        // rather than lose the file.
+                        Err(err) => err.into_inner(),
+                    },
+                    None => task,
+                }
+            }
+            None => task,
+        };
+        let _ = std::fs::remove_file(&task.path);
+    }
+
+    /// Close the queue and join the worker, unlinking everything already
+    /// queued. Idempotent.
+    fn drain(&self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        // Dropping the only sender is what ends the worker's `for` loop — after
+        // it has drained every task still in the channel, which is exactly the
+        // ordering close needs.
+        drop(worker.tx.lock().take());
+        let handle = worker.handle.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// Release a worker parked on its bucket. See `DbInner::cancel_background_io`.
+    fn cancel(&self) {
+        if let Some(worker) = &self.worker {
+            if let Some(limiter) = &worker.limiter {
+                limiter.cancel();
+            }
+        }
+    }
+}
+
+/// Unlink obsolete files in FIFO order, paced by `limiter`.
+///
+/// Order is not load-bearing — file ids are never reused, so no later task can
+/// depend on an earlier one having run — but FIFO keeps the queue's depth a
+/// function of the rate alone.
+fn deletion_worker(rx: Receiver<DeleteTask>, limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>) {
+    // Dedicated thread: set the class once, never restore it.
+    crate::ioctrl::set_class(crate::ioctrl::IoClass::ObsoleteDelete);
+    // Ends when the sender is dropped *and* the queue is empty: `drain` relies
+    // on that to guarantee every queued file is gone before it returns.
+    for task in rx {
+        crate::ioctrl::charge(&limiter, task.bytes);
+        let _ = std::fs::remove_file(&task.path);
+    }
 }
 
 /// Internal database state shared with workers and column families.
@@ -99,7 +239,7 @@ pub struct DbInner {
     /// batch operations can assert they collapse N per-item persists into one.
     manifest_persists: AtomicU64,
 
-    file_deletion: Mutex<FileDeletionState>,
+    file_deletion: FileDeletionState,
 
     workers: Mutex<Vec<JoinHandle<()>>>,
 
@@ -354,6 +494,10 @@ impl DbInner {
         if let Some(limiter) = &self.io_limiter {
             limiter.cancel();
         }
+        // The deletion worker parks on a bucket of its own (unless the
+        // embedder injected one limiter for both), and a queue it can no longer
+        // drain is a queue `close` would wait on forever.
+        self.file_deletion.cancel();
     }
 
     /// Trip the fail-stop flag and release anything waiting on this database.
@@ -366,39 +510,58 @@ impl DbInner {
         self.cancel_background_io();
     }
 
-    /// Unlink an obsolete SSTable file, or defer it if deletions are paused (a
-    /// checkpoint/backup is copying a consistent file set). Compaction routes all
-    /// input-file removals through here.
-    pub(crate) fn remove_sst_file(&self, path: &str) {
-        let mut s = self.file_deletion.lock();
-        if s.disabled > 0 {
-            s.pending.push(path.to_string());
-        } else {
-            drop(s);
-            let _ = std::fs::remove_file(path);
+    /// Retire an obsolete SSTable file, or defer it if deletions are paused (a
+    /// checkpoint/backup is copying a consistent file set). Compaction, FIFO
+    /// eviction and the part mover route all input-file removals through here.
+    ///
+    /// `bytes` is the file's size from its `SstMeta` — every caller already
+    /// holds one — floored at [`DELETE_METADATA_BYTES`], and is what the unlink
+    /// is charged when pacing is on. Unpaced (the default) it is ignored and
+    /// the file is unlinked right here, on the caller's thread.
+    pub(crate) fn remove_sst_file(&self, path: &str, bytes: u64) {
+        let task = DeleteTask {
+            path: path.to_string(),
+            bytes: bytes.max(DELETE_METADATA_BYTES),
+        };
+        let mut paused = self.file_deletion.paused.lock();
+        if paused.disabled > 0 {
+            paused.pending.push(task);
+            return;
         }
+        drop(paused);
+        self.file_deletion.dispatch(task);
     }
 
     /// Pause obsolete-file deletion for the lifetime of the returned guard. Nested
-    /// pauses are counted; deferred files are unlinked when the last guard drops.
+    /// pauses are counted; deferred files are retired when the last guard drops.
     pub(crate) fn pause_deletions(&self) -> DeletionPause<'_> {
-        self.file_deletion.lock().disabled += 1;
+        self.file_deletion.paused.lock().disabled += 1;
         DeletionPause { inner: self }
     }
 
     fn resume_deletions(&self) {
         let drained = {
-            let mut s = self.file_deletion.lock();
-            s.disabled = s.disabled.saturating_sub(1);
-            if s.disabled == 0 {
-                std::mem::take(&mut s.pending)
+            let mut paused = self.file_deletion.paused.lock();
+            paused.disabled = paused.disabled.saturating_sub(1);
+            if paused.disabled == 0 {
+                std::mem::take(&mut paused.pending)
             } else {
                 Vec::new()
             }
         };
-        for p in drained {
-            let _ = std::fs::remove_file(p);
+        for task in drained {
+            self.file_deletion.dispatch(task);
         }
+    }
+
+    /// Unlink everything queued for deletion and stop the worker.
+    ///
+    /// Called by `close` before the directory lock is released — the same
+    /// obligation deferred deletes under a pause already had: nothing may
+    /// outlive the open database that knows the file is obsolete, or the next
+    /// open inherits a file no manifest names.
+    pub(crate) fn drain_deletions(&self) {
+        self.file_deletion.drain();
     }
 }
 
@@ -573,7 +736,7 @@ fn build_db_inner(
         wal_layout: Mutex::new(requested_layout),
         instance_nonce: Mutex::new(manifest.instance_nonce),
         manifest_persists: AtomicU64::new(0),
-        file_deletion: Mutex::new(FileDeletionState::default()),
+        file_deletion: FileDeletionState::new(opts),
         workers: Mutex::new(Vec::new()),
         lock_file: Mutex::new(Some(lock_file)),
         handles: Arc::new(AtomicUsize::new(1)),
@@ -1121,6 +1284,11 @@ impl DB {
         for cf in &cfs {
             cf.close_resources();
         }
+        // Every obsolete file the run queued must be gone before the lock is:
+        // the compaction and flush workers are joined above, so the queue is
+        // now closed, and pacing was cancelled at the top of `close`, so this
+        // drains at full speed rather than at the configured rate.
+        self.inner.drain_deletions();
         // Release the directory lock last, once all state is durable, so a
         // concurrent open never sees a half-closed database.
         *self.inner.lock_file.lock() = None;
@@ -1483,6 +1651,108 @@ mod tests {
         let db = DB::open(opts).unwrap();
         assert!(db.inner.io_limiter.is_some());
         assert!(db.inner.ctx.io_limiter.is_some());
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn no_deletion_worker_when_unpaced() {
+        // The rollback position for review B: at rate 0 there is no channel and
+        // no thread, and `remove_sst_file` unlinks on the caller's thread
+        // exactly as it did before the worker existed.
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        assert!(db.inner.file_deletion.worker.is_none());
+        let victim = dir.path().join("1.klog");
+        std::fs::write(&victim, b"x").unwrap();
+        db.inner
+            .remove_sst_file(victim.to_str().unwrap(), 1 << 20);
+        assert!(!victim.exists(), "unpaced deletion must unlink inline");
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn retire_charges_metadata_minimum_for_empty_vlog() {
+        // A CF with no separated values retires a `<id>.vlog` of zero bytes at
+        // every compaction. Charging the literal 0 would make a storm of tiny
+        // deletions free, and a storm of tiny deletions is exactly the thing
+        // that saturates a device with metadata IO.
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(crate::ioctrl::RecordingLimiter::default());
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.obsolete_delete_bytes_per_second = 1 << 30; // paced, but not slow
+        opts.io_limiter = Some(recorder.clone());
+        let db = DB::open(opts).unwrap();
+        let empty = dir.path().join("7.vlog");
+        std::fs::write(&empty, b"").unwrap();
+        db.inner.remove_sst_file(empty.to_str().unwrap(), 0);
+        db.close().unwrap(); // drains the worker
+
+        assert!(!empty.exists());
+        let charges: Vec<u64> = recorder
+            .charges()
+            .into_iter()
+            .filter(|(class, _)| *class == crate::ioctrl::IoClass::ObsoleteDelete)
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(
+            charges,
+            vec![DELETE_METADATA_BYTES],
+            "a zero-byte retirement must still cost one metadata block"
+        );
+    }
+
+    #[test]
+    fn paused_deletion_defers_to_the_pending_list() {
+        // Pause semantics are what checkpoint and backup rest on, and the
+        // worker must not become a way around them: while a pause is held not
+        // even a queued task may reach the filesystem.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.obsolete_delete_bytes_per_second = 1 << 30;
+        let db = DB::open(opts).unwrap();
+        let victim = dir.path().join("9.klog");
+        std::fs::write(&victim, b"x").unwrap();
+        {
+            let _pause = db.inner.pause_deletions();
+            db.inner.remove_sst_file(victim.to_str().unwrap(), 4096);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(victim.exists(), "a pause must defer even a paced deletion");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while victim.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!victim.exists(), "the last guard drop must drain the pending list");
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn poison_does_not_hang_the_deletion_worker() {
+        // Lives in-module because tripping the fail-stop flag needs the
+        // crate-private poison handle. A worker parked on a one-byte-per-second
+        // bucket outlives any test — and, in production, would hold up close on
+        // a database that has already given up on durability.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.obsolete_delete_bytes_per_second = 1; // ~4096 seconds per file
+        let db = DB::open(opts).unwrap();
+        let victim = dir.path().join("11.klog");
+        std::fs::write(&victim, b"x").unwrap();
+        db.inner.remove_sst_file(victim.to_str().unwrap(), 1 << 20);
+        // Give the worker time to actually park on the bucket.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(victim.exists(), "the worker should still be waiting on credit");
+
+        let started = std::time::Instant::now();
+        db.inner.fail_stop("test-induced".to_string());
+        db.inner.drain_deletions();
+        let drained_in = started.elapsed();
+
+        assert!(!victim.exists(), "poison must release the parked worker");
+        assert!(
+            drained_in < Duration::from_secs(30),
+            "poison must wake the deletion worker; drain took {drained_in:?}"
+        );
         db.close().unwrap();
     }
 

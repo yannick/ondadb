@@ -526,8 +526,11 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
         }
         db.persist_manifest()?;
         for t in &victims {
-            db.remove_sst_file(&cf.klog_path(t.meta.id));
-            db.remove_sst_file(&format!("{}/{}.vlog", cf.dir(), t.meta.id));
+            db.remove_sst_file(&cf.klog_path(t.meta.id), t.meta.klog_size);
+            db.remove_sst_file(
+                &format!("{}/{}.vlog", cf.dir(), t.meta.id),
+                t.meta.vlog_size,
+            );
         }
         cf.compaction_count
             .fetch_add(victims.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1035,8 +1038,11 @@ fn install_compaction_outputs(
 fn remove_compaction_inputs(db: &DbInner, cf: &ColumnFamily, inputs: &[Arc<SstHandle>]) {
     for table in inputs {
         table.close();
-        db.remove_sst_file(&cf.klog_path(table.meta.id));
-        db.remove_sst_file(&format!("{}/{}.vlog", cf.dir(), table.meta.id));
+        db.remove_sst_file(&cf.klog_path(table.meta.id), table.meta.klog_size);
+        db.remove_sst_file(
+            &format!("{}/{}.vlog", cf.dir(), table.meta.id),
+            table.meta.vlog_size,
+        );
     }
 }
 

@@ -1,0 +1,10 @@
+{"run":0,"phase":"delete_unpaced","delete_rate_bytes_per_sec":0,"reads":1506856,"p50_us":0,"p99_us":0,"p999_us":2,"max_us":53022,"fsync_p99_us":23999,"files_retired":0,"delete_bytes":0,"window_secs":1.270}
+{"run":0,"phase":"delete_paced","delete_rate_bytes_per_sec":4194304,"reads":9857356,"p50_us":0,"p99_us":0,"p999_us":1,"max_us":64230,"fsync_p99_us":406208,"files_retired":480,"delete_bytes":28550545,"window_secs":6.285}
+{"run":1,"phase":"delete_unpaced","delete_rate_bytes_per_sec":0,"reads":1810322,"p50_us":0,"p99_us":0,"p999_us":1,"max_us":44177,"fsync_p99_us":31897,"files_retired":0,"delete_bytes":0,"window_secs":1.410}
+{"run":1,"phase":"delete_paced","delete_rate_bytes_per_sec":4194304,"reads":11249642,"p50_us":0,"p99_us":0,"p999_us":1,"max_us":72545,"fsync_p99_us":28039,"files_retired":480,"delete_bytes":28550545,"window_secs":6.356}
+{"run":2,"phase":"delete_unpaced","delete_rate_bytes_per_sec":0,"reads":98408,"p50_us":0,"p99_us":0,"p999_us":387,"max_us":28879,"fsync_p99_us":7194,"files_retired":0,"delete_bytes":0,"window_secs":0.409}
+{"run":2,"phase":"delete_paced","delete_rate_bytes_per_sec":4194304,"reads":11948929,"p50_us":0,"p99_us":0,"p999_us":1,"max_us":10176,"fsync_p99_us":22393,"files_retired":480,"delete_bytes":28550545,"window_secs":6.151}
+{"run":3,"phase":"delete_unpaced","delete_rate_bytes_per_sec":0,"reads":141016,"p50_us":0,"p99_us":1,"p999_us":484,"max_us":9853,"fsync_p99_us":20249,"files_retired":0,"delete_bytes":0,"window_secs":0.481}
+{"run":3,"phase":"delete_paced","delete_rate_bytes_per_sec":4194304,"reads":12039365,"p50_us":0,"p99_us":0,"p999_us":0,"max_us":14471,"fsync_p99_us":34209,"files_retired":480,"delete_bytes":28550545,"window_secs":6.209}
+{"run":4,"phase":"delete_unpaced","delete_rate_bytes_per_sec":0,"reads":323121,"p50_us":0,"p99_us":0,"p999_us":320,"max_us":11010,"fsync_p99_us":447854,"files_retired":0,"delete_bytes":0,"window_secs":1.056}
+{"run":4,"phase":"delete_paced","delete_rate_bytes_per_sec":4194304,"reads":11307592,"p50_us":0,"p99_us":0,"p999_us":0,"max_us":9515,"fsync_p99_us":110287,"files_retired":480,"delete_bytes":28550545,"window_secs":6.251}

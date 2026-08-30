@@ -79,7 +79,7 @@ pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
     Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend, TierDef, TierRule,
 };
-pub use db::DB;
+pub use db::{DELETE_METADATA_BYTES, DB};
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;

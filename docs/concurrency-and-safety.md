@@ -103,7 +103,8 @@ the two unexamined candidates.
 | `DbInner::commit_mu` | Snapshot/Serializable validation + apply | conflict check → apply → publish |
 | `DbInner::manifest_mu` | manifest rebuild + save | whole `persist_manifest` |
 | `DbInner::publish` (Mutex) | publish cursor | short |
-| `DbInner::file_deletion` | deferred-SST-delete state | short; `pause_deletions` returns an RAII guard |
+| `DbInner::file_deletion.paused` | pause counter + deferred-delete list | short; `pause_deletions` returns an RAII guard. Never held across the unlink or the channel send |
+| `DbInner::file_deletion.worker.{tx,handle}` | deletion-queue sender / join handle | one unbounded `send` (never blocks) or one `take`; the join in `drain_deletions` happens with neither held |
 | `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating` | gate checks, rotation drain |
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
 | `ColumnFamily::compact_mu` (Mutex) | whole-CF compaction operations | manual compaction sweep and FIFO eviction; acquired before the whole-keyspace range lock |
@@ -175,6 +176,40 @@ condvar; every subsequent charge is free. `close` cancels **first**, before the
 configured rate says the final flush's bytes take — and after close is called
 there is no foreground latency left to protect. `SystemClock::wait` additionally
 caps a single park at 50 ms, so even a lost wakeup cannot hang a waiter.
+
+### Deletion worker (`db.rs`, 0.6-B)
+
+A fourth blocking point: the `onda-delete` thread charges
+`max(file size, DELETE_METADATA_BYTES)` under `IoClass::ObsoleteDelete` before
+each unlink. It exists only when
+`Options::obsolete_delete_bytes_per_second` is non-zero; at the default of 0
+`remove_sst_file` unlinks on the caller's thread with no channel and no thread,
+exactly as before 0.6.
+
+The worker **holds no engine lock while it waits**, which is why it needs no
+exception to the background-wait rule: it is handed a path and a byte count and
+never touches CF state, the manifest, or the levels. `remove_sst_file` releases
+the `paused` mutex before dispatching, so a paced queue can never delay a
+compaction that is retiring files, nor a `pause_deletions` taken concurrently.
+
+Ordering obligations:
+
+- **A pause still wins.** While `paused.disabled > 0` a retirement goes to the
+  pending list and is *not* queued; the last guard drop dispatches it. Backup
+  and checkpoint correctness rests on this and is unchanged by pacing.
+- **`close` drains before releasing `LOCK`.** `cancel_background_io` (first
+  thing in `close`) frees the worker's bucket, then — after the flush and
+  compaction workers are joined, so nothing can enqueue more —
+  `drain_deletions` drops the sender and joins the thread. The worker's
+  `for task in rx` loop ends only when the queue is empty, so every queued file
+  is gone before the directory lock is. Late retirements after that point
+  unlink inline; nothing is dropped.
+- **Poison does not hang it.** `fail_stop` routes through
+  `cancel_background_io`, so a worker parked on credit a dying database will
+  never grant is released immediately.
+
+FIFO is the queue's discipline but not a correctness requirement: file ids are
+never reused, so no retirement can depend on an earlier one having run.
 
 ## Rotation protocol (`ColumnFamily::rotate_memtable`)
 

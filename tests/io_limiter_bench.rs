@@ -219,6 +219,230 @@ mod parking_lot_lite {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 0.6-B: the delete-storm phase.
+// ---------------------------------------------------------------------------
+
+/// Meters every class and paces **only** `ObsoleteDelete`.
+///
+/// Both arms of the delete-storm comparison leave flush and compaction
+/// unlimited, so the only variable between them is how the unlinks are spread.
+#[derive(Debug)]
+struct DeleteMeter {
+    inner: Option<TokenBucket>,
+    delete_bytes: AtomicU64,
+    deletes: AtomicU64,
+    other_bytes: AtomicU64,
+}
+
+impl DeleteMeter {
+    fn new(rate: u64) -> Arc<DeleteMeter> {
+        Arc::new(DeleteMeter {
+            inner: (rate > 0).then(|| TokenBucket::new(rate, rate)),
+            delete_bytes: AtomicU64::new(0),
+            deletes: AtomicU64::new(0),
+            other_bytes: AtomicU64::new(0),
+        })
+    }
+}
+
+impl IoLimiter for DeleteMeter {
+    fn charge(&self, class: IoClass, bytes: u64) {
+        if class != IoClass::ObsoleteDelete {
+            self.other_bytes.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        }
+        self.delete_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.deletes.fetch_add(1, Ordering::Relaxed);
+        if let Some(b) = &self.inner {
+            b.charge(class, bytes);
+        }
+    }
+    fn cancel(&self) {
+        if let Some(b) = &self.inner {
+            b.cancel();
+        }
+    }
+}
+
+const STORM_FILES: u32 = 120;
+const STORM_KEYS: u32 = 1_500;
+
+struct StormPhase {
+    name: &'static str,
+    reads: usize,
+    p50_us: u64,
+    p99_us: u64,
+    p999_us: u64,
+    max_us: u64,
+    fsync_p99_us: u64,
+    files_retired: u64,
+    delete_bytes: u64,
+    window_secs: f64,
+}
+
+fn sst_paths(cf_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(cf_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            let ext = path.extension()?.to_str()?.to_string();
+            (ext == "klog" || ext == "vlog").then_some(path)
+        })
+        .collect()
+}
+
+/// One delete storm: `STORM_FILES` L0 files retired by a single sweep, with
+/// point reads running throughout.
+///
+/// The measured window runs from the start of the sweep to the moment the last
+/// obsolete file is gone — unpaced those unlinks happen inside `compact`,
+/// paced they trail it, and the point of the phase is exactly that difference
+/// in distribution over the same total work.
+fn measure_delete_storm(name: &'static str, dir: &std::path::Path, rate: u64) -> StormPhase {
+    let meter = DeleteMeter::new(rate);
+    let limiter: Arc<dyn IoLimiter> = meter.clone();
+    let mut options = Options::new(dir.to_str().unwrap());
+    options.io_limiter = Some(limiter);
+    options.obsolete_delete_bytes_per_second = rate;
+    options.block_cache_size = 4 << 20;
+    let db = DB::open(options).unwrap();
+    let cf = db
+        .create_column_family(
+            "bench",
+            ColumnFamilyConfig {
+                // Unreachable trigger: the sweep below decides when the files
+                // go obsolete, so the storm is one event and not a trickle.
+                l1_file_count_trigger: 1 << 20,
+                write_buffer_size: 256 << 10,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    let value = [b'v'; 128];
+    for generation in 0..STORM_FILES {
+        for i in 0..STORM_KEYS {
+            db.put(
+                &cf,
+                format!("key{i:08}").as_bytes(),
+                &[&generation.to_le_bytes()[..], &value[..]].concat(),
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+    }
+    let obsolete = sst_paths(&dir.join("cf-bench"));
+    std::thread::sleep(Duration::from_secs(1));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let window = parking_lot_lite::Cell::new(0.0);
+    let (reads, latencies, fsyncs) = std::thread::scope(|scope| {
+        let reader = {
+            let db = &db;
+            let cf = cf.clone();
+            let stop = stop.clone();
+            scope.spawn(move || {
+                let mut latencies: Vec<u64> = Vec::with_capacity(1 << 20);
+                let mut fsyncs: Vec<u64> = Vec::new();
+                let mut i = 0u32;
+                let mut next_fsync = Instant::now();
+                while !stop.load(Ordering::SeqCst) {
+                    let key = format!("key{:08}", (i.wrapping_mul(2_654_435_761)) % STORM_KEYS);
+                    let t0 = Instant::now();
+                    let _ = db.get(&cf, key.as_bytes());
+                    latencies.push(t0.elapsed().as_micros() as u64);
+                    i = i.wrapping_add(1);
+                    if Instant::now() >= next_fsync {
+                        let t0 = Instant::now();
+                        db.sync_wal().unwrap();
+                        fsyncs.push(t0.elapsed().as_micros() as u64);
+                        next_fsync = Instant::now() + Duration::from_millis(100);
+                    }
+                }
+                (latencies.len(), latencies, fsyncs)
+            })
+        };
+        let t0 = Instant::now();
+        db.compact(&cf).unwrap();
+        // Wait out the queue: unpaced this is already true on return.
+        while obsolete.iter().any(|p| p.exists()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        window.set(t0.elapsed().as_secs_f64());
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap()
+    });
+
+    let mut sorted = latencies;
+    sorted.sort_unstable();
+    let mut fs = fsyncs;
+    fs.sort_unstable();
+    let phase = StormPhase {
+        name,
+        reads,
+        p50_us: percentile(&sorted, 0.50),
+        p99_us: percentile(&sorted, 0.99),
+        p999_us: percentile(&sorted, 0.999),
+        max_us: sorted.last().copied().unwrap_or(0),
+        fsync_p99_us: percentile(&fs, 0.99),
+        files_retired: meter.deletes.load(Ordering::Relaxed),
+        delete_bytes: meter.delete_bytes.load(Ordering::Relaxed),
+        window_secs: window.get(),
+    };
+    db.close().unwrap();
+    phase
+}
+
+#[test]
+#[ignore = "measurement harness; run explicitly with --ignored"]
+fn delete_storm_paced_versus_unpaced() {
+    let runs: usize = std::env::var("RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let rate: u64 = std::env::var("ONDADB_DELETE_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4 << 20); // 4 MiB/s of unlink credit
+    let out = std::env::var("ONDADB_BENCH_OUT")
+        .unwrap_or_else(|_| "bench-results/0.6B/latest.jsonl".to_string());
+    if let Some(parent) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let mut sink = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&out)
+        .unwrap();
+    use std::io::Write;
+
+    for run in 0..runs {
+        for (name, phase_rate) in [("delete_unpaced", 0u64), ("delete_paced", rate)] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = measure_delete_storm(name, dir.path(), phase_rate);
+            let line = format!(
+                r#"{{"run":{run},"phase":"{}","delete_rate_bytes_per_sec":{phase_rate},"reads":{},"p50_us":{},"p99_us":{},"p999_us":{},"max_us":{},"fsync_p99_us":{},"files_retired":{},"delete_bytes":{},"window_secs":{:.3}}}"#,
+                p.name,
+                p.reads,
+                p.p50_us,
+                p.p99_us,
+                p.p999_us,
+                p.max_us,
+                p.fsync_p99_us,
+                p.files_retired,
+                p.delete_bytes,
+                p.window_secs,
+            );
+            println!("{line}");
+            writeln!(sink, "{line}").unwrap();
+            sink.flush().unwrap();
+        }
+    }
+}
+
 #[test]
 #[ignore = "measurement harness; run explicitly with --ignored"]
 fn foreground_reads_during_forced_compaction() {

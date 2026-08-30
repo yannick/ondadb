@@ -1014,9 +1014,9 @@ impl crate::db::DbInner {
             h.close();
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
-            self.remove_sst_file(&src_klog);
+            self.remove_sst_file(&src_klog, h.meta.klog_size);
             if Path::new(&src_vlog).exists() {
-                self.remove_sst_file(&src_vlog);
+                self.remove_sst_file(&src_vlog, h.meta.vlog_size);
             }
         }
         let remaining_files = handles

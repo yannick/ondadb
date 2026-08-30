@@ -290,7 +290,8 @@ boundaries** (see § Partitions). Every output carries
 `max_entry_time = max` over its inputs' stamps, so re-compacting cold data
 does not reset its age for the part mover. Ordering: new levels installed →
 `persist_manifest()?` → inputs deleted via `DbInner::remove_sst_file`
-(defer-aware). Input deletion resolves **default-tier paths only** — a
+(defer-aware, and paced when `obsolete_delete_bytes_per_second` is set — see
+§ Paced obsolete-file deletion). Input deletion resolves **default-tier paths only** — a
 compacted input that lived on a named tier is not unlinked there (a storage
 leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
 
@@ -483,7 +484,7 @@ part via the crash-safe protocol of `relocate_part`:
 copy every file pair to the target tier (StorageWriter::finish = durable)
 → swap the in-memory handles (reads flip; in-flight reads finish on old handles)
 → persist_manifest()          # the commit point: records tier=<t> for the ids
-→ delete the source files (remove_sst_file, defer-aware)
+→ delete the source files (remove_sst_file, defer-aware and paceable)
 ```
 
 A crash before the flip leaves target-side copies the manifest does not
@@ -607,6 +608,35 @@ makes all later charges free. `close` does this *first*, before the flush-drain
 spin-wait, so shutdown durability runs at full speed. The blocking contract and
 the compaction range-lock exception are in `docs/concurrency-and-safety.md`.
 
-Not yet done (review B of this feature): pacing obsolete-SSTable deletion.
-`IoClass::ObsoleteDelete` exists and is unused; `remove_sst_file` still unlinks
-inline.
+### Paced obsolete-file deletion (0.6-B)
+
+`DbInner::remove_sst_file(path, bytes)` is the single retirement point for an
+obsolete SSTable file (invariant 6). `bytes` is the file's size from the
+`SstMeta` every caller already holds — `klog_size` for the klog, `vlog_size` for
+the vlog — floored at `DELETE_METADATA_BYTES` (4096, one filesystem block),
+because an unlink costs metadata IO even for a file of zero bytes and a CF with
+no separated values retires an empty `<id>.vlog` at every compaction.
+
+`FileDeletionState` owns two things: the pause counter plus its pending list
+(unchanged — a pause still defers every unlink, which is what makes
+checkpoint/backup self-consistent), and, when
+`Options::obsolete_delete_bytes_per_second` is non-zero, a `DeletionWorker`: an
+unbounded crossbeam channel, one `onda-delete` thread, and its own `TokenBucket`
+at the deletion rate (an injected `Options::io_limiter` overrides it — one
+supplied limiter describes one device budget). The worker sets
+`IoClass::ObsoleteDelete` once at spawn and charges each file before unlinking
+it, in FIFO order. Deletion *order* is never load-bearing: file ids are never
+reused, so no task depends on an earlier one.
+
+At the default rate of 0 there is no channel, no thread and no queue: the
+caller unlinks inline, exactly as every release before 0.6. Resuming from a
+pause hands the deferred tasks to the worker if there is one, and unlinks them
+inline otherwise.
+
+`close` cancels the pacing (via `cancel_background_io`, first thing) and then,
+after the flush and compaction workers are joined, calls `drain_deletions`:
+drop the sender, join the worker: the `for task in rx` loop only ends once the
+queue is empty, so every queued file is unlinked **before** the `LOCK` file is
+released. After that the sender is `None` and any late retirement unlinks
+inline. `fail_stop` cancels the pacing too, so a poisoned database never leaves
+the worker parked on credit it will never be granted.

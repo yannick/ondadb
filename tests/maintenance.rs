@@ -578,6 +578,10 @@ struct PacedRecorder {
     /// class name -> (bytes, waited nanos). Keyed by name because `IoClass` is
     /// only what the engine reports; the test never constructs one to look up.
     seen: Mutex<HashMap<String, (u64, u64)>>,
+    /// class name -> number of charges. Separate from `seen` because a paced
+    /// deletion is counted per *file*, and bytes alone cannot tell how many
+    /// files a total covers.
+    counts: Mutex<HashMap<String, usize>>,
 }
 
 impl PacedRecorder {
@@ -587,6 +591,7 @@ impl PacedRecorder {
             bucket: TokenBucket::with_clock(rate, burst, clock.clone()),
             clock,
             seen: Mutex::new(HashMap::new()),
+            counts: Mutex::new(HashMap::new()),
         })
     }
     fn entry(&self, class: IoClass) -> (u64, u64) {
@@ -612,6 +617,29 @@ impl PacedRecorder {
     fn total_simulated(&self) -> Duration {
         self.clock.elapsed()
     }
+    /// Number of charges seen under `class`.
+    fn count_for(&self, class: IoClass) -> usize {
+        self.counts
+            .lock()
+            .unwrap()
+            .get(&format!("{class:?}"))
+            .copied()
+            .unwrap_or(0)
+    }
+    /// Record a charge without admitting it through the bucket — the class is
+    /// accounted for but never delayed, and the simulated clock does not move.
+    fn record_free(&self, class: IoClass, bytes: u64) {
+        self.note(class, bytes, Duration::ZERO);
+    }
+    fn note(&self, class: IoClass, bytes: u64, waited: Duration) {
+        let key = format!("{class:?}");
+        let mut seen = self.seen.lock().unwrap();
+        let e = seen.entry(key.clone()).or_insert((0, 0));
+        e.0 += bytes;
+        e.1 += waited.as_nanos() as u64;
+        drop(seen);
+        *self.counts.lock().unwrap().entry(key).or_insert(0) += 1;
+    }
     /// Bytes charged under every background class.
     fn background_bytes(&self) -> u64 {
         self.bytes_for(IoClass::Flush)
@@ -625,10 +653,7 @@ impl IoLimiter for PacedRecorder {
         let before = self.clock.elapsed();
         self.bucket.charge(class, bytes);
         let waited = self.clock.elapsed().saturating_sub(before);
-        let mut seen = self.seen.lock().unwrap();
-        let e = seen.entry(format!("{class:?}")).or_insert((0, 0));
-        e.0 += bytes;
-        e.1 += waited.as_nanos() as u64;
+        self.note(class, bytes, waited);
     }
     fn cancel(&self) {
         self.bucket.cancel();
@@ -848,4 +873,302 @@ fn close_wakes_a_blocked_background_charge() {
         "close must cancel the limiter before draining flushes; took {:?}",
         started.elapsed()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 0.6-B: paced obsolete-file deletion.
+// ---------------------------------------------------------------------------
+
+/// A limiter that paces **only** `ObsoleteDelete`, admitting every other class
+/// at once and merely recording it.
+///
+/// In production flush, compaction and deletion share one bucket — they share
+/// one device. A test that let them share the *simulated clock* could not say
+/// whether the time it measured was spent pacing deletions or pacing the
+/// compaction that produced them. Here the clock advances if and only if a
+/// deletion waited.
+#[derive(Debug)]
+struct DeletePacer {
+    inner: Arc<PacedRecorder>,
+}
+
+impl DeletePacer {
+    fn new(rate: u64, burst: u64) -> Arc<DeletePacer> {
+        Arc::new(DeletePacer {
+            inner: PacedRecorder::new(rate, burst),
+        })
+    }
+}
+
+impl IoLimiter for DeletePacer {
+    fn charge(&self, class: IoClass, bytes: u64) {
+        if class == IoClass::ObsoleteDelete {
+            self.inner.charge(class, bytes);
+        } else {
+            self.inner.record_free(class, bytes);
+        }
+    }
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+}
+
+/// Every SSTable file currently in `cf_dir`.
+fn sst_files(cf_dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(cf_dir) else {
+        return std::collections::HashSet::new();
+    };
+    entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            let ext = path.extension()?.to_str()?.to_string();
+            (ext == "klog" || ext == "vlog").then_some(path)
+        })
+        .collect()
+}
+
+/// `rounds` L0 files over the same key span, with background compaction held
+/// off by an unreachable trigger so the *test* decides when they all become
+/// obsolete at once.
+fn stacked_l0(db: &DB, rounds: u32) -> Arc<ondadb::ColumnFamily> {
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                l1_file_count_trigger: 1 << 20,
+                write_buffer_size: 8 << 10,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    for round in 0..rounds {
+        for i in 0..200u32 {
+            db.put(
+                &cf,
+                format!("k{i:05}").as_bytes(),
+                format!("value-{round}-{i:04}").as_bytes(),
+                Duration::ZERO,
+            )
+            .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+    }
+    cf
+}
+
+/// Wait until every file in `files` is gone, or fail.
+fn await_unlinked(files: &std::collections::HashSet<std::path::PathBuf>, within: Duration) {
+    let deadline = Instant::now() + within;
+    loop {
+        let left = files.iter().filter(|p| p.exists()).count();
+        if left == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{left}/{} obsolete files still on disk after {within:?}",
+            files.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn unpaced_deletion_is_immediate() {
+    // Pins today's observable behaviour at the default rate of 0: no worker, no
+    // channel, and the unlink has already happened when the compaction that
+    // obsoleted the file returns. Anything slower would be a regression for
+    // every database that never configures pacing at all.
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options::new(dir.path().to_str().unwrap());
+    assert_eq!(
+        options.obsolete_delete_bytes_per_second, 0,
+        "unpaced must be the default"
+    );
+    let db = DB::open(options).unwrap();
+    let cf = stacked_l0(&db, 8);
+    let cf_dir = dir.path().join("cf-default");
+    let before = sst_files(&cf_dir);
+    assert!(!before.is_empty(), "no SST files to obsolete");
+
+    db.compact(&cf).unwrap();
+
+    let survivors = before.iter().filter(|p| p.exists()).count();
+    db.close().unwrap();
+    assert_eq!(
+        survivors, 0,
+        "unpaced deletion must unlink inline; {survivors} input files survived compact()"
+    );
+}
+
+#[test]
+fn paced_deletion_spreads_over_fake_clock() {
+    // A hundred files going obsolete at once is the delete storm the feature
+    // exists for. Under a rate the storm must be spread across (simulated)
+    // time instead of issued as one burst of unlinks — and every file must
+    // still be gone at the end.
+    let dir = tempfile::tempdir().unwrap();
+    let rate = 64 << 10; // 64 KiB/s of unlink credit
+    let pacer = DeletePacer::new(rate, rate);
+    let mut options = limited_options(dir.path(), pacer.clone());
+    options.obsolete_delete_bytes_per_second = rate;
+    let db = DB::open(options).unwrap();
+    let cf = stacked_l0(&db, 100);
+    let cf_dir = dir.path().join("cf-default");
+    let obsolete = sst_files(&cf_dir);
+    assert!(
+        obsolete.len() >= 100,
+        "want a real storm, got {} files",
+        obsolete.len()
+    );
+
+    db.compact(&cf).unwrap();
+    await_unlinked(&obsolete, Duration::from_secs(60));
+
+    let charged = pacer.inner.bytes_for(IoClass::ObsoleteDelete);
+    let simulated = pacer.inner.total_simulated();
+    let count = pacer.inner.count_for(IoClass::ObsoleteDelete);
+    db.close().unwrap();
+
+    assert!(
+        count >= obsolete.len(),
+        "every obsolete file must be charged: {count} charges for {} files",
+        obsolete.len()
+    );
+    assert!(
+        charged >= 100 * 4096,
+        "a missing vlog still costs the metadata minimum; charged {charged}"
+    );
+    // Work-conserving: one burst is free, everything after it is paid at the
+    // rate. That is a lower bound on the simulated time the storm must take.
+    let floor = Duration::from_secs_f64(charged.saturating_sub(rate) as f64 / rate as f64);
+    assert!(
+        simulated >= floor.mul_f64(0.75),
+        "pacing should consume at least ~{floor:?} of simulated time for \
+         {charged} bytes, got {simulated:?}"
+    );
+}
+
+#[test]
+fn paused_deletion_still_defers_with_worker() {
+    // The pause is what makes a backup self-consistent, and it now has to win
+    // against a *worker* rather than against the caller's own unlink. If one
+    // queued task escaped it, the copied manifest would name a file the backup
+    // does not contain. Same shape as `backup_consistent_during_compaction`,
+    // with pacing on.
+    let dir = tempfile::tempdir().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let mut options = Options::new(dir.path().to_str().unwrap());
+    options.obsolete_delete_bytes_per_second = 32 << 10;
+    let n = 30_000u32;
+    {
+        let db = DB::open(options).unwrap();
+        let cf = db
+            .create_column_family(
+                "default",
+                ColumnFamilyConfig {
+                    write_buffer_size: 32 * 1024, // tiny -> many flushes
+                    l1_file_count_trigger: 2,     // frequent compactions
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        for i in 0..n {
+            db.put(&cf, format!("k{i:08}").as_bytes(), b"value", Duration::ZERO)
+                .unwrap();
+        }
+        db.backup(backup.path()).unwrap();
+        db.close().unwrap();
+    }
+    let db = DB::open(Options::new(backup.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").expect("cf in backup");
+    for i in 0..n {
+        assert_eq!(
+            db.get(&cf, format!("k{i:08}").as_bytes()).unwrap(),
+            b"value",
+            "missing k{i} in a backup taken under paced deletion"
+        );
+    }
+    db.close().unwrap();
+}
+
+/// A limiter that makes every `ObsoleteDelete` take a fixed, real interval, and
+/// deliberately ignores `cancel`.
+///
+/// Close cancels the limiter first thing, which normally lets the queue drain
+/// at full speed — and at full speed a "did close wait for the queue?" test
+/// only ever races the worker and passes either way. An embedder's limiter is
+/// under no obligation to honour `cancel` instantly, so this one does not, and
+/// close is then forced to actually wait for the tail of the queue.
+#[derive(Debug)]
+struct SlowDeleter {
+    per_file: Duration,
+    deletes: AtomicU64,
+}
+
+impl SlowDeleter {
+    fn new(per_file: Duration) -> Arc<SlowDeleter> {
+        Arc::new(SlowDeleter {
+            per_file,
+            deletes: AtomicU64::new(0),
+        })
+    }
+    fn deletes(&self) -> u64 {
+        self.deletes.load(AtOrd::SeqCst)
+    }
+}
+
+impl IoLimiter for SlowDeleter {
+    fn charge(&self, class: IoClass, _bytes: u64) {
+        // Only deletion is slowed: flush and compaction charge thousands of
+        // blocks, and delaying those would measure the wrong thing entirely.
+        if class == IoClass::ObsoleteDelete {
+            self.deletes.fetch_add(1, AtOrd::SeqCst);
+            std::thread::sleep(self.per_file);
+        }
+    }
+}
+
+#[test]
+fn close_drains_deletion_queue_before_lock_release() {
+    // Deferred deletes already had to finish before the directory lock went
+    // away; the worker's queue is the same obligation. A queue abandoned at
+    // close would leave files no manifest names, which the next open's orphan
+    // sweep would then have to guess about.
+    let dir = tempfile::tempdir().unwrap();
+    let per_file = Duration::from_millis(20);
+    let slow = SlowDeleter::new(per_file);
+    let mut options = limited_options(dir.path(), slow.clone());
+    options.obsolete_delete_bytes_per_second = 1 << 20; // any rate: spawns the worker
+    let db = DB::open(options).unwrap();
+    let cf = stacked_l0(&db, 40);
+    let cf_dir = dir.path().join("cf-default");
+    let obsolete = sst_files(&cf_dir);
+    assert!(obsolete.len() >= 40);
+    db.compact(&cf).unwrap();
+
+    let started = Instant::now();
+    db.close().unwrap();
+    let closed_in = started.elapsed();
+    // Read the filesystem *after* close returned and before anything else: if
+    // the queue outlived close, these files are still here.
+    let left = obsolete.iter().filter(|p| p.exists()).count();
+
+    assert_eq!(
+        left, 0,
+        "close must drain the deletion queue; {left} files survived it"
+    );
+    // Close cannot have raced the worker to that result: the queue costs at
+    // least this much wall-clock time to get through.
+    let queued = slow.deletes();
+    assert!(queued >= obsolete.len() as u64);
+    assert!(
+        closed_in >= per_file.mul_f64(obsolete.len() as f64 * 0.5),
+        "close returned in {closed_in:?}, too fast to have waited for \
+         {queued} paced unlinks"
+    );
+    // The lock is released only after that drain, so a fresh open must succeed.
+    let reopened = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    assert!(reopened.get_column_family("default").is_some());
+    reopened.close().unwrap();
 }

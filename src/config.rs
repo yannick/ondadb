@@ -271,6 +271,28 @@ pub struct Options {
     /// the smallest burst that lets a steady producer actually reach the
     /// configured rate. Ignored when the rate is `0`. Not persisted.
     pub background_io_burst_bytes: u64,
+    /// Rate at which obsolete SSTable files are unlinked, in bytes per second.
+    ///
+    /// `0` (the default) unlinks them inline on the thread that obsoleted them,
+    /// which is what every release before 0.6 did: no channel, no worker
+    /// thread, no added latency. Any other value spawns a single deletion
+    /// worker that unlinks in FIFO order, charging each file's size (at least
+    /// [`crate::DELETE_METADATA_BYTES`], since an unlink costs metadata IO even
+    /// for an empty file) under [`IoClass::ObsoleteDelete`](crate::ioctrl::IoClass::ObsoleteDelete).
+    ///
+    /// It is a separate rate from
+    /// [`background_io_bytes_per_second`](Self::background_io_bytes_per_second)
+    /// because deletion is a metadata storm rather than a bandwidth one: a
+    /// compaction that retires two hundred files moves almost no bytes and can
+    /// still stall a device. When
+    /// [`io_limiter`](Self::io_limiter) is set it governs both — an embedder
+    /// supplying its own limiter is describing one device budget.
+    ///
+    /// Deletion *order* is never load-bearing (file ids are never reused), and
+    /// a pause ([`DB::backup`](crate::DB::backup),
+    /// [`DB::checkpoint`](crate::DB::checkpoint)) still defers every unlink
+    /// regardless of this setting. Not persisted.
+    pub obsolete_delete_bytes_per_second: u64,
     /// Replace the built-in token bucket with a caller-supplied limiter.
     ///
     /// Set, this overrides
@@ -467,6 +489,7 @@ impl Default for Options {
             partition_fns: Vec::new(),
             background_io_bytes_per_second: 0, // unlimited: no limiter object
             background_io_burst_bytes: 0,
+            obsolete_delete_bytes_per_second: 0, // unlink inline: no worker thread
             io_limiter: None,
         }
     }
