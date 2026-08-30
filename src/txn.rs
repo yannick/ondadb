@@ -21,6 +21,7 @@ use crate::db::{DbInner, DB};
 use crate::error::{OndaError, Result};
 use crate::iterator::Iterator;
 use crate::memtable::Memtable;
+use crate::perf::PerfContext;
 use crate::util::now_nanos;
 use crate::wal::RecordRef;
 
@@ -204,6 +205,21 @@ impl DB {
         cf.get(key, self.inner.read_floor_seq())
     }
 
+    /// [`get`](Self::get), with the read path's [`PerfContext`] for this one
+    /// operation.
+    ///
+    /// The counters are collected on the calling thread and cost nothing to the
+    /// threads not measuring; see [`crate::perf`] for the thread-affinity rules.
+    pub fn get_with_perf(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        key: &[u8],
+    ) -> (Result<Vec<u8>>, PerfContext) {
+        let scope = crate::perf::enter();
+        let r = self.get(cf, key);
+        (r, scope.finish())
+    }
+
     /// Delete a single key (auto-committed at ReadCommitted).
     pub fn delete(&self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<()> {
         let mut t = self.begin_with_isolation(IsolationLevel::ReadCommitted);
@@ -302,6 +318,18 @@ impl Txn {
             self.db.read_floor_seq()
         };
         cf.get(key, rs)
+    }
+
+    /// [`get`](Self::get), with the read path's [`PerfContext`] for this one
+    /// operation.
+    pub fn get_with_perf(
+        &mut self,
+        cf: &Arc<ColumnFamily>,
+        key: &[u8],
+    ) -> (Result<Vec<u8>>, PerfContext) {
+        let scope = crate::perf::enter();
+        let r = self.get(cf, key);
+        (r, scope.finish())
     }
 
     /// Create a snapshot iterator over `cf` that includes this transaction's

@@ -49,6 +49,7 @@ pub mod memtable;
 #[cfg(feature = "arena-memtable")]
 pub mod memtable_arena;
 pub mod parts;
+pub mod perf;
 pub(crate) mod range_lock;
 pub mod sst;
 pub mod storage;
@@ -77,6 +78,7 @@ pub use parts::{
     DetachedPart, MovePhase, MovePhaseEvent, MovePhaseObserver, PartManifest, PartTable,
     PartitionInfo,
 };
+pub use perf::PerfContext;
 pub use storage::{LocalStorage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;

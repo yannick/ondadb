@@ -629,7 +629,18 @@ impl Iterator {
         Ok(visible)
     }
 
+    /// Open a [`crate::perf::Scope`] for the walk that follows.
+    ///
+    /// Takes `&mut self` because a measured walk is a mutation of this
+    /// iterator; the scope itself is thread-scoped, not iterator-scoped, so
+    /// counters land in it only while the walk runs on the thread that opened
+    /// it (see [`crate::perf::PerfContext`]).
+    pub fn perf_scope(&mut self) -> crate::perf::Scope {
+        crate::perf::enter()
+    }
+
     pub fn seek_to_first(&mut self) {
+        crate::perf::bump(|p| p.iterator_seeks += 1);
         // Start at the lower bound, not the raw heap minimum: SSTables fully
         // outside the bounds were pruned at construction, but memtables and
         // straddling tables still hold keys below `lower` that must never
@@ -644,6 +655,7 @@ impl Iterator {
         self.advance_forward();
     }
     pub fn seek_to_last(&mut self) {
+        crate::perf::bump(|p| p.iterator_seeks += 1);
         // Mirror of `seek_to_first`: start at the upper bound.
         match &self.upper {
             Bound::Unbounded => self.m.seek_to_last(),
@@ -654,10 +666,12 @@ impl Iterator {
         self.advance_backward();
     }
     pub fn seek(&mut self, user_key: &[u8]) {
+        crate::perf::bump(|p| p.iterator_seeks += 1);
         self.m.seek_ge(user_key, u64::MAX);
         self.advance_forward();
     }
     pub fn seek_for_prev(&mut self, user_key: &[u8]) {
+        crate::perf::bump(|p| p.iterator_seeks += 1);
         self.m.seek_le(user_key, 0);
         self.advance_backward();
     }
@@ -699,6 +713,11 @@ impl Iterator {
                 if self.past_upper() {
                     self.valid = false;
                 }
+                // A group rejected by the bound was never surfaced, so it is
+                // not a step.
+                if self.valid {
+                    crate::perf::bump(|p| p.iterator_steps += 1);
+                }
                 return;
             }
         }
@@ -721,6 +740,9 @@ impl Iterator {
                 // Terminate at the first group below the declared lower bound.
                 if self.below_lower() {
                     self.valid = false;
+                }
+                if self.valid {
+                    crate::perf::bump(|p| p.iterator_steps += 1);
                 }
                 return;
             }

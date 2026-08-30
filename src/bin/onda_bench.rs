@@ -108,6 +108,31 @@ struct Args {
     db_path: String,
     keep: bool,
     phases: PhaseSet,
+    perf_scope: PerfScope,
+}
+
+/// How the Get phase exercises [`ondadb::perf`]. The nil-path acceptance for
+/// 0.10 is `Off` versus `Thread`: same reads, the only difference being whether
+/// every `perf::bump` in the read path has a frame to write into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PerfScope {
+    /// No scope open: every bump is the thread-local nil check.
+    Off,
+    /// One scope per worker thread, open across the whole phase.
+    Thread,
+    /// `get_with_perf` per operation: also pays scope push/pop per read.
+    Op,
+}
+
+impl PerfScope {
+    fn parse(name: &str) -> Result<PerfScope, String> {
+        match name {
+            "off" => Ok(PerfScope::Off),
+            "thread" => Ok(PerfScope::Thread),
+            "op" => Ok(PerfScope::Op),
+            other => Err(format!("-perf_scope must be off|thread|op: {other}")),
+        }
+    }
 }
 
 fn parse_args_from<I, S>(args: I) -> Result<Args, String>
@@ -126,6 +151,7 @@ where
         db_path: String::new(),
         keep: false,
         phases: PhaseSet::all(),
+        perf_scope: PerfScope::Off,
     };
     let argv: Vec<String> = args
         .into_iter()
@@ -159,6 +185,7 @@ where
             "-batch" => a.batch = positive("-batch", val(&mut i)?)?,
             "-db" => a.db_path = val(&mut i)?,
             "-phases" => a.phases = PhaseSet::parse_list(&val(&mut i)?)?,
+            "-perf_scope" => a.perf_scope = PerfScope::parse(&val(&mut i)?)?,
             "-keep" => a.keep = true,
             "-engine" => {
                 let _ = val(&mut i)?; // accepted for CLI compatibility
@@ -311,9 +338,18 @@ fn main() {
             let cf = &cf;
             let keys = &keys;
             let vsize = a.value_size;
+            let mode = a.perf_scope;
             run_threaded(a.ops, a.threads, |lo, hi| {
+                // Held for the whole slice in `Thread` mode, so every bump in
+                // the read path writes into a real frame.
+                let _scope = (mode == PerfScope::Thread).then(ondadb::perf::enter);
                 for k in &keys[lo..hi] {
-                    match db.get(cf, k) {
+                    let got = if mode == PerfScope::Op {
+                        db.get_with_perf(cf, k).0
+                    } else {
+                        db.get(cf, k)
+                    };
+                    match got {
                         Ok(v) if v.len() == vsize => {}
                         _ => { /* count silently; random keys may collide/miss */ }
                     }
@@ -416,6 +452,19 @@ mod tests {
     }
 
     #[test]
+    fn perf_scope_defaults_to_off_and_parses_its_modes() {
+        assert_eq!(
+            parse_args_from(["onda_bench"]).unwrap().perf_scope,
+            PerfScope::Off
+        );
+        for (name, want) in [("thread", PerfScope::Thread), ("op", PerfScope::Op)] {
+            let args = parse_args_from(["onda_bench", "-perf_scope", name]).unwrap();
+            assert_eq!(args.perf_scope, want);
+        }
+        assert!(parse_args_from(["onda_bench", "-perf_scope", "bogus"]).is_err());
+    }
+
+    #[test]
     fn phases_reject_unknown_and_empty_values() {
         assert!(parse_args_from(["onda_bench", "-phases", "bogus"]).is_err());
         assert!(parse_args_from(["onda_bench", "-phases", ""]).is_err());
@@ -465,6 +514,7 @@ mod tests {
             db_path: String::new(),
             keep: false,
             phases: PhaseSet::all(),
+            perf_scope: PerfScope::Off,
         };
 
         let _ = populate(&db, &cf, &keys, value, &args);

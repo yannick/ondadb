@@ -801,3 +801,289 @@ fn bottom_level_compaction_cuts_at_partition_boundaries() {
         "expected all three partitions represented at the bottom (alpha={seen_alpha}, beta={seen_beta}, default={seen_default})"
     );
 }
+
+#[test]
+fn perf_memtable_only_get() {
+    // A key that never left the active memtable must show exactly the memtable
+    // probes the layout implies and no SSTable work at all.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+
+    let scope = ondadb::perf::enter();
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+    let p = scope.finish();
+
+    // Per-CF layout: one probe of the active memtable, no sealed memtables.
+    assert_eq!(p.memtable_probes, 1);
+    assert_eq!(p.bloom_probes, 0);
+    assert_eq!(p.bloom_negatives, 0);
+    assert_eq!(p.sstable_probes, 0);
+    assert_eq!(p.index_seeks, 0);
+    assert_eq!(p.block_cache_hits, 0);
+    assert_eq!(p.block_misses, 0);
+    assert_eq!(p.block_read_bytes, 0);
+    db.close().unwrap();
+}
+
+/// A CF whose L0 files are never auto-compacted, so a test controls exactly how
+/// many SSTables a point read must consider.
+fn perf_cf(db: &DB, name: &str) -> Arc<ColumnFamily> {
+    db.create_column_family(
+        name,
+        ColumnFamilyConfig {
+            l1_file_count_trigger: 1 << 20,
+            ..ColumnFamilyConfig::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn perf_get_missing_through_n_sstables() {
+    const N: u64 = 4;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = perf_cf(&db, "n");
+    // Every table spans "aaa".."zzz", so all N are candidates for "mmm".
+    for i in 0..N {
+        db.put(&cf, b"aaa", format!("{i}").as_bytes(), Duration::ZERO)
+            .unwrap();
+        db.put(&cf, b"zzz", format!("{i}").as_bytes(), Duration::ZERO)
+            .unwrap();
+        db.flush_memtable(&cf).unwrap();
+    }
+
+    let scope = ondadb::perf::enter();
+    assert!(db.get(&cf, b"mmm").is_err());
+    let p = scope.finish();
+
+    assert_eq!(p.bloom_probes, N, "every candidate table is filtered once");
+    // Robust to the filter's false-positive rate: whatever the filter admits is
+    // exactly what gets probed.
+    assert_eq!(p.sstable_probes, p.bloom_probes - p.bloom_negatives);
+    assert!(p.bloom_negatives <= N);
+    // Block work happens only for the tables the filter let through.
+    assert_eq!(p.index_seeks, p.sstable_probes);
+    if p.sstable_probes == 0 {
+        assert_eq!(p.block_misses, 0);
+        assert_eq!(p.block_cache_hits, 0);
+        assert_eq!(p.block_read_bytes, 0);
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn perf_block_cache_hit_on_second_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = perf_cf(&db, "c");
+    db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let cold = ondadb::perf::enter();
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+    let cold = cold.finish();
+    let warm = ondadb::perf::enter();
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+    let warm = warm.finish();
+
+    assert_eq!(cold.sstable_probes, 1);
+    assert!(cold.block_read_bytes > 0, "the block had to come from disk");
+    if cfg!(feature = "mmap-reads") {
+        // Uncompressed blocks are served as zero-copy views into the mmap: the
+        // bytes are still counted, but the block cache is never consulted.
+        assert_eq!(cold.block_misses, 0);
+        assert_eq!(cold.block_cache_hits, 0);
+        assert_eq!(warm.block_cache_hits, 0);
+        assert_eq!(warm.block_misses, 0);
+        assert_eq!(warm.block_read_bytes, cold.block_read_bytes);
+    } else {
+        assert_eq!(cold.block_misses, 1);
+        assert_eq!(cold.block_cache_hits, 0);
+        assert_eq!(warm.block_cache_hits, 1);
+        assert_eq!(warm.block_misses, 0);
+        assert_eq!(warm.block_read_bytes, 0, "a cache hit reads no bytes");
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn perf_counts_vlog_reads_for_separated_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "v",
+            ColumnFamilyConfig {
+                klog_value_threshold: 64, // values >= 64B are separated
+                l1_file_count_trigger: 1 << 20,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    let big = vec![b'B'; 4096];
+    db.put(&cf, b"k-big", &big, Duration::ZERO).unwrap();
+    db.put(&cf, b"k-small", b"small", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let scope = ondadb::perf::enter();
+    assert_eq!(db.get(&cf, b"k-big").unwrap(), big);
+    let separated = scope.finish();
+    assert_eq!(separated.vlog_reads, 1);
+    assert_eq!(separated.vlog_read_bytes, big.len() as u64);
+
+    let scope = ondadb::perf::enter();
+    assert_eq!(db.get(&cf, b"k-small").unwrap(), b"small");
+    let inline = scope.finish();
+    assert_eq!(inline.vlog_reads, 0, "an inline value touches no vlog");
+    assert_eq!(inline.vlog_read_bytes, 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn perf_iterator_walk_counts_steps() {
+    const ENTRIES: u64 = 32;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = perf_cf(&db, "i");
+    for i in 0..ENTRIES {
+        db.put(&cf, format!("k{i:04}").as_bytes(), b"v", Duration::ZERO)
+            .unwrap();
+    }
+    // One deleted key: a tombstone group is resolved but never surfaced.
+    db.put(&cf, b"k9999", b"v", Duration::ZERO).unwrap();
+    db.delete(&cf, b"k9999").unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let mut t = db.begin();
+    let mut it = t.new_iterator(&cf);
+    let scope = ondadb::perf::enter();
+    let mut seen = 0u64;
+    it.seek_to_first();
+    while it.valid() {
+        seen += 1;
+        it.next();
+    }
+    assert!(it.err().is_none());
+    let p = scope.finish();
+    assert_eq!(seen, ENTRIES);
+    assert_eq!(p.iterator_steps, ENTRIES, "one step per surfaced group");
+    assert_eq!(p.iterator_seeks, 1, "`next` is not a seek");
+    drop(it);
+    t.rollback().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn get_with_perf_matches_plain_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = perf_cf(&db, "p");
+    db.put(&cf, b"hit", b"v", Duration::ZERO).unwrap();
+    db.put(&cf, b"gone", b"v", Duration::ZERO).unwrap();
+    db.delete(&cf, b"gone").unwrap();
+    db.put(&cf, b"stale", b"v", Duration::from_millis(50))
+        .unwrap();
+    // Half the keys resolve from an SSTable, half from the memtable.
+    db.flush_memtable(&cf).unwrap();
+    db.put(&cf, b"hit2", b"v2", Duration::ZERO).unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+
+    for key in [
+        b"hit".as_slice(),
+        b"hit2".as_slice(),
+        b"missing".as_slice(),
+        b"gone".as_slice(),
+        b"stale".as_slice(),
+    ] {
+        let plain = db.get(&cf, key);
+        let (measured, perf) = db.get_with_perf(&cf, key);
+        match (&plain, &measured) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "value for {key:?}"),
+            (Err(a), Err(b)) => assert_eq!(
+                std::mem::discriminant(a),
+                std::mem::discriminant(b),
+                "error for {key:?}"
+            ),
+            _ => panic!("get and get_with_perf disagreed on {key:?}"),
+        }
+        assert!(perf.memtable_probes >= 1, "the read path was measured");
+
+        // The transactional entry point behaves the same way.
+        let mut t = db.begin();
+        let (in_txn, txn_perf) = t.get_with_perf(&cf, key);
+        assert_eq!(in_txn.is_ok(), plain.is_ok(), "txn result for {key:?}");
+        if let (Ok(a), Ok(b)) = (&plain, &in_txn) {
+            assert_eq!(a, b);
+        }
+        assert!(txn_perf.memtable_probes >= 1);
+        t.rollback().unwrap();
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn iterator_perf_scope_measures_a_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for k in ["a", "b", "c"] {
+        db.put(&cf, k.as_bytes(), b"v", Duration::ZERO).unwrap();
+    }
+    let mut t = db.begin();
+    let mut it = t.new_iterator(&cf);
+    let scope = it.perf_scope();
+    it.seek_to_first();
+    while it.valid() {
+        it.next();
+    }
+    let p = scope.finish();
+    assert_eq!(p.iterator_seeks, 1);
+    assert_eq!(p.iterator_steps, 3);
+    drop(it);
+    t.rollback().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn iterator_counters_are_thread_affine() {
+    // `Iterator` is `Send`, and this test pins the documented consequence:
+    // counters follow the *thread doing the work*, not the iterator. Moving a
+    // walk to another thread is allowed; it just stops being measured by the
+    // scope left open behind it.
+    fn assert_send<T: Send>() {}
+    assert_send::<ondadb::Iterator>();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for k in ["a", "b", "c", "d"] {
+        db.put(&cf, k.as_bytes(), b"v", Duration::ZERO).unwrap();
+    }
+    let mut t = db.begin();
+    let mut it = t.new_iterator(&cf);
+
+    let scope = ondadb::perf::enter();
+    it.seek_to_first(); // one seek plus the first group, on this thread
+    assert!(it.valid());
+
+    let walked = std::thread::spawn(move || {
+        let mut n = 0;
+        while it.valid() {
+            n += 1;
+            it.next();
+        }
+        n
+    })
+    .join()
+    .unwrap();
+    let p = scope.finish();
+
+    assert_eq!(walked, 4, "the moved iterator kept working");
+    assert_eq!(p.iterator_seeks, 1);
+    assert_eq!(
+        p.iterator_steps, 1,
+        "work done on another thread must not grow this thread's context"
+    );
+    t.rollback().unwrap();
+    db.close().unwrap();
+}

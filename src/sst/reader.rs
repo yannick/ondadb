@@ -8,7 +8,6 @@ use super::{
     FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
     VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
 };
-use crate::block::read_block;
 use crate::bloom::Bloom;
 use crate::cache::BlockCache;
 use crate::comparator::ComparatorRef;
@@ -232,7 +231,7 @@ impl Reader {
         r.vlog_v2 = flags & FOOTER_VLOG_V2 != 0;
 
         if flags & FOOTER_HAS_BLOOM != 0 && bloom_len > 0 {
-            let raw = read_block_at(&*f, bloom_off, bloom_len)?;
+            let (raw, _) = read_block_at(&*f, bloom_off, bloom_len)?;
             r.bloom = Some(Bloom::decode(&raw)?);
         }
         if flags & FOOTER_BTREE != 0 {
@@ -246,7 +245,7 @@ impl Reader {
                 },
             )?;
         } else {
-            let idx_raw = read_block_at(&*f, index_off, index_len)?;
+            let (idx_raw, _) = read_block_at(&*f, index_off, index_len)?;
             r.decode_index(&idx_raw)?;
         }
 
@@ -334,7 +333,7 @@ impl Reader {
     }
 
     fn walk_btree_node(&mut self, f: &dyn ReadHandle, h: BlockHandle, is_root: bool) -> Result<()> {
-        let block = read_block_at(f, h.offset, h.length)?;
+        let (block, _) = read_block_at(f, h.offset, h.length)?;
         let mut p = &block[..];
         if p.is_empty() {
             return Err(corrupt());
@@ -436,7 +435,9 @@ impl Reader {
             };
             let (alg, payload, raw_len, _total) = parsed;
             if alg == Compression::None {
-                // Zero-copy: point straight at the mapped raw bytes.
+                // Zero-copy: point straight at the mapped raw bytes. No cache
+                // traffic at all, so neither a hit nor a miss is recorded.
+                crate::perf::bump(|p| p.block_read_bytes += raw_len as u64);
                 let payload_start = start + crate::block::BLOCK_HEADER;
                 return Ok(Block::Mapped {
                     mmap: mmap.clone(),
@@ -446,19 +447,33 @@ impl Reader {
             }
             // Compressed: decompress once, cache the owned result.
             if let Some(raw) = self.bc.get(self.file_id, h.offset) {
+                crate::perf::bump(|p| p.block_cache_hits += 1);
                 return Ok(Block::Owned(raw));
             }
+            crate::perf::bump(|p| {
+                p.block_misses += 1;
+                p.block_read_bytes += h.length;
+            });
             let raw = crate::compress::decompress(alg, payload, raw_len)?;
+            crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
             let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
             self.bc.put(self.file_id, h.offset, arc.clone());
             return Ok(Block::Owned(arc));
         }
 
         if let Some(raw) = self.bc.get(self.file_id, h.offset) {
+            crate::perf::bump(|p| p.block_cache_hits += 1);
             return Ok(Block::Owned(raw));
         }
+        crate::perf::bump(|p| {
+            p.block_misses += 1;
+            p.block_read_bytes += h.length;
+        });
         let f = self.storage.open_read(&self.klog_path)?;
-        let raw = read_block_at(&*f, h.offset, h.length)?;
+        let (raw, alg) = read_block_at(&*f, h.offset, h.length)?;
+        if alg != Compression::None {
+            crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
+        }
         let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
         self.bc.put(self.file_id, h.offset, arc.clone());
         Ok(Block::Owned(arc))
@@ -485,6 +500,7 @@ impl Reader {
             };
             let (alg, _payload, raw_len, _total) = parsed;
             if alg == Compression::None {
+                crate::perf::bump(|p| p.block_read_bytes += raw_len as u64);
                 let payload_start = start + crate::block::BLOCK_HEADER;
                 return Ok(BlockRef::Mapped(
                     &mmap[payload_start..payload_start + raw_len],
@@ -519,6 +535,7 @@ impl Reader {
 
     /// Index of the first data block whose last key is `>= (user_key, seq)`.
     pub(crate) fn find_block(&self, user_key: &[u8], seq: u64) -> usize {
+        crate::perf::bump(|p| p.index_seeks += 1);
         let (mut lo, mut hi) = (0, self.index.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -779,10 +796,19 @@ impl Reader {
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
         let len = usize::try_from(length).map_err(|_| corrupt())?;
         #[cfg(feature = "mmap-reads")]
-        if self.read_vlog_from_mmap(off, len, out)? {
-            return Ok(());
+        let served = self.read_vlog_from_mmap(off, len, out)?;
+        #[cfg(not(feature = "mmap-reads"))]
+        let served = false;
+        if !served {
+            self.read_vlog_from_file(off, len, out)?;
         }
-        self.read_vlog_from_file(off, len, out)
+        // One logical read per resolved value, whichever path served it —
+        // counted here so the mmap fallback cannot double-count.
+        crate::perf::bump(|p| {
+            p.vlog_reads += 1;
+            p.vlog_read_bytes += length;
+        });
+        Ok(())
     }
 
     /// Lazily mmap the vlog file (created only when large values exist).
@@ -837,11 +863,19 @@ impl Reader {
     }
 }
 
-fn read_block_at(f: &dyn ReadHandle, off: u64, length: u64) -> Result<Vec<u8>> {
+/// Read and decode the framed block at `off`, returning the raw bytes **and the
+/// algorithm the frame was stored with** — a caller cannot otherwise tell a
+/// decompression from a raw copy, and `perf::bytes_decompressed` must count only
+/// the former.
+fn read_block_at(f: &dyn ReadHandle, off: u64, length: u64) -> Result<(Vec<u8>, Compression)> {
     let mut buf = vec![0u8; length as usize];
     f.read_exact_at(&mut buf, off)?;
-    let (raw, _) = read_block(&buf)?;
-    Ok(raw)
+    let (alg, payload, raw_len, _total) = crate::block::block_payload(&buf)?;
+    let raw = crate::compress::decompress(alg, payload, raw_len)?;
+    if raw.len() != raw_len {
+        return Err(OndaError::Corruption("block: raw length mismatch".into()));
+    }
+    Ok((raw, alg))
 }
 
 #[cfg(test)]

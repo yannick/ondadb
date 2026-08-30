@@ -1,0 +1,170 @@
+=== config=default invocation=1 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 1, block_misses: 0, block_read_bytes: 0, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=121.81 ms  scope=120.66 ms  ratio=0.9906
+trial 1: no_scope=129.79 ms  scope=131.16 ms  ratio=1.0106
+trial 2: no_scope=125.03 ms  scope=131.94 ms  ratio=1.0553
+trial 3: no_scope=127.58 ms  scope=127.96 ms  ratio=1.0029
+trial 4: no_scope=136.17 ms  scope=138.26 ms  ratio=1.0153
+trial 5: no_scope=135.07 ms  scope=126.04 ms  ratio=0.9332
+trial 6: no_scope=135.67 ms  scope=123.43 ms  ratio=0.9097
+trial 7: no_scope=132.27 ms  scope=135.59 ms  ratio=1.0251
+trial 8: no_scope=139.29 ms  scope=137.43 ms  ratio=0.9866
+trial 9: no_scope=120.72 ms  scope=123.78 ms  ratio=1.0254
+trial 10: no_scope=126.19 ms  scope=130.06 ms  ratio=1.0307
+keys=200000 trials=11
+p50 no_scope = 129.79 ms
+p50 scope    = 130.06 ms
+p50 delta    = +0.21%   (median of per-trial ratios: +1.06%)
+=== config=default invocation=2 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 1, block_misses: 0, block_read_bytes: 0, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=133.18 ms  scope=134.54 ms  ratio=1.0102
+trial 1: no_scope=119.78 ms  scope=123.16 ms  ratio=1.0282
+trial 2: no_scope=115.95 ms  scope=115.53 ms  ratio=0.9963
+trial 3: no_scope=122.75 ms  scope=119.33 ms  ratio=0.9721
+trial 4: no_scope=126.25 ms  scope=127.18 ms  ratio=1.0074
+trial 5: no_scope=134.23 ms  scope=120.88 ms  ratio=0.9006
+trial 6: no_scope=126.39 ms  scope=125.09 ms  ratio=0.9897
+trial 7: no_scope=127.26 ms  scope=135.65 ms  ratio=1.0660
+trial 8: no_scope=124.15 ms  scope=139.67 ms  ratio=1.1250
+trial 9: no_scope=127.29 ms  scope=127.75 ms  ratio=1.0036
+trial 10: no_scope=124.98 ms  scope=133.78 ms  ratio=1.0704
+keys=200000 trials=11
+p50 no_scope = 126.25 ms
+p50 scope    = 127.18 ms
+p50 delta    = +0.74%   (median of per-trial ratios: +0.74%)
+=== config=default invocation=3 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 1, block_misses: 0, block_read_bytes: 0, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=151.60 ms  scope=130.57 ms  ratio=0.8613
+trial 1: no_scope=140.07 ms  scope=133.38 ms  ratio=0.9522
+trial 2: no_scope=124.81 ms  scope=130.72 ms  ratio=1.0474
+trial 3: no_scope=138.32 ms  scope=128.78 ms  ratio=0.9310
+trial 4: no_scope=141.19 ms  scope=121.80 ms  ratio=0.8627
+trial 5: no_scope=128.63 ms  scope=132.39 ms  ratio=1.0292
+trial 6: no_scope=132.08 ms  scope=124.34 ms  ratio=0.9414
+trial 7: no_scope=128.28 ms  scope=120.30 ms  ratio=0.9378
+trial 8: no_scope=137.57 ms  scope=130.33 ms  ratio=0.9474
+trial 9: no_scope=134.86 ms  scope=142.41 ms  ratio=1.0560
+trial 10: no_scope=126.01 ms  scope=137.98 ms  ratio=1.0949
+keys=200000 trials=11
+p50 no_scope = 134.86 ms
+p50 scope    = 130.57 ms
+p50 delta    = -3.18%   (median of per-trial ratios: -5.26%)
+=== config=default invocation=4 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 1, block_misses: 0, block_read_bytes: 0, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=123.24 ms  scope=118.55 ms  ratio=0.9619
+trial 1: no_scope=123.43 ms  scope=120.03 ms  ratio=0.9724
+trial 2: no_scope=123.80 ms  scope=132.87 ms  ratio=1.0733
+trial 3: no_scope=130.51 ms  scope=128.03 ms  ratio=0.9810
+trial 4: no_scope=129.00 ms  scope=136.44 ms  ratio=1.0577
+trial 5: no_scope=122.93 ms  scope=137.67 ms  ratio=1.1199
+trial 6: no_scope=128.75 ms  scope=131.88 ms  ratio=1.0244
+trial 7: no_scope=129.32 ms  scope=127.96 ms  ratio=0.9895
+trial 8: no_scope=137.31 ms  scope=133.82 ms  ratio=0.9746
+trial 9: no_scope=139.66 ms  scope=129.59 ms  ratio=0.9279
+trial 10: no_scope=129.96 ms  scope=146.14 ms  ratio=1.1245
+keys=200000 trials=11
+p50 no_scope = 129.00 ms
+p50 scope    = 131.88 ms
+p50 delta    = +2.24%   (median of per-trial ratios: -1.05%)
+=== config=default invocation=5 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 1, block_misses: 0, block_read_bytes: 0, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=123.33 ms  scope=134.28 ms  ratio=1.0888
+trial 1: no_scope=136.25 ms  scope=138.96 ms  ratio=1.0199
+trial 2: no_scope=116.22 ms  scope=130.31 ms  ratio=1.1213
+trial 3: no_scope=141.24 ms  scope=153.71 ms  ratio=1.0883
+trial 4: no_scope=137.40 ms  scope=139.45 ms  ratio=1.0149
+trial 5: no_scope=147.25 ms  scope=162.18 ms  ratio=1.1014
+trial 6: no_scope=141.60 ms  scope=154.41 ms  ratio=1.0904
+trial 7: no_scope=151.33 ms  scope=141.34 ms  ratio=0.9340
+trial 8: no_scope=142.95 ms  scope=132.18 ms  ratio=0.9246
+trial 9: no_scope=136.11 ms  scope=130.27 ms  ratio=0.9571
+trial 10: no_scope=126.93 ms  scope=122.92 ms  ratio=0.9685
+keys=200000 trials=11
+p50 no_scope = 137.40 ms
+p50 scope    = 138.96 ms
+p50 delta    = +1.14%   (median of per-trial ratios: +1.99%)
+=== config=unsafe-fastpath invocation=1 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 0, block_misses: 0, block_read_bytes: 4168, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=118.25 ms  scope=109.20 ms  ratio=0.9235
+trial 1: no_scope=115.20 ms  scope=109.35 ms  ratio=0.9492
+trial 2: no_scope=107.23 ms  scope=102.92 ms  ratio=0.9598
+trial 3: no_scope=114.29 ms  scope=107.91 ms  ratio=0.9442
+trial 4: no_scope=109.52 ms  scope=107.06 ms  ratio=0.9775
+trial 5: no_scope=112.22 ms  scope=108.90 ms  ratio=0.9704
+trial 6: no_scope=107.58 ms  scope=109.31 ms  ratio=1.0160
+trial 7: no_scope=109.80 ms  scope=121.11 ms  ratio=1.1030
+trial 8: no_scope=107.96 ms  scope=118.77 ms  ratio=1.1001
+trial 9: no_scope=109.23 ms  scope=111.57 ms  ratio=1.0215
+trial 10: no_scope=122.45 ms  scope=119.77 ms  ratio=0.9781
+keys=200000 trials=11
+p50 no_scope = 109.80 ms
+p50 scope    = 109.31 ms
+p50 delta    = -0.45%   (median of per-trial ratios: -2.25%)
+=== config=unsafe-fastpath invocation=2 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 0, block_misses: 0, block_read_bytes: 4168, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=115.06 ms  scope=121.88 ms  ratio=1.0593
+trial 1: no_scope=104.95 ms  scope=108.63 ms  ratio=1.0350
+trial 2: no_scope=116.59 ms  scope=117.93 ms  ratio=1.0114
+trial 3: no_scope=117.22 ms  scope=106.38 ms  ratio=0.9076
+trial 4: no_scope=117.91 ms  scope=108.07 ms  ratio=0.9165
+trial 5: no_scope=127.49 ms  scope=117.34 ms  ratio=0.9204
+trial 6: no_scope=108.90 ms  scope=116.29 ms  ratio=1.0679
+trial 7: no_scope=122.55 ms  scope=115.67 ms  ratio=0.9439
+trial 8: no_scope=104.78 ms  scope=105.72 ms  ratio=1.0089
+trial 9: no_scope=114.42 ms  scope=104.01 ms  ratio=0.9091
+trial 10: no_scope=113.98 ms  scope=108.88 ms  ratio=0.9553
+keys=200000 trials=11
+p50 no_scope = 115.06 ms
+p50 scope    = 108.88 ms
+p50 delta    = -5.37%   (median of per-trial ratios: -4.47%)
+=== config=unsafe-fastpath invocation=3 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 0, block_misses: 0, block_read_bytes: 4168, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=130.10 ms  scope=115.97 ms  ratio=0.8914
+trial 1: no_scope=128.32 ms  scope=108.77 ms  ratio=0.8476
+trial 2: no_scope=109.47 ms  scope=116.45 ms  ratio=1.0638
+trial 3: no_scope=117.12 ms  scope=120.16 ms  ratio=1.0260
+trial 4: no_scope=145.22 ms  scope=266.33 ms  ratio=1.8340
+trial 5: no_scope=114.08 ms  scope=132.42 ms  ratio=1.1608
+trial 6: no_scope=121.46 ms  scope=120.74 ms  ratio=0.9941
+trial 7: no_scope=117.65 ms  scope=119.87 ms  ratio=1.0188
+trial 8: no_scope=115.68 ms  scope=111.08 ms  ratio=0.9602
+trial 9: no_scope=118.24 ms  scope=105.96 ms  ratio=0.8962
+trial 10: no_scope=110.76 ms  scope=105.75 ms  ratio=0.9547
+keys=200000 trials=11
+p50 no_scope = 117.65 ms
+p50 scope    = 116.45 ms
+p50 delta    = -1.02%   (median of per-trial ratios: -0.59%)
+=== config=unsafe-fastpath invocation=4 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 0, block_misses: 0, block_read_bytes: 4168, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=117.77 ms  scope=108.40 ms  ratio=0.9204
+trial 1: no_scope=111.77 ms  scope=104.07 ms  ratio=0.9311
+trial 2: no_scope=121.29 ms  scope=111.32 ms  ratio=0.9178
+trial 3: no_scope=157.87 ms  scope=122.60 ms  ratio=0.7766
+trial 4: no_scope=116.96 ms  scope=115.19 ms  ratio=0.9849
+trial 5: no_scope=124.92 ms  scope=121.55 ms  ratio=0.9730
+trial 6: no_scope=118.10 ms  scope=118.04 ms  ratio=0.9994
+trial 7: no_scope=121.16 ms  scope=118.05 ms  ratio=0.9743
+trial 8: no_scope=110.87 ms  scope=111.73 ms  ratio=1.0077
+trial 9: no_scope=108.46 ms  scope=113.26 ms  ratio=1.0442
+trial 10: no_scope=106.61 ms  scope=110.57 ms  ratio=1.0372
+keys=200000 trials=11
+p50 no_scope = 117.77 ms
+p50 scope    = 113.26 ms
+p50 delta    = -3.83%   (median of per-trial ratios: -2.57%)
+=== config=unsafe-fastpath invocation=5 ===
+per-get context: PerfContext { bloom_probes: 1, bloom_negatives: 0, memtable_probes: 1, sstable_probes: 1, index_seeks: 1, block_cache_hits: 0, block_misses: 0, block_read_bytes: 4168, bytes_decompressed: 0, vlog_reads: 0, vlog_read_bytes: 0, iterator_seeks: 0, iterator_steps: 0 }
+trial 0: no_scope=113.40 ms  scope=111.00 ms  ratio=0.9788
+trial 1: no_scope=112.06 ms  scope=113.65 ms  ratio=1.0141
+trial 2: no_scope=104.22 ms  scope=101.39 ms  ratio=0.9729
+trial 3: no_scope=108.88 ms  scope=110.06 ms  ratio=1.0109
+trial 4: no_scope=107.28 ms  scope=110.12 ms  ratio=1.0265
+trial 5: no_scope=112.65 ms  scope=103.54 ms  ratio=0.9192
+trial 6: no_scope=106.08 ms  scope=112.98 ms  ratio=1.0650
+trial 7: no_scope=106.78 ms  scope=118.23 ms  ratio=1.1073
+trial 8: no_scope=120.42 ms  scope=112.75 ms  ratio=0.9362
+trial 9: no_scope=127.60 ms  scope=119.68 ms  ratio=0.9379
+trial 10: no_scope=119.51 ms  scope=133.60 ms  ratio=1.1179
+keys=200000 trials=11
+p50 no_scope = 112.06 ms
+p50 scope    = 112.75 ms
+p50 delta    = +0.61%   (median of per-trial ratios: +1.09%)

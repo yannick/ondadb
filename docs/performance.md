@@ -88,6 +88,49 @@ Rules learned the hard way:
 4. **Time the close.** See below — this one cost us three releases of a write
    number that was not real.
 
+## Measuring a change (the evidence format)
+
+Every phase-0 feature's acceptance section quotes numbers. This is the shape
+they have to be in to count, and the shape a reviewer should ask for.
+
+**Where it lives.** Raw, unedited tool output under
+`bench-results/<feature>/<date>/`, plus a `summary.md` next to it that states
+the feature's acceptance bar, the verdict, the method, and the numbers. The
+summary interprets; the raw files are the record. Keep runs that came out
+inconclusive and say why — `bench-results/0.10/2026-08-30/` keeps a whole
+process-level attempt that could not resolve its 2% bar, because the reason it
+failed is the useful part.
+
+**What to report.** At least 5 runs per arm, and the **p50**, not the mean — one
+thermal excursion drags a mean and leaves a median alone. Report the per-run
+spread too: a delta smaller than the spread is a non-result, however clean the
+median looks. State the feature configuration (`default` and/or
+`unsafe-fastpath`) for every number; the two builds run different reader code.
+
+**Same-run ratios, never cross-session absolutes.** Interleave the arms inside
+each round so thermal drift hits them equally, and compare the arms against each
+other within a round. Absolute ops/sec from one session cannot be compared with
+another session's — see the thermal rules above.
+
+**Attribute the change to a mechanism.** Wall time says a change helped; it does
+not say why, and a plausible story about why is not evidence. Open a
+[`PerfContext`](../src/perf.rs) scope (`DB::get_with_perf`, `Txn::get_with_perf`,
+`Iterator::perf_scope`) around a representative operation and quote the counter
+that moved — `bloom_negatives` for a filter change, `block_misses` for a cache
+change, `vlog_reads` for a value-separation change. A latency win with no
+counter movement behind it is a measurement artifact until proven otherwise.
+Counters are per-operation and thread-affine, so they cost nothing to the
+threads that are not measuring: the nil path is a thread-local depth check
+(measured at 0.10; see `bench-results/0.10/2026-08-30/summary.md`).
+
+**When the process-level harness is too coarse.** `onda_bench` re-populates and
+re-opens a database per run, so its Get phase carries the session's page-cache
+and thermal state and can go bimodal within one sitting. For deltas of a few
+percent, use an in-process A/B instead — both arms in one process over one warm
+database, alternating arm order per trial — as
+`tests/perf_nilpath.rs::nil_path_scope_overhead` does. Mark such a test
+`#[ignore]` so the gate compiles it without running it.
+
 ## Deferred work is not free work
 
 A benchmark that stops its timer before the engine has finished the work

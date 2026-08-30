@@ -999,11 +999,17 @@ impl ColumnFamily {
             // filter (it was just consulted).
             let rd = th.reader()?;
             let h = rd.bloom_hash(user_key);
+            // Counted for every candidate, filter or not: `sstable_probes ==
+            // bloom_probes - bloom_negatives` is then an invariant a test can
+            // assert without knowing the false-positive rate.
+            crate::perf::bump(|p| p.bloom_probes += 1);
             if !rd.bloom_may_contain_hash(h) {
                 self.bloom_skips.fetch_add(1, Ordering::Relaxed);
+                crate::perf::bump(|p| p.bloom_negatives += 1);
                 continue;
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
+            crate::perf::bump(|p| p.sstable_probes += 1);
             let (value, seq, found, deleted) = rd.get_unfiltered(user_key, read_seq, now)?;
             candidate.consider(value, seq, found, deleted);
         }
@@ -1019,10 +1025,13 @@ impl ColumnFamily {
 
         // Unified-memtable mode: the shared store holds this CF's hot data.
         if let Some(u) = &self.ctx.unified {
+            crate::perf::bump(|p| p.memtable_probes += 1);
             candidate.consider_memtable(u.get(self.id, user_key, read_seq, now));
         }
+        crate::perf::bump(|p| p.memtable_probes += 1);
         candidate.consider_memtable(sources.mem.get(user_key, read_seq, now));
         for imm in sources.imms.iter().rev() {
+            crate::perf::bump(|p| p.memtable_probes += 1);
             candidate.consider_memtable(imm.mem.get(user_key, read_seq, now));
         }
         self.consider_sstables(&mut candidate, &sources.tables, user_key, read_seq, now)?;
