@@ -979,7 +979,12 @@ impl ColumnFamily {
             compression_rules: self.opts.compression_rules.clone(),
             cmp: self.cmp.clone(),
             enable_bloom: self.opts.enable_bloom_filter,
-            bloom_fpr: self.opts.bloom_fpr,
+            // `bottom = false` unconditionally. L0 *is* the bottom level of a
+            // young family (`levels` starts as one empty level), so honouring
+            // `optimize_filters_for_hits` here would strip the filter from
+            // every table such a family has. That option is about compaction
+            // output, not about the tables reads hit first.
+            bloom_fpr: self.opts.bloom_fpr_for_level(0, false),
             klog_value_threshold: self.opts.klog_value_threshold,
             block_size: self.opts.data_block_size,
             expected_entries: expected,

@@ -141,6 +141,17 @@ divergence from N `get`s, deliberate: a failing source errors only the keys
 whose resolution needed it — a key a strictly newer source already resolved
 keeps its value, where `get` propagates the error.
 
+A table's filter strength is chosen when it is **written**, from its output
+level: `ColumnFamilyConfig::bloom_fpr_for_level(level, bottom)` returns the
+rate (`bloom_fpr_per_level`, last entry repeating, or the uniform `bloom_fpr`)
+or `None` for "write no filter block" when `optimize_filters_for_hits` is set
+and the output lands in the bottom level (`compaction::is_bottom_target`).
+Flush and ingest always pass `bottom = false`; only compaction can omit a
+filter. A table without one is read exactly as before — `bloom_may_contain_hash`
+answers `true` — so the omission costs negative-lookup speed, never
+correctness. See `ColumnFamilyConfig::optimize_filters_for_hits` for the
+one-way degradation this implies.
+
 Every SSTable touched by a read or scan resolves its reader through the shared
 `TableCache` (`table_cache.rs`), not by opening the file directly: `SstHandle`
 holds only the information to re-open a reader and asks the cache for one. A

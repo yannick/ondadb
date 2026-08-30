@@ -1,0 +1,130 @@
+=== config=default invocation=1 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=875ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=754
+  hit  p50=458ns p99=3875ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=5290 block_cache_hits=46477
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=708ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=698
+  hit  p50=459ns p99=3750ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=5220 block_cache_hits=46297
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=917ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=1984
+  hit  p50=458ns p99=3292ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=4271 block_cache_hits=47374
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=417ns p99=875ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=34404
+  hit  p50=417ns p99=2833ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=1914 block_cache_hits=49603
+=== config=default invocation=2 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=958ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=754
+  hit  p50=458ns p99=3708ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=5290 block_cache_hits=46477
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=1125ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=698
+  hit  p50=459ns p99=5209ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=5220 block_cache_hits=46297
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1250ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=1984
+  hit  p50=459ns p99=3208ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=4271 block_cache_hits=47374
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=417ns p99=959ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=34404
+  hit  p50=459ns p99=3167ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=1914 block_cache_hits=49603
+=== config=default invocation=3 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=792ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=754
+  hit  p50=458ns p99=3542ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=5290 block_cache_hits=46477
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=958ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=698
+  hit  p50=458ns p99=3416ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=5220 block_cache_hits=46297
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1166ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=1984
+  hit  p50=458ns p99=3459ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=4271 block_cache_hits=47374
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=416ns p99=875ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=34404
+  hit  p50=458ns p99=2750ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=1914 block_cache_hits=49603
+=== config=default invocation=4 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=916ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=754
+  hit  p50=459ns p99=3916ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=5290 block_cache_hits=46477
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=1000ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=698
+  hit  p50=458ns p99=3416ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=5220 block_cache_hits=46297
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=208ns p99=1375ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=1984
+  hit  p50=458ns p99=4375ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=4271 block_cache_hits=47374
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=417ns p99=875ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=34404
+  hit  p50=458ns p99=3000ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=1914 block_cache_hits=49603
+=== config=default invocation=5 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=1000ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=754
+  hit  p50=459ns p99=5166ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=5290 block_cache_hits=46477
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=1083ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=698
+  hit  p50=458ns p99=3791ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=5220 block_cache_hits=46297
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1250ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=1984
+  hit  p50=459ns p99=3833ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=4271 block_cache_hits=47374
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=416ns p99=958ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=34404
+  hit  p50=458ns p99=3041ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=1914 block_cache_hits=49603
+=== config=unsafe-fastpath invocation=1 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=1167ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=0
+  hit  p50=458ns p99=1875ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=0 block_cache_hits=0
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=959ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=0
+  hit  p50=416ns p99=1167ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1125ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=0
+  hit  p50=416ns p99=1042ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=0 block_cache_hits=0
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=375ns p99=584ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=0
+  hit  p50=375ns p99=834ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+=== config=unsafe-fastpath invocation=2 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=208ns p99=1000ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=0
+  hit  p50=500ns p99=1291ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=0 block_cache_hits=0
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=875ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=0
+  hit  p50=375ns p99=1000ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1083ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=0
+  hit  p50=416ns p99=1083ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=0 block_cache_hits=0
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=375ns p99=750ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=0
+  hit  p50=375ns p99=959ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+=== config=unsafe-fastpath invocation=3 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=916ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=0
+  hit  p50=458ns p99=1209ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=0 block_cache_hits=0
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=792ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=0
+  hit  p50=416ns p99=1083ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1083ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=0
+  hit  p50=417ns p99=1125ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=0 block_cache_hits=0
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=375ns p99=708ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=0
+  hit  p50=375ns p99=958ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+=== config=unsafe-fastpath invocation=4 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=750ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=0
+  hit  p50=417ns p99=1166ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=0 block_cache_hits=0
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=1000ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=0
+  hit  p50=416ns p99=1125ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1125ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=0
+  hit  p50=417ns p99=1125ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=0 block_cache_hits=0
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=375ns p99=792ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=0
+  hit  p50=417ns p99=1000ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+=== config=unsafe-fastpath invocation=5 ===
+arm=uniform levels=[0, 4, 8] readers=12 resident_bytes=616588 index_bytes=369788 filter_bytes=246800
+  miss p50=167ns p99=709ns probes=79678 negatives=78924 sstable_probes=754 block_misses=0 block_cache_hits=0
+  hit  p50=417ns p99=1041ns probes=79682 negatives=27915 sstable_probes=51767 block_misses=0 block_cache_hits=0
+arm=per_level_equal levels=[0, 4, 8] readers=12 resident_bytes=632836 index_bytes=369788 filter_bytes=263048
+  miss p50=167ns p99=792ns probes=79678 negatives=78980 sstable_probes=698 block_misses=0 block_cache_hits=0
+  hit  p50=416ns p99=1084ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0
+arm=per_level_lean levels=[0, 4, 8] readers=12 resident_bytes=571388 index_bytes=369788 filter_bytes=201600
+  miss p50=167ns p99=1167ns probes=79678 negatives=77694 sstable_probes=1984 block_misses=0 block_cache_hits=0
+  hit  p50=417ns p99=1209ns probes=79682 negatives=28037 sstable_probes=51645 block_misses=0 block_cache_hits=0
+arm=hits levels=[0, 4, 8] readers=12 resident_bytes=492892 index_bytes=369788 filter_bytes=123104
+  miss p50=334ns p99=583ns probes=79678 negatives=45274 sstable_probes=34404 block_misses=0 block_cache_hits=0
+  hit  p50=375ns p99=875ns probes=79682 negatives=28165 sstable_probes=51517 block_misses=0 block_cache_hits=0

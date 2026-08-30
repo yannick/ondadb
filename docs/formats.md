@@ -340,7 +340,15 @@ ONDACMP1 | target_file_size u64 | l1_base_bytes u64
           | hard_pending_compaction_bytes u64   compaction geometry
 ONDABLK1 | data_block_size u64                  per-CF block target
 ONDAVVC1 | max_cached_vlog_value_bytes u64      per-CF vlog value cache limit
+ONDABLM1 | count u64 | fpr f64-bits x count
+          | optimize_filters_for_hits u8        per-level bloom policy
 ```
+
+`ONDABLM1` is all-or-nothing: a truncated tail, or one holding a rate outside
+`(0, 1)`, leaves both fields at their defaults (empty vector, `false`) rather
+than applying half a policy. `ONDABLM2` is **reserved** for a future geometric
+(Monkey-style) auto-allocation policy, which would be mutually exclusive with
+the explicit vector; nothing writes or reads it yet.
 
 Each tag is omitted when its setting is absent or equal to the release default.
 Decoders consume only tags they recognize and leave missing or truncated tails

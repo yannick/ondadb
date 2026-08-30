@@ -240,6 +240,38 @@ settled tree. Neither number is wrong; they answer different questions. See
   **Existing SSTables keep their broken filters until rewritten** — the fix
   applies to newly written tables, and a full compaction migrates the rest.
 
+## Per-level Bloom policy: why it is opt-in (0.1)
+
+`ColumnFamilyConfig::bloom_fpr_per_level` and `optimize_filters_for_hits` are
+both **off by default**, and the measurements are the reason. Harness:
+`tests/bloom_policy_bench.rs` (`#[ignore]`d), full numbers in
+`bench-results/0.1/2026-08-30/`.
+
+- **Per-level rates at equal resident bytes are a wash.** Monkey's premise is
+  that a negative lookup probes *every* level, so bits are worth more in the
+  small upper levels. ondaDB's read path only probes tables whose `[min, max]`
+  covers the key, and leveled compaction makes each level's tables disjoint —
+  the measured candidate count is **1.59 tables per lookup**, not one per level.
+  Redistributing bits across a cascade that short buys little: at matched
+  resident bytes a `[0.001, 0.001, 0.02]` vector returned **−7.4 %** miss-path
+  `sstable_probes` (754 → 698) with no movement in p50 at all, and the opposite
+  trade (`[0.001, 0.005, 0.05]`, −18 % filter bytes) cost **+163 %**.
+  That 1.59 needs a workload that keeps writing: after a bulk load and one
+  compaction every level owns a *disjoint* slice of the keyspace, the count is
+  exactly 1.00, and there is no cascade at all — so a benchmark without a
+  scattered overlay pass will always show per-level rates losing, which is a
+  fixture artifact and not a result.
+- **`optimize_filters_for_hits` is a real, large, one-directional trade.**
+  Resident filter bytes fall **50 %** (246,800 → 123,104 B) and hit-heavy p99
+  improves **~22 %**, because the hit path stops hashing against a filter that
+  was going to admit the key anyway. Miss-heavy `sstable_probes` rise **46×**
+  (754 → 34,404) and miss p50 **+150 %**: a bottom table with no filter is read
+  on every negative lookup. It is the right setting only for a workload that is
+  known to hit.
+- The degradation is **one-way**: "bottom" is dynamic, and a table written
+  filterless never regains a filter until a compaction rewrites it into a
+  non-bottom target. See `ColumnFamilyConfig::optimize_filters_for_hits`.
+
 ## Vlog reads: CRC-once, and the opt-in value cache
 
 Large values (`>= klog_value_threshold`) live in the vlog, and every read of one

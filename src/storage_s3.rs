@@ -500,7 +500,7 @@ mod tests {
                 compression_rules: Vec::new(),
                 cmp: default_comparator(),
                 enable_bloom: true,
-                bloom_fpr: 0.01,
+                bloom_fpr: Some(0.01),
                 klog_value_threshold: 512, // inline values -> no vlog
                 block_size: 256,
                 expected_entries: n,

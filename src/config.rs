@@ -561,6 +561,45 @@ pub struct ColumnFamilyConfig {
     pub tier_rules: Vec<TierRule>,
     pub enable_bloom_filter: bool,
     pub bloom_fpr: f64,
+    /// Per-level override of [`bloom_fpr`](Self::bloom_fpr). Empty (the
+    /// default) = the uniform `bloom_fpr` at every level. Otherwise a table
+    /// written into level L is filtered at `bloom_fpr_per_level[min(L,
+    /// len-1)]` — the last entry repeats for all deeper levels, exactly like
+    /// [`compression_per_level`](Self::compression_per_level).
+    ///
+    /// The intended shape is a *strong* (small) FPR for the small upper levels,
+    /// where a filter costs little memory, and a weaker one for the huge bottom
+    /// level, where it costs the most. Filters are sized from the keys a table
+    /// actually holds, so the setting is honest per table.
+    ///
+    /// Every entry must be finite and strictly inside `(0, 1)`
+    /// ([`validate`](Self::validate) rejects the rest). Purely a write-side
+    /// policy: changing it rewrites nothing, and existing tables keep the
+    /// filter they were written with until a later compaction rewrites them.
+    pub bloom_fpr_per_level: Vec<f64>,
+    /// Omit the bloom filter entirely on **compaction** output written into the
+    /// bottom level (`false` by default).
+    ///
+    /// The bottom level holds most of the data and therefore most of the filter
+    /// bytes. A workload whose point reads almost always hit pays for those
+    /// bytes and gets nothing: the filter is consulted, admits the key, and the
+    /// table is read anyway. Dropping it trades negative-lookup speed for
+    /// resident memory. It is the wrong trade for a miss-heavy workload — a
+    /// miss that reaches the bottom level now always reads a block.
+    ///
+    /// Flush and ingestion output is never affected: those always write L0, and
+    /// in a young column family L0 *is* the bottom level, so honouring the
+    /// option there would strip the filter from every table the family has.
+    ///
+    /// **The degradation is one-way.** "Bottom" is dynamic: a table written
+    /// filterless while level N was bottom keeps no filter once a deeper level
+    /// appears, and nothing retro-fits one. Reads stay correct (a missing
+    /// filter means "may contain"), but negative lookups against that table
+    /// stay degraded until it is recompacted. Enabling this is a decision about
+    /// the data already in the bottom level as much as about future writes.
+    /// The converse is guaranteed: any compaction whose output target is *not*
+    /// bottom writes a filter, whatever its inputs carried.
+    pub optimize_filters_for_hits: bool,
     /// Reserved sampled-index policy; indexes are currently exhaustive.
     pub enable_block_indexes: bool,
     /// Reserved sampled-index policy; currently ignored.
@@ -657,6 +696,8 @@ impl Default for ColumnFamilyConfig {
             tier_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
+            bloom_fpr_per_level: Vec::new(),
+            optimize_filters_for_hits: false,
             enable_block_indexes: true,
             index_sample_ratio: 1,
             block_index_prefix_len: 16,
@@ -931,6 +972,30 @@ impl ColumnFamilyConfig {
         }
     }
 
+    /// Bloom false-positive rate for a table written into `level`, or `None`
+    /// when no filter block should be written at all.
+    ///
+    /// `bottom` is a *compaction* input: it says this output lands in the
+    /// deepest populated level (see `compaction::is_bottom_target`). Flush and
+    /// ingestion pass `false` unconditionally — see
+    /// [`optimize_filters_for_hits`](Self::optimize_filters_for_hits).
+    ///
+    /// The decision is made from `level` and `bottom` alone and is never
+    /// inherited from a compaction's inputs, which is what makes the
+    /// re-filter-on-promotion guarantee hold: a filterless table compacted into
+    /// a non-bottom target comes back out with a filter.
+    pub fn bloom_fpr_for_level(&self, level: u32, bottom: bool) -> Option<f64> {
+        if self.optimize_filters_for_hits && bottom {
+            return None; // write no filter block at all
+        }
+        match self.bloom_fpr_per_level.as_slice() {
+            // The empty arm is what keeps `v.len() - 1` below off an empty
+            // slice: that subtraction is a `usize` underflow, not a fallback.
+            [] => Some(self.bloom_fpr),
+            v => Some(v[(level as usize).min(v.len() - 1)]),
+        }
+    }
+
     /// Compression algorithm for `user_key` written at `level`: the longest
     /// matching entry in `compression_rules`, falling back to
     /// [`compression_for_level`](Self::compression_for_level).
@@ -1005,6 +1070,18 @@ impl ColumnFamilyConfig {
         if self.l1_base_bytes == 0 {
             return Err("l1_base_bytes must be non-zero".to_string());
         }
+        // A rate outside (0, 1) has no filter that realizes it: `Bloom::new`
+        // would derive a non-positive or zero-length bit array from it, and NaN
+        // would propagate silently into the sizing arithmetic. Refuse at
+        // configuration time, where the operator can still see why.
+        for (level, fpr) in self.bloom_fpr_per_level.iter().enumerate() {
+            if !fpr.is_finite() || *fpr <= 0.0 || *fpr >= 1.0 {
+                return Err(format!(
+                    "bloom_fpr_per_level[{level}] is {fpr}; every entry must be \
+                     finite and strictly between 0 and 1"
+                ));
+            }
+        }
         // Pacing that starts after the hard stop can never run, and the
         // inversion reads as a tuning success until debt is already unbounded.
         if self.soft_pending_compaction_bytes != 0
@@ -1030,6 +1107,7 @@ impl ColumnFamilyConfig {
         encode_compaction_geometry(&mut b, self);
         encode_block_size(&mut b, self);
         encode_vlog_cache(&mut b, self);
+        encode_bloom_policy(&mut b, self);
         b
     }
 
@@ -1065,6 +1143,14 @@ const CONFIG_COMPACTION_MAGIC: &[u8; 8] = b"ONDACMP1";
 const CONFIG_BLOCK_SIZE_MAGIC: &[u8; 8] = b"ONDABLK1";
 /// Tag introducing the vlog-value-cache tail (feature 0.5).
 const CONFIG_VLOG_CACHE_MAGIC: &[u8; 8] = b"ONDAVVC1";
+/// Tag introducing the per-level bloom-policy tail (0.1).
+const CONFIG_BLOOM_POLICY_MAGIC: &[u8; 8] = b"ONDABLM1";
+/// Reserved for a future geometric (Monkey-style) auto-allocation policy. It is
+/// mutually exclusive with the explicit `bloom_fpr_per_level` vector, so the tag
+/// is claimed here to keep the two from ever sharing one; nothing writes or
+/// reads it yet.
+#[allow(dead_code)]
+const CONFIG_BLOOM_AUTO_MAGIC: &[u8; 8] = b"ONDABLM2";
 
 #[derive(Clone, Copy)]
 struct LegacyPolicyCounts {
@@ -1249,6 +1335,26 @@ fn encode_vlog_cache(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
     append_u64(b, cfg.max_cached_vlog_value_bytes as u64);
 }
 
+/// The per-level bloom-policy tail: `count` levels of IEEE-754 bits, then the
+/// `optimize_filters_for_hits` byte. Elided at the defaults so a family that
+/// never touches the policy encodes byte-for-byte as earlier releases wrote it.
+fn encode_bloom_policy(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_u64;
+
+    if cfg.bloom_fpr_per_level.is_empty() && !cfg.optimize_filters_for_hits {
+        return;
+    }
+    b.extend_from_slice(CONFIG_BLOOM_POLICY_MAGIC);
+    // A fixed-width count, matching the other tails: the vector holds one entry
+    // per level and is never large, but a varint here would buy nothing and
+    // make the truncation check below less obvious.
+    append_u64(b, cfg.bloom_fpr_per_level.len() as u64);
+    for fpr in &cfg.bloom_fpr_per_level {
+        append_u64(b, fpr.to_bits());
+    }
+    b.push(u8::from(cfg.optimize_filters_for_hits));
+}
+
 #[derive(Clone, Copy)]
 struct ConfigCursor<'a> {
     remaining: &'a [u8],
@@ -1318,7 +1424,8 @@ fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     let p = read_partition_fn_tail(cursor.into_remaining(), cfg);
     let p = read_compaction_tail(p, cfg);
     let p = read_block_size_tail(p, cfg);
-    read_vlog_cache_tail(p, cfg);
+    let p = read_vlog_cache_tail(p, cfg);
+    read_bloom_policy_tail(p, cfg);
     Some(())
 }
 
@@ -1545,17 +1652,61 @@ fn read_block_size_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u
     &rest[8..]
 }
 
-fn read_vlog_cache_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+fn read_vlog_cache_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     let Some(rest) = p.strip_prefix(CONFIG_VLOG_CACHE_MAGIC) else {
-        return;
+        return p;
     };
     if rest.len() < 8 {
-        return;
+        return p;
     }
     // Unlike the block size, 0 is a meaningful value here (disabled) — but the
     // encoder elides it, so a stored 0 can only come from a truncated or
     // hand-edited blob. Take it at face value: it is also the default.
     cfg.max_cached_vlog_value_bytes = crate::encoding::read_u64(rest) as usize;
+    &rest[8..]
+}
+
+/// Consume the per-level bloom-policy tail if present. Absent (every manifest
+/// written before 0.1, and any family left at the defaults), the struct
+/// defaults stand — an empty vector and `optimize_filters_for_hits == false`,
+/// which is exactly the uniform behaviour of earlier releases.
+///
+/// All-or-nothing, like the compaction tail: a truncated tail leaves both
+/// fields at their defaults rather than applying a half-read policy that would
+/// silently filter some levels and not others.
+fn read_bloom_policy_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    use crate::encoding::read_u64;
+
+    let Some(rest) = p.strip_prefix(CONFIG_BLOOM_POLICY_MAGIC) else {
+        return;
+    };
+    if rest.len() < 8 {
+        return;
+    }
+    let count = read_u64(rest) as usize;
+    let rest = &rest[8..];
+    // `count` comes off disk, so the size it implies is computed with checked
+    // arithmetic — a lying count must fail the bounds check, not wrap past it —
+    // and the bytes must actually be present before anything is reserved.
+    let Some(needed) = count.checked_mul(8).and_then(|n| n.checked_add(1)) else {
+        return;
+    };
+    if rest.len() < needed {
+        return;
+    }
+    let mut per_level = Vec::with_capacity(count);
+    for i in 0..count {
+        let fpr = f64::from_bits(read_u64(&rest[i * 8..]));
+        // A blob whose rates would not `validate` is not made valid by having
+        // been written: fall back to uniform rather than hand a NaN to the
+        // filter sizer.
+        if !fpr.is_finite() || fpr <= 0.0 || fpr >= 1.0 {
+            return;
+        }
+        per_level.push(fpr);
+    }
+    cfg.bloom_fpr_per_level = per_level;
+    cfg.optimize_filters_for_hits = rest[count * 8] != 0;
 }
 
 #[cfg(test)]
@@ -2264,5 +2415,112 @@ mod block_size_tests {
         };
         let error = config.validate().expect_err("zero must not validate");
         assert!(error.contains("data_block_size"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod bloom_policy_tests {
+    use super::*;
+
+    #[test]
+    fn bloom_fpr_for_level_repeats_last_element() {
+        // Empty vector: uniform `bloom_fpr` at every level. This also pins the
+        // underflow guard — `v.len() - 1` on an empty slice would panic.
+        let uniform = ColumnFamilyConfig::default();
+        assert_eq!(uniform.bloom_fpr_for_level(0, false), Some(0.01));
+        assert_eq!(uniform.bloom_fpr_for_level(3, false), Some(0.01));
+
+        let tiered = ColumnFamilyConfig {
+            bloom_fpr_per_level: vec![0.001, 0.01],
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(tiered.bloom_fpr_for_level(0, false), Some(0.001));
+        assert_eq!(tiered.bloom_fpr_for_level(1, false), Some(0.01));
+        assert_eq!(tiered.bloom_fpr_for_level(2, false), Some(0.01));
+        assert_eq!(tiered.bloom_fpr_for_level(7, false), Some(0.01));
+
+        // `optimize_filters_for_hits` fires only for bottom output.
+        let hits = ColumnFamilyConfig {
+            bloom_fpr_per_level: vec![0.001, 0.01],
+            optimize_filters_for_hits: true,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(hits.bloom_fpr_for_level(1, true), None);
+        assert_eq!(hits.bloom_fpr_for_level(1, false), Some(0.01));
+        assert_eq!(hits.bloom_fpr_for_level(0, true), None);
+        // Off by default: bottom output keeps its filter.
+        assert_eq!(tiered.bloom_fpr_for_level(1, true), Some(0.01));
+    }
+
+    #[test]
+    fn validate_rejects_bloom_fpr_out_of_range() {
+        for bad in [0.0, 1.0, f64::NAN, f64::INFINITY, -0.5, 1.5] {
+            let cfg = ColumnFamilyConfig {
+                bloom_fpr_per_level: vec![0.01, bad],
+                ..ColumnFamilyConfig::default()
+            };
+            let error = cfg
+                .validate()
+                .expect_err("an out-of-range per-level FPR must not validate");
+            assert!(error.contains("bloom_fpr_per_level"), "{error}");
+        }
+        let good = ColumnFamilyConfig {
+            bloom_fpr_per_level: vec![0.001, 0.01, 0.05],
+            optimize_filters_for_hits: true,
+            ..ColumnFamilyConfig::default()
+        };
+        good.validate().expect("in-range FPRs validate");
+    }
+
+    #[test]
+    fn bloom_policy_blob_omits_defaults() {
+        // A config that differs only elsewhere must encode exactly as it did
+        // before this tail existed, so an older binary keeps decoding it.
+        let blob = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            data_block_size: 16 << 10,
+            ..ColumnFamilyConfig::default()
+        }
+        .encode();
+        assert!(!blob
+            .windows(CONFIG_BLOOM_POLICY_MAGIC.len())
+            .any(|window| window == CONFIG_BLOOM_POLICY_MAGIC));
+    }
+
+    #[test]
+    fn a_set_bloom_policy_round_trips_and_coexists_with_preceding_tails() {
+        let config = ColumnFamilyConfig {
+            partition_scheme: PartitionScheme::Unresolved("byhash".into()),
+            target_file_size: 2 << 20,
+            data_block_size: 16 << 10,
+            bloom_fpr_per_level: vec![0.001, 0.01, 0.05],
+            optimize_filters_for_hits: true,
+            ..ColumnFamilyConfig::default()
+        };
+        let decoded = ColumnFamilyConfig::decode(&config.encode());
+        assert_eq!(decoded.bloom_fpr_per_level, vec![0.001, 0.01, 0.05]);
+        assert!(decoded.optimize_filters_for_hits);
+        assert_eq!(decoded.data_block_size, 16 << 10);
+        assert_eq!(decoded.target_file_size, 2 << 20);
+        assert!(matches!(
+            decoded.partition_scheme,
+            PartitionScheme::Unresolved(ref name) if name == "byhash"
+        ));
+    }
+
+    /// A truncated tail leaves both fields at their defaults rather than
+    /// applying a half-read policy (the compaction tail's rule).
+    #[test]
+    fn a_truncated_bloom_policy_tail_is_ignored() {
+        let config = ColumnFamilyConfig {
+            bloom_fpr_per_level: vec![0.001, 0.01],
+            optimize_filters_for_hits: true,
+            ..ColumnFamilyConfig::default()
+        };
+        let mut blob = config.encode();
+        blob.truncate(blob.len() - 4);
+        let decoded = ColumnFamilyConfig::decode(&blob);
+        assert!(decoded.bloom_fpr_per_level.is_empty());
+        assert!(!decoded.optimize_filters_for_hits);
     }
 }

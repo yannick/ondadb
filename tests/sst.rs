@@ -14,7 +14,7 @@ fn opts(alg: Compression, n: usize, klog_threshold: usize, block_size: usize) ->
         compression_rules: Vec::new(),
         cmp: default_comparator(),
         enable_bloom: true,
-        bloom_fpr: 0.01,
+        bloom_fpr: Some(0.01),
         klog_value_threshold: klog_threshold,
         block_size,
         expected_entries: n,
@@ -1105,4 +1105,67 @@ fn vlog_reads_are_charged() {
         charged >= 4096,
         "the vlog frame must be charged: {charged} bytes"
     );
+}
+
+/// `bloom_fpr: None` means "write no filter block" — distinct from
+/// `enable_bloom: false` (the family-wide switch) only in where the decision
+/// comes from, but identical in the bytes it produces.
+#[test]
+fn writer_omits_bloom_block_when_fpr_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("1.klog");
+    let klog = klog.to_str().unwrap();
+
+    let mut options = opts(Compression::None, 2048, 512, 1024);
+    options.bloom_fpr = None;
+    let mut w = Writer::new(klog, options).unwrap();
+    for i in 0..2048u32 {
+        let k = format!("key{i:06}");
+        w.add(k.as_bytes(), b"v", (i + 1) as u64, 0, false, false)
+            .unwrap();
+    }
+    w.finish().unwrap();
+
+    let reader = Reader::open(
+        klog,
+        LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        1,
+        default_comparator(),
+        0,
+    )
+    .unwrap();
+
+    // The filter is ABSENT, not empty: an empty filter still occupies resident
+    // bytes, and would answer "no" for the absent key below.
+    let (_index, bloom, _entries) = reader.resident_breakdown();
+    assert_eq!(bloom, 0, "no filter block should have been written");
+
+    // A key that was never written is still admitted — a missing filter means
+    // "may contain", which is what keeps a filterless table readable.
+    let (value, _seq, found, deleted) = reader.get(b"absent-key", u64::MAX, 0).unwrap();
+    assert!(!found, "the absent key must not resolve");
+    assert!(!deleted);
+    assert!(value.is_none());
+
+    // And every written key still reads back.
+    for i in 0..2048u32 {
+        let k = format!("key{i:06}");
+        let (value, _seq, found, deleted) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        assert!(found && !deleted, "{k} lost");
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    }
+}
+
+/// The counterpart: with a rate set, the block is there and it rules keys out.
+#[test]
+fn writer_writes_a_bloom_block_when_fpr_is_some() {
+    let dir = tempfile::tempdir().unwrap();
+    let (reader, keys) = build_sst(dir.path(), Compression::None, 2048, 8);
+    let (_index, bloom, _entries) = reader.resident_breakdown();
+    assert!(bloom > 0, "a filter block should have been written");
+    for k in &keys {
+        let (_v, _seq, found, _d) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        assert!(found, "{k} lost");
+    }
 }

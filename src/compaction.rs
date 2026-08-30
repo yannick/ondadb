@@ -698,6 +698,10 @@ struct CompactionOutputBuilder<'a> {
     cf: &'a Arc<ColumnFamily>,
     cmp: &'a ComparatorRef,
     target: usize,
+    /// The job's one snapshot of `is_bottom_target`, carried rather than
+    /// re-derived per output file so every table this job writes agrees with
+    /// the retention and partition decisions made from the same snapshot.
+    bottom: bool,
     target_bytes: u64,
     carry_entry_time: Option<i64>,
     partitioner: Option<crate::config::PartitionResolver>,
@@ -715,6 +719,7 @@ impl<'a> CompactionOutputBuilder<'a> {
         cf: &'a Arc<ColumnFamily>,
         cmp: &'a ComparatorRef,
         target: usize,
+        bottom: bool,
         inputs: &[Arc<SstHandle>],
         partitioner: Option<crate::config::PartitionResolver>,
     ) -> Self {
@@ -723,6 +728,7 @@ impl<'a> CompactionOutputBuilder<'a> {
             cf,
             cmp,
             target,
+            bottom,
             target_bytes: (cf.opts.target_file_size as u64).max(1),
             carry_entry_time: inputs
                 .iter()
@@ -796,8 +802,11 @@ impl<'a> CompactionOutputBuilder<'a> {
     fn open_output(&mut self, partition: Option<String>) -> Result<()> {
         let id = self.db.next_file_id();
         let klog = self.cf.klog_path(id);
-        let writer = match Writer::new(&klog, cf_writer_opts(self.cf, self.cmp, self.target as u32))
-            .map(|w| w.with_limiter(self.cf.ctx.io_limiter.clone()))
+        let writer = match Writer::new(
+            &klog,
+            cf_writer_opts(self.cf, self.cmp, self.target as u32, self.bottom),
+        )
+        .map(|w| w.with_limiter(self.cf.ctx.io_limiter.clone()))
         {
             Ok(writer) => writer,
             Err(error) => {
@@ -932,6 +941,7 @@ impl CompactionMerge<'_> {
             self.cf,
             self.cmp,
             self.target,
+            self.bottom,
             self.inputs,
             self.partitioner,
         );
@@ -1047,9 +1057,10 @@ pub(crate) fn compact_inputs(
         return Ok(());
     }
 
-    let num_levels = cf.with_levels(|levels| levels.len()).max(target + 1);
-    let bottom = target >= num_levels - 1
-        && cf.with_levels(|levels| levels.iter().skip(target + 1).all(|level| level.is_empty()));
+    // One snapshot of the predicate for the whole job: retention, partition
+    // cutting and the output filter policy must all agree on whether this
+    // output is bottom, even if a concurrent compaction changes the shape.
+    let bottom = is_bottom_target(cf, target);
     let oldest_snapshot = db.oldest_snapshot();
     let now = now_nanos();
     let filter = cf.compaction_filter();
@@ -1096,17 +1107,49 @@ pub(crate) fn compact_inputs(
     Ok(())
 }
 
+/// Does compaction output written into `target` land in the bottom level?
+///
+/// Lifted verbatim out of [`compact_inputs`], which is the point: the retention
+/// and partition-cutting decisions there and the output filter policy in
+/// [`cf_writer_opts`] must agree, and re-deriving "bottom" at the second site
+/// is how they would drift. It is deliberately not `levels.len() - 1` either —
+/// a push-down may create a level beyond the current vector, hence the clamp up
+/// to `target + 1`.
+pub(crate) fn is_bottom_target(cf: &Arc<ColumnFamily>, target: usize) -> bool {
+    cf.with_levels(|levels| target_is_bottom(levels, target))
+}
+
+/// The predicate itself, over the level shape alone. Generic so a test can pin
+/// it against a shape without standing up a column family; only each level's
+/// emptiness is read.
+///
+/// Both clauses are kept as `compact_inputs` had them. Over the single snapshot
+/// this now takes, the second is implied by the first — `target >= num_levels -
+/// 1` already puts `target` at or past the last index, so `skip(target + 1)`
+/// skips everything — but it is the clause that states the intent, and the
+/// original read the level set twice, where it was not implied. So a level that
+/// merely *exists* below the target, empty or not, makes the target non-bottom;
+/// the levels vector never shrinks, so that is the durable signal.
+fn target_is_bottom<T>(levels: &[Vec<T>], target: usize) -> bool {
+    let num_levels = levels.len().max(target + 1);
+    target >= num_levels - 1 && levels.iter().skip(target + 1).all(|level| level.is_empty())
+}
+
 fn cf_writer_opts(
     cf: &Arc<ColumnFamily>,
     cmp: &ComparatorRef,
     target_level: u32,
+    bottom: bool,
 ) -> crate::sst::WriterOptions {
     crate::sst::WriterOptions {
         compression: cf.opts.compression_for_level(target_level),
         compression_rules: cf.opts.compression_rules.clone(),
         cmp: cmp.clone(),
         enable_bloom: cf.opts.enable_bloom_filter,
-        bloom_fpr: cf.opts.bloom_fpr,
+        // The filter policy is decided from the OUTPUT level and the bottom
+        // predicate, never inherited from the inputs — which is what makes a
+        // filterless table compacted into a non-bottom target regain a filter.
+        bloom_fpr: cf.opts.bloom_fpr_for_level(target_level, bottom),
         klog_value_threshold: cf.opts.klog_value_threshold,
         block_size: cf.opts.data_block_size,
         // Capacity hint for the writer's bloom-hash buffer ONLY. It used to
@@ -1155,10 +1198,41 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        build_job, gather_target, key_span, overlap_bytes, rank_candidates, Retention,
-        VersionRetention, COMPACTION_OUTPUT_BYTES, FIRST_FIT_ORDER,
+        build_job, gather_target, key_span, overlap_bytes, rank_candidates, target_is_bottom,
+        Retention, VersionRetention, COMPACTION_OUTPUT_BYTES, FIRST_FIT_ORDER,
     };
     use crate::comparator::{default_comparator, CaseInsensitive, ComparatorRef};
+
+    /// A level shape: `levels[i]` stands in for level `i`'s file list, and only
+    /// its emptiness matters to the predicate.
+    fn shape(counts: &[usize]) -> Vec<Vec<u8>> {
+        counts.iter().map(|n| vec![0u8; *n]).collect()
+    }
+
+    #[test]
+    fn is_bottom_target_requires_deeper_levels_empty() {
+        // A deeper level below the target — populated OR merely present and
+        // empty — makes the target non-bottom. The levels vector never shrinks,
+        // so "a level exists below me" is the durable signal, and this is the
+        // case a `levels.len() - 1` rederivation would have gotten wrong in the
+        // other direction.
+        assert!(!target_is_bottom(&shape(&[0, 3, 2]), 1));
+        assert!(!target_is_bottom(&shape(&[0, 3, 0]), 1));
+        assert!(!target_is_bottom(&shape(&[0, 3, 0, 0]), 1));
+        assert!(!target_is_bottom(&shape(&[2, 0, 0, 1]), 0));
+        // The last index is bottom, populated below it or not.
+        assert!(target_is_bottom(&shape(&[0, 3, 2]), 2));
+        assert!(target_is_bottom(&shape(&[0, 3, 0]), 2));
+        assert!(target_is_bottom(&shape(&[0, 0, 3, 0]), 3));
+        // A target past the end of the vector is bottom too: `num_levels`
+        // clamps up to `target + 1`, so a push-down that creates the level
+        // lands in the bottom.
+        assert!(target_is_bottom(&shape(&[4]), 1));
+        assert!(target_is_bottom(&shape(&[4]), 7));
+        // A fresh family is one level, and L0 is its bottom — which is exactly
+        // why flush passes `bottom = false` instead of asking.
+        assert!(target_is_bottom(&shape(&[0]), 0));
+    }
 
     #[test]
     fn version_retention_preserves_snapshots_and_reclaims_bottom_debris() {

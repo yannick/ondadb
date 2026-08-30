@@ -28,7 +28,14 @@ pub struct WriterOptions {
     pub compression_rules: Vec<CompressionRule>,
     pub cmp: ComparatorRef,
     pub enable_bloom: bool,
-    pub bloom_fpr: f64,
+    /// False-positive rate for this table's filter, or `None` to write **no**
+    /// filter block.
+    ///
+    /// Distinct from `enable_bloom`, which is the family-wide "never build
+    /// filters" switch: this is the per-output-level decision
+    /// (`ColumnFamilyConfig::bloom_fpr_for_level`). Either one produces a table
+    /// a reader treats as "may contain" for every key.
+    pub bloom_fpr: Option<f64>,
     pub klog_value_threshold: usize,
     pub block_size: usize,
     pub expected_entries: usize,
@@ -171,7 +178,9 @@ impl Writer {
         // getting it wrong costs a realloc, not a filter that admits
         // everything. Cap the pre-allocation so a wildly optimistic hint
         // cannot reserve hundreds of MB for a table that ends up small.
-        let bloom_hashes = if opts.enable_bloom {
+        // No rate means no filter block, so there is nothing to buffer hashes
+        // for either — skipping the buffer is the whole memory saving.
+        let bloom_hashes = if opts.enable_bloom && opts.bloom_fpr.is_some() {
             Some(Vec::with_capacity(
                 opts.expected_entries.clamp(1024, 1 << 20),
             ))
@@ -500,9 +509,11 @@ impl Writer {
             footer_flags |= FOOTER_RESTARTS;
         }
         let mut bloom_handle = BlockHandle::default();
-        // Size the filter from the keys actually written, not from a hint.
-        if let Some(hashes) = self.bloom_hashes.take() {
-            let mut b = Bloom::new(hashes.len().max(1), self.opts.bloom_fpr);
+        // Size the filter from the keys actually written, not from a hint. Both
+        // halves are matched together so there is no default rate to fall back
+        // on: the buffer only exists when a rate was configured.
+        if let (Some(hashes), Some(fpr)) = (self.bloom_hashes.take(), self.opts.bloom_fpr) {
+            let mut b = Bloom::new(hashes.len().max(1), fpr);
             for h in hashes {
                 b.add_hash(h);
             }
@@ -683,7 +694,7 @@ mod tests {
                 compression_rules: Vec::new(),
                 cmp: default_comparator(),
                 enable_bloom: false,
-                bloom_fpr: 0.01,
+                bloom_fpr: Some(0.01),
                 klog_value_threshold: 1 << 20, // keep values inline
                 block_size: 4 << 10,
                 expected_entries: n,

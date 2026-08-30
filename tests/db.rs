@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ondadb::{ColumnFamily, ColumnFamilyConfig, IsolationLevel, OndaError, Options, DB};
+use ondadb::{
+    ColumnFamily, ColumnFamilyConfig, IsolationLevel, OndaError, Options, PartitionRule, DB,
+};
 
 fn open(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>) {
     let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
@@ -1991,5 +1993,414 @@ fn multi_get_with_perf_matches_multi_get() {
     let (measured, perf) = db.multi_get_with_perf(&cf, &keys);
     assert_same_results(&measured, &plain, &keys, "multi_get_with_perf");
     assert!(perf.memtable_probes >= keys.len() as u64, "{perf:?}");
+    db.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 0.1 — per-level Bloom policy
+// ---------------------------------------------------------------------------
+
+/// A key in the policy tests' fixed-width namespace. Even `i` is stored, odd
+/// `i` is an absent probe — so every probe falls *inside* the written table's
+/// key span and is therefore a real filter candidate, which is what makes the
+/// bloom counters below mean anything.
+fn policy_key(prefix: char, i: u32) -> Vec<u8> {
+    format!("{prefix}{i:07}").into_bytes()
+}
+
+/// `(bloom probes, bloom negatives)` accumulated looking up keys that do not
+/// exist. `probes - negatives` is exactly the filters' false positives, so the
+/// ratio is the measured FP rate over the candidate tables — the 0.10
+/// PerfContext counters are the evidence, not a wall clock.
+fn probe_absent(db: &DB, cf: &Arc<ColumnFamily>, prefix: char, count: u32) -> (u64, u64) {
+    let scope = ondadb::perf::enter();
+    for i in 0..count {
+        let key = policy_key(prefix, i * 2 + 1);
+        assert!(db.get(cf, &key).is_err(), "probe key must be absent");
+    }
+    let p = scope.finish();
+    (p.bloom_probes, p.bloom_negatives)
+}
+
+fn write_policy_keys(db: &DB, cf: &Arc<ColumnFamily>, prefix: char, range: std::ops::Range<u32>) {
+    for i in range {
+        db.put(cf, &policy_key(prefix, i * 2), b"v", Duration::ZERO)
+            .unwrap();
+    }
+}
+
+/// Spin until `cond` holds, or fail. Background compaction is what produces a
+/// *non-bottom* output — `DB::compact`'s sweep always drains every level to the
+/// bottom, so it can never leave one behind to look at.
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn bloom_policy_round_trips_through_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    db.create_column_family(
+        "b",
+        ColumnFamilyConfig {
+            bloom_fpr_per_level: vec![0.001, 0.01, 0.05],
+            optimize_filters_for_hits: true,
+            ..ColumnFamilyConfig::default()
+        },
+    )
+    .unwrap();
+    db.create_column_family("d", ColumnFamilyConfig::default())
+        .unwrap();
+    db.close().unwrap();
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let tuned = db.column_family_config("b").unwrap();
+    assert_eq!(tuned.bloom_fpr_per_level, vec![0.001, 0.01, 0.05]);
+    assert!(tuned.optimize_filters_for_hits);
+    // A family that never touched the policy reopens at the defaults, which is
+    // also what a manifest written before this tail existed decodes to.
+    let plain = db.column_family_config("d").unwrap();
+    assert!(plain.bloom_fpr_per_level.is_empty());
+    assert!(!plain.optimize_filters_for_hits);
+    db.close().unwrap();
+}
+
+/// The FP rate a table actually delivers follows the level it was written
+/// into. The assertion is ordering plus order-of-magnitude: filters are sized
+/// per table from the keys it holds, and the double-hashing scheme runs a
+/// little worse than the closed-form rate, so an exact match would be a lie.
+#[test]
+fn per_level_bloom_fpr_is_applied_by_output_level() {
+    const N: u32 = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "t",
+            ColumnFamilyConfig {
+                // Strong filter for the small upper level, weak for everything
+                // below it.
+                bloom_fpr_per_level: vec![0.001, 0.05],
+                l1_file_count_trigger: 2,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    // Level 1: two flushes, then compacted down.
+    write_policy_keys(&db, &cf, 'b', 0..N / 2);
+    db.flush_memtable(&cf).unwrap();
+    write_policy_keys(&db, &cf, 'b', N / 2..N);
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+
+    // Level 0: a single flush, below the L0 trigger, so nothing compacts it.
+    write_policy_keys(&db, &cf, 'a', 0..N);
+    db.flush_memtable(&cf).unwrap();
+
+    // The two key spans are disjoint, so each probe has exactly one candidate
+    // table and the two rates are measured independently.
+    let (probes0, negatives0) = probe_absent(&db, &cf, 'a', N);
+    let (probes1, negatives1) = probe_absent(&db, &cf, 'b', N);
+    // One candidate per probe, less the single probe that sorts past the
+    // table's max key and is therefore not a candidate at all.
+    assert_eq!(probes0, u64::from(N) - 1, "one L0 candidate per probe");
+    assert_eq!(probes1, u64::from(N) - 1, "one L1 candidate per probe");
+
+    let fp0 = (probes0 - negatives0) as f64 / probes0 as f64;
+    let fp1 = (probes1 - negatives1) as f64 / probes1 as f64;
+    assert!(
+        fp1 > fp0 * 4.0,
+        "the weaker level-1 filter must admit materially more: L0={fp0}, L1={fp1}"
+    );
+    assert!(fp0 < 0.001 * 15.0, "L0 rate {fp0} is nowhere near 0.001");
+    assert!(
+        fp1 > 0.05 / 5.0 && fp1 < 0.05 * 5.0,
+        "L1 rate {fp1} is nowhere near 0.05"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn optimize_filters_for_hits_omits_only_compaction_bottom_output() {
+    const N: u32 = 5_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "h",
+            ColumnFamilyConfig {
+                optimize_filters_for_hits: true,
+                l1_file_count_trigger: 2,
+                // Small enough that the levels actually deepen below.
+                l1_base_bytes: 8 << 10,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    // A fresh family has one level, so L0 *is* bottom by the predicate — and a
+    // flushed table there still carries a filter, because flush passes
+    // `bottom = false` unconditionally.
+    write_policy_keys(&db, &cf, 'b', 0..N / 2);
+    db.flush_memtable(&cf).unwrap();
+    let (probes, negatives) = probe_absent(&db, &cf, 'b', N / 2);
+    assert_eq!(probes, u64::from(N / 2) - 1);
+    assert!(
+        negatives > 0,
+        "flush output must carry a filter even when L0 is the bottom level"
+    );
+
+    // Compaction output written into the bottom level carries none.
+    write_policy_keys(&db, &cf, 'b', N / 2..N);
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    let (probes, negatives) = probe_absent(&db, &cf, 'b', N);
+    assert!(probes > 0, "the bottom table must still be a candidate");
+    assert_eq!(
+        negatives, 0,
+        "bottom compaction output must carry no filter at all"
+    );
+
+    // The one-way degradation is a performance contract, never a correctness
+    // one: with deeper levels now in play, every key still reads back.
+    write_policy_keys(&db, &cf, 'c', 0..N);
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    assert!(
+        cf.stats().num_levels > 1,
+        "the family should have deepened past a single level"
+    );
+    for i in 0..N {
+        let key = policy_key('b', i * 2);
+        assert_eq!(db.get(&cf, &key).unwrap(), b"v", "b/{i} lost");
+    }
+    db.close().unwrap();
+}
+
+/// Re-filter on promotion: the filter decision is made from the output level
+/// and the bottom predicate, never inherited from the inputs.
+#[test]
+fn non_bottom_compaction_output_regains_a_filter() {
+    const N: u32 = 5_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "p",
+            ColumnFamilyConfig {
+                optimize_filters_for_hits: true,
+                l1_file_count_trigger: 2,
+                l1_base_bytes: 8 << 10,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    // Phase 1: let the background worker cascade everything past level 1, so
+    // the levels vector is deeper than the table that ends up bottom. Every
+    // output on the way down was written into a bottom target, so none has a
+    // filter.
+    write_policy_keys(&db, &cf, 'b', 0..N / 2);
+    db.flush_memtable(&cf).unwrap();
+    write_policy_keys(&db, &cf, 'b', N / 2..N);
+    db.flush_memtable(&cf).unwrap();
+    wait_until("the levels to deepen past level 1", || {
+        let stats = cf.stats();
+        stats.num_levels >= 3 && stats.levels[0].0 == 0 && !cf.is_compacting()
+    });
+    let (probes, negatives) = probe_absent(&db, &cf, 'b', 200);
+    assert!(probes > 0);
+    assert_eq!(negatives, 0, "the bottom table must be filterless");
+
+    // Phase 2: a small overlapping write, compacted by the BACKGROUND worker
+    // only. Its target is level 1 — not bottom, because the levels vector is
+    // already deeper — so the output is filtered again.
+    for i in 0..200u32 {
+        db.put(&cf, &policy_key('b', i * 20), b"w", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    for i in 200..400u32 {
+        db.put(&cf, &policy_key('b', i * 20), b"w", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    wait_until("background compaction to drain L0", || {
+        let stats = cf.stats();
+        stats.levels.first().map(|(n, _)| *n) == Some(0) && !cf.is_compacting()
+    });
+
+    let (probes, negatives) = probe_absent(&db, &cf, 'b', 200);
+    assert!(
+        probes >= 2,
+        "both the new and the bottom table are candidates"
+    );
+    assert!(
+        negatives > 0,
+        "output written into a non-bottom target must carry a filter"
+    );
+    // And nothing was lost on the way.
+    for i in 0..N {
+        let key = policy_key('b', i * 2);
+        assert!(db.get(&cf, &key).is_ok(), "b/{i} lost");
+    }
+    db.close().unwrap();
+}
+
+/// One level holding tables written under three different filter policies: a
+/// uniform `bloom_fpr`, a per-level vector, and none at all. Detach/attach is
+/// the only way to put tables written under one family's config into another's
+/// level — which is exactly the shape a config change leaves behind.
+#[test]
+fn mixed_filter_tables_in_one_level_read_correctly() {
+    fn rules(names: &[(&str, &str)]) -> Vec<PartitionRule> {
+        names
+            .iter()
+            .map(|(prefix, name)| PartitionRule {
+                prefix: prefix.as_bytes().to_vec(),
+                name: (*name).into(),
+            })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+
+    // Source families: one uniform, one on the per-level vector.
+    let uniform = db
+        .create_column_family(
+            "uniform",
+            ColumnFamilyConfig {
+                partition_rules: rules(&[("img/", "img")]),
+                l1_file_count_trigger: 1,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    let tiered = db
+        .create_column_family(
+            "tiered",
+            ColumnFamilyConfig {
+                bloom_fpr_per_level: vec![0.001, 0.05],
+                partition_rules: rules(&[("vec/", "vec")]),
+                l1_file_count_trigger: 1,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    // The destination: its own bottom output is filterless.
+    let mixed = db
+        .create_column_family(
+            "mixed",
+            ColumnFamilyConfig {
+                bloom_fpr_per_level: vec![0.001, 0.05],
+                optimize_filters_for_hits: true,
+                partition_rules: rules(&[("img/", "img"), ("log/", "log"), ("vec/", "vec")]),
+                l1_file_count_trigger: 1,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    for i in 0..200u32 {
+        db.put(
+            &uniform,
+            format!("img/{i:04}").as_bytes(),
+            b"IMG",
+            Duration::ZERO,
+        )
+        .unwrap();
+        db.put(
+            &tiered,
+            format!("vec/{i:04}").as_bytes(),
+            b"VEC",
+            Duration::ZERO,
+        )
+        .unwrap();
+        db.put(
+            &mixed,
+            format!("log/{i:04}").as_bytes(),
+            b"LOG",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    for cf in [&uniform, &tiered, &mixed] {
+        db.flush_memtable(cf).unwrap();
+        db.compact(cf).unwrap();
+    }
+
+    let img = db.detach_part(&uniform, "img").unwrap();
+    let vector = db.detach_part(&tiered, "vec").unwrap();
+    // Both spans are disjoint from `log/`, so both land in `mixed`'s bottom
+    // level beside its own filterless tables.
+    db.attach_part(&mixed, &img.dir).unwrap();
+    db.attach_part(&mixed, &vector.dir).unwrap();
+
+    // The three flavors really do share one level: the deepest level now holds
+    // `mixed`'s own filterless tables plus both attached parts.
+    let levels = mixed.stats().levels;
+    let (bottom_files, _) = *levels.last().unwrap();
+    assert!(
+        bottom_files >= 3,
+        "expected the attached parts beside the family's own bottom tables: {levels:?}"
+    );
+    // And they behave differently, as their writers intended: the attached
+    // uniform-FPR part rules keys out, the family's own bottom part cannot.
+    let probe = |prefix: &str| {
+        let scope = ondadb::perf::enter();
+        for i in 0..200u32 {
+            let key = format!("{prefix}/{i:04}x").into_bytes();
+            assert!(db.get(&mixed, &key).is_err());
+        }
+        let p = scope.finish();
+        (p.bloom_probes, p.bloom_negatives)
+    };
+    let (img_probes, img_negatives) = probe("img");
+    assert!(
+        img_probes > 0 && img_negatives > 0,
+        "attached part is filtered"
+    );
+    let (log_probes, log_negatives) = probe("log");
+    assert!(
+        log_probes > 0,
+        "the family's own bottom part is a candidate"
+    );
+    assert_eq!(
+        log_negatives, 0,
+        "the family's own bottom part is filterless"
+    );
+
+    let mut expected: Vec<Vec<u8>> = Vec::new();
+    for i in 0..200u32 {
+        for (prefix, value) in [("img", &b"IMG"[..]), ("log", b"LOG"), ("vec", b"VEC")] {
+            let key = format!("{prefix}/{i:04}").into_bytes();
+            assert_eq!(db.get(&mixed, &key).unwrap(), value, "{prefix}/{i} lost");
+            expected.push(key);
+        }
+    }
+    expected.sort();
+
+    // And the scan is complete: no filter, of any strength, may hide a key
+    // from an iterator.
+    let snapshot = db.begin();
+    let mut it = snapshot.new_iterator(&mixed);
+    it.seek_to_first();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    while it.valid() {
+        seen.push(it.key().to_vec());
+        it.next();
+    }
+    drop(it);
+    drop(snapshot);
+    assert_eq!(seen, expected, "the mixed level must scan completely");
     db.close().unwrap();
 }

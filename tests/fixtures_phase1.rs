@@ -123,7 +123,7 @@ fn klog_options(use_btree: bool, restarts: bool, bloom: bool) -> WriterOptions {
         compression_rules: Vec::new(),
         cmp: default_comparator(),
         enable_bloom: bloom,
-        bloom_fpr: 0.01,
+        bloom_fpr: Some(0.01),
         klog_value_threshold: 32,
         block_size: 256,
         expected_entries: 64,
