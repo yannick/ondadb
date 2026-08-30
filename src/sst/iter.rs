@@ -783,6 +783,11 @@ impl SstIterator {
     pub fn is_single_delete(&self) -> bool {
         self.cur.unwrap().single_delete()
     }
+    /// Record kind of the current entry; see [`crate::wal::Record::kind`].
+    #[inline]
+    pub fn kind(&self) -> u64 {
+        u64::from(self.cur.unwrap().kind)
+    }
 
     /// The current entry's value, reading from the vlog if necessary.
     pub fn value(&self) -> Result<Vec<u8>> {
@@ -904,7 +909,7 @@ mod tests {
         keys.sort();
         keys.dedup();
         for (i, k) in keys.iter().enumerate() {
-            w.add(k, b"v", (i + 1) as u64, 0, false, false).unwrap();
+            w.add(k, b"v", (i + 1) as u64, 0, crate::format::KIND_PUT).unwrap();
         }
         w.finish().unwrap();
 
@@ -947,8 +952,7 @@ mod tests {
             let mut w = Writer::new(path.to_str().unwrap(), opts(4, 512, is_delta)).unwrap();
             for i in 0..100u64 {
                 let k = format!("tenant/alpha/{i:04}");
-                w.add(k.as_bytes(), b"value", i + 1, 0, false, false)
-                    .unwrap();
+                w.add(k.as_bytes(), b"value", i + 1, 0, crate::format::KIND_PUT).unwrap();
             }
             w.finish().unwrap();
         }
@@ -982,7 +986,7 @@ mod tests {
         let mut w = Writer::new(klog, opts(4, 512, true)).unwrap();
         for i in 0..64u64 {
             let k = format!("tenant/alpha/{i:04}");
-            w.add(k.as_bytes(), b"the-inline-value", i + 1, 0, false, false)
+            w.add(k.as_bytes(), b"the-inline-value", i + 1, 0, crate::format::KIND_PUT)
                 .unwrap();
         }
         w.finish().unwrap();

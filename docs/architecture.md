@@ -10,7 +10,7 @@ type/function names — grep for them; line numbers rot.
 | Module | Role |
 |---|---|
 | `db.rs` | `DB`/`DbInner`: CF registry, global sequence + publish machinery, snapshot refcounts, background flush/compaction workers, recovery, manifest persistence, deferred SST deletion, `LOCK` file, fail-stop poisoning |
-| `column_family.rs` | `ColumnFamily`: per-CF memtable + WAL + LSM levels; commit application, memtable rotation, flush to L0, point reads, iterator construction |
+| `column_family.rs` | `ColumnFamily`: per-CF memtable + WAL + LSM levels; commit application, memtable rotation, flush to L0, point reads (incl. merge-chain folding), iterator construction |
 | `txn.rs` | `Txn`: arena-buffered writes, five isolation levels, conflict detection, savepoints; also the `DB::put/get/delete` single-op helpers |
 | `memtable.rs` | Sharded (16) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath); the per-memtable `RangeTombstoneSet` |
 | `range_tombstone.rs` | Range deletes (1.2): the live `RangeTombstoneSet` beside the point shards, the durable `Fragment` form, the aux-section codec, and the `RangeMask` cursors the read paths apply |
@@ -20,9 +20,9 @@ type/function names — grep for them; line numbers rot.
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
 | `table_cache.rs` | `TableCache`: sharded (CLOCK) LRU of open SSTable readers, bounding resident index+bloom memory by reader count (`max_open_readers`) and byte budget (`max_open_reader_bytes`); the `max_open_files` equivalent |
-| `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse and pinned-block borrowed keys/values |
+| `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse, pinned-block borrowed keys/values and the merge-operand arena (1.1) |
 | `tailing.rs` | `TailingIterator`: forward-only keyspace tail that refreshes past its own end (not a change feed) |
-| `compaction.rs` | Leveled compaction: pick level, k-way merge, version collapse, tombstone/TTL GC, compaction filters; bottom-level output cut at partition boundaries; FIFO style (oldest-table eviction) |
+| `compaction.rs` | Leveled compaction: pick level, k-way merge, kind-aware version collapse, tombstone/TTL GC, merge-operand folding (1.1), compaction filters; bottom-level output cut at partition boundaries; FIFO style (oldest-table eviction) |
 | `ingest.rs` | Bulk ingestion: pre-sorted stream → L0 SSTables directly (no WAL/memtable); atomic install at `finish()` |
 | `manifest.rs` | Durable catalog (`MANIFEST`): next file id, global seq, per-CF config blob + SST set (incl. per-table partition/tier/max-entry-time via the append-tolerant tail); crash-atomic save |
 | `manifest_edit.rs` | Numbered catalog edits (2.2): `VersionEdit`/`Op` codec, all-or-nothing `apply_edit` with per-op preconditions, the `MANIFEST-EDITS` log writer, the four-step snapshot-compaction protocol and `recover_catalog` |
@@ -67,6 +67,11 @@ in the database directory; only bottom-level parts may live on a named tier
    per-op allocations at the API boundary.
 2. Dedup: last write per (cf, key) wins, sequenced in first-write order
    (`slot_of` map hashing key slices with xxh3; single-write txns skip it).
+   A transaction holding a **merge operand** (1.1) takes the merge-aware
+   variant instead: operands compose rather than replace, so a key commits the
+   run of writes starting at its last *base* — identical to the collapsed order
+   whenever that run has length one, which is every key of every merge-free
+   transaction.
 3. A commit holding a range delete first rejects any of its **own** point
    writes that fall inside one of its own spans (v1 restriction — see
    `Txn::check_own_range_overlap`), then reserves span-index capacity **with no
@@ -90,10 +95,14 @@ in the database directory; only bottom-level parts may live on a named tier
    - gate: wait while rotating or imm-queue ≥ `l0_queue_stall_threshold`;
      increment `active_writers`
    - `Wal::append_batch(&recs)` — encodes ONE frame in this thread, writes it
-     to this thread's WAL stripe (see `docs/formats.md`). A batch holding a
-     range delete instead writes one **envelope** frame carrying both kinds
-     (`append_batch_envelope`); one frame either way, because batch atomicity
-     is per frame
+     to this thread's WAL stripe (see `docs/formats.md`). A batch that carries
+     anything the legacy record cannot spell — a 1.1 merge operand, whose kind
+     has no flags-byte encoding, or a 1.2 range delete — instead writes one
+     **envelope** frame carrying every kind together (`append_batch_envelope`,
+     or `append_batch_enveloped` for a point-only batch). One frame either way,
+     because batch atomicity is per frame. The test is on the batch, not the
+     family, so every ordinary commit keeps its 0.8.2 frame bytes, including on
+     a family that merely *has* a merge operator
    - `Memtable::put_batch(&recs)` — counting-sorts into per-shard runs, one
      shard lock per batch, nodes prebuilt outside locks, counters updated once
    - `Memtable::add_range` per range delete, into the `RangeTombstoneSet`
@@ -136,6 +145,43 @@ Iterators apply the same rule per surfaced group, through a monotonic cursor per
 source that walks with the scan in either direction. SSTable get: bloom filter →
 `find_block` binary search on the in-memory index → linear entry scan inside
 the data block → inline value or vlog read (CRC-verified).
+
+### Merge operands (1.1)
+
+A column family with a merge operator takes a parallel resolution path, entered
+by a single `Option::is_none()` at the top of `get` — the no-operator family
+runs exactly the code it ran before 1.1.
+
+`get_with_merge` asks each source for a *chain* rather than a winner:
+`Memtable::chain` / `UnifiedStore::chain` walk a key's versions newest-first,
+and `collect_table_chain` drives an `SstIterator` seeked to `(key, read_seq)`
+(the iterator, not the point-read block walk, because a key's versions are
+contiguous in internal order but may straddle a block boundary). Each source
+contributes its own run — every operand it holds plus the base that terminates
+them — and `fold_chain` orders the runs by sequence, collects operands down to
+the first base, and calls `full_merge` with them oldest-first. `multi_get` keeps
+its single snapshot and single clock reading but resolves each key's chain
+separately, so it does not dedupe blocks across a merge batch.
+
+In the merge iterator, `resolve_current_group` accumulates operands into a
+**per-iterator arena** (`operands: Vec<u8>` plus `operand_spans`), entered
+lazily on the first kind-4 entry of a group and `clear()`ed rather than shrunk,
+so steady-state scanning allocates nothing after warm-up. Copying is what
+invariant 8 leaves available: operands of one group can come from several
+children and several blocks, so they cannot all be pinned, and per-entry `Arc`
+clones of shared mmaps are the measured 3x scan regression. The folded value is
+published as `CurVal::Buffered`; no pin slot changes hands. Forward iteration
+sees the group newest-first and reverses the operands before folding; backward
+sees it oldest-first, and each base clears the operands it superseded.
+
+A transaction's own buffered operands are resolved against the buffer first
+(`Txn::buffered_chain`), and only a chain with no buffered base reaches the
+store — which is then a genuine read and is recorded in the read set. The
+overlay memtable a scan builds **pre-folds** merged keys: every buffered write
+lands at the same sequence, which is what makes last-write-wins work for puts,
+and operands cannot share a sequence that way because they compose. Pre-folding
+costs one point read per merged key and keeps the merge iterator free of any
+overlay special case.
 
 **The block cache holds two key domains.** A `Reader` owns two files under one
 `file_id` — the klog and the vlog — and their offset spaces are independent and
@@ -360,6 +406,28 @@ fsynced → new levels installed → inputs deleted via `DbInner::remove_sst_fil
 § Paced obsolete-file deletion). Input deletion resolves **default-tier paths only** — a
 compacted input that lived on a named tier is not unlinked there (a storage
 leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
+
+### Merge-operand retention and folding (1.1)
+
+`VersionRetention::decide` takes the record **kind**, because the "keep exactly
+one version at or below `oldest_snapshot`" rule is correct only for point
+kinds — each of which replaces everything older. A merge operand composes, so:
+it neither consumes that slot nor sets `emitted_at_or_below_snapshot` (only the
+base terminating the chain does); a bottom-level tombstone that terminates a
+chain whose operands are still live is not reclaimed; the bottom TTL drop never
+applies to an operand; and an operand is not bloom-filter-eligible. Everything
+*older* than a chain's base is still dropped exactly as before — the drop that
+follows from the flag applies to every kind.
+
+On top of that, `run_span` may **fold**: it collects a key's operand suffix
+(`PendingFold`) and, on reaching the base, writes one kind-1 entry carrying the
+suffix's newest sequence. Folding is a space-and-read optimization and never a
+correctness or durability requirement; it is fenced by `oldest_snapshot` (only
+a suffix wholly at or below it folds), by the bottom predicate (a suffix that
+met no base folds only where there is nothing below), by a live TTL on the base,
+and by `Options::enable_merge_folding` — a rollout switch, because a fold bug
+silently rewrites history. `tests/merge.rs::fold_oracle` is the guard: pre- and
+post-compaction reads must be identical at every snapshot.
 
 ### Delete-only excise (1.2)
 

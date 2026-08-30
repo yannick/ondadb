@@ -126,6 +126,12 @@ pub const CAP_TXN_DECISIONS: u64 = 1 << 6;
 /// [`CAP_EXTENDED_RECORDS`] is the permission for that envelope.
 pub const CAPS_PREFIX_DELTA_WRITE: u64 = CAP_EXTENDED_RECORDS | CAP_PREFIX_DELTA;
 
+/// Capabilities a writer must hold before it may emit a merge operand (1.1).
+/// Both, for the same reason [`CAPS_PREFIX_DELTA_WRITE`] needs both: a
+/// [`KIND_MERGE`] record exists only inside the kind-bearing envelope, and
+/// [`CAP_EXTENDED_RECORDS`] is the permission for that envelope.
+pub const CAPS_MERGE_WRITE: u64 = CAP_EXTENDED_RECORDS | CAP_MERGE_OPERANDS;
+
 /// Mask of every capability bit this roadmap has assigned (`0x7F`).
 pub const KNOWN_CAPS: u64 = CAP_EXTENDED_RECORDS
     | CAP_MERGE_OPERANDS
@@ -156,9 +162,9 @@ pub const KIND_PUT: u64 = 1;
 pub const KIND_DELETE: u64 = 2;
 /// Single-delete tombstone.
 pub const KIND_SINGLE_DELETE: u64 = 3;
-/// Merge operand (1.1); assigned, not yet implemented.
+/// Merge operand (1.1).
 pub const KIND_MERGE: u64 = 4;
-/// Range delete (1.2); assigned, not yet implemented.
+/// Range delete (1.2).
 pub const KIND_RANGE_DELETE: u64 = 5;
 // 6..15   reserved for future data kinds
 // 16..31  transaction control (3.2)
@@ -196,7 +202,7 @@ pub fn check_kind(kind: u64) -> crate::error::Result<()> {
         )));
     }
     match kind {
-        KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE | KIND_RANGE_DELETE => Ok(()),
+        KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE | KIND_MERGE | KIND_RANGE_DELETE => Ok(()),
         _ => Err(crate::error::OndaError::UnsupportedFormat(format!(
             "record kind {kind} is not implemented by this binary"
         ))),
@@ -232,6 +238,18 @@ pub fn check_modifiers(mods: u64) -> crate::error::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether `kind` names a *point* record — one that replaces every older
+/// version of its key, rather than composing with them.
+///
+/// [`KIND_MERGE`] is the first kind that is not a point: it is an operand that
+/// only becomes a value once folded against everything below it, which is why
+/// compaction retention, the iterator's group resolution and the point-read
+/// candidate all have to ask this question rather than reading `tombstone`.
+#[inline]
+pub fn is_point_kind(kind: u64) -> bool {
+    matches!(kind, KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE)
 }
 
 /// The kind naming a point record's `(tombstone, single_delete)` pair.
@@ -315,6 +333,11 @@ mod tests {
         assert_eq!(point_kind(false, false), KIND_PUT);
         assert_eq!(point_kind(true, false), KIND_DELETE);
         assert_eq!(point_kind(true, true), KIND_SINGLE_DELETE);
+        assert!(is_point_kind(KIND_PUT));
+        assert!(is_point_kind(KIND_DELETE));
+        assert!(is_point_kind(KIND_SINGLE_DELETE));
+        assert!(!is_point_kind(KIND_MERGE));
+        assert_eq!(CAPS_MERGE_WRITE, CAP_EXTENDED_RECORDS | CAP_MERGE_OPERANDS);
     }
 
     /// An assigned-but-unimplemented kind names a real feature (`UnsupportedFormat`);
@@ -322,10 +345,16 @@ mod tests {
     /// (`Corruption`).
     #[test]
     fn kind_check_splits_unsupported_from_corruption() {
-        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE, KIND_RANGE_DELETE] {
+        for k in [
+            KIND_PUT,
+            KIND_DELETE,
+            KIND_SINGLE_DELETE,
+            KIND_MERGE,
+            KIND_RANGE_DELETE,
+        ] {
             assert!(check_kind(k).is_ok());
         }
-        for k in [0, KIND_MERGE, 16, 63] {
+        for k in [0, 6, 16, 63] {
             assert_eq!(check_kind(k).unwrap_err().kind(), "unsupported_format");
         }
         for k in [64u64, 1000] {
@@ -337,16 +366,14 @@ mod tests {
     /// a data-block point entry naming it is corruption, not a newer format.
     #[test]
     fn range_delete_kind_is_refused_in_the_point_stream() {
-        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE] {
+        // 1.1's merge operand is not a *point* kind, but it is still a
+        // one-key data-block entry: only the two-key fragment is refused here.
+        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE, KIND_MERGE] {
             assert!(check_point_kind(k).is_ok());
         }
         assert_eq!(
             check_point_kind(KIND_RANGE_DELETE).unwrap_err().kind(),
             "corruption"
-        );
-        assert_eq!(
-            check_point_kind(KIND_MERGE).unwrap_err().kind(),
-            "unsupported_format"
         );
     }
 

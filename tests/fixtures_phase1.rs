@@ -92,14 +92,13 @@ fn wal_all_flags_records() -> Vec<Record> {
         Record {
             key: b"del".to_vec(),
             seq: 3,
-            tombstone: true,
+            kind: ondadb::format::KIND_DELETE,
             ..Default::default()
         },
         Record {
             key: b"sdel".to_vec(),
             seq: 4,
-            tombstone: true,
-            single_delete: true,
+            kind: ondadb::format::KIND_SINGLE_DELETE,
             ..Default::default()
         },
     ]
@@ -201,7 +200,8 @@ fn klog_entries() -> Vec<(String, Vec<u8>, u64, i64, bool, bool)> {
 fn write_klog(path: &Path, opts: WriterOptions) {
     let mut w = Writer::new(path.to_str().unwrap(), opts).unwrap();
     for (k, v, seq, ttl, tomb, sdel) in klog_entries() {
-        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+        w.add(k.as_bytes(), &v, seq, ttl, ondadb::format::point_kind(tomb, sdel))
+            .unwrap();
     }
     w.finish().unwrap();
 }
@@ -431,7 +431,7 @@ fn envelope_schema2_records() -> Vec<Record> {
         Record {
             key: with_prefix(b"gone"),
             seq: 8,
-            tombstone: true,
+            kind: ondadb::format::KIND_DELETE,
             ..Default::default()
         },
     ]
@@ -531,8 +531,7 @@ fn legacy_corpus_decodes_unchanged() {
         assert_eq!(got.value, want.value);
         assert_eq!(got.seq, want.seq);
         assert_eq!(got.ttl, want.ttl);
-        assert_eq!(got.tombstone, want.tombstone);
-        assert_eq!(got.single_delete, want.single_delete);
+        assert_eq!(got.kind, want.kind);
     }
 
     // --- klogs: entry flags, both index shapes, with and without restarts ---
@@ -610,8 +609,7 @@ fn phase1b_corpus_decodes_unchanged() {
             assert_eq!(g.value, w.value, "{name}");
             assert_eq!(g.seq, w.seq, "{name}");
             assert_eq!(g.ttl, w.ttl, "{name}");
-            assert_eq!(g.tombstone, w.tombstone, "{name}");
-            assert_eq!(g.single_delete, w.single_delete, "{name}");
+            assert_eq!(g.kind, w.kind, "{name}");
         }
     }
     // Schema 2 keeps the CF-id prefix inside the key; replay hands it back whole.

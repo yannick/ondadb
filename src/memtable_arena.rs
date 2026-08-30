@@ -56,12 +56,15 @@ struct Node {
     klen: u32,
     ttl: i64,
     flags: u8,
+    /// Record kind, narrowed to a byte (see `memtable::Val::kind`); it lands in
+    /// the padding beside `flags`, so it costs no node bytes.
+    kind: u8,
     next: [AtomicPtr<Node>; MAX_HEIGHT],
 }
 
 impl Node {
     /// Build a node, packing key, sequence trailer and value into one buffer.
-    fn new(user_key: &[u8], value: &[u8], seq: u64, ttl: i64, flags: u8) -> Node {
+    fn new(user_key: &[u8], value: &[u8], seq: u64, ttl: i64, flags: u8, kind: u8) -> Node {
         let mut data = Vec::with_capacity(user_key.len() + format::TRAILER_SIZE + value.len());
         format::append_internal_key(&mut data, user_key, seq);
         data.extend_from_slice(value);
@@ -72,6 +75,7 @@ impl Node {
             klen: user_key.len() as u32,
             ttl,
             flags,
+            kind,
             next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
         }
     }
@@ -159,7 +163,7 @@ unsafe impl Sync for ArenaShard {}
 
 impl ArenaShard {
     pub(crate) fn new(cmp: ComparatorRef) -> ArenaShard {
-        let head = Box::new(Node::new(&[], &[], u64::MAX, 0, 0));
+        let head = Box::new(Node::new(&[], &[], u64::MAX, 0, 0, format::KIND_PUT as u8));
         let bytewise = cmp.is_bytewise();
         ArenaShard {
             head,
@@ -206,10 +210,10 @@ impl ArenaShard {
         key_ord.then_with(|| seq.cmp(&node.nseq))
     }
 
-    pub(crate) fn put(&self, user_key: &[u8], value: &[u8], seq: u64, ttl: i64, fl: u8) {
+    pub(crate) fn put(&self, user_key: &[u8], value: &[u8], seq: u64, ttl: i64, fl: u8, kind: u8) {
         // Build the node (allocation + copies) before taking the writer lock so
         // the critical section is just the traversal and pointer swings.
-        let node = Node::new(user_key, value, seq, ttl, fl);
+        let node = Node::new(user_key, value, seq, ttl, fl, kind);
         let mut arena = self.arena.lock();
         self.insert_node(&mut arena, node);
     }
@@ -222,8 +226,8 @@ impl ArenaShard {
             .iter()
             .map(|&i| {
                 let r = &recs[i as usize];
-                let fl = crate::memtable::flag_bits(r.tombstone, r.single_delete, r.ttl);
-                Node::new(r.key, r.value, r.seq, r.ttl, fl)
+                let fl = crate::memtable::flag_bits_for_kind(r.kind, r.ttl);
+                Node::new(r.key, r.value, r.seq, r.ttl, fl, r.kind as u8)
             })
             .collect();
         let mut arena = self.arena.lock();
@@ -379,6 +383,7 @@ impl ArenaShard {
                 seq,
                 found: true,
                 deleted: true,
+                kind: u64::from(node.kind),
                 ..Default::default()
             };
         }
@@ -387,6 +392,7 @@ impl ArenaShard {
                 seq,
                 found: true,
                 deleted: true,
+                kind: u64::from(node.kind),
                 ..Default::default()
             };
         }
@@ -395,6 +401,35 @@ impl ArenaShard {
             seq,
             found: true,
             deleted: false,
+            kind: u64::from(node.kind),
+        }
+    }
+
+    /// Walk every version of `user_key` visible at `read_seq`, newest first.
+    /// See [`crate::memtable::Memtable::chain`].
+    pub(crate) fn chain(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        mut f: impl FnMut(u64, u64, Option<&[u8]>) -> bool,
+    ) {
+        // Through the safe cursor rather than raw `next[0]` hops: the walk is
+        // not on any hot path (a family with no merge operator never reaches
+        // it), so it has no reason to add a new pointer dereference to this
+        // module's `unsafe` surface.
+        let mut cursor = self.cursor_ge(user_key, read_seq);
+        while cursor.valid() {
+            if self.cmp.compare(cursor.user_key(), user_key) != Ordering::Equal {
+                return;
+            }
+            let (ttl, dead) = (cursor.ttl(), cursor.tombstone());
+            let dead = dead || (ttl != 0 && ttl <= now);
+            let value = if dead { None } else { Some(cursor.value()) };
+            if !f(cursor.seq(), cursor.kind(), value) {
+                return;
+            }
+            cursor.advance();
         }
     }
 
@@ -408,8 +443,7 @@ impl ArenaShard {
                 value: node.value().to_vec(),
                 seq: node.seq(),
                 ttl: node.ttl,
-                tombstone: node.flags & flags::TOMBSTONE != 0,
-                single_delete: node.flags & flags::SINGLE_DELETE != 0,
+                kind: u64::from(node.kind),
             });
             x = unsafe { (*x).next[0].load(AtOrd::Acquire) };
         }
@@ -516,9 +550,10 @@ impl<'a> ShardCursor<'a> {
     pub(crate) fn tombstone(&self) -> bool {
         self.node().flags & flags::TOMBSTONE != 0
     }
+    /// Record kind of the current entry; see [`crate::wal::Record::kind`].
     #[inline]
-    pub(crate) fn single_delete(&self) -> bool {
-        self.node().flags & flags::SINGLE_DELETE != 0
+    pub(crate) fn kind(&self) -> u64 {
+        u64::from(self.node().kind)
     }
 }
 

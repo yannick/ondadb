@@ -101,7 +101,8 @@ fn variants() -> [(&'static str, WriterOptions); 3] {
 fn write_klog(path: &Path, opts: WriterOptions) {
     let mut w = Writer::new(path.to_str().unwrap(), opts).unwrap();
     for (k, v, seq, ttl, tomb, sdel) in entries() {
-        w.add(&k, &v, seq, ttl, tomb, sdel).unwrap();
+        w.add(&k, &v, seq, ttl, ondadb::format::point_kind(tomb, sdel))
+            .unwrap();
     }
     w.finish().unwrap();
 }

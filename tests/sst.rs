@@ -39,7 +39,7 @@ fn build_sst(
     let mut keys = Vec::with_capacity(n);
     for i in 0..n {
         let k = format!("key{i:06}");
-        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
         keys.push(k);
     }
@@ -64,13 +64,13 @@ fn get_present_absent() {
         let dir = tempfile::tempdir().unwrap();
         let (r, keys) = build_sst(dir.path(), alg, 500, 50);
         for k in &keys {
-            let (v, _seq, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            let (v, _seq, found, deleted, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
             assert!(found && !deleted, "alg {alg:?} get {k}");
             assert_eq!(v.unwrap().len(), 50);
         }
-        let (_, _, found, _) = r.get(b"key999999", u64::MAX, 0).unwrap();
+        let (_, _, found, ..) = r.get(b"key999999", u64::MAX, 0).unwrap();
         assert!(!found, "alg {alg:?}: unexpected find of absent key");
-        let (_, _, found, _) = r.get(b"aaa", u64::MAX, 0).unwrap();
+        let (_, _, found, ..) = r.get(b"aaa", u64::MAX, 0).unwrap();
         assert!(!found, "alg {alg:?}: unexpected find of key before min");
     }
 }
@@ -82,8 +82,8 @@ fn large_value_vlog() {
     let klog = klog.to_str().unwrap();
     let mut w = Writer::new(klog, opts(Compression::None, 10, 64, 1024)).unwrap();
     let big = vec![b'X'; 4096];
-    w.add(b"a", b"tiny", 1, 0, false, false).unwrap();
-    w.add(b"b", &big, 2, 0, false, false).unwrap();
+    w.add(b"a", b"tiny", 1, 0, ondadb::format::KIND_PUT).unwrap();
+    w.add(b"b", &big, 2, 0, ondadb::format::KIND_PUT).unwrap();
     let meta = w.finish().unwrap();
     assert!(meta.vlog_size > 0, "expected vlog for large value");
 
@@ -98,9 +98,9 @@ fn large_value_vlog() {
         0,
     )
     .unwrap();
-    let (v, _, found, _) = r.get(b"b", u64::MAX, 0).unwrap();
+    let (v, _, found, ..) = r.get(b"b", u64::MAX, 0).unwrap();
     assert!(found && v.as_deref() == Some(big.as_slice()));
-    let (v, _, found, _) = r.get(b"a", u64::MAX, 0).unwrap();
+    let (v, _, found, ..) = r.get(b"a", u64::MAX, 0).unwrap();
     assert!(found && v.as_deref() == Some(b"tiny".as_slice()));
 }
 
@@ -113,7 +113,7 @@ fn corrupt_vlog_value_is_detected() {
     let klog = klog.to_str().unwrap();
     let mut w = Writer::new(klog, opts(Compression::None, 4, 64, 1024)).unwrap();
     let big = vec![b'Z'; 4096];
-    w.add(b"a", &big, 1, 0, false, false).unwrap();
+    w.add(b"a", &big, 1, 0, ondadb::format::KIND_PUT).unwrap();
     w.finish().unwrap();
 
     // Flip a byte in the vlog value region (past the 4-byte CRC prefix).
@@ -153,8 +153,8 @@ fn corrupt_vlog_value_is_detected_on_every_read() {
     let mut w = Writer::new(klog, opts(Compression::None, 4, 64, 1024)).unwrap();
     let good = vec![b'G'; 8192];
     let bad = vec![b'B'; 8192];
-    w.add(b"good", &good, 1, 0, false, false).unwrap();
-    w.add(b"zbad", &bad, 2, 0, false, false).unwrap();
+    w.add(b"good", &good, 1, 0, ondadb::format::KIND_PUT).unwrap();
+    w.add(b"zbad", &bad, 2, 0, ondadb::format::KIND_PUT).unwrap();
     w.finish().unwrap();
 
     // Corrupt only the second frame; the first must stay readable.
@@ -180,7 +180,7 @@ fn corrupt_vlog_value_is_detected_on_every_read() {
             res.is_err(),
             "read {i} of a corrupt frame succeeded: {res:?}"
         );
-        let (v, _, found, _) = r.get(b"good", u64::MAX, 0).unwrap();
+        let (v, _, found, ..) = r.get(b"good", u64::MAX, 0).unwrap();
         assert!(found && v.as_deref() == Some(good.as_slice()), "read {i}");
     }
 
@@ -194,7 +194,7 @@ fn corrupt_vlog_value_is_detected_on_every_read() {
         hs.push(std::thread::spawn(move || {
             for _ in 0..200 {
                 assert!(r.get(b"zbad", u64::MAX, 0).is_err());
-                let (v, _, found, _) = r.get(b"good", u64::MAX, 0).unwrap();
+                let (v, _, found, ..) = r.get(b"good", u64::MAX, 0).unwrap();
                 assert!(found && v.as_deref() == Some(good.as_slice()));
             }
         }));
@@ -223,8 +223,7 @@ fn vlog_values_stable_across_repeat_reads() {
                 v,
                 (i + 1) as u64,
                 0,
-                false,
-                false,
+                ondadb::format::KIND_PUT,
             )
             .unwrap();
         }
@@ -240,7 +239,7 @@ fn vlog_values_stable_across_repeat_reads() {
         .unwrap();
         for round in 0..4 {
             for (i, want) in vals.iter().enumerate() {
-                let (v, _, found, _) = r.get(format!("k{i}").as_bytes(), u64::MAX, 0).unwrap();
+                let (v, _, found, ..) = r.get(format!("k{i}").as_bytes(), u64::MAX, 0).unwrap();
                 assert!(found, "{alg:?} round {round} key k{i} missing");
                 assert_eq!(v.as_ref(), Some(want), "{alg:?} round {round} key k{i}");
             }
@@ -255,8 +254,8 @@ fn tombstone_and_mvcc() {
     let klog = klog.to_str().unwrap();
     let mut w = Writer::new(klog, opts(Compression::None, 10, 512, 4096)).unwrap();
     // Two versions of "k": newer tombstone (seq 5), older value (seq 3).
-    w.add(b"k", b"", 5, 0, true, false).unwrap();
-    w.add(b"k", b"old", 3, 0, false, false).unwrap();
+    w.add(b"k", b"", 5, 0, ondadb::format::KIND_DELETE).unwrap();
+    w.add(b"k", b"old", 3, 0, ondadb::format::KIND_PUT).unwrap();
     w.finish().unwrap();
 
     let fc = Arc::new(FileCache::new(16));
@@ -271,9 +270,9 @@ fn tombstone_and_mvcc() {
     )
     .unwrap();
 
-    let (_, _, found, deleted) = r.get(b"k", 100, 0).unwrap();
+    let (_, _, found, deleted, ..) = r.get(b"k", 100, 0).unwrap();
     assert!(found && deleted, "latest version should be tombstone");
-    let (v, _, found, deleted) = r.get(b"k", 4, 0).unwrap();
+    let (v, _, found, deleted, ..) = r.get(b"k", 4, 0).unwrap();
     assert!(found && !deleted && v.as_deref() == Some(b"old".as_slice()));
 }
 
@@ -334,7 +333,7 @@ fn btree_hybrid_klog_round_trip() {
     let mut keys = Vec::with_capacity(n);
     for i in 0..n {
         let k = format!("key{i:08}");
-        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
         keys.push(k);
     }
@@ -355,7 +354,7 @@ fn btree_hybrid_klog_round_trip() {
 
     // Point reads (exercises find_block over the reconstructed index).
     for k in keys.iter().step_by(97) {
-        let (v, _, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (v, _, found, deleted, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found && !deleted, "btree get {k}");
         assert_eq!(v.unwrap().len(), 40);
     }
@@ -409,7 +408,7 @@ fn vlog_compression_roundtrip_and_shrinks() {
         let mut w = Writer::new(klog, opts(alg, n, 512, 4096)).unwrap();
         for i in 0..n {
             let k = format!("key{i:06}");
-            w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+            w.add(k.as_bytes(), &val, (i + 1) as u64, 0, ondadb::format::KIND_PUT)
                 .unwrap();
         }
         w.finish().unwrap();
@@ -428,7 +427,7 @@ fn vlog_compression_roundtrip_and_shrinks() {
         .unwrap();
         for i in 0..n {
             let k = format!("key{i:06}");
-            let (v, _seq, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            let (v, _seq, found, deleted, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
             assert!(found && !deleted, "alg {alg:?} get {k}");
             assert_eq!(v.unwrap(), val, "alg {alg:?} value mismatch for {k}");
         }
@@ -477,7 +476,7 @@ fn vlog_incompressible_stored_raw() {
     let mut w = Writer::new(klog, opts(Compression::Lz4, n, 512, 4096)).unwrap();
     for i in 0..n {
         let k = format!("key{i:06}");
-        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
     }
     w.finish().unwrap();
@@ -494,7 +493,7 @@ fn vlog_incompressible_stored_raw() {
     .unwrap();
     for i in 0..n {
         let k = format!("key{i:06}");
-        let (v, _s, found, _d) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (v, _s, found, _d, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found);
         assert_eq!(v.unwrap(), val);
     }
@@ -534,7 +533,7 @@ fn per_prefix_compression_rules() {
     }
     keys.sort();
     for (i, k) in keys.iter().enumerate() {
-        w.add(k.as_bytes(), &compressible, (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), &compressible, (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
     }
     w.finish().unwrap();
@@ -557,7 +556,7 @@ fn per_prefix_compression_rules() {
     )
     .unwrap();
     for k in &keys {
-        let (v, _s, found, _d) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (v, _s, found, _d, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found, "missing {k}");
         assert_eq!(v.unwrap(), compressible, "value mismatch for {k}");
     }
@@ -678,7 +677,7 @@ fn build_vlog_table_with(
     // Threshold 64 separates every value used here; 1 KiB blocks.
     let mut w = Writer::new(&klog, opts(alg, entries.len(), 64, 1024)).unwrap();
     for (i, (k, v)) in entries.iter().enumerate() {
-        w.add(k, v, (i + 1) as u64, 0, false, false).unwrap();
+        w.add(k, v, (i + 1) as u64, 0, ondadb::format::KIND_PUT).unwrap();
     }
     let meta = w.finish().unwrap();
     assert!(meta.vlog_size > 0, "expected a vlog for {name}");
@@ -705,12 +704,12 @@ fn klog_block_and_vlog_frame_at_same_offset_do_not_alias() {
         let r = open_reader(&klog, bc, 7, 1 << 20);
 
         let read_value = || {
-            let (v, _, found, _) = r.get(b"b", u64::MAX, 0).unwrap();
+            let (v, _, found, ..) = r.get(b"b", u64::MAX, 0).unwrap();
             assert!(found, "separated value missing");
             assert_eq!(v.as_deref(), Some(big.as_slice()), "vlog frame aliased");
         };
         let read_block = || {
-            let (v, _, found, _) = r.get(b"a", u64::MAX, 0).unwrap();
+            let (v, _, found, ..) = r.get(b"a", u64::MAX, 0).unwrap();
             assert!(found, "inline value missing");
             assert_eq!(v.as_deref(), Some(b"tiny".as_slice()), "data block aliased");
         };
@@ -742,14 +741,14 @@ fn hot_vlog_frame_is_served_from_cache() {
         let r = open_reader(&klog, bc, 11, 1 << 20);
 
         let cold = ondadb::perf::enter();
-        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
         let cold = cold.finish();
         assert!(found && v.as_deref() == Some(big.as_slice()));
         assert_eq!(cold.vlog_reads, 1, "{alg:?} cold read");
         assert_eq!(cold.vlog_cache_hits, 0, "{alg:?} cold read");
 
         let warm = ondadb::perf::enter();
-        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
         let warm = warm.finish();
         assert!(found && v.as_deref() == Some(big.as_slice()));
         assert_eq!(warm.vlog_reads, 0, "{alg:?}: warm read touched the vlog");
@@ -774,7 +773,7 @@ fn vlog_admission_respects_limit() {
         let r = open_reader(&klog, bc.clone(), 21, LIMIT);
 
         let before = bc.stats().vlog_entries;
-        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
         assert!(found && v.as_deref() == Some(val.as_slice()));
         let added = bc.stats().vlog_entries - before;
         assert_eq!(
@@ -792,7 +791,7 @@ fn vlog_admission_respects_limit() {
     let r = open_reader(&klog, bc.clone(), 22, 0);
     let before = bc.stats().vlog_entries;
     for _ in 0..3 {
-        let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+        let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
         assert!(found && v.as_deref() == Some(val.as_slice()));
     }
     assert_eq!(
@@ -844,7 +843,7 @@ fn corrupt_vlog_frame_is_not_admitted() {
     let bc = Arc::new(BlockCache::new(1 << 20));
     let r = open_reader(&klog, bc.clone(), 32, 1 << 20);
     let before = bc.stats().vlog_entries;
-    let (v, _, found, _) = r.get(b"a", u64::MAX, 0).unwrap();
+    let (v, _, found, ..) = r.get(b"a", u64::MAX, 0).unwrap();
     assert!(found && v.as_deref() == Some(big.as_slice()));
     assert_eq!(
         bc.stats().vlog_entries,
@@ -872,7 +871,7 @@ fn concurrent_vlog_misses_both_return_correct_bytes() {
         let (r, start, big) = (r.clone(), start.clone(), big.clone());
         hs.push(std::thread::spawn(move || {
             start.wait();
-            let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+            let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
             assert!(found && v.as_deref() == Some(big.as_slice()));
         }));
     }
@@ -921,14 +920,14 @@ fn legacy_v1_vlog_frames_are_cached() {
     let before = bc.stats().vlog_entries;
 
     let cold = ondadb::perf::enter();
-    let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+    let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
     let cold = cold.finish();
     assert!(found && v.as_deref() == Some(big.as_slice()));
     assert_eq!(cold.vlog_reads, 1);
     assert_eq!(bc.stats().vlog_entries, before + 1, "v1 frame not admitted");
 
     let warm = ondadb::perf::enter();
-    let (v, _, found, _) = r.get(b"k", u64::MAX, 0).unwrap();
+    let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
     let warm = warm.finish();
     assert!(found && v.as_deref() == Some(big.as_slice()));
     assert_eq!(warm.vlog_reads, 0);
@@ -953,7 +952,7 @@ fn cached_block_reads_are_not_charged() {
     let mut w = Writer::new(klog, opts(Compression::None, 4, 1 << 20, 1 << 20)).unwrap();
     for i in 0..4u32 {
         let k = format!("key{i:06}");
-        w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
     }
     w.finish().unwrap();
@@ -1013,8 +1012,7 @@ fn written_bytes_are_charged_once() {
             &value,
             (i + 1) as u64,
             0,
-            false,
-            false,
+            ondadb::format::KIND_PUT,
         )
         .unwrap();
     }
@@ -1050,7 +1048,7 @@ fn large_write_charges_in_bounded_chunks() {
         .unwrap()
         .with_limiter(limiter);
     let huge = vec![b'x'; (MAX_CHARGE_CHUNK as usize) * 3 + 4096];
-    w.add(b"big", &huge, 1, 0, false, false).unwrap();
+    w.add(b"big", &huge, 1, 0, ondadb::format::KIND_PUT).unwrap();
     w.finish().unwrap();
 
     let charges = recorder.charges();
@@ -1081,8 +1079,7 @@ fn vlog_reads_are_charged() {
             &value,
             (i + 1) as u64,
             0,
-            false,
-            false,
+            ondadb::format::KIND_PUT,
         )
         .unwrap();
     }
@@ -1125,7 +1122,7 @@ fn writer_omits_bloom_block_when_fpr_is_none() {
     let mut w = Writer::new(klog, options).unwrap();
     for i in 0..2048u32 {
         let k = format!("key{i:06}");
-        w.add(k.as_bytes(), b"v", (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), b"v", (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
     }
     w.finish().unwrap();
@@ -1147,7 +1144,7 @@ fn writer_omits_bloom_block_when_fpr_is_none() {
 
     // A key that was never written is still admitted — a missing filter means
     // "may contain", which is what keeps a filterless table readable.
-    let (value, _seq, found, deleted) = reader.get(b"absent-key", u64::MAX, 0).unwrap();
+    let (value, _seq, found, deleted, ..) = reader.get(b"absent-key", u64::MAX, 0).unwrap();
     assert!(!found, "the absent key must not resolve");
     assert!(!deleted);
     assert!(value.is_none());
@@ -1155,7 +1152,7 @@ fn writer_omits_bloom_block_when_fpr_is_none() {
     // And every written key still reads back.
     for i in 0..2048u32 {
         let k = format!("key{i:06}");
-        let (value, _seq, found, deleted) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (value, _seq, found, deleted, ..) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found && !deleted, "{k} lost");
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
     }
@@ -1169,7 +1166,7 @@ fn writer_writes_a_bloom_block_when_fpr_is_some() {
     let (_index, bloom, _entries) = reader.resident_breakdown();
     assert!(bloom > 0, "a filter block should have been written");
     for k in &keys {
-        let (_v, _seq, found, _d) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (_v, _seq, found, _d, ..) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found, "{k} lost");
     }
 }
@@ -1245,7 +1242,8 @@ fn open_klog(klog: &std::path::Path) -> ondadb::Result<Arc<Reader>> {
 fn write_extended(klog: &std::path::Path, opts: WriterOptions) {
     let mut w = Writer::new(klog.to_str().unwrap(), opts).unwrap();
     for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
-        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+        w.add(k.as_bytes(), &v, seq, ttl, ondadb::format::point_kind(tomb, sdel))
+            .unwrap();
     }
     w.finish().unwrap();
 }
@@ -1321,7 +1319,7 @@ fn extended_table_restart_search_matches_scan() {
     let r = open_klog(&klog).unwrap();
     for (k, v, seq, _ttl, tomb, _sdel) in extended_entries() {
         // Point read: bloom, index, restart binary search, then the scan.
-        let (value, got_seq, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (value, got_seq, found, deleted, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found, "{k}");
         assert_eq!(got_seq, seq, "{k}");
         assert_eq!(deleted, tomb, "{k}");
@@ -1379,7 +1377,14 @@ fn extended_golden_bytes() {
         ));
     }
     for (k, v, seq, ttl, tomb, sdel) in &entries {
-        w.add(k.as_bytes(), v, *seq, *ttl, *tomb, *sdel).unwrap();
+        w.add(
+            k.as_bytes(),
+            v,
+            *seq,
+            *ttl,
+            ondadb::format::point_kind(*tomb, *sdel),
+        )
+        .unwrap();
     }
     w.finish().unwrap();
     assert_eq!(
@@ -1446,7 +1451,8 @@ fn sample_fragments() -> Vec<Fragment> {
 fn write_with_fragments(klog: &std::path::Path, frags: Vec<Fragment>) -> ondadb::sst::FileMeta {
     let mut w = Writer::new(klog.to_str().unwrap(), extended_opts(false, true)).unwrap();
     for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
-        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+        w.add(k.as_bytes(), &v, seq, ttl, ondadb::format::point_kind(tomb, sdel))
+            .unwrap();
     }
     w.set_range_fragments(frags);
     w.finish().unwrap()
@@ -1568,7 +1574,8 @@ fn legacy_table_reports_no_fragments() {
     )
     .unwrap();
     for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
-        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+        w.add(k.as_bytes(), &v, seq, ttl, ondadb::format::point_kind(tomb, sdel))
+            .unwrap();
     }
     let meta = w.finish().unwrap();
     assert_eq!(meta.range_count, 0);
@@ -1591,7 +1598,7 @@ fn fragments_require_an_extended_table() {
         },
     )
     .unwrap();
-    w.add(b"k01", b"v", 1, 0, false, false).unwrap();
+    w.add(b"k01", b"v", 1, 0, ondadb::format::KIND_PUT).unwrap();
     w.set_range_fragments(sample_fragments());
     let err = w
         .finish()

@@ -1640,6 +1640,7 @@ fn recover_column_families(
             OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
         })?;
         resolve_partition_scheme(&mut config, opts, &persisted.name)?;
+        resolve_merge_operator(&mut config, opts, &persisted.name)?;
         let (cf, max_seq) = ColumnFamily::load(
             inner.ctx.clone(),
             persisted.name.clone(),
@@ -1653,6 +1654,68 @@ fn recover_column_families(
         inner.cf_by_id.write().insert(cf.id(), cf.clone());
         inner.cfs.write().insert(persisted.name.clone(), cf);
     }
+    Ok(())
+}
+
+/// Reject an `Options::merge_fns` list holding two operators with the same
+/// [`MergeOperator::name`](crate::MergeOperator::name).
+///
+/// At open, not at first use: the engine would otherwise resolve a stored name
+/// to whichever of the two came first in the vector and fold that family's
+/// whole history with it, silently and non-reproducibly. The check is over the
+/// registry alone, so a duplicate is refused even when no column family names
+/// it yet — the ambiguity is the caller's bug either way.
+fn check_merge_fn_names(opts: &Options) -> Result<()> {
+    for (i, a) in opts.merge_fns.iter().enumerate() {
+        if opts.merge_fns[..i].iter().any(|b| b.name() == a.name()) {
+            return Err(OndaError::InvalidArgs(format!(
+                "Options::merge_fns registers two merge operators named {:?}",
+                a.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Exchange a column family's stored merge-operator *name* for the
+/// implementation registered in [`Options::merge_fns`](crate::Options::merge_fns).
+///
+/// The mirror of [`resolve_partition_scheme`], and for the same reason: the
+/// manifest can only carry a name. The rules, in order:
+///
+/// 1. No stored name — nothing to resolve.
+/// 2. A stored name with no registered implementation is
+///    [`OndaError::InvalidArgs`], never a silent fallback to "no operator":
+///    every operand already on disk would then read back as its own raw bytes,
+///    which is a wrong answer rather than a missing one.
+/// 3. Two registrations of one name are refused earlier, by
+///    [`check_merge_fn_names`] at open.
+/// 4. **The stored name wins.** This function is only ever handed the config
+///    decoded from the manifest, and `create_column_family` on an existing
+///    family returns `Exists`, so a caller has no path to rename a family's
+///    operator — folding operands with a different operator than wrote them is
+///    unreachable through the API.
+fn resolve_merge_operator(
+    config: &mut ColumnFamilyConfig,
+    opts: &Options,
+    cf_name: &str,
+) -> Result<()> {
+    let Some(name) = config.merge_operator_name.clone() else {
+        config.merge_operator = None;
+        return Ok(());
+    };
+    let found = opts
+        .merge_fns
+        .iter()
+        .find(|operator| operator.name() == name)
+        .cloned()
+        .ok_or_else(|| {
+            OndaError::InvalidArgs(format!(
+                "column family {cf_name:?} was written with merge operator {name:?}, \
+                 which is not registered in `Options::merge_fns`"
+            ))
+        })?;
+    config.merge_operator = Some(found);
     Ok(())
 }
 
@@ -1716,6 +1779,7 @@ impl DB {
         if opts.path.is_empty() {
             return Err(OndaError::InvalidArgs("empty path".into()));
         }
+        check_merge_fn_names(&opts)?;
         if opts.migrate_to_unified {
             if !opts.unified_memtable {
                 return Err(OndaError::InvalidArgs(
@@ -1817,6 +1881,15 @@ impl DB {
             OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
         })?;
         config.validate().map_err(OndaError::InvalidArgs)?;
+        let mut config = config;
+        resolve_merge_operator(&mut config, &self.inner.opts, name)?;
+        // Persist-before-use: the capability reaches the manifest before the
+        // family that may write kind-4 records exists, so a binary too old to
+        // fold operands refuses the database instead of reading them as values.
+        if config.merge_operator_name.is_some() {
+            self.inner
+                .enable_capability(crate::format::CAPS_MERGE_WRITE)?;
+        }
         // `cf_lifecycle_mu`, not `cfs.write()`, is what makes a losing racer see
         // `Exists` now: the registry insert happens inside the transaction, and
         // holding the registry's write lock across `catalog_txn` would deadlock
@@ -1888,9 +1961,17 @@ impl DB {
                 OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
             })?;
             config.validate().map_err(OndaError::InvalidArgs)?;
+            resolve_merge_operator(&mut config.clone(), &self.inner.opts, name)?;
             if seen.insert(name, ()).is_some() {
                 return Err(OndaError::Exists((*name).into()));
             }
+        }
+        if specs
+            .iter()
+            .any(|(_, config)| config.merge_operator_name.is_some())
+        {
+            self.inner
+                .enable_capability(crate::format::CAPS_MERGE_WRITE)?;
         }
 
         // Hold `cf_lifecycle_mu` across the whole batch: check every name is
@@ -1911,11 +1992,13 @@ impl DB {
         for (name, config) in specs {
             let cmp =
                 comparator_by_name(&config.comparator_name).expect("comparator validated above");
+            let mut config = config.clone();
+            resolve_merge_operator(&mut config, &self.inner.opts, name)?;
             let cf = ColumnFamily::create(
                 self.inner.ctx.clone(),
                 (*name).to_string(),
                 self.inner.cf_dir(name),
-                config.clone(),
+                config,
                 cmp,
             )?;
             created.push(cf);

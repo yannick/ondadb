@@ -93,7 +93,7 @@ fn build(path: &str, keys: &[Vec<u8>], o: WriterOptions) {
     let mut w = Writer::new(path, o).unwrap();
     let value = vec![b'v'; 24];
     for (i, k) in keys.iter().enumerate() {
-        w.add(k, &value, i as u64 + 1, 0, false, false).unwrap();
+        w.add(k, &value, i as u64 + 1, 0, ondadb::format::KIND_PUT).unwrap();
     }
     w.finish().unwrap();
 }

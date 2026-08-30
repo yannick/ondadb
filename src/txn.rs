@@ -60,13 +60,35 @@ struct WriteEntry {
     key: BufRange,
     value: BufRange,
     ttl: i64,
-    tombstone: bool,
-    single_delete: bool,
-    /// This entry is a **range delete** (1.2): `key` holds `start` and `value`
-    /// holds `end`, reusing the same two arena slots the wire format's generic
-    /// `a`/`b` slots use. `tombstone`/`single_delete`/`ttl` are meaningless and
-    /// left at their defaults.
-    range: bool,
+    /// Record kind; see [`crate::wal::Record::kind`]. Kind 5 (1.2's range
+    /// delete) means `key` holds `start` and `value` holds `end`, reusing the
+    /// same two arena slots the wire format's generic `a`/`b` slots use; `ttl`
+    /// is meaningless there and left at its default.
+    kind: u64,
+}
+
+impl WriteEntry {
+    #[inline]
+    fn tombstone(&self) -> bool {
+        self.kind == crate::format::KIND_DELETE || self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    #[inline]
+    fn is_merge(&self) -> bool {
+        self.kind == crate::format::KIND_MERGE
+    }
+    #[inline]
+    fn is_range(&self) -> bool {
+        self.kind == crate::format::KIND_RANGE_DELETE
+    }
+}
+
+/// What a transaction's own buffer says about one key of a merge family.
+struct BufferedChain {
+    /// The last base the buffer holds for the key: `Some(Some(v))` a put,
+    /// `Some(None)` a delete, `None` no buffered base at all.
+    base: Option<Option<Vec<u8>>>,
+    /// Operands buffered after that base, oldest first.
+    operands: Vec<Vec<u8>>,
 }
 
 /// The range deletes this transaction has buffered, as `(cf, start, end)`
@@ -77,7 +99,7 @@ fn buffered_ranges<'a>(
 ) -> impl std::iter::Iterator<Item = (&'a Arc<ColumnFamily>, &'a [u8], &'a [u8])> {
     writes
         .iter()
-        .filter(|w| w.range)
+        .filter(|w| w.is_range())
         .map(move |w| (&w.cf, buf_slice(buf, w.key), buf_slice(buf, w.value)))
 }
 
@@ -361,18 +383,23 @@ impl DB {
         t.delete_range(cf, start, end)?;
         t.commit()
     }
+
+    /// Append a merge operand for `key` (auto-committed at ReadCommitted).
+    ///
+    /// The point of the feature: this is one append, with no read of the
+    /// current value and no conflict window around it, where the equivalent
+    /// read-modify-write costs a snapshot `get` plus a write-write conflict
+    /// check. `cf` must have been created with a
+    /// [`merge_operator_name`](crate::ColumnFamilyConfig::merge_operator_name).
+    pub fn merge(&self, cf: &Arc<ColumnFamily>, key: &[u8], operand: &[u8]) -> Result<()> {
+        let mut t = self.begin_with_isolation(IsolationLevel::ReadCommitted);
+        t.merge(cf, key, operand)?;
+        t.commit()
+    }
 }
 
 impl Txn {
-    fn buffer(
-        &mut self,
-        cf: &Arc<ColumnFamily>,
-        key: &[u8],
-        value: &[u8],
-        ttl: i64,
-        tombstone: bool,
-        single_delete: bool,
-    ) {
+    fn buffer(&mut self, cf: &Arc<ColumnFamily>, key: &[u8], value: &[u8], ttl: i64, kind: u64) {
         let koff = self.buf.len();
         self.buf.extend_from_slice(key);
         let voff = self.buf.len();
@@ -382,9 +409,7 @@ impl Txn {
             key: (koff, key.len()),
             value: (voff, value.len()),
             ttl,
-            tombstone,
-            single_delete,
-            range: false,
+            kind,
         });
     }
 
@@ -411,9 +436,7 @@ impl Txn {
             key: (soff, start.len()),
             value: (eoff, end.len()),
             ttl: 0,
-            tombstone: false,
-            single_delete: false,
-            range: true,
+            kind: crate::format::KIND_RANGE_DELETE,
         });
         Ok(())
     }
@@ -447,7 +470,7 @@ impl Txn {
     /// construction (`apply_prepared` assigns `start + slot`), so this is the
     /// only hazard, and v1 refuses it outright.
     fn check_own_range_overlap(&self) -> Result<()> {
-        for w in self.writes.iter().filter(|w| !w.range) {
+        for w in self.writes.iter().filter(|w| !w.is_range()) {
             let key = buf_slice(&self.buf, w.key);
             let id = cf_id(&w.cf);
             let cmp = w.cf.comparator();
@@ -457,7 +480,10 @@ impl Txn {
                     && cmp.compare(end, key).is_gt()
                 {
                     return Err(OndaError::InvalidArgs(format!(
-                        "write to key {key:?} falls inside this transaction's own                          range delete [{start:?}, {end:?}); v1 rejects the                          combination because the range would be ordered after                          the key's first write and could mask a later one"
+                        "write to key {key:?} falls inside this transaction's own \
+                         range delete [{start:?}, {end:?}); v1 rejects the \
+                         combination because the range would be ordered after \
+                         the key's first write and could mask a later one"
                     )));
                 }
             }
@@ -478,7 +504,7 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
-        self.buffer(cf, key, value, ttl_to_abs(ttl), false, false);
+        self.buffer(cf, key, value, ttl_to_abs(ttl), crate::format::KIND_PUT);
         Ok(())
     }
 
@@ -489,7 +515,7 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
-        self.buffer(cf, key, &[], 0, true, false);
+        self.buffer(cf, key, &[], 0, crate::format::KIND_DELETE);
         Ok(())
     }
 
@@ -502,17 +528,148 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
-        self.buffer(cf, key, &[], 0, true, true);
+        self.buffer(cf, key, &[], 0, crate::format::KIND_SINGLE_DELETE);
         Ok(())
+    }
+
+    /// Buffer a merge operand for `key`.
+    ///
+    /// Operands compose rather than replace: the value a reader sees is
+    /// `full_merge(key, base, operands-oldest-first)`. A merge conflicts
+    /// exactly like a write on the same key under
+    /// [`Snapshot`](crate::IsolationLevel::Snapshot) and
+    /// [`Serializable`](crate::IsolationLevel::Serializable) — it *is* a write,
+    /// and conflict detection reads the newest sequence of the key without
+    /// looking at kinds at all.
+    ///
+    /// Operands carry no TTL in v1: a per-operand expiry would resurrect the
+    /// base it was folded into.
+    pub fn merge(&mut self, cf: &Arc<ColumnFamily>, key: &[u8], operand: &[u8]) -> Result<()> {
+        if self.done {
+            return Err(OndaError::InvalidArgs(
+                "transaction already finished".into(),
+            ));
+        }
+        if cf.merge_op().is_none() {
+            return Err(OndaError::InvalidArgs(format!(
+                "column family {:?} has no merge operator; set \
+                 ColumnFamilyConfig::merge_operator_name when creating it",
+                cf.name()
+            )));
+        }
+        if !cf.merge_writes_enabled() {
+            // Unreachable through `create_column_family`, which takes the
+            // capability before the family exists; a read-only handle is the
+            // one way to hold an operator without the permission to write one.
+            return Err(OndaError::ReadOnly(
+                "merge operands require CAP_MERGE_OPERANDS, which this database has not enabled"
+                    .into(),
+            ));
+        }
+        self.buffer(cf, key, operand, 0, crate::format::KIND_MERGE);
+        Ok(())
+    }
+
+    /// This transaction's buffered chain for `key` in column family `id`, in
+    /// write order: the last base it buffered (if any) and every operand
+    /// buffered after that base.
+    ///
+    /// `None` means the buffer says nothing about the key. `Some((None, ops))`
+    /// means the buffer holds only operands, so the base still has to come from
+    /// the store — which is exactly "overlay merges append to the buffered
+    /// chain ahead of the committed ones".
+    #[allow(clippy::type_complexity)]
+    fn buffered_chain(&self, id: usize, key: &[u8]) -> Option<BufferedChain> {
+        let mut seen = false;
+        let mut base: Option<Option<Vec<u8>>> = None;
+        let mut operands: Vec<Vec<u8>> = Vec::new();
+        for w in &self.writes {
+            if cf_id(&w.cf) != id || buf_slice(&self.buf, w.key) != key {
+                continue;
+            }
+            seen = true;
+            if w.is_merge() {
+                operands.push(buf_slice(&self.buf, w.value).to_vec());
+            } else if w.tombstone() {
+                base = Some(None);
+                operands.clear();
+            } else {
+                base = Some(Some(buf_slice(&self.buf, w.value).to_vec()));
+                operands.clear();
+            }
+        }
+        seen.then_some(BufferedChain { base, operands })
+    }
+
+    /// Record that this transaction is about to read `key` from the store, and
+    /// return the sequence to read it at.
+    ///
+    /// Under [`IsolationLevel::Serializable`] that record is the read set
+    /// commit-time validation replays; under every other level it is a no-op.
+    fn note_store_read(&mut self, cf: &Arc<ColumnFamily>, id: usize, key: &[u8]) -> u64 {
+        if self.isolation == IsolationLevel::Serializable {
+            let read = (id, key.to_vec());
+            if self.read_set.insert(read.clone()) {
+                self.read_log.push(read);
+            }
+            self.read_cfs.entry(id).or_insert_with(|| cf.clone());
+        }
+        if self.fixed {
+            self.read_seq
+        } else {
+            self.db.read_floor_seq()
+        }
+    }
+
+    /// Fold a buffered operand chain onto `committed`, the value the store
+    /// resolves to (already folded over the committed operands, if any).
+    fn fold_buffered(
+        cf: &Arc<ColumnFamily>,
+        key: &[u8],
+        committed: Option<&[u8]>,
+        operands: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
+        let op = cf.merge_op().expect("caller checked the operator");
+        let refs: Vec<&[u8]> = operands.iter().map(Vec::as_slice).collect();
+        op.full_merge(key, committed, &refs).map_err(|e| {
+            OndaError::Corruption(format!(
+                "merge operator {:?} failed for key {:?}: {e}",
+                op.name(),
+                String::from_utf8_lossy(key)
+            ))
+        })
     }
 
     /// Read a key, honoring the transaction's own buffered writes.
     pub fn get(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<Vec<u8>> {
         let id = cf_id(cf);
+        // Read-your-writes on a merge family: the buffered chain is resolved
+        // first, and only a chain with no buffered base still needs the store —
+        // in which case this *is* a read of the store and is recorded as one.
+        if cf.merge_op().is_some() {
+            if let Some(chain) = self.buffered_chain(id, key) {
+                if chain.operands.is_empty() {
+                    return match chain.base.expect("a chain with no operand has a base") {
+                        Some(value) => Ok(value),
+                        None => Err(OndaError::NotFound),
+                    };
+                }
+                if let Some(base) = chain.base {
+                    return Self::fold_buffered(cf, key, base.as_deref(), &chain.operands);
+                }
+                let rs = self.note_store_read(cf, id, key);
+                let committed = match cf.get(key, rs) {
+                    Ok(value) => Some(value),
+                    Err(OndaError::NotFound) => None,
+                    Err(e) => return Err(e),
+                };
+                return Self::fold_buffered(cf, key, committed.as_deref(), &chain.operands);
+            }
+        }
         // Read-your-writes: scan the buffer backward for the latest write.
         for w in self.writes.iter().rev() {
-            if !w.range && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key {
-                if w.tombstone {
+            if !w.is_range() && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key {
+                if w.tombstone() {
                     return Err(OndaError::NotFound);
                 }
                 return Ok(buf_slice(&self.buf, w.value).to_vec());
@@ -562,6 +719,14 @@ impl Txn {
     /// keys excluded, since reading one's own write is not a read of the store.
     pub fn multi_get(&mut self, cf: &Arc<ColumnFamily>, keys: &[&[u8]]) -> Vec<Result<Vec<u8>>> {
         let id = cf_id(cf);
+        // A merge family's buffer can hold operands that still need the store's
+        // base, which the "buffered or pending, never both" split below cannot
+        // express. Resolving those keys one by one loses the batch's block
+        // dedup but keeps its semantics identical to N `get`s — and a batch
+        // over a family with no operator is untouched.
+        if cf.merge_op().is_some() && !self.writes.is_empty() {
+            return keys.iter().map(|key| self.get(cf, key)).collect();
+        }
         let mut out: Vec<Option<Result<Vec<u8>>>> = (0..keys.len()).map(|_| None).collect();
         // Indices still to resolve from the store, and their keys — built in
         // input order so the batch's results scatter straight back.
@@ -572,10 +737,10 @@ impl Txn {
             // Read-your-writes: scan the buffer backward for the latest write.
             let buffered =
                 self.writes.iter().rev().find(|w| {
-                    !w.range && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == *key
+                    !w.is_range() && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == *key
                 });
             if let Some(w) = buffered {
-                out[i] = Some(if w.tombstone {
+                out[i] = Some(if w.tombstone() {
                     Err(OndaError::NotFound)
                 } else {
                     Ok(buf_slice(&self.buf, w.value).to_vec())
@@ -653,6 +818,11 @@ impl Txn {
         // must not construct a throwaway overlay memtable per iterator.
         let overlay: Option<Arc<Memtable>> = if self.writes.is_empty() {
             None
+        } else if cf.merge_op().is_some() {
+            match self.merge_overlay(cf, id, rs) {
+                Ok(overlay) => overlay,
+                Err(error) => return Iterator::failed(cf.comparator().clone(), error),
+            }
         } else {
             let mem = Memtable::new(cf.comparator().clone());
             let mut any = false;
@@ -660,7 +830,7 @@ impl Txn {
                 if cf_id(&w.cf) != id {
                     continue;
                 }
-                if w.range {
+                if w.is_range() {
                     // At `rs`, so the overlay's spans mask exactly what the
                     // transaction can already see plus its own writes.
                     mem.add_range(
@@ -674,8 +844,7 @@ impl Txn {
                         buf_slice(&self.buf, w.value),
                         rs,
                         w.ttl,
-                        w.tombstone,
-                        w.single_delete,
+                        w.kind,
                     );
                 }
                 any = true;
@@ -687,6 +856,76 @@ impl Txn {
             }
         };
         cf.new_iterator(rs, overlay, (lower, upper))
+    }
+
+    /// Build the overlay memtable for a scan over a merge family.
+    ///
+    /// Every buffered write of this transaction lands at the same sequence
+    /// (`rs`), which is what makes last-write-wins work for puts — the memtable
+    /// simply overwrites the internal key. Operands cannot share a sequence
+    /// that way: they compose, so a second one at the same key would replace
+    /// the first instead of extending the chain. So the buffered chain is
+    /// **pre-folded** here, one point read per key the transaction merged, and
+    /// the overlay carries a single ordinary put per key. That keeps the merge
+    /// iterator free of any overlay special case, at the cost of those reads —
+    /// which the scan would have paid anyway.
+    fn merge_overlay(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        id: usize,
+        rs: u64,
+    ) -> Result<Option<Arc<Memtable>>> {
+        // Keys this transaction merged. Everything else replays exactly as the
+        // ordinary overlay does, TTL and single-delete kind included.
+        let mut merged: Vec<&[u8]> = Vec::new();
+        let mut any = false;
+        for w in &self.writes {
+            if cf_id(&w.cf) != id {
+                continue;
+            }
+            any = true;
+            let key = buf_slice(&self.buf, w.key);
+            if w.is_merge() && !merged.contains(&key) {
+                merged.push(key);
+            }
+        }
+        if !any {
+            return Ok(None);
+        }
+        let mem = Memtable::new(cf.comparator().clone());
+        for w in &self.writes {
+            let key = buf_slice(&self.buf, w.key);
+            if cf_id(&w.cf) != id || merged.contains(&key) {
+                continue;
+            }
+            mem.put_ref(key, buf_slice(&self.buf, w.value), rs, w.ttl, w.kind);
+        }
+        for key in merged {
+            let chain = self
+                .buffered_chain(id, key)
+                .expect("the key came out of the buffer");
+            let committed = match chain.base {
+                Some(base) => base,
+                // No buffered base: the chain continues into the store, which
+                // `cf.get` folds for us.
+                None => match cf.get(key, rs) {
+                    Ok(value) => Some(value),
+                    Err(OndaError::NotFound) => None,
+                    Err(e) => return Err(e),
+                },
+            };
+            if chain.operands.is_empty() {
+                // A base written *after* the last operand supersedes it.
+                match committed {
+                    Some(value) => mem.put_ref(key, &value, rs, 0, crate::format::KIND_PUT),
+                    None => mem.put_ref(key, &[], rs, 0, crate::format::KIND_DELETE),
+                }
+                continue;
+            }
+            let folded = Self::fold_buffered(cf, key, committed.as_deref(), &chain.operands)?;
+            mem.put_ref(key, &folded, rs, 0, crate::format::KIND_PUT);
+        }
+        Ok(Some(mem))
     }
 
     /// Name a savepoint at the current buffer position.
@@ -731,9 +970,51 @@ impl Txn {
         Ok(())
     }
 
+    /// [`deduplicated_write_order`](Self::deduplicated_write_order) for a
+    /// transaction that buffered at least one merge operand.
+    ///
+    /// Operands **compose**, so collapsing a key to its last write would commit
+    /// one operand and silently drop the rest — and would drop the delete in
+    /// `delete(k); merge(k)`, which is the base the operand folds against. What
+    /// is genuinely superseded is everything before the key's last *base*, so a
+    /// key commits the run starting there: identical to the collapsed order
+    /// whenever the run has length one, which is every key of every
+    /// merge-free transaction.
+    fn merge_aware_write_order(&self) -> Vec<usize> {
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        let mut slot_of: HashMap<(usize, &[u8]), usize, xxhash_rust::xxh3::Xxh3DefaultBuilder> =
+            HashMap::with_capacity_and_hasher(
+                self.writes.len(),
+                xxhash_rust::xxh3::Xxh3DefaultBuilder::new(),
+            );
+        for (index, write) in self.writes.iter().enumerate() {
+            match slot_of.entry((cf_id(&write.cf), buf_slice(&self.buf, write.key))) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(runs.len());
+                    runs.push(vec![index]);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let run = &mut runs[*entry.get()];
+                    if write.is_merge() {
+                        run.push(index);
+                    } else {
+                        run.clear();
+                        run.push(index);
+                    }
+                }
+            }
+        }
+        runs.concat()
+    }
+
     fn deduplicated_write_order(&self) -> Vec<usize> {
         if self.writes.len() == 1 {
             return vec![0];
+        }
+        // Only a merge family can produce writes that must not collapse, and
+        // the scan is over writes the caller is about to iterate anyway.
+        if self.writes.iter().any(WriteEntry::is_merge) {
+            return self.merge_aware_write_order();
         }
         // Keys borrow the transaction arena: deduplication allocates only the
         // slot map and order vector, never key/value copies.
@@ -748,7 +1029,7 @@ impl Txn {
             // a range delete must never collapse into a point write whose key
             // happens to equal its start bound: both take their own slot, and
             // therefore their own sequence.
-            if write.range {
+            if write.is_range() {
                 order.push(index);
                 continue;
             }
@@ -814,7 +1095,7 @@ impl Txn {
             let cf = w.cf.id();
             let cmp = w.cf.comparator();
             let a = buf_slice(&self.buf, w.key);
-            if w.range {
+            if w.is_range() {
                 let b = buf_slice(&self.buf, w.value);
                 if let Some(seq) = index.range_conflict(cf, cmp, a, b, self.read_seq) {
                     return Err(OndaError::Conflict(format!(
@@ -845,7 +1126,7 @@ impl Txn {
             let w = &self.writes[i];
             let seq = start + slot as u64;
             let a = buf_slice(&self.buf, w.key);
-            if w.range {
+            if w.is_range() {
                 index.insert_range(
                     reservation,
                     w.cf.id(),
@@ -888,7 +1169,7 @@ impl Txn {
             });
             let key = buf_slice(&self.buf, write.key);
             let value = buf_slice(&self.buf, write.value);
-            if write.range {
+            if write.is_range() {
                 // Commit hooks describe point writes (`CommitOp` has one key
                 // and one value); a range delete has two keys and no value, so
                 // v1 does not surface it to hooks rather than inventing a
@@ -904,7 +1185,7 @@ impl Txn {
                 group.3.push(CommitOp {
                     key: key.to_vec(),
                     value: value.to_vec(),
-                    tombstone: write.tombstone,
+                    tombstone: write.tombstone(),
                     ttl: write.ttl,
                 });
             }
@@ -913,8 +1194,7 @@ impl Txn {
                 value,
                 seq,
                 ttl: write.ttl,
-                tombstone: write.tombstone,
-                single_delete: write.single_delete,
+                kind: write.kind,
             });
         }
         let error = if let Some(unified) = &self.db.unified {
@@ -1007,7 +1287,7 @@ impl Txn {
                 ));
             }
         }
-        let has_range = self.writes.iter().any(|w| w.range);
+        let has_range = self.writes.iter().any(|w| w.is_range());
         if has_range {
             if let Err(error) = self.check_own_range_overlap() {
                 self.release();

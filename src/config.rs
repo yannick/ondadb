@@ -272,6 +272,34 @@ pub struct Options {
     /// This is the same name-and-registry indirection used for comparators,
     /// made extensible because partitioners are consumer-defined.
     pub partition_fns: Vec<Arc<dyn PartitionFn>>,
+    /// Merge operators available to this database, resolved by
+    /// [`MergeOperator::name`].
+    ///
+    /// A column family created with
+    /// [`merge_operator_name`](ColumnFamilyConfig::merge_operator_name)
+    /// records only that *name* in the manifest, because a boxed function is
+    /// not serializable. On open the engine looks the name up here; if it is
+    /// absent the open fails rather than silently reverting the family to
+    /// "no operator", which would make every stored operand unreadable and
+    /// every folded value wrong.
+    ///
+    /// Registering two operators reporting the same `name()` is an error at
+    /// open: the engine would otherwise pick one arbitrarily and fold history
+    /// with it.
+    pub merge_fns: Vec<Arc<dyn MergeOperator>>,
+    /// Let compaction collapse an operand chain into the value it folds to
+    /// (default `true`).
+    ///
+    /// A pure space-and-read optimization: without it every operand a family
+    /// ever writes stays on disk forever and every read of that key folds the
+    /// whole chain again. Turning it off changes no answer — folding is only
+    /// correct when it does not — so it exists as a rollout switch: a fold bug
+    /// silently rewrites history, and being able to stop new folds without
+    /// reverting the binary is worth one boolean.
+    ///
+    /// **Not persisted.** It is a policy of this process, not of the stored
+    /// data, and already-folded entries stay folded either way.
+    pub enable_merge_folding: bool,
     /// Bandwidth ceiling for *background* IO — flush, compaction and the part
     /// mover — in bytes per second. `0` (the default) is unlimited, and costs
     /// exactly one nil check per read/write: no limiter object is built.
@@ -548,6 +576,8 @@ impl Default for Options {
             tiers: Vec::new(),
             part_mover_interval: Duration::from_secs(30),
             partition_fns: Vec::new(),
+            merge_fns: Vec::new(),
+            enable_merge_folding: true,
             background_io_bytes_per_second: 0, // unlimited: no limiter object
             background_io_burst_bytes: 0,
             obsolete_delete_bytes_per_second: 0, // unlink inline: no worker thread
@@ -656,6 +686,26 @@ pub struct ColumnFamilyConfig {
     /// is persisted; register the implementation in
     /// [`Options::partition_fns`] so reopening can resolve it.
     pub partition_scheme: PartitionScheme,
+    /// Name of this family's merge operator, or `None` (the default) for a
+    /// family that has none. Persisted in the manifest blob.
+    ///
+    /// Setting it on `create_column_family` durably enables
+    /// [`CAPS_MERGE_WRITE`](crate::format::CAPS_MERGE_WRITE) and requires an
+    /// implementation of the same name in [`Options::merge_fns`]. Reopening a
+    /// family that stored a name without registering that implementation is an
+    /// error — see [`MergeOperator`]. The **stored** name always wins: a
+    /// different name supplied at reopen cannot rename a family's operator,
+    /// because that would fold already-written operands with the wrong
+    /// function.
+    pub merge_operator_name: Option<String>,
+    /// The implementation behind [`merge_operator_name`](Self::merge_operator_name),
+    /// resolved from [`Options::merge_fns`] at create/open. Never persisted.
+    ///
+    /// `pub` only because [`ColumnFamilyConfig`] is built with struct-update
+    /// syntax; the engine overwrites whatever a caller leaves here from the
+    /// stored name, so setting it by hand changes nothing.
+    #[doc(hidden)]
+    pub merge_operator: Option<Arc<dyn MergeOperator>>,
     /// Prefix rules that pin a partition's bottom-level part to a storage
     /// **tier** (see [`TierDef`]). The **longest** matching prefix wins, exactly
     /// like [`partition_rules`](Self::partition_rules) and
@@ -831,6 +881,8 @@ impl Default for ColumnFamilyConfig {
             compression_rules: Vec::new(),
             partition_rules: Vec::new(),
             partition_scheme: PartitionScheme::Rules,
+            merge_operator_name: None,
+            merge_operator: None,
             tier_rules: Vec::new(),
             enable_bloom_filter: true,
             bloom_fpr: 0.01,
@@ -1031,6 +1083,95 @@ impl std::fmt::Debug for PartitionScheme {
             PartitionScheme::Unresolved(n) => write!(f, "Unresolved({n})"),
         }
     }
+}
+
+/// Deterministic per-column-family fold of merge operands (feature 1.1).
+///
+/// A `merge` writes an *operand* — a value that is not yet the record. Reads,
+/// compaction and flush fold the operands of one key against the value below
+/// them by calling [`full_merge`](Self::full_merge). This removes the
+/// read-modify-write round trip a counter or a set-union otherwise pays: under
+/// MVCC that round trip costs a snapshot `get` **plus** the write-write
+/// conflict window.
+///
+/// # Contract
+///
+/// 1. **Deterministic and pure.** The same `(key, existing, operands)` must
+///    always produce the same bytes. Compaction folds a prefix of the chain at
+///    unpredictable times and may re-fold the result later, so a non-pure
+///    operator makes the stored value depend on when compaction ran.
+/// 2. **Associative over the chain.** Folding `[a, b, c]` against `E` must
+///    equal folding `[c]` against `full_merge(k, E, [a, b])` — that identity is
+///    exactly what compaction folding relies on.
+/// 3. **Total.** An operand this operator cannot interpret must return `Err`,
+///    which surfaces as [`OndaError::Corruption`](crate::OndaError) naming the
+///    key. It must not panic and must not silently invent a value.
+/// 4. **Stable name.** [`name`](Self::name) is persisted in the column
+///    family's manifest blob and re-resolved from [`Options::merge_fns`] at
+///    every open. Change it whenever the fold's meaning changes; reopening
+///    without a registered implementation of the stored name is an error, not
+///    a fallback.
+///
+/// Operands carry **no TTL** (v1): a per-operand expiry would resurrect the
+/// base it was folded into. `Options::merge_fns` is where implementations are
+/// registered.
+///
+/// # Example
+///
+/// ```
+/// use ondadb::MergeOperator;
+///
+/// /// Little-endian i64 counter: operands are deltas.
+/// #[derive(Debug)]
+/// struct Counter;
+///
+/// impl MergeOperator for Counter {
+///     fn name(&self) -> &str {
+///         "example.counter.i64.v1"
+///     }
+///     fn full_merge(
+///         &self,
+///         _key: &[u8],
+///         existing: Option<&[u8]>,
+///         operands: &[&[u8]],
+///     ) -> Result<Vec<u8>, String> {
+///         let read = |b: &[u8]| -> Result<i64, String> {
+///             b.try_into()
+///                 .map(i64::from_le_bytes)
+///                 .map_err(|_| format!("operand is {} bytes, want 8", b.len()))
+///         };
+///         let mut acc = match existing {
+///             Some(b) => read(b)?,
+///             None => 0,
+///         };
+///         for operand in operands {
+///             acc = acc.wrapping_add(read(operand)?);
+///         }
+///         Ok(acc.to_le_bytes().to_vec())
+///     }
+/// }
+/// ```
+pub trait MergeOperator: Send + Sync + std::fmt::Debug {
+    /// Stable identifier for this operator, persisted in the column family's
+    /// manifest blob (see the contract above).
+    fn name(&self) -> &str;
+
+    /// Fold `operands` (**oldest first**) onto `existing`.
+    ///
+    /// `existing` is `None` when no visible put backs the chain — either the
+    /// base is a delete, or the chain reaches the end of history without one.
+    /// A real zero-length value is `Some(b"")`, and the distinction is
+    /// deliberate: it is the same found/deleted split the point-read path
+    /// already carries.
+    ///
+    /// An `Err` message is surfaced verbatim inside
+    /// [`OndaError::Corruption`](crate::OndaError), together with the key.
+    fn full_merge(
+        &self,
+        key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> Result<Vec<u8>, String>;
 }
 
 /// A partition resolver snapshotted for the duration of one compaction run.
@@ -1269,6 +1410,7 @@ impl ColumnFamilyConfig {
         encode_bloom_policy(&mut b, self);
         encode_periodic_interval(&mut b, self);
         encode_prefix_delta(&mut b, self);
+        encode_merge_operator(&mut b, self);
         b
     }
 
@@ -1310,6 +1452,8 @@ const CONFIG_BLOOM_POLICY_MAGIC: &[u8; 8] = b"ONDABLM1";
 const CONFIG_PERIODIC_MAGIC: &[u8; 8] = b"ONDAPRD1";
 /// Tag introducing the prefix-delta key-encoding tail (2.1).
 const CONFIG_PREFIX_DELTA_MAGIC: &[u8; 8] = b"ONDAPFX1";
+/// Tag introducing the merge-operator-name tail (1.1).
+const CONFIG_MERGE_OP_MAGIC: &[u8; 8] = b"ONDAMRG1";
 /// Reserved for a future geometric (Monkey-style) auto-allocation policy. It is
 /// mutually exclusive with the explicit `bloom_fpr_per_level` vector, so the tag
 /// is claimed here to keep the two from ever sharing one; nothing writes or
@@ -1592,7 +1736,8 @@ fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     let p = read_vlog_cache_tail(p, cfg);
     let p = read_bloom_policy_tail(p, cfg);
     let p = read_periodic_interval_tail(p, cfg);
-    read_prefix_delta_tail(p, cfg);
+    let p = read_prefix_delta_tail(p, cfg);
+    read_merge_operator_tail(p, cfg);
     Some(())
 }
 
@@ -1932,19 +2077,55 @@ fn encode_prefix_delta(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
 /// defaults rather than applying half a policy — and an interval outside
 /// `[1, 1024]` would not survive `validate`, so it is not made valid by having
 /// been written.
-fn read_prefix_delta_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+fn read_prefix_delta_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     let Some(rest) = p.strip_prefix(CONFIG_PREFIX_DELTA_MAGIC) else {
-        return;
+        return p;
     };
     if rest.len() < 9 {
-        return;
+        return p;
     }
     let interval = crate::encoding::read_u64(&rest[1..]) as usize;
     if !(1..=1024).contains(&interval) {
-        return;
+        return p;
     }
     cfg.enable_prefix_delta_keys = rest[0] != 0;
     cfg.block_restart_interval = interval;
+    &rest[9..]
+}
+
+/// The 1.1 merge-operator tail: `name_len uvarint | name`. Elided entirely for
+/// a family with no operator, so a family that never sets one encodes
+/// byte-for-byte as earlier releases wrote it.
+fn encode_merge_operator(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_uvarint;
+
+    let Some(name) = cfg.merge_operator_name.as_deref() else {
+        return;
+    };
+    b.extend_from_slice(CONFIG_MERGE_OP_MAGIC);
+    append_uvarint(b, name.len() as u64);
+    b.extend_from_slice(name.as_bytes());
+}
+
+/// Consume the merge-operator tail if present. All-or-nothing, like the tails
+/// before it: a truncated tail leaves `merge_operator_name` at `None`, which is
+/// how a pre-1.1 blob decodes and is the only safe default — the resolver then
+/// simply has nothing to look up.
+fn read_merge_operator_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
+    use crate::encoding::uvarint;
+    let Some(rest) = p.strip_prefix(CONFIG_MERGE_OP_MAGIC) else {
+        return p;
+    };
+    let Some((len, n)) = uvarint(rest) else {
+        return p;
+    };
+    let rest = &rest[n..];
+    let len = len as usize;
+    if rest.len() < len {
+        return p;
+    }
+    cfg.merge_operator_name = Some(String::from_utf8_lossy(&rest[..len]).into_owned());
+    &rest[len..]
 }
 
 #[cfg(test)]
@@ -2894,6 +3075,65 @@ mod periodic_tests {
         }
         .validate()
         .expect("periodic compaction is a leveled-family option");
+    }
+
+    /// 1.1: the operator name is the durable half of the merge feature, and it
+    /// is decoded from the remainder of the prefix-delta tail — so the two must
+    /// chain, in both orders of being set.
+    #[test]
+    fn merge_operator_name_round_trips() {
+        let cfg = ColumnFamilyConfig {
+            merge_operator_name: Some("example.counter.i64.v1".to_string()),
+            ..ColumnFamilyConfig::default()
+        };
+        let decoded = ColumnFamilyConfig::decode(&cfg.encode());
+        assert_eq!(
+            decoded.merge_operator_name.as_deref(),
+            Some("example.counter.i64.v1")
+        );
+        // The resolved implementation is not persisted; only the name is.
+        assert!(decoded.merge_operator.is_none());
+
+        // Behind every other tail this release writes.
+        let chained = ColumnFamilyConfig {
+            merge_operator_name: Some("m".to_string()),
+            enable_prefix_delta_keys: true,
+            block_restart_interval: 16,
+            periodic_compaction_interval: Duration::from_secs(60),
+            bloom_fpr_per_level: vec![0.001, 0.01],
+            data_block_size: 8192,
+            ..ColumnFamilyConfig::default()
+        };
+        let decoded = ColumnFamilyConfig::decode(&chained.encode());
+        assert_eq!(decoded.merge_operator_name.as_deref(), Some("m"));
+        assert!(decoded.enable_prefix_delta_keys);
+        assert_eq!(decoded.block_restart_interval, 16);
+        assert_eq!(decoded.data_block_size, 8192);
+    }
+
+    /// A blob written before 1.1 has no merge tail, so the family decodes as
+    /// having no operator rather than reading garbage off the end — and a
+    /// family that sets none must still encode byte-for-byte as 0.8.2 wrote it.
+    #[test]
+    fn config_blob_without_operator_decodes_none() {
+        let default = ColumnFamilyConfig::default();
+        let blob = default.encode();
+        assert!(
+            !blob
+                .windows(CONFIG_MERGE_OP_MAGIC.len())
+                .any(|w| w == CONFIG_MERGE_OP_MAGIC),
+            "a family with no operator must stay byte-identical to a pre-1.1 blob"
+        );
+        assert!(ColumnFamilyConfig::decode(&blob).merge_operator_name.is_none());
+
+        // A truncated tail is all-or-nothing: no name rather than half a name.
+        let cfg = ColumnFamilyConfig {
+            merge_operator_name: Some("truncated".to_string()),
+            ..ColumnFamilyConfig::default()
+        };
+        let full = cfg.encode();
+        let cut = &full[..full.len() - 3];
+        assert!(ColumnFamilyConfig::decode(cut).merge_operator_name.is_none());
     }
 
     #[test]

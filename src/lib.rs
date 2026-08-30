@@ -81,7 +81,8 @@ pub use comparator::{Comparator, ComparatorRef};
 pub use config::S3Config;
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
-    Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend, TierDef, TierRule,
+    MergeOperator, Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend,
+    TierDef, TierRule,
 };
 pub use db::{DB, DELETE_METADATA_BYTES};
 pub use error::{OndaError, Result};

@@ -208,8 +208,15 @@ but unimplemented kind → `UnsupportedFormat`; unknown modifier bit →
 `Corruption`; a `count` that disagrees with the payload in either direction →
 `Corruption`, so an envelope frame can never deliver a partial batch.
 
-The engine enables no capability by default and therefore writes no envelopes;
-`Wal::append_batch_enveloped` is the codec entry point.
+A database enables no capability by default and therefore writes no envelopes.
+Emission is decided **per batch, not per database**: `ColumnFamily::apply_commit`
+(and `UnifiedStore::apply`) writes an envelope frame iff the batch carries
+something the legacy record cannot spell — a record whose kind is not a point
+kind (1.1's merge operand) or a range delete (1.2). `Wal::append_batch_enveloped`
+is the codec entry point for a point-only batch, `append_batch_envelope` for one
+mixing points and ranges. Checking the batch rather than the database keeps every
+ordinary commit byte-identical to what 0.8.2 wrote, including on a family that
+merely *has* a merge operator.
 
 #### Kind 5 — range delete (1.2)
 
@@ -228,11 +235,9 @@ cf-id prefix on **both** bounds, exactly as it does on a point key; a span can
 never cross a cf-id boundary, because both bounds come from one `delete_range`
 call on one column family, and that is asserted at encode rather than assumed.
 
-Emission is decided **per batch, not per database**: a point-only commit keeps
-writing the legacy record stream (unchanged bytes, unchanged size), and a commit
-holding a range delete writes **one** envelope frame carrying both kinds. One
-frame, because WAL batch atomicity (invariant 3) is per frame — two frames could
-replay half a commit.
+A commit holding a range delete writes **one** envelope frame carrying both
+kinds. One frame, because WAL batch atomicity (invariant 3) is per frame — two
+frames could replay half a commit.
 
 ## SSTable (`sst/`)
 
@@ -290,6 +295,71 @@ resolves the layout once from `footer[48]` and threads it to every
 are untouched — entry boundaries still come from `decode_entry`'s returned
 `next`, so restart binary search, the B+tree index and the block CRC all keep
 working unchanged.
+
+#### Merge operands (kind 4, `CAP_MERGE_OPERANDS`)
+
+A **merge operand** is a record that does not replace older versions of its key:
+it composes with them. It is written as an ordinary extended entry with
+`kind = 4`, its operand bytes in the value slot, and no TTL modifier — v1 puts
+no expiry on an operand, because a per-operand expiry would resurrect the base
+it was folded into.
+
+Writer rule, the same shape as prefix-delta's: a family emits kind 4 only when
+it has a merge operator **and** the database durably holds
+`CAPS_MERGE_WRITE = CAP_EXTENDED_RECORDS | CAP_MERGE_OPERANDS`. Because the kind
+exists only inside the extended entry, a family with an operator writes
+`FOOTER_EXTENDED_BLOCK` tables from flush, ingestion and compaction alike;
+`Writer::add` refuses a non-point kind on a legacy-layout table rather than
+emitting bytes that say something else.
+
+**The fold rule.** For key `k` at `read_seq`, over the versions of `k`
+newest-first, considering only `seq <= read_seq`:
+
+1. collect kind-4 entries into a list as they are seen;
+2. the **base** is the first put, delete or single-delete met: a put gives
+   `existing = Some(value)`, a delete (or a TTL-expired put) gives
+   `existing = None`; versions older than the base are ignored;
+3. sources exhausted without a base is also `existing = None`;
+4. reverse the collected operands to oldest-first and return
+   `full_merge(k, existing, &operands)`;
+5. a group with **no** operand resolves exactly as it did before 1.1 — no
+   operator call and no allocation.
+
+`existing = None` and `Some(b"")` are a real distinction, and the same one the
+point-read path already carries as found/deleted.
+
+The operator is identified by *name*, persisted in the column family's config
+blob (tag `ONDAMRG1`, `name_len uvarint | name`) and re-resolved from
+`Options::merge_fns` at every open. A stored name with no registered
+implementation fails the open — never a silent fallback, which would read every
+stored operand back as its own raw bytes. The stored name always wins, and
+`create_column_family` on an existing family returns `Exists`, so folding with a
+different operator than wrote the operands is unreachable through the API.
+
+**Compaction folding.** Compaction may collapse a chain into the value it folds
+to, writing one kind-1 entry that carries the **newest sequence the folded
+suffix represented**. It is a space-and-read optimization, never a durability or
+correctness requirement, and it is fenced by four rules:
+
+* only a contiguous suffix wholly **at or below `oldest_snapshot`** folds — a
+  live snapshot between two operands would otherwise read a different value;
+* a suffix that meets no base among the job's inputs folds only at the
+  **bottom** level, where "no base" really is `existing = None`; above it, the
+  base may live deeper and the operands are written back unchanged;
+* a base carrying a **live TTL** is not a fold target: the folded value would
+  either inherit an expiry that also deletes the operands' contribution or lose
+  one that must apply;
+* a **foreign mount** among the inputs disables folding for the job (structurally
+  impossible today — both input-selection paths filter mounts out — but folding
+  is the one thing here that rewrites history, so it re-checks).
+
+Retention is kind-aware in the same code that lets kind 4 reach compaction
+(`VersionRetention::decide`): the "keep exactly one version at or below
+`oldest_snapshot`" rule holds only for point kinds, so an operand neither
+consumes that slot nor sets the flag, a bottom-level tombstone terminating a
+live chain is not reclaimed, the bottom TTL drop never applies to an operand,
+and an operand is not bloom-filter-eligible. Everything *older* than a chain's
+base is still dropped exactly as before.
 
 **Extended footer prefix.** The 64-byte footer is full, so the aux-block handle
 lives in the 16 bytes immediately preceding it:
@@ -651,6 +721,7 @@ ONDABLM1 | count u64 | fpr f64-bits x count
 ONDAPRD1 | periodic_compaction_interval u64     microseconds; 0 = disabled (0.3)
 ONDAPFX1 | enable_prefix_delta_keys u8
           | block_restart_interval u64           prefix-delta key encoding (2.1)
+ONDAMRG1 | merge_operator_name*                  merge operator name (1.1)
 ```
 
 `ONDAPFX1` is elided when both fields are at their defaults (`false` and 8), and
@@ -659,6 +730,14 @@ leaves both at their defaults. `0` is deliberately **not** a legal config
 interval even though `WriterOptions::restart_interval` takes it — there it means
 "emit no restart trailer at all", which stays reachable only by constructing
 `WriterOptions` directly.
+
+`ONDAMRG1` is elided entirely for a family with no merge operator, so such a
+family encodes byte-for-byte as pre-1.1 releases wrote it; a truncated tail
+leaves the name at `None`, which is also how a pre-1.1 blob decodes and is the
+only safe default — the resolver then has nothing to look up. The name is the
+*durable* half of the feature: the implementation is re-supplied through
+`Options::merge_fns` at every open, and a stored name that resolves to nothing
+fails the open.
 
 `ONDAPRD1` is elided at the default (zero, disabled), so a family that never
 sets it encodes byte-for-byte as earlier releases wrote it; it is refused by

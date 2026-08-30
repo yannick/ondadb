@@ -328,15 +328,29 @@ impl Writer {
     }
 
     /// Append one entry. `value` is ignored for tombstones.
+    ///
+    /// `kind` is the record kind ([`KIND_PUT`](crate::format::KIND_PUT) and
+    /// friends). A kind outside the three point kinds — 1.1's merge operand —
+    /// exists only in the extended entry layout, so a writer that was not asked
+    /// for extended entries refuses it rather than writing a byte stream that
+    /// says something other than what the caller meant.
     pub fn add(
         &mut self,
         user_key: &[u8],
         value: &[u8],
         seq: u64,
         ttl: i64,
-        tombstone: bool,
-        single_delete: bool,
+        kind: u64,
     ) -> Result<()> {
+        crate::format::check_kind(kind)?;
+        if !self.extended() && !crate::format::is_point_kind(kind) {
+            return Err(OndaError::InvalidArgs(format!(
+                "record kind {kind} needs the extended entry layout; this table \
+                 was opened with extended_entries = false"
+            )));
+        }
+        let tombstone = kind == crate::format::KIND_DELETE
+            || kind == crate::format::KIND_SINGLE_DELETE;
         self.settle_pending_index(user_key);
         // Per-key compression rule; also decides whether this key may share
         // the block being built.
@@ -383,8 +397,7 @@ impl Writer {
                 value,
                 seq,
                 ttl,
-                tombstone,
-                single_delete,
+                kind,
                 has_vlog,
                 vlog_off,
             );
@@ -399,8 +412,7 @@ impl Writer {
                 value,
                 seq,
                 ttl,
-                tombstone,
-                single_delete,
+                kind,
                 has_vlog,
                 vlog_off,
             );
@@ -820,7 +832,7 @@ mod tests {
         for i in 0..200u64 {
             // Long shared prefix, so a non-anchor entry always shares bytes.
             let k = format!("tenant/alpha/cluster/{i:04}");
-            w.add(k.as_bytes(), b"v", i + 1, 0, false, false).unwrap();
+            w.add(k.as_bytes(), b"v", i + 1, 0, crate::format::KIND_PUT).unwrap();
         }
         w.finish().unwrap();
         let r = Reader::open(
@@ -887,7 +899,7 @@ mod tests {
             let mut w = Writer::new(klog, opts(4, delta, 1024)).unwrap();
             for i in 0..400u64 {
                 let k = format!("tenant/alpha/{i:04}");
-                w.add(k.as_bytes(), b"payload-payload", i + 1, 0, false, false)
+                w.add(k.as_bytes(), b"payload-payload", i + 1, 0, crate::format::KIND_PUT)
                     .unwrap();
             }
             w.finish().unwrap();
@@ -991,7 +1003,7 @@ mod tests {
             // 2 KiB keys: 16-byte ordered prefix + 2032 bytes of padding.
             let mut k = format!("{i:016}").into_bytes();
             k.resize(2048, b'x');
-            w.add(&k, &val, (i + 1) as u64, 0, false, false).unwrap();
+            w.add(&k, &val, (i + 1) as u64, 0, crate::format::KIND_PUT).unwrap();
         }
         w.finish().unwrap();
         let r = Reader::open(

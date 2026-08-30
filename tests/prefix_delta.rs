@@ -155,7 +155,8 @@ fn opts(
 fn build(path: &str, entries: &[Entry], o: WriterOptions) {
     let mut w = Writer::new(path, o).unwrap();
     for (k, v, seq, ttl, tomb, sdel) in entries {
-        w.add(k, v, *seq, *ttl, *tomb, *sdel).unwrap();
+        w.add(k, v, *seq, *ttl, ondadb::format::point_kind(*tomb, *sdel))
+            .unwrap();
     }
     w.finish().unwrap();
 }
@@ -315,12 +316,8 @@ fn delta_point_get_finds_key_at_every_run_position() {
     for interval in [1usize, 2, 4, 8, 32] {
         let t = twins(&keys, interval, 1024);
         for (k, v, seq, ttl, tomb, _) in &t.entries {
-            let (value, got_seq, found, deleted) = t.delta.get(k, u64::MAX, 0).unwrap();
-            assert!(
-                found,
-                "r={interval}: missing {:?}",
-                String::from_utf8_lossy(k)
-            );
+            let (value, got_seq, found, deleted, ..) = t.delta.get(k, u64::MAX, 0).unwrap();
+            assert!(found, "r={interval}: missing {:?}", String::from_utf8_lossy(k));
             assert_eq!(got_seq, *seq);
             // `now = 0` is before every TTL in the corpus, so only the
             // tombstones read as deleted.

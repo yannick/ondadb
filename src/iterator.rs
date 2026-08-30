@@ -76,6 +76,16 @@ impl ChildIter {
             ChildIter::Sst(s) => s.is_tombstone(),
         }
     }
+    /// Record kind of the current entry; only read when the column family has a
+    /// merge operator, so a family without one never pays for the dispatch.
+    #[inline]
+    fn kind(&self) -> u64 {
+        match self {
+            ChildIter::Mem(m) => m.kind(),
+            ChildIter::Unified(m) => m.kind(),
+            ChildIter::Sst(s) => s.kind(),
+        }
+    }
     /// Append the current value to `out` (no intermediate allocation).
     fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
@@ -400,6 +410,25 @@ pub struct Iterator {
     /// every column family that has never issued a range delete, and the
     /// emptiness check is what keeps a plain scan at exactly its old cost.
     mask: crate::range_tombstone::RangeMask,
+    /// This column family's merge operator, cached at construction. `None` —
+    /// the overwhelmingly common case — is the single check that keeps 1.1 off
+    /// this iterator's hot loop entirely.
+    merge_op: Option<std::sync::Arc<dyn crate::config::MergeOperator>>,
+    /// Operand arena for the group being resolved: the bytes back-to-back in
+    /// `operands`, one `(start, len)` per operand in `operand_spans`.
+    ///
+    /// Entered **lazily** — a group with no kind-4 entry never touches it — and
+    /// `clear()`ed rather than shrunk per group, so steady-state scanning
+    /// allocates nothing after warm-up. Copying is what invariant 8 leaves
+    /// available: operands of one group can come from several children and
+    /// several blocks, so they cannot all be pinned, and per-entry `Arc` clones
+    /// of shared mmaps are the measured 3x scan regression.
+    ///
+    /// Each span carries its operand's sequence, which 1.2 needs: a range
+    /// delete cuts the chain, so the fold has to know which operands lie above
+    /// it.
+    operands: Vec<u8>,
+    operand_spans: Vec<(usize, usize, u64)>,
 }
 
 impl std::fmt::Debug for Iterator {
@@ -428,6 +457,10 @@ struct VisibleVersion {
     seq: u64,
     tombstone: bool,
     ttl: i64,
+    /// The group resolved through a merge fold, so its value is the operator's
+    /// output: live whatever the base underneath it was (deleted, expired, or
+    /// absent entirely).
+    merged: bool,
 }
 
 impl VisibleVersion {
@@ -447,7 +480,7 @@ impl VisibleVersion {
     }
 
     fn is_live(&self, now: i64) -> bool {
-        self.found && !self.tombstone && !expired(self.ttl, now)
+        self.merged || (self.found && !self.tombstone && !expired(self.ttl, now))
     }
 }
 
@@ -477,17 +510,20 @@ impl Iterator {
             lower: bounds.0,
             upper: bounds.1,
             mask,
+            merge_op: None,
+            operands: Vec::new(),
+            operand_spans: Vec::new(),
         }
     }
 
-    /// Is the group just resolved hidden by a range delete?
+    /// Newest range delete (1.2) covering the group key, or `None`.
     ///
     /// The cursor walks with the scan, so this is amortized O(1) per key in
     /// either direction; an empty mask returns immediately.
     #[inline]
-    fn masked_by_range(&mut self, visible: &VisibleVersion) -> bool {
+    fn group_covering_seq(&mut self) -> Option<u64> {
         if self.mask.is_empty() {
-            return false;
+            return None;
         }
         // Moved out and back rather than cloning the group key: the key may be
         // a slice borrowed from a pinned block, and taking the mask is what
@@ -496,6 +532,16 @@ impl Iterator {
         let mut mask = std::mem::take(&mut self.mask);
         let covering = mask.covering_seq(&self.m.cmp, self.key(), self.read_seq);
         self.mask = mask;
+        covering
+    }
+
+    /// Is the group just resolved hidden by a range delete?
+    ///
+    /// The cursor walks with the scan, so this is amortized O(1) per key in
+    /// either direction; an empty mask returns immediately.
+    #[inline]
+    fn masked_by_range(&mut self, visible: &VisibleVersion) -> bool {
+        let covering = self.group_covering_seq();
         let hidden = match covering {
             // Strictly greater: a point version written after the tombstone is
             // visible again, exactly as it would be after a point tombstone.
@@ -506,6 +552,16 @@ impl Iterator {
             crate::perf::bump(|p| p.range_masked += 1);
         }
         hidden
+    }
+
+    /// Attach the column family's merge operator (builder form, so
+    /// `Iterator::new`'s signature stays what every other caller passes).
+    pub(crate) fn with_merge_operator(
+        mut self,
+        op: Option<std::sync::Arc<dyn crate::config::MergeOperator>>,
+    ) -> Iterator {
+        self.merge_op = op;
+        self
     }
 
     /// Is the current group key past the declared upper bound (forward
@@ -649,7 +705,32 @@ impl Iterator {
         Ok(())
     }
 
+    /// Copy the merge top's value into the operand arena.
+    ///
+    /// A copy, not a pin: see the `operands` field. `value_into` appends, so
+    /// the span is recorded around the append.
+    fn push_operand(&mut self, seq: u64) -> Result<()> {
+        let idx = self.m.top_idx();
+        let start = self.operands.len();
+        // Disjoint borrows of two fields of `self`, which is why the arena
+        // lives on the iterator rather than behind the merge heap.
+        self.m.children[idx].value_into(&mut self.operands)?;
+        let len = self.operands.len() - start;
+        self.operand_spans.push((start, len, seq));
+        Ok(())
+    }
+
+    /// Drain the current user-key group and decide what it resolves to.
+    ///
+    /// A column family with no merge operator takes this loop, which is
+    /// byte-for-byte the pre-1.1 one: the branch that would have asked every
+    /// entry whether it is an operand is hoisted into a single `is_some()` at
+    /// the top, because it is the per-entry work on this path that the 1.1
+    /// acceptance gate is about.
     fn resolve_current_group(&mut self, forward: bool) -> Result<VisibleVersion> {
+        if self.merge_op.is_some() {
+            return self.resolve_merging_group(forward);
+        }
         let mut visible = VisibleVersion::default();
         self.cur_val = CurVal::Empty;
         while self.top_in_group() {
@@ -665,6 +746,127 @@ impl Iterator {
             self.m.advance(forward);
         }
         Ok(visible)
+    }
+
+    /// [`resolve_current_group`](Self::resolve_current_group) for a family that
+    /// has a merge operator: the same walk, plus operand accumulation and the
+    /// fold that closes the group.
+    fn resolve_merging_group(&mut self, forward: bool) -> Result<VisibleVersion> {
+        let mut visible = VisibleVersion::default();
+        self.cur_val = CurVal::Empty;
+        self.operands.clear();
+        self.operand_spans.clear();
+        while self.top_in_group() {
+            if self.m.top().kind() == crate::format::KIND_MERGE {
+                let seq = self.m.top().seq();
+                // Forward, the group arrives newest-first, so an operand seen
+                // after the base is older than it and belongs to a superseded
+                // chain. Backward it arrives oldest-first, and each base clears
+                // the operands it superseded (below).
+                if seq <= self.read_seq && !(forward && visible.found) {
+                    self.push_operand(seq)?;
+                }
+                self.m.advance(forward);
+                continue;
+            }
+            let decision = {
+                let top = self.m.top();
+                visible.consider(top.seq(), top.tombstone(), top.ttl(), self.read_seq)
+            };
+            match decision {
+                VersionDecision::Ignore => {}
+                VersionDecision::Tombstone => {
+                    self.cur_val = CurVal::Empty;
+                    if !forward {
+                        self.operands.clear();
+                        self.operand_spans.clear();
+                    }
+                }
+                VersionDecision::Value => {
+                    self.capture_value()?;
+                    if !forward {
+                        self.operands.clear();
+                        self.operand_spans.clear();
+                    }
+                }
+            }
+            self.m.advance(forward);
+        }
+        if !self.operand_spans.is_empty() {
+            // A range delete cuts the chain: operands at or below it, and a
+            // base at or below it, are masked. Asked once per folding group,
+            // and only for a group that actually has operands.
+            let cover = self.group_covering_seq();
+            self.fold_group(&mut visible, forward, cover)?;
+        }
+        Ok(visible)
+    }
+
+    /// Fold this group's operands onto the base `resolve_current_group` found
+    /// and publish the result as the group's value.
+    fn fold_group(
+        &mut self,
+        visible: &mut VisibleVersion,
+        forward: bool,
+        cover: Option<u64>,
+    ) -> Result<()> {
+        let op = self
+            .merge_op
+            .clone()
+            .expect("only called with an operator configured");
+        if let Some(c) = cover {
+            self.operand_spans.retain(|&(_, _, seq)| seq > c);
+            if self.operand_spans.is_empty() {
+                // Every operand was masked. The base is at or below the span
+                // too (it is older than the operands), so leaving `visible`
+                // untouched lets `masked_by_range` hide the group, exactly as
+                // it would for a family with no operator.
+                return Ok(());
+            }
+        }
+        if forward {
+            // Collected newest-first; the operator is handed oldest-first.
+            self.operand_spans.reverse();
+        }
+        let folded = {
+            let key = self.key();
+            // A deleted, expired or absent base is `existing = None`; a real
+            // empty value stays `Some(b"")`. A base at or below a covering
+            // range delete is absent for the same reason a point read treats
+            // the span as a deleted base.
+            let existing = if visible.found
+                && !visible.tombstone
+                && !expired(visible.ttl, self.now)
+                && !cover.is_some_and(|c| visible.seq <= c)
+            {
+                Some(self.value())
+            } else {
+                None
+            };
+            let operands: Vec<&[u8]> = self
+                .operand_spans
+                .iter()
+                .map(|&(start, len, _)| &self.operands[start..start + len])
+                .collect();
+            op.full_merge(key, existing, &operands).map_err(|e| {
+                crate::error::OndaError::Corruption(format!(
+                    "merge operator {:?} failed for key {:?}: {e}",
+                    op.name(),
+                    String::from_utf8_lossy(key)
+                ))
+            })?
+        };
+        self.val = folded;
+        self.cur_val = CurVal::Buffered;
+        visible.found = true;
+        visible.merged = true;
+        // The folded group's sequence is its newest surviving operand's, not
+        // the base's: `masked_by_range` runs after this and would otherwise
+        // hide a chain whose operands sit *above* the covering span.
+        if let Some(newest) = self.operand_spans.iter().map(|&(_, _, seq)| seq).max() {
+            visible.seq = visible.seq.max(newest);
+        }
+        Ok(())
     }
 
     /// Open a [`crate::perf::Scope`] for the walk that follows.
@@ -800,9 +1002,9 @@ mod tests {
     fn exact_tie_children() -> Vec<ChildIter> {
         let comparator = default_comparator();
         let overlay = Memtable::new(comparator.clone());
-        overlay.put(b"key", b"overlay".to_vec(), 7, 0, false, false);
+        overlay.put(b"key", b"overlay".to_vec(), 7, 0, crate::format::KIND_PUT);
         let committed = Memtable::new(comparator);
-        committed.put(b"key", b"committed".to_vec(), 7, 0, false, false);
+        committed.put(b"key", b"committed".to_vec(), 7, 0, crate::format::KIND_PUT);
         vec![
             ChildIter::Mem(overlay.iter()),
             ChildIter::Mem(committed.iter()),

@@ -42,15 +42,34 @@ use crate::format::flags;
 const HEADER_SIZE: usize = 8; // payload_len(4) + crc(4)
 
 /// One logical WAL entry (owned; produced by replay).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Record {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
     pub seq: u64,
     /// Absolute Unix-nanosecond expiry; `0` for none.
     pub ttl: i64,
-    pub tombstone: bool,
-    pub single_delete: bool,
+    /// Record kind ([`KIND_PUT`](crate::format::KIND_PUT) and friends).
+    ///
+    /// One field rather than the `(tombstone, single_delete)` pair it replaced:
+    /// the pair could express `single_delete && !tombstone`, which no writer
+    /// produces, and 1.1 would have had to add a third boolean whose
+    /// combinations with the other two are equally meaningless. A kind has
+    /// exactly one value, and [`check_kind`](crate::format::check_kind) is the
+    /// single place that decides which values this binary honors.
+    pub kind: u64,
+}
+
+impl Default for Record {
+    fn default() -> Record {
+        Record {
+            key: Vec::new(),
+            value: Vec::new(),
+            seq: 0,
+            ttl: 0,
+            kind: crate::format::KIND_PUT,
+        }
+    }
 }
 
 /// A borrowed view of one logical WAL entry, used on the commit path so keys
@@ -62,8 +81,41 @@ pub struct RecordRef<'a> {
     pub value: &'a [u8],
     pub seq: u64,
     pub ttl: i64,
-    pub tombstone: bool,
-    pub single_delete: bool,
+    /// See [`Record::kind`].
+    pub kind: u64,
+}
+
+impl RecordRef<'_> {
+    /// Whether this record hides older versions of its key.
+    #[inline]
+    pub fn tombstone(&self) -> bool {
+        self.kind == crate::format::KIND_DELETE || self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    #[inline]
+    pub fn single_delete(&self) -> bool {
+        self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    /// Whether this record is a merge operand (1.1) rather than a point write.
+    #[inline]
+    pub fn is_merge(&self) -> bool {
+        self.kind == crate::format::KIND_MERGE
+    }
+}
+
+impl Record {
+    /// See [`RecordRef::tombstone`].
+    #[inline]
+    pub fn tombstone(&self) -> bool {
+        self.kind == crate::format::KIND_DELETE || self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    #[inline]
+    pub fn single_delete(&self) -> bool {
+        self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    #[inline]
+    pub fn is_merge(&self) -> bool {
+        self.kind == crate::format::KIND_MERGE
+    }
 }
 
 impl Record {
@@ -74,8 +126,7 @@ impl Record {
             value: &self.value,
             seq: self.seq,
             ttl: self.ttl,
-            tombstone: self.tombstone,
-            single_delete: self.single_delete,
+            kind: self.kind,
         }
     }
 }
@@ -185,13 +236,12 @@ fn point_envelope<'a>(recs: &[RecordRef<'a>]) -> Vec<EnvelopeRecord<'a>> {
 fn envelope_record_len(rec: EnvelopeRecord<'_>) -> usize {
     match rec {
         EnvelopeRecord::Point(r) => {
-            let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
             let mods = if r.ttl != 0 {
                 crate::format::modifiers::HAS_TTL
             } else {
                 0
             };
-            uvarint_len(kind)
+            uvarint_len(r.kind)
                 + uvarint_len(mods)
                 + uvarint_len(r.key.len() as u64)
                 + uvarint_len(r.value.len() as u64)
@@ -223,14 +273,17 @@ fn envelope_record_len(rec: EnvelopeRecord<'_>) -> usize {
 fn encode_envelope_record(dst: &mut Vec<u8>, rec: EnvelopeRecord<'_>) {
     match rec {
         EnvelopeRecord::Point(r) => {
-            crate::format::debug_check_entry_flags(r.tombstone, r.single_delete, false);
-            let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
+            debug_assert!(
+                crate::format::check_kind(r.kind).is_ok(),
+                "envelope record with unimplemented kind {}",
+                r.kind
+            );
             let mods = if r.ttl != 0 {
                 crate::format::modifiers::HAS_TTL
             } else {
                 0
             };
-            append_uvarint(dst, kind);
+            append_uvarint(dst, r.kind);
             append_uvarint(dst, mods);
             append_uvarint(dst, r.key.len() as u64);
             append_uvarint(dst, r.value.len() as u64);
@@ -316,8 +369,7 @@ fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
         value: p[off + alen..off + need].to_vec(),
         seq,
         ttl,
-        tombstone: kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE,
-        single_delete: kind == crate::format::KIND_SINGLE_DELETE,
+        kind,
     };
     Ok((ReplayRecord::Point(rec), off + need))
 }
@@ -356,10 +408,18 @@ fn decode_envelope(payload: &[u8], mut f: impl FnMut(ReplayRecord) -> Result<u64
 
 /// Append one record's body (no framing) to `dst`.
 fn encode_record_body(dst: &mut Vec<u8>, r: RecordRef<'_>) {
-    // Normalize here, not only at decode: `RecordRef` is public, so a caller
-    // outside the crate can hand us `single_delete` without `tombstone`.
-    crate::format::debug_check_entry_flags(r.tombstone, r.single_delete, false);
-    let fl = crate::format::normalized_entry_flags(r.tombstone, r.single_delete, r.ttl != 0, false);
+    // The legacy record has no kind field: everything it can say is said by the
+    // flags byte, so a kind outside the three point kinds cannot be written
+    // here at all. Callers route such a batch to an envelope frame instead
+    // (`ColumnFamily::apply_commit`); reaching this with one is an engine bug.
+    debug_assert!(
+        crate::format::is_point_kind(r.kind),
+        "legacy WAL record cannot carry kind {}",
+        r.kind
+    );
+    let (tombstone, single_delete) = (r.tombstone(), r.single_delete());
+    crate::format::debug_check_entry_flags(tombstone, single_delete, false);
+    let fl = crate::format::normalized_entry_flags(tombstone, single_delete, r.ttl != 0, false);
     dst.push(fl);
     append_uvarint(dst, r.key.len() as u64);
     append_uvarint(dst, r.value.len() as u64);
@@ -387,8 +447,10 @@ fn decode_record(p: &[u8]) -> Result<(Record, usize)> {
     crate::format::check_entry_flags(fl)?;
     let mut off = 1usize;
     let mut r = Record {
-        tombstone: fl & flags::TOMBSTONE != 0,
-        single_delete: fl & flags::SINGLE_DELETE != 0,
+        kind: crate::format::point_kind(
+            fl & flags::TOMBSTONE != 0,
+            fl & flags::SINGLE_DELETE != 0,
+        ),
         ..Default::default()
     };
     let (klen, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
@@ -1014,8 +1076,7 @@ mod tests {
             Record {
                 key: b"d".to_vec(),
                 seq: 3,
-                tombstone: true,
-                single_delete: true,
+                kind: crate::format::KIND_SINGLE_DELETE,
                 ..Default::default()
             },
         ]
@@ -1083,8 +1144,10 @@ mod tests {
     }
 
     /// `encode_record_body` builds its flags byte through
-    /// `format::normalized_entry_flags`; the byte assertion goes there because
-    /// the encode site debug-asserts the invariant (twin below).
+    /// `format::normalized_entry_flags`, and the kind is what decides the two
+    /// tombstone bits — so `SINGLE_DELETE` without `TOMBSTONE`, the state the
+    /// old `(tombstone, single_delete)` pair could express, is now
+    /// unrepresentable rather than merely normalized away.
     #[test]
     fn wal_encode_normalizes_single_delete() {
         use crate::format::normalized_entry_flags;
@@ -1100,26 +1163,28 @@ mod tests {
                 value: b"",
                 seq: 1,
                 ttl: 0,
-                tombstone: true,
-                single_delete: true,
+                kind: crate::format::KIND_SINGLE_DELETE,
             },
         );
         assert_eq!(buf[0], flags::TOMBSTONE | flags::SINGLE_DELETE);
     }
 
+    /// The legacy record has no kind field, so it cannot carry 1.1's merge
+    /// operand. Batches holding one are routed to an envelope frame by
+    /// `ColumnFamily::apply_commit`; reaching the legacy encoder with one is an
+    /// engine bug and is loud in debug builds.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "SINGLE_DELETE")]
-    fn wal_encode_debug_asserts_single_delete_implies_tombstone() {
+    #[should_panic(expected = "cannot carry kind")]
+    fn wal_legacy_encode_debug_asserts_point_kind() {
         encode_record_body(
             &mut Vec::new(),
             RecordRef {
                 key: b"k",
-                value: b"",
+                value: b"operand",
                 seq: 1,
                 ttl: 0,
-                tombstone: false,
-                single_delete: true,
+                kind: crate::format::KIND_MERGE,
             },
         );
     }
@@ -1140,14 +1205,13 @@ mod tests {
             Record {
                 key: b"del".to_vec(),
                 seq: 3,
-                tombstone: true,
+                kind: crate::format::KIND_DELETE,
                 ..Default::default()
             },
             Record {
                 key: b"sdel".to_vec(),
                 seq: 4,
-                tombstone: true,
-                single_delete: true,
+                kind: crate::format::KIND_SINGLE_DELETE,
                 ..Default::default()
             },
         ]
@@ -1170,6 +1234,21 @@ mod tests {
         recs.iter()
             .map(|r| EnvelopeRecord::Point(r.as_ref()))
             .collect()
+    }
+
+    /// The point records plus 1.1's merge operand, which has no legacy spelling
+    /// at all. Kept out of [`envelope_point_records`] because that one backs the
+    /// golden fixtures, whose bytes are the wavesdb contract and never move.
+    fn envelope_records_with_merge() -> Vec<Record> {
+        let mut recs = envelope_point_records();
+        recs.push(Record {
+            key: b"merge".to_vec(),
+            value: b"operand".to_vec(),
+            seq: 5,
+            kind: crate::format::KIND_MERGE,
+            ..Default::default()
+        });
+        recs
     }
 
     /// Decode a hand-built envelope payload into its records.
@@ -1205,7 +1284,7 @@ mod tests {
 
     #[test]
     fn envelope_schema1_round_trips_all_point_kinds() {
-        let want = envelope_point_records();
+        let want = envelope_records_with_merge();
         let payload = envelope_payload(ENVELOPE_SCHEMA_PER_CF, &want);
         assert_eq!(payload[0], ENVELOPE_TAG);
         let got = decode_envelope_payload(&payload).unwrap();
@@ -1215,8 +1294,7 @@ mod tests {
             assert_eq!(g.value, w.value);
             assert_eq!(g.seq, w.seq);
             assert_eq!(g.ttl, w.ttl);
-            assert_eq!(g.tombstone, w.tombstone);
-            assert_eq!(g.single_delete, w.single_delete);
+            assert_eq!(g.kind, w.kind);
         }
     }
 
@@ -1288,14 +1366,17 @@ mod tests {
         b
     }
 
-    /// Kind 4 is assigned (1.1's merge operand) but not implemented here: the
-    /// bytes are intact and name a real feature, so this binary is the one at
-    /// fault. (Kind 5 *is* implemented as of 1.2 — see
-    /// `range_record_round_trips`.)
+    /// A kind inside the assignable range that this binary does not implement:
+    /// the bytes are intact and name a feature that may exist in a newer
+    /// writer, so this binary is the one at fault. Kind 6 is the first still
+    /// unassigned data kind — 4 (merge, 1.1) and 5 (range delete, 1.2) are both
+    /// implemented now, so neither can stand in for "too old to read this".
     #[test]
     fn envelope_unknown_kind_is_unsupported_format() {
-        let p = envelope_with_body(&envelope_body(crate::format::KIND_MERGE, 0));
-        let err = decode_envelope_payload(&p).expect_err("kind 4 is not implemented here");
+        const UNASSIGNED_DATA_KIND: u64 = 6;
+        assert!(UNASSIGNED_DATA_KIND <= crate::format::MAX_ASSIGNABLE_KIND);
+        let p = envelope_with_body(&envelope_body(UNASSIGNED_DATA_KIND, 0));
+        let err = decode_envelope_payload(&p).expect_err("kind 6 is not assigned yet");
         assert_eq!(err.kind(), "unsupported_format");
     }
 
@@ -1535,7 +1616,7 @@ mod tests {
                     Record {
                         key: del,
                         seq: 8,
-                        tombstone: true,
+                        kind: crate::format::KIND_DELETE,
                         ..Default::default()
                     },
                 ]
@@ -1551,8 +1632,7 @@ mod tests {
                 assert_eq!(g.value, w.value, "{name}");
                 assert_eq!(g.seq, w.seq, "{name}");
                 assert_eq!(g.ttl, w.ttl, "{name}");
-                assert_eq!(g.tombstone, w.tombstone, "{name}");
-                assert_eq!(g.single_delete, w.single_delete, "{name}");
+                assert_eq!(g.kind, w.kind, "{name}");
             }
         }
     }
@@ -1639,8 +1719,7 @@ mod tests {
                             value: b"v",
                             seq: base + i as u64 + 1,
                             ttl: 0,
-                            tombstone: false,
-                            single_delete: false,
+                            kind: crate::format::KIND_PUT,
                         })
                         .collect();
                     w.append_batch(&recs).unwrap();
@@ -1714,8 +1793,7 @@ mod tests {
                 key: b"d".to_vec(),
                 value: Vec::new(),
                 seq: 6,
-                tombstone: true,
-                single_delete: true,
+                kind: crate::format::KIND_SINGLE_DELETE,
                 ..Default::default()
             })
             .unwrap();
@@ -1728,7 +1806,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(recs[0].ttl, 1234567890);
-        assert!(recs[1].tombstone && recs[1].single_delete);
+        assert!(recs[1].tombstone() && recs[1].single_delete());
     }
 
     #[test]

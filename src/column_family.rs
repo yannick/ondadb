@@ -187,21 +187,49 @@ struct RotState {
     rotating: bool,
 }
 
-#[derive(Default)]
 struct PointReadCandidate {
     value: Option<Vec<u8>>,
     seq: u64,
     found: bool,
     deleted: bool,
+    /// Kind of the winning version. A family with no merge operator never reads
+    /// it; a merge family uses it as the *decision* whether this key needs the
+    /// chain walk at all — see `ColumnFamily::get_with_merge`.
+    kind: u64,
+    /// Newest range delete (1.2) covering this key, whether or not it beat the
+    /// point version. A merge fold needs it even when it lost: operands below
+    /// it are masked, so it is the chain's floor.
+    range_floor: Option<u64>,
+}
+
+impl Default for PointReadCandidate {
+    fn default() -> PointReadCandidate {
+        PointReadCandidate {
+            value: None,
+            seq: 0,
+            found: false,
+            deleted: false,
+            kind: crate::format::KIND_PUT,
+            range_floor: None,
+        }
+    }
 }
 
 impl PointReadCandidate {
-    fn consider(&mut self, value: Option<Vec<u8>>, seq: u64, found: bool, deleted: bool) {
+    fn consider(
+        &mut self,
+        value: Option<Vec<u8>>,
+        seq: u64,
+        found: bool,
+        deleted: bool,
+        kind: u64,
+    ) {
         if found && (!self.found || seq > self.seq) {
             self.value = value;
             self.seq = seq;
             self.found = true;
             self.deleted = deleted;
+            self.kind = kind;
         }
     }
 
@@ -211,7 +239,13 @@ impl PointReadCandidate {
         } else {
             Some(lookup.value)
         };
-        self.consider(value, lookup.seq, lookup.found, lookup.deleted);
+        self.consider(
+            value,
+            lookup.seq,
+            lookup.found,
+            lookup.deleted,
+            lookup.kind,
+        );
     }
 
     /// Apply range-delete coverage.
@@ -222,13 +256,18 @@ impl PointReadCandidate {
     /// `start + slot`) and own-write overlap is rejected, so the comparison is
     /// total — no tie can arise for it to resolve.
     fn mask(&mut self, covering: Option<u64>) {
-        if let Some(seq) = covering {
-            if !self.found || seq > self.seq {
-                self.value = None;
-                self.seq = seq;
-                self.found = true;
-                self.deleted = true;
-            }
+        let Some(seq) = covering else { return };
+        // Recorded even when the span loses: `fold_point_chain` still has to
+        // cut the operand chain at it.
+        self.range_floor = Some(seq);
+        if !self.found || seq > self.seq {
+            self.value = None;
+            self.seq = seq;
+            self.found = true;
+            self.deleted = true;
+            // The winning version is now the span, not the point entry — a
+            // masked operand must not send the reader down the fold path.
+            self.kind = crate::format::KIND_DELETE;
         }
     }
 
@@ -239,6 +278,81 @@ impl PointReadCandidate {
             Err(OndaError::NotFound)
         }
     }
+}
+
+/// One version of a key gathered while resolving a merge chain.
+///
+/// Sources are walked newest-first and each contributes its own run — every
+/// operand it holds plus, if it has one, the base that terminates them — and
+/// the runs are then ordered by sequence. A per-source run is what makes this
+/// correct across sources: two memtables and three tables can each hold part of
+/// one chain, and only the sequence numbers say how they interleave.
+struct ChainVersion {
+    seq: u64,
+    merge: bool,
+    /// Operand bytes, the base's value, or `None` for a deleted or expired
+    /// base — the found/deleted split the point-read path already carries.
+    value: Option<Vec<u8>>,
+}
+
+/// A [`crate::memtable::Memtable::chain`] callback that appends into `out` and
+/// stops the walk at the first base.
+fn collect_chain(out: &mut Vec<ChainVersion>) -> impl FnMut(u64, u64, Option<&[u8]>) -> bool + '_ {
+    move |seq, kind, value| {
+        let merge = kind == crate::format::KIND_MERGE;
+        out.push(ChainVersion {
+            seq,
+            merge,
+            value: value.map(<[u8]>::to_vec),
+        });
+        merge
+    }
+}
+
+/// Resolve a gathered chain into the value a reader sees.
+///
+/// The fold rule, over the versions of one key newest-first: collect operands
+/// until the first `Put`/`Delete`/`SingleDelete`; a `Put` is `existing =
+/// Some(value)` and a delete (or an expired put) is `existing = None`; running
+/// out of versions is also `existing = None`. The operands are then reversed to
+/// oldest-first and handed to the operator.
+///
+/// A group with **no** operand resolves exactly as it did before 1.1 — no
+/// operator call and no allocation beyond the value itself.
+fn fold_chain(
+    op: &Arc<dyn crate::config::MergeOperator>,
+    user_key: &[u8],
+    versions: &mut [ChainVersion],
+) -> Result<Vec<u8>> {
+    // Stable, so equal sequences keep the source order they were gathered in.
+    versions.sort_by_key(|v| std::cmp::Reverse(v.seq));
+    let mut operands: Vec<&[u8]> = Vec::new();
+    let mut existing: Option<&[u8]> = None;
+    for version in versions.iter() {
+        if version.merge {
+            // A merge operand is never `None`: only a base can be deleted.
+            operands.push(version.value.as_deref().unwrap_or(&[]));
+            continue;
+        }
+        existing = version.value.as_deref();
+        break;
+    }
+    if operands.is_empty() {
+        return match existing {
+            Some(value) => Ok(value.to_vec()),
+            None => Err(OndaError::NotFound),
+        };
+    }
+    operands.reverse();
+    op.full_merge(user_key, existing, &operands).map_err(|e| {
+        // The operator is part of the stored format: a chain it cannot fold is
+        // a database this binary cannot read, not a missing key.
+        OndaError::Corruption(format!(
+            "merge operator {:?} failed for key {:?}: {e}",
+            op.name(),
+            String::from_utf8_lossy(user_key)
+        ))
+    })
 }
 
 struct PointReadSources {
@@ -629,7 +743,7 @@ impl ColumnFamily {
             let last = Wal::replay(&p, |rec| {
                 match rec {
                     crate::wal::ReplayRecord::Point(r) => {
-                        mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+                        mem.put(&r.key, r.value, r.seq, r.ttl, r.kind);
                     }
                     // Schema 1: both bounds are user keys already.
                     crate::wal::ReplayRecord::RangeDelete { start, end, seq } => {
@@ -840,7 +954,13 @@ impl ColumnFamily {
             let Some(w) = &wal else {
                 return Err(OndaError::ReadOnly("wal unavailable".into()));
             };
-            if ranges.is_empty() {
+            // The legacy record has no kind field, so a batch carrying one that
+            // is not a point kind — 1.1's operand — or any 1.2 range fragment
+            // goes out as an envelope frame instead. Checking the batch rather
+            // than the family keeps every ordinary commit byte-identical to
+            // what 0.8.2 wrote, including on a family that merely *has* an
+            // operator.
+            if ranges.is_empty() && recs.iter().all(|r| crate::format::is_point_kind(r.kind)) {
                 w.append_batch(recs)?;
             } else {
                 let mut batch: Vec<wal::EnvelopeRecord<'_>> =
@@ -1082,14 +1202,7 @@ impl ColumnFamily {
         w.set_range_fragments(fragments);
         while m.valid() {
             let c = m.top();
-            w.add(
-                c.user_key(),
-                c.value(),
-                c.seq(),
-                c.ttl(),
-                c.tombstone(),
-                c.single_delete(),
-            )?;
+            w.add(c.user_key(), c.value(), c.seq(), c.ttl(), c.kind())?;
             m.advance();
         }
         self.finish_writer_to_handle(w, file_id).map(Some)
@@ -1110,14 +1223,7 @@ impl ColumnFamily {
         let mut w = self.new_writer(&klog, entries.len())?;
         w.set_range_fragments(fragments);
         for e in entries {
-            w.add(
-                &e.user_key,
-                &e.value,
-                e.seq,
-                e.ttl,
-                e.tombstone,
-                e.single_delete,
-            )?;
+            w.add(&e.user_key, &e.value, e.seq, e.ttl, e.kind)?;
         }
         self.finish_writer_to_handle(w, file_id).map(Some)
     }
@@ -1170,6 +1276,25 @@ impl ColumnFamily {
         self.id
     }
 
+    /// This family's merge operator, or `None` when it has none.
+    ///
+    /// Resolved once at create/open from `Options::merge_fns`; every read path
+    /// branches on `is_none()` here, so a family that never configured one pays
+    /// a single null check and takes none of 1.1's code.
+    #[inline]
+    pub(crate) fn merge_op(&self) -> Option<&Arc<dyn crate::config::MergeOperator>> {
+        self.opts.merge_operator.as_ref()
+    }
+
+    /// Whether this family may write kind-4 records: it has an operator *and*
+    /// the database durably holds the capability that authorizes the envelope
+    /// carrying them.
+    pub(crate) fn merge_writes_enabled(&self) -> bool {
+        self.opts.merge_operator.is_some()
+            && self.ctx.caps.load(Ordering::SeqCst) & crate::format::CAPS_MERGE_WRITE
+                == crate::format::CAPS_MERGE_WRITE
+    }
+
     fn writer_opts(&self, expected: usize) -> WriterOptions {
         // Delta output is the option AND the durable capability: the bit
         // reaches the manifest before the first byte using it exists, so a
@@ -1201,9 +1326,11 @@ impl ColumnFamily {
             // CAP_RANGE_DELETES therefore writes every new table extended,
             // whether or not this particular one ends up with a fragment — the
             // alternative is knowing the answer before the merge has run. A
+            // family with a merge operator needs the same layout for a second
+            // reason: its operands have nowhere but the kind field to live. A
             // delta table is an extended table too, and `Writer` sets both
             // footer flags.
-            extended_entries: self.range_deletes_enabled(),
+            extended_entries: self.range_deletes_enabled() || self.merge_writes_enabled(),
             prefix_delta,
         }
     }
@@ -1424,13 +1551,119 @@ impl ColumnFamily {
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
             crate::perf::bump(|p| p.sstable_probes += 1);
-            let (value, seq, found, deleted) = rd.get_unfiltered(user_key, read_seq, now)?;
-            candidate.consider(value, seq, found, deleted);
+            let (value, seq, found, deleted, kind) = rd.get_unfiltered(user_key, read_seq, now)?;
+            candidate.consider(value, seq, found, deleted, kind);
         }
         Ok(())
     }
 
+    /// Gather every version of `user_key` this table holds at or below
+    /// `read_seq`, newest first, stopping at (and including) the first base.
+    ///
+    /// Driven through an [`SstIterator`] rather than the point-read block walk:
+    /// a key's versions are contiguous in internal order but may straddle a
+    /// block boundary, and the iterator already handles block transitions and
+    /// both entry layouts. Only a key whose newest visible version is an
+    /// operand reaches this, so the extra iterator per candidate table is paid
+    /// by chains and by nothing else.
+    fn collect_table_chain(
+        &self,
+        th: &Arc<SstHandle>,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        out: &mut Vec<ChainVersion>,
+    ) -> Result<()> {
+        let rd = th.reader()?;
+        // The bloom and probe counters were already charged by the ordinary
+        // candidate pass that decided this key needs folding; counting them
+        // again would double every probe for a merge family.
+        if !rd.bloom_may_contain_hash(rd.bloom_hash(user_key)) {
+            return Ok(());
+        }
+        let mut it = rd.iter();
+        // `(user_key, read_seq)` lands on the newest version visible at
+        // `read_seq` — entries are ordered user key ascending, sequence
+        // descending.
+        it.seek(user_key, read_seq);
+        while it.valid() {
+            if self.cmp.compare(it.user_key(), user_key) != std::cmp::Ordering::Equal {
+                break;
+            }
+            let seq = it.seq();
+            if it.kind() == crate::format::KIND_MERGE {
+                out.push(ChainVersion {
+                    seq,
+                    merge: true,
+                    value: Some(it.value()?),
+                });
+                it.next();
+                continue;
+            }
+            let dead = it.is_tombstone() || (it.ttl() != 0 && it.ttl() <= now);
+            out.push(ChainVersion {
+                seq,
+                merge: false,
+                value: if dead { None } else { Some(it.value()?) },
+            });
+            break; // a base terminates this table's contribution
+        }
+        Ok(())
+    }
+
+    /// Gather and fold `user_key`'s whole operand chain across `sources`.
+    ///
+    /// Only reached for a key whose newest visible version really is an operand
+    /// — see [`get`](Self::get).
+    #[allow(clippy::too_many_arguments)]
+    fn fold_point_chain<'a>(
+        &self,
+        op: &Arc<dyn crate::config::MergeOperator>,
+        mem: &Memtable,
+        imms: &[Arc<ImmMemtable>],
+        tables: impl std::iter::Iterator<Item = &'a Arc<SstHandle>>,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        range_floor: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let mut versions: Vec<ChainVersion> = Vec::new();
+        // A range delete is, for this one key, a tombstone at its sequence.
+        // Injecting it as a deleted base is the whole composition of 1.1 with
+        // 1.2: `fold_chain` sorts by sequence and stops at the first base, so
+        // operands above the span fold onto nothing and everything at or below
+        // it — operands and base alike — is masked, with no second rule.
+        if let Some(seq) = range_floor {
+            versions.push(ChainVersion {
+                seq,
+                merge: false,
+                value: None,
+            });
+        }
+        // Newest source first, so equal sequences (which only a transaction
+        // overlay can produce) keep the newer source's version.
+        if let Some(u) = &self.ctx.unified {
+            u.chain(self.id, user_key, read_seq, now, collect_chain(&mut versions));
+        }
+        mem.chain(user_key, read_seq, now, collect_chain(&mut versions));
+        for imm in imms.iter().rev() {
+            imm.mem
+                .chain(user_key, read_seq, now, collect_chain(&mut versions));
+        }
+        for th in tables {
+            self.collect_table_chain(th, user_key, read_seq, now, &mut versions)?;
+        }
+        fold_chain(op, user_key, &mut versions)
+    }
+
     /// Resolve `user_key` as of `read_seq`. Returns the value, or `NotFound`.
+    ///
+    /// A merge family takes the same candidate pass as everyone else and only
+    /// walks the chain when the winning version turns out to be an operand.
+    /// That is exact, not an approximation: the fold rule reads the versions of
+    /// a key newest first and stops at the first base, so if the newest visible
+    /// version across all sources is not an operand, the chain has no operand
+    /// above its base and the ordinary answer *is* the folded one.
     pub(crate) fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
         self.point_reads.fetch_add(1, Ordering::Relaxed);
         let now = coarse_now_nanos();
@@ -1450,6 +1683,27 @@ impl ColumnFamily {
         }
         self.consider_sstables(&mut candidate, &sources.tables, user_key, read_seq, now)?;
         candidate.mask(self.covering_range_seq(&sources, user_key, read_seq)?);
+        if candidate.kind == crate::format::KIND_MERGE {
+            if let Some(op) = self.opts.merge_operator.as_ref() {
+                return self.fold_point_chain(
+                    op,
+                    &sources.mem,
+                    &sources.imms,
+                    sources.tables.iter(),
+                    user_key,
+                    read_seq,
+                    now,
+                    candidate.range_floor,
+                );
+            }
+            // An operand with no operator can only come from a hand-edited
+            // config blob: `resolve_merge_operator` fails the open otherwise.
+            return Err(OndaError::Corruption(format!(
+                "column family {:?} holds a merge operand for key {:?} but has no merge operator",
+                self.name,
+                String::from_utf8_lossy(user_key)
+            )));
+        }
         candidate.finish()
     }
 
@@ -1671,8 +1925,8 @@ impl ColumnFamily {
                     .restart_scan_offset(raw, restarts, keys[i], read_seq)
                     .and_then(|off| rd.scan_point_entry(raw, off, keys[i], read_seq, now));
                 match found {
-                    Ok((value, seq, found, deleted)) => {
-                        cands[i].consider(value, seq, found, deleted)
+                    Ok((value, seq, found, deleted, kind)) => {
+                        cands[i].consider(value, seq, found, deleted, kind)
                     }
                     Err(e) => Self::record_read_error(i, cands, errs, &e),
                 }
@@ -1779,11 +2033,39 @@ impl ColumnFamily {
             }
         }
 
+        // Merge post-pass: exactly the keys whose winning version is an operand
+        // need their chain walked (see `get` for why that test is exact). The
+        // batch keeps its one clock reading and one source snapshot; only those
+        // keys give up the block dedup.
+        let operator = self.opts.merge_operator.as_ref();
         cands
             .into_iter()
             .zip(errs)
-            .map(|(c, e)| match e {
+            .enumerate()
+            .map(|(i, (c, e))| match e {
                 Some(e) => Err(e),
+                None if c.kind == crate::format::KIND_MERGE => match operator {
+                    Some(op) => self.fold_point_chain(
+                        op,
+                        &sources.mem,
+                        &sources.imms,
+                        sources
+                            .tables
+                            .iter()
+                            .filter(|(_, idxs)| idxs.contains(&i))
+                            .map(|(th, _)| th),
+                        keys[i],
+                        read_seq,
+                        now,
+                        c.range_floor,
+                    ),
+                    None => Err(OndaError::Corruption(format!(
+                        "column family {:?} holds a merge operand for key {:?} \
+                         but has no merge operator",
+                        self.name,
+                        String::from_utf8_lossy(keys[i])
+                    ))),
+                },
                 None => c.finish(),
             })
             .collect()
@@ -1827,7 +2109,7 @@ impl ColumnFamily {
             }
         }
         for th in &tables {
-            let (_, seq, found, _) = th.reader()?.get(user_key, u64::MAX, now)?;
+            let (_, seq, found, ..) = th.reader()?.get(user_key, u64::MAX, now)?;
             if found {
                 best = best.max(seq);
             }
@@ -1876,14 +2158,7 @@ impl ColumnFamily {
                 if !entries.is_empty() {
                     let overlay = Memtable::new(self.cmp.clone());
                     for e in entries {
-                        overlay.put(
-                            &e.user_key,
-                            e.value,
-                            e.seq,
-                            e.ttl,
-                            e.tombstone,
-                            e.single_delete,
-                        );
+                        overlay.put(&e.user_key, e.value, e.seq, e.ttl, e.kind);
                     }
                     children.push(ChildIter::Mem(overlay.iter()));
                 }
@@ -2064,6 +2339,7 @@ impl ColumnFamily {
             owned,
             mask,
         )
+        .with_merge_operator(self.opts.merge_operator.clone())
     }
 
     /// Catalogued table metadata, level by level, in the order each level
@@ -2700,10 +2976,10 @@ mod tests {
     fn point_read_candidate_keeps_the_newest_visible_result() {
         let mut candidate = PointReadCandidate::default();
 
-        candidate.consider(Some(b"new".to_vec()), 9, true, false);
-        candidate.consider(Some(b"old".to_vec()), 3, true, false);
-        candidate.consider(Some(b"same-sequence".to_vec()), 9, true, false);
-        candidate.consider(Some(b"absent".to_vec()), 12, false, false);
+        candidate.consider(Some(b"new".to_vec()), 9, true, false, crate::format::KIND_PUT);
+        candidate.consider(Some(b"old".to_vec()), 3, true, false, crate::format::KIND_PUT);
+        candidate.consider(Some(b"same-sequence".to_vec()), 9, true, false, crate::format::KIND_PUT);
+        candidate.consider(Some(b"absent".to_vec()), 12, false, false, crate::format::KIND_PUT);
 
         assert_eq!(candidate.finish().unwrap(), b"new");
     }
@@ -2712,8 +2988,8 @@ mod tests {
     fn point_read_candidate_newer_tombstone_hides_older_value() {
         let mut candidate = PointReadCandidate::default();
 
-        candidate.consider(Some(b"value".to_vec()), 4, true, false);
-        candidate.consider(None, 5, true, true);
+        candidate.consider(Some(b"value".to_vec()), 4, true, false, crate::format::KIND_PUT);
+        candidate.consider(None, 5, true, true, crate::format::KIND_PUT);
 
         assert!(matches!(candidate.finish(), Err(OndaError::NotFound)));
     }

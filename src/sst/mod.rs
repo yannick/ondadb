@@ -259,6 +259,19 @@ pub(crate) struct DecEntry {
     pub seq: u64,
     pub ttl: i64,
     pub flags: u8,
+    /// Record kind. A legacy entry has no kind field on disk, so it decodes to
+    /// the [`point_kind`](crate::format::point_kind) its flags describe — every
+    /// consumer can then ask one question instead of two.
+    ///
+    /// Narrowed to a byte deliberately: kinds are bounded by
+    /// [`MAX_ASSIGNABLE_KIND`](crate::format::MAX_ASSIGNABLE_KIND) (63) and
+    /// [`check_kind`](crate::format::check_kind) runs before the cast, so the
+    /// byte packs into the padding beside `flags` and `DecEntry` stays the size
+    /// it was before 1.1. This entry is returned **by value** once per decoded
+    /// entry, and growing it by 8 bytes cost a measurable ~5 % on a full scan
+    /// of a family that has no merge operator at all (see
+    /// `bench-results/1.1/`).
+    pub kind: u8,
     pub vlog_off: u64,
 }
 
@@ -312,26 +325,31 @@ pub(crate) fn encode_entry(
     value: &[u8],
     seq: u64,
     ttl: i64,
-    tombstone: bool,
-    single_delete: bool,
+    kind: u64,
     has_vlog: bool,
     vlog_off: u64,
 ) {
+    let (tombstone, single_delete) = kind_to_point_flags(kind);
     crate::format::debug_check_entry_flags(tombstone, single_delete, has_vlog);
     let fl = crate::format::normalized_entry_flags(tombstone, single_delete, ttl != 0, has_vlog);
     // Normalization may have cleared HAS_VLOG (a tombstone has no separated
     // value); the layout below must follow the byte that was actually written.
     let has_vlog = fl & flags::HAS_VLOG != 0;
     match layout {
-        EntryLayout::Legacy => dst.push(fl),
+        EntryLayout::Legacy => {
+            // A legacy entry has nowhere to put a kind, so only the three point
+            // kinds are representable. `Writer::add` refuses the rest before
+            // reaching here; this is the last line of defence.
+            debug_assert!(
+                crate::format::is_point_kind(kind),
+                "legacy block entry cannot carry kind {kind}"
+            );
+            dst.push(fl);
+        }
         EntryLayout::Extended => {
             // The modifier bits are the flag bits, so an extended entry and a
             // legacy entry describe the same thing with the same numbers; the
-            // tombstone/single-delete distinction moves into the kind.
-            let kind = crate::format::point_kind(
-                fl & flags::TOMBSTONE != 0,
-                fl & flags::SINGLE_DELETE != 0,
-            );
+            // tombstone/single-delete distinction lives in the kind.
             let mods = u64::from(fl) & crate::format::modifiers::KNOWN;
             append_uvarint(dst, kind);
             append_uvarint(dst, mods);
@@ -362,11 +380,15 @@ pub(crate) fn decode_entry(
     if off >= raw.len() {
         return Err(corrupt());
     }
-    let (fl, mut p) = match layout {
+    let (fl, kind, mut p) = match layout {
         EntryLayout::Legacy => {
             let fl = raw[off];
             crate::format::check_entry_flags(fl)?;
-            (fl, off + 1)
+            let kind = crate::format::point_kind(
+                fl & flags::TOMBSTONE != 0,
+                fl & flags::SINGLE_DELETE != 0,
+            ) as u8;
+            (fl, kind, off + 1)
         }
         EntryLayout::Extended => {
             let (kind, n) = uvarint(&raw[off..]).ok_or_else(corrupt)?;
@@ -377,18 +399,21 @@ pub(crate) fn decode_entry(
             let (mods, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
             crate::format::check_modifiers(mods)?;
             p += n;
-            // Fold back into the legacy flags byte: every consumer of
-            // `DecEntry` (tombstone/TTL/vlog checks, compaction, iteration)
-            // reads that one representation.
+            // The TTL/vlog bits are also folded back into a legacy flags byte:
+            // every consumer of `DecEntry` reads that one representation for
+            // them. The kind itself is kept as the kind — 1.1's merge operand
+            // has no flags-byte spelling.
+            let (tombstone, single_delete) = kind_to_point_flags(kind);
             let mut fl = mods as u8;
-            if kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE {
+            if tombstone {
                 fl |= flags::TOMBSTONE;
             }
-            if kind == crate::format::KIND_SINGLE_DELETE {
+            if single_delete {
                 fl |= flags::SINGLE_DELETE;
             }
             crate::format::check_entry_flags(fl)?;
-            (fl, p)
+            // `check_kind` bounded it by MAX_ASSIGNABLE_KIND (63) above.
+            (fl, kind as u8, p)
         }
     };
     let (klen, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
@@ -433,10 +458,21 @@ pub(crate) fn decode_entry(
             seq,
             ttl,
             flags: fl,
+            kind,
             vlog_off,
         },
         next,
     ))
+}
+
+/// The `(tombstone, single_delete)` pair a record kind implies. A merge operand
+/// is neither: it hides nothing.
+#[inline]
+pub(crate) fn kind_to_point_flags(kind: u64) -> (bool, bool) {
+    (
+        kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE,
+        kind == crate::format::KIND_SINGLE_DELETE,
+    )
 }
 
 /// Length of the longest common prefix of `a` and `b`.
@@ -472,18 +508,16 @@ pub(crate) fn encode_entry_delta(
     value: &[u8],
     seq: u64,
     ttl: i64,
-    tombstone: bool,
-    single_delete: bool,
+    kind: u64,
     has_vlog: bool,
     vlog_off: u64,
 ) -> usize {
+    let (tombstone, single_delete) = kind_to_point_flags(kind);
     crate::format::debug_check_entry_flags(tombstone, single_delete, has_vlog);
     let fl = crate::format::normalized_entry_flags(tombstone, single_delete, ttl != 0, has_vlog);
     // Normalization may have cleared HAS_VLOG (a tombstone has no separated
     // value); the layout below must follow the bits that were actually written.
     let has_vlog = fl & flags::HAS_VLOG != 0;
-    let kind =
-        crate::format::point_kind(fl & flags::TOMBSTONE != 0, fl & flags::SINGLE_DELETE != 0);
     let mods = u64::from(fl) & crate::format::modifiers::KNOWN;
     let shared = shared_prefix_len(prev_key, user_key);
     append_uvarint(dst, kind);
@@ -525,12 +559,14 @@ pub(crate) fn decode_delta_header(raw: &[u8], off: usize) -> Result<(DecEntry, u
     crate::format::check_modifiers(mods)?;
     p += n;
     // Folded back into the legacy flags byte, exactly as `decode_entry` does:
-    // every consumer of `DecEntry` reads that one representation.
+    // every consumer of `DecEntry` reads that one representation for TTL and
+    // vlog placement, and the kind itself for everything else.
+    let (tombstone, single_delete) = kind_to_point_flags(kind);
     let mut fl = mods as u8;
-    if kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE {
+    if tombstone {
         fl |= flags::TOMBSTONE;
     }
-    if kind == crate::format::KIND_SINGLE_DELETE {
+    if single_delete {
         fl |= flags::SINGLE_DELETE;
     }
     crate::format::check_entry_flags(fl)?;
@@ -579,6 +615,8 @@ pub(crate) fn decode_delta_header(raw: &[u8], off: usize) -> Result<(DecEntry, u
             seq,
             ttl,
             flags: fl,
+            // `check_kind` bounded it by MAX_ASSIGNABLE_KIND (63) above.
+            kind: kind as u8,
             vlog_off,
         },
         next,
@@ -812,8 +850,8 @@ mod tests {
         // A well-formed entry stream, so mutations start from valid framing.
         let mut buf = Vec::new();
         let lay = EntryLayout::Legacy;
-        encode_entry(&mut buf, lay, b"k1", b"v", 1, 0, false, false, false, 0);
-        encode_entry(&mut buf, lay, b"k2", b"", 2, 0, true, true, false, 0);
+        encode_entry(&mut buf, lay, b"k1", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
+        encode_entry(&mut buf, lay, b"k2", b"", 2, 0, crate::format::KIND_SINGLE_DELETE, false, 0);
         encode_entry(
             &mut buf,
             lay,
@@ -821,8 +859,7 @@ mod tests {
             b"vvvv",
             3,
             1_700_000_000,
-            false,
-            false,
+            crate::format::KIND_PUT,
             true,
             64,
         );
@@ -890,8 +927,7 @@ mod tests {
             b"v",
             1,
             0,
-            false,
-            false,
+            crate::format::KIND_PUT,
             true,
             0x1234,
         );
@@ -906,8 +942,7 @@ mod tests {
             b"",
             1,
             0,
-            true,
-            true,
+            crate::format::KIND_SINGLE_DELETE,
             false,
             0,
         );
@@ -920,7 +955,7 @@ mod tests {
     /// Encode one delta entry against `prev` and decode it back.
     fn delta_round_trip(prev: &[u8], key: &[u8], value: &[u8], ttl: i64) -> (Vec<u8>, usize) {
         let mut buf = Vec::new();
-        let shared = encode_entry_delta(&mut buf, prev, key, value, 7, ttl, false, false, false, 0);
+        let shared = encode_entry_delta(&mut buf, prev, key, value, 7, ttl, crate::format::KIND_PUT, false, 0);
         let mut out = prev.to_vec();
         let (dec, next) = decode_entry_delta(&buf, 0, &mut out, true).unwrap();
         assert_eq!(next, buf.len(), "decode must consume the entry exactly");
@@ -959,18 +994,7 @@ mod tests {
     #[test]
     fn delta_entry_rejects_shared_longer_than_prev() {
         let mut buf = Vec::new();
-        encode_entry_delta(
-            &mut buf,
-            b"abcdef",
-            b"abcdefgh",
-            b"v",
-            1,
-            0,
-            false,
-            false,
-            false,
-            0,
-        );
+        encode_entry_delta(&mut buf, b"abcdef", b"abcdefgh", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
         // The predecessor is shorter than the recorded shared_len (6).
         let mut out = b"abc".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true)
@@ -985,18 +1009,7 @@ mod tests {
     #[test]
     fn delta_entry_rejects_truncated_suffix() {
         let mut buf = Vec::new();
-        encode_entry_delta(
-            &mut buf,
-            b"ab",
-            b"abcdefgh",
-            b"v",
-            1,
-            0,
-            false,
-            false,
-            false,
-            0,
-        );
+        encode_entry_delta(&mut buf, b"ab", b"abcdefgh", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
         // Drop the value and part of the suffix.
         buf.truncate(buf.len() - 4);
         let mut out = b"ab".to_vec();
@@ -1007,18 +1020,7 @@ mod tests {
     #[test]
     fn delta_entry_rejects_truncated_value() {
         let mut buf = Vec::new();
-        encode_entry_delta(
-            &mut buf,
-            b"ab",
-            b"abc",
-            b"a-long-value",
-            1,
-            0,
-            false,
-            false,
-            false,
-            0,
-        );
+        encode_entry_delta(&mut buf, b"ab", b"abc", b"a-long-value", 1, 0, crate::format::KIND_PUT, false, 0);
         buf.truncate(buf.len() - 3);
         let mut out = b"ab".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("truncated value");
@@ -1037,8 +1039,7 @@ mod tests {
             &vec![b'x'; 4096],
             9,
             0,
-            false,
-            false,
+            crate::format::KIND_PUT,
             true,
             0x1234_5678_9abc_def0,
         );
@@ -1055,7 +1056,7 @@ mod tests {
     #[test]
     fn delta_entry_rejects_out_of_order_keys_under_bytewise_order() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"", b"aaa", b"v", 1, 0, false, false, false, 0);
+        encode_entry_delta(&mut buf, b"", b"aaa", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
         let mut out = b"zzz".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("descending keys");
         assert_eq!(err.kind(), "corruption");
@@ -1064,7 +1065,7 @@ mod tests {
         assert!(decode_entry_delta(&buf, 0, &mut out, false).is_ok());
         // Equal keys are legal: the same user key at a lower sequence.
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"aaa", b"aaa", b"v", 1, 0, false, false, false, 0);
+        encode_entry_delta(&mut buf, b"aaa", b"aaa", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
         let mut out = b"aaa".to_vec();
         assert!(decode_entry_delta(&buf, 0, &mut out, true).is_ok());
     }
@@ -1101,8 +1102,11 @@ mod tests {
                 b"value",
                 i as u64 + 1,
                 if i % 2 == 0 { 0 } else { 1_700_000_000 },
-                i == 3,
-                i == 3,
+                if i == 3 {
+                    crate::format::KIND_SINGLE_DELETE
+                } else {
+                    crate::format::KIND_PUT
+                },
                 false,
                 0,
             );
@@ -1152,10 +1156,20 @@ mod tests {
             b"v",
             1,
             0,
-            true,
-            false,
+            crate::format::KIND_DELETE,
             true,
             7,
         );
+    }
+}
+
+#[cfg(test)]
+mod size_probe {
+    /// `DecEntry` is returned **by value** once per decoded entry on every scan,
+    /// so its size is a scan-path cost, not a detail. 1.1 added the record kind
+    /// as a byte beside `flags` precisely so this number did not move.
+    #[test]
+    fn dec_entry_stays_the_size_it_was() {
+        assert_eq!(std::mem::size_of::<super::DecEntry>(), 72);
     }
 }

@@ -54,7 +54,7 @@ fn build(dir: &std::path::Path, n: usize, val_size: usize) -> (Arc<Reader>, Vec<
             *b = (j.wrapping_mul(31).wrapping_add(i)) as u8;
         }
         let k = format!("key{i:06}");
-        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, false, false)
+        w.add(k.as_bytes(), &val, (i + 1) as u64, 0, ondadb::format::KIND_PUT)
             .unwrap();
         keys.push(k);
     }
@@ -80,7 +80,7 @@ fn measure(label: &str, n: usize, val_size: usize, rounds: usize) {
     let (r, keys) = build(dir.path(), n, val_size);
 
     for k in &keys {
-        let (v, _, found, _) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        let (v, _, found, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found);
         assert_eq!(v.unwrap().len(), val_size);
     }
@@ -89,7 +89,7 @@ fn measure(label: &str, n: usize, val_size: usize, rounds: usize) {
     let t0 = Instant::now();
     for _ in 0..rounds {
         for k in &keys {
-            let (v, _, _, _) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            let (v, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
             let v = v.unwrap();
             sink = sink
                 .wrapping_add(v[0] as u64)
@@ -157,8 +157,7 @@ fn build_mixed(dir: &std::path::Path, n_small: usize, n_big: usize, big_size: us
             &small,
             (i + 1) as u64,
             0,
-            false,
-            false,
+            ondadb::format::KIND_PUT,
         )
         .unwrap();
     }
@@ -172,8 +171,7 @@ fn build_mixed(dir: &std::path::Path, n_small: usize, n_big: usize, big_size: us
             &val,
             (n_small + i + 1) as u64,
             0,
-            false,
-            false,
+            ondadb::format::KIND_PUT,
         )
         .unwrap();
     }
@@ -221,7 +219,7 @@ fn run_phase(
         for i in 0..hot_big {
             let key = format!("v{i:07}");
             let t0 = Instant::now();
-            let (v, _, _, _) = r.get(key.as_bytes(), u64::MAX, 0).unwrap();
+            let (v, ..) = r.get(key.as_bytes(), u64::MAX, 0).unwrap();
             hot_nanos += t0.elapsed().as_nanos();
             let v = v.unwrap();
             sink = sink
@@ -230,7 +228,7 @@ fn run_phase(
             // Interleaved klog pressure: this is what vlog admission evicts.
             for _ in 0..small_per_big {
                 let j = (next_rand(&mut rng) as usize) % n_small;
-                let (v, _, _, _) = r.get(format!("s{j:07}").as_bytes(), u64::MAX, 0).unwrap();
+                let (v, ..) = r.get(format!("s{j:07}").as_bytes(), u64::MAX, 0).unwrap();
                 sink = sink.wrapping_add(v.unwrap()[0] as u64);
             }
         }

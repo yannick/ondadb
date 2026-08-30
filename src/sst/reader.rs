@@ -139,10 +139,10 @@ const VLOG_VERIFIED_SLOTS: usize = 1024;
 /// `u64::MAX` — the offset is a position in a file.
 const VLOG_SLOT_EMPTY: u64 = u64::MAX;
 
-/// `(value, seq, found, deleted)` for one key in one table. `pub(crate)` so
+/// `(value, seq, found, deleted, kind)` for one key in one table. `pub(crate)` so
 /// the batched planner in `column_family.rs` can name what the block walk it
 /// drives by hand returns.
-pub(crate) type PointResult = (Option<Vec<u8>>, u64, bool, bool);
+pub(crate) type PointResult = (Option<Vec<u8>>, u64, bool, bool, u64);
 
 fn append_vlog_payload(
     compression: Compression,
@@ -792,15 +792,10 @@ impl Reader {
     /// indicates a tombstone or expired entry. The column-family read path
     /// hashes once across candidate tables and therefore calls
     /// [`get_unfiltered`](Self::get_unfiltered) after pre-filtering instead.
-    pub fn get(
-        &self,
-        user_key: &[u8],
-        read_seq: u64,
-        now: i64,
-    ) -> Result<(Option<Vec<u8>>, u64, bool, bool)> {
+    pub fn get(&self, user_key: &[u8], read_seq: u64, now: i64) -> Result<PointResult> {
         if let Some(b) = &self.bloom {
             if !b.may_contain(user_key) {
-                return Ok((None, 0, false, false));
+                return Ok((None, 0, false, false, crate::format::KIND_PUT));
             }
         }
         self.get_unfiltered(user_key, read_seq, now)
@@ -880,16 +875,16 @@ impl Reader {
                 break;
             }
             if entry.tombstone() || (entry.ttl != 0 && entry.ttl <= now) {
-                return Ok((None, entry.seq, true, true));
+                return Ok((None, entry.seq, true, true, u64::from(entry.kind)));
             }
             let value = if entry.has_vlog() {
                 self.read_vlog(entry.vlog_off, entry.val_len as u64)?
             } else {
                 entry.inline_value(raw).to_vec()
             };
-            return Ok((Some(value), entry.seq, true, false));
+            return Ok((Some(value), entry.seq, true, false, u64::from(entry.kind)));
         }
-        Ok((None, 0, false, false))
+        Ok((None, 0, false, false, crate::format::KIND_PUT))
     }
 
     /// [`get`](Self::get) without the bloom check, for callers that have
@@ -902,7 +897,7 @@ impl Reader {
     ) -> Result<PointResult> {
         let bi = self.find_block(user_key, read_seq);
         if bi >= self.index.len() {
-            return Ok((None, 0, false, false));
+            return Ok((None, 0, false, false, crate::format::KIND_PUT));
         }
         let block = self.read_data_block_local(bi)?;
         let (raw, restarts) = self.split_block(block.bytes())?;
@@ -1196,7 +1191,7 @@ mod tests {
         .unwrap();
         for i in 0..n {
             let k = format!("key{i:06}");
-            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
                 .unwrap();
         }
         w.finish().unwrap();
@@ -1218,12 +1213,12 @@ mod tests {
         assert!(r.has_restarts, "footer flag must be set");
         for i in 0..500 {
             let k = format!("key{i:06}");
-            let (v, _, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            let (v, _, found, deleted, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
             assert!(found && !deleted, "missing {k}");
             assert_eq!(v.unwrap(), b"value");
         }
         for probe in ["key00000", "key0005000", "aaa", "zzz"] {
-            let (_, _, found, _) = r.get(probe.as_bytes(), u64::MAX, 0).unwrap();
+            let (_, _, found, ..) = r.get(probe.as_bytes(), u64::MAX, 0).unwrap();
             assert!(!found, "phantom hit for {probe}");
         }
     }
@@ -1253,7 +1248,7 @@ mod tests {
         .unwrap();
         for i in 0..300 {
             let k = format!("key{i:06}");
-            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
                 .unwrap();
         }
         w.finish().unwrap();
@@ -1269,7 +1264,7 @@ mod tests {
         assert!(!r.has_restarts);
         for i in 0..300 {
             let k = format!("key{i:06}");
-            let (_, _, found, _) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+            let (_, _, found, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
             assert!(found, "missing {k}");
         }
         let mut it = r.iter();
@@ -1310,7 +1305,7 @@ mod tests {
         let mut w = Writer::new(path, opts).unwrap();
         for i in 0..n {
             let k = format!("tenant/alpha/cluster/{:04}/segment", i);
-            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
                 .unwrap();
         }
         w.finish().unwrap();
@@ -1466,9 +1461,9 @@ mod tests {
             let seq = i + 1;
             match i % 4 {
                 // A tombstone, an expired-TTL entry, and two live values.
-                1 => w.add(k.as_bytes(), b"", seq, 0, true, false),
-                2 => w.add(k.as_bytes(), b"expired", seq, NOW - 1, false, false),
-                _ => w.add(k.as_bytes(), b"live", seq, 0, false, false),
+                1 => w.add(k.as_bytes(), b"", seq, 0, crate::format::KIND_DELETE),
+                2 => w.add(k.as_bytes(), b"expired", seq, NOW - 1, crate::format::KIND_PUT),
+                _ => w.add(k.as_bytes(), b"live", seq, 0, crate::format::KIND_PUT),
             }
             .unwrap();
         }
@@ -1491,7 +1486,7 @@ mod tests {
             let want = r.get_unfiltered(probe, u64::MAX, NOW).unwrap();
             let bi = r.find_block(probe, u64::MAX);
             let got = if bi >= r.data_block_count() {
-                (None, 0, false, false)
+                (None, 0, false, false, crate::format::KIND_PUT)
             } else {
                 let block = r.read_data_block_local(bi).unwrap();
                 let (raw, restarts) = r.split_block(block.bytes()).unwrap();

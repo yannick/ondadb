@@ -859,6 +859,11 @@ struct VersionRetention {
     cmp: ComparatorRef,
     last_key: Option<Vec<u8>>,
     emitted_at_or_below_snapshot: bool,
+    /// Whether a merge operand of the current key has been kept since the last
+    /// base. Versions arrive newest-first, so every operand of a chain is seen
+    /// before the base that terminates it — which is what lets the base's
+    /// bottom-level drops consult this.
+    live_operands: bool,
 }
 
 impl VersionRetention {
@@ -870,10 +875,21 @@ impl VersionRetention {
             cmp,
             last_key: None,
             emitted_at_or_below_snapshot: false,
+            live_operands: false,
         }
     }
 
-    fn decide(&mut self, key: &[u8], seq: u64, tombstone: bool, ttl: i64) -> Retention {
+    /// Decide whether one version survives this compaction.
+    ///
+    /// `kind` is not decoration. The "keep exactly one version at or below
+    /// `oldest_snapshot`" rule is correct only for *point* kinds, each of which
+    /// replaces everything older. A merge operand does not: it composes with
+    /// what is below it, so applying the rule unchanged would silently truncate
+    /// an operand chain to its newest link and lose history with no folding bug
+    /// at all. Hence the three merge carve-outs below, all of which had to land
+    /// in the same change that first let kind 4 reach compaction.
+    fn decide(&mut self, key: &[u8], seq: u64, kind: u64, tombstone: bool, ttl: i64) -> Retention {
+        let merge = kind == crate::format::KIND_MERGE;
         let new_key = self
             .last_key
             .as_deref()
@@ -881,24 +897,66 @@ impl VersionRetention {
         if new_key {
             self.last_key = Some(key.to_vec());
             self.emitted_at_or_below_snapshot = false;
+            self.live_operands = false;
         }
         if seq <= self.oldest_snapshot {
+            // Everything below the base that terminates the visible chain is
+            // dead history, operands included — no reader ever walks past a
+            // base — so the "already emitted" drop applies to every kind.
             if self.emitted_at_or_below_snapshot {
                 return Retention::Drop;
             }
+        }
+        if seq <= self.oldest_snapshot && !merge {
+            // Carve-out 1: an operand does not consume the one-version slot and
+            // does not set the flag; only the base that terminates the chain
+            // does. That is what keeps a whole chain alive below the snapshot
+            // while still collapsing everything older than its base.
             self.emitted_at_or_below_snapshot = true;
-            if tombstone && self.bottom {
+            // Carve-out 2: a delete that terminates a chain whose operands are
+            // still live is that chain's base, and dropping it would leave the
+            // operands reading against whatever a later compaction leaves
+            // below. Conservative — at the bottom the older versions are
+            // dropped anyway — but it is also what compaction folding needs to
+            // see, and a stray bottom tombstone costs one entry.
+            if tombstone && self.bottom && !self.live_operands {
                 return Retention::Drop;
             }
         }
-        if self.bottom && !tombstone && ttl != 0 && ttl <= self.now {
+        // Carve-out 3: operands carry no TTL in v1, so the bottom TTL drop
+        // cannot apply to one. (`ttl` is 0 for every operand a writer produces;
+        // the guard makes a hand-edited byte harmless rather than lossy.)
+        if self.bottom && !merge && !tombstone && ttl != 0 && ttl <= self.now {
             return Retention::Drop;
         }
+        self.live_operands = merge;
         Retention::Keep {
-            filter_eligible: !tombstone
+            // A merge operand is not filter-eligible. The filter answers "is
+            // there a version of this key", and the key is already contributed
+            // by the operand's base or by the newest operand; letting an
+            // operand answer it would also hand a user filter an operand where
+            // it expects a value.
+            filter_eligible: !merge
+                && !tombstone
                 && seq <= self.oldest_snapshot
                 && (ttl == 0 || ttl > self.now),
         }
+    }
+}
+
+#[cfg(test)]
+impl VersionRetention {
+    /// [`decide`](Self::decide) for a point kind, which is what every
+    /// pre-1.1 case is. Keeps the existing table of cases readable now that
+    /// `decide` also has to be told which kind it is looking at.
+    fn decide_point(&mut self, key: &[u8], seq: u64, tombstone: bool, ttl: i64) -> Retention {
+        self.decide(
+            key,
+            seq,
+            crate::format::point_kind(tombstone, false),
+            tombstone,
+            ttl,
+        )
     }
 }
 
@@ -1112,15 +1170,7 @@ impl<'a> CompactionOutputBuilder<'a> {
         Ok(())
     }
 
-    fn write(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        seq: u64,
-        ttl: i64,
-        tombstone: bool,
-        single_delete: bool,
-    ) -> Result<()> {
+    fn write(&mut self, key: &[u8], value: &[u8], seq: u64, ttl: i64, kind: u64) -> Result<()> {
         let partition = self.partitioner.as_ref().and_then(|p| p.name_of(key));
         let (cut, _boundary_changed) = self.output_boundary_change(key, &partition);
         if cut || (self.pending_cut && self.current.is_some()) {
@@ -1143,9 +1193,7 @@ impl<'a> CompactionOutputBuilder<'a> {
             self.open_output(partition)?;
         }
         let current = self.current.as_mut().expect("output opened above");
-        current
-            .writer
-            .add(key, value, seq, ttl, tombstone, single_delete)?;
+        current.writer.add(key, value, seq, ttl, kind)?;
         current.bytes += (key.len() + value.len()) as u64;
         if current.bytes >= self.target_bytes {
             // Deferred: the interval's upper edge is the next key.
@@ -1318,6 +1366,16 @@ struct FrozenJob {
     carry_entry_time: Option<i64>,
     partitioner: Option<crate::config::PartitionResolver>,
     filter: Option<crate::column_family::CompactionFilterFn>,
+    /// The family's merge operator when this job may fold operand chains with
+    /// it: `None` when the family has none, when folding is switched off
+    /// ([`Options::enable_merge_folding`](crate::Options::enable_merge_folding)),
+    /// or when an input is a foreign mount.
+    ///
+    /// The foreign-mount case cannot arise today — both input-selection paths
+    /// filter mounts out, because merging around a read-only mount would leave
+    /// overlapping tables in one level — but folding is the one thing here that
+    /// rewrites history, so it re-checks rather than inheriting the invariant.
+    merge_fold: Option<Arc<dyn crate::config::MergeOperator>>,
     /// Set by the first span that fails; every span polls it once per entry so
     /// siblings stop instead of finishing megabytes of doomed output. Lives
     /// here because it is the one piece of per-job state every span shares,
@@ -1363,6 +1421,11 @@ impl FrozenJob {
                 None
             },
             filter: cf.compaction_filter(),
+            merge_fold: cf
+                .merge_op()
+                .filter(|_| db.opts.enable_merge_folding)
+                .filter(|_| !inputs.iter().any(|t| is_foreign_mount(db, &t.meta)))
+                .cloned(),
             cancel: std::sync::atomic::AtomicBool::new(false),
             ranges: collect_input_ranges(inputs)?,
             foreign_spans: cf.with_levels(|levels| {
@@ -1488,15 +1551,19 @@ fn run_span(
         frozen.partitioner.clone(),
     )
     .with_fragments(retained, span_hi.map(<[u8]>::to_vec));
+    // The operand suffix being collected for the current key, or `None` —
+    // which is every iteration for a family with no operator, and every
+    // iteration of a merge family's non-merge keys.
+    let mut pending: Option<PendingFold> = None;
     while let Some(index) = smallest_input(&iterators, cmp) {
-        let (key, seq, tombstone, ttl, single_delete) = {
+        let (key, seq, tombstone, ttl, kind) = {
             let iterator = &iterators[index];
             (
                 iterator.user_key().to_vec(),
                 iterator.seq(),
                 iterator.is_tombstone(),
                 iterator.ttl(),
-                iterator.is_single_delete(),
+                iterator.kind(),
             )
         };
         if past_upper(&key) {
@@ -1509,10 +1576,24 @@ fn run_span(
                 "compaction span cancelled by a failing sibling span".to_string(),
             ));
         }
+        // A new user key ends any pending fold: its suffix had no base among
+        // these inputs. Ahead of the range-delete drop below, which `continue`s
+        // without ending the key — leaving the previous key's suffix pending
+        // would attach it to whatever key surfaced next.
+        if pending
+            .as_ref()
+            .is_some_and(|p| !cmp.compare(&p.key, &key).is_eq())
+        {
+            flush_pending(&mut pending, &mut outputs, frozen)?;
+        }
         // Range-delete masking, ahead of `decide`. Only a tombstone at or
         // below `oldest_snapshot` may drop a point: a newer one still has to
         // let snapshots between the two sequences see the value, and those
         // snapshots read the fragment, not the absence of the point.
+        //
+        // An operand is dropped by the same rule, and correctly: the read path
+        // treats a covering span as a deleted base, so operands at or below it
+        // contribute nothing. Ones above it survive and fold onto no base.
         if !covering.is_empty()
             && crate::range_tombstone::covering_seq_in(cmp, &covering, &key, frozen.oldest_snapshot)
                 .is_some_and(|c| c > seq)
@@ -1520,26 +1601,140 @@ fn run_span(
             iterators[index].next();
             continue;
         }
-        if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl) {
+        if let Retention::Keep { filter_eligible } =
+            retention.decide(&key, seq, kind, tombstone, ttl)
+        {
             let value = iterators[index].value()?;
+            // Fold only a contiguous suffix wholly at or below
+            // `oldest_snapshot`: above it a live snapshot could sit between two
+            // operands, and folding across one would change what that snapshot
+            // reads.
+            let foldable = frozen.merge_fold.is_some() && seq <= frozen.oldest_snapshot;
+            if foldable && kind == crate::format::KIND_MERGE {
+                pending
+                    .get_or_insert_with(|| PendingFold {
+                        key: key.clone(),
+                        newest_seq: seq,
+                        operands: Vec::new(),
+                    })
+                    .operands
+                    .push((seq, value));
+                iterators[index].next();
+                continue;
+            }
+            if let Some(p) = pending.take() {
+                // This version terminates the suffix. A base with a live TTL is
+                // not foldable: the fold would produce a value whose expiry
+                // would later delete the operands' contribution too, where the
+                // unfolded chain resolves to `existing = None` plus the
+                // operands. Emit the operands unchanged instead.
+                if foldable && ttl == 0 {
+                    let base = if tombstone { None } else { Some(value) };
+                    emit_fold(p, base, &mut outputs, frozen)?;
+                    iterators[index].next();
+                    continue;
+                }
+                emit_operands(p, &mut outputs)?;
+            }
             let filter_removes = filter_eligible
                 && frozen.filter.as_ref().is_some_and(|filter| {
                     filter(&key, &value) == crate::column_family::FilterDecision::Remove
                 });
             if !(filter_removes && frozen.bottom) {
-                outputs.write(
-                    &key,
-                    &value,
-                    seq,
-                    ttl,
-                    tombstone || filter_removes,
-                    single_delete,
-                )?;
+                // A filtered-out version is replaced by an ordinary tombstone
+                // above the bottom; `filter_eligible` is false for an operand,
+                // so this can never rewrite a merge operand's kind.
+                let out_kind = if filter_removes {
+                    crate::format::KIND_DELETE
+                } else {
+                    kind
+                };
+                outputs.write(&key, &value, seq, ttl, out_kind)?;
             }
         }
         iterators[index].next();
     }
+    flush_pending(&mut pending, &mut outputs, frozen)?;
     outputs.finish()
+}
+
+/// An operand suffix of one key, collected at or below `oldest_snapshot` and
+/// waiting for the base that terminates it.
+struct PendingFold {
+    key: Vec<u8>,
+    /// Newest sequence in the suffix — the sequence the folded entry keeps, so
+    /// the collapsed record still shadows exactly what the chain shadowed.
+    newest_seq: u64,
+    /// `(seq, operand)` newest first, the order compaction sees them in.
+    operands: Vec<(u64, Vec<u8>)>,
+}
+
+/// Emit a pending suffix that never met its base among this job's inputs.
+///
+/// At the bottom there is nothing below, so "no base" really is
+/// `existing = None` and the suffix folds. Above the bottom the base may live
+/// in a deeper level, and folding against `None` would invent history — the
+/// operands are written back unchanged instead.
+fn flush_pending(
+    pending: &mut Option<PendingFold>,
+    outputs: &mut CompactionOutputBuilder<'_>,
+    frozen: &FrozenJob,
+) -> Result<()> {
+    let Some(p) = pending.take() else {
+        return Ok(());
+    };
+    if frozen.bottom {
+        return emit_fold(p, None, outputs, frozen);
+    }
+    emit_operands(p, outputs)
+}
+
+/// Write a suffix's operands back out unchanged, in the order they arrived.
+fn emit_operands(p: PendingFold, outputs: &mut CompactionOutputBuilder<'_>) -> Result<()> {
+    for (seq, operand) in &p.operands {
+        outputs.write(&p.key, operand, *seq, 0, crate::format::KIND_MERGE)?;
+    }
+    Ok(())
+}
+
+/// Collapse a suffix and its base into the single value they fold to.
+fn emit_fold(
+    p: PendingFold,
+    base: Option<Vec<u8>>,
+    outputs: &mut CompactionOutputBuilder<'_>,
+    frozen: &FrozenJob,
+) -> Result<()> {
+    let op = frozen
+        .merge_fold
+        .as_ref()
+        .expect("a pending fold exists only when the job may fold");
+    // Collected newest first; the operator is handed oldest first.
+    let mut operands: Vec<&[u8]> = p.operands.iter().map(|(_, o)| o.as_slice()).collect();
+    operands.reverse();
+    let folded = op
+        .full_merge(&p.key, base.as_deref(), &operands)
+        .map_err(|e| {
+            crate::error::OndaError::Corruption(format!(
+                "merge operator {:?} failed for key {:?}: {e}",
+                op.name(),
+                String::from_utf8_lossy(&p.key)
+            ))
+        })?;
+    // The folded entry is the surviving version at or below the snapshot, so it
+    // is exactly what the compaction filter is meant to see — and it sees a
+    // value, never an operand.
+    let filter_removes = frozen.filter.as_ref().is_some_and(|filter| {
+        filter(&p.key, &folded) == crate::column_family::FilterDecision::Remove
+    });
+    if filter_removes && frozen.bottom {
+        return Ok(());
+    }
+    let (value, kind) = if filter_removes {
+        (&[][..], crate::format::KIND_DELETE)
+    } else {
+        (folded.as_slice(), crate::format::KIND_PUT)
+    };
+    outputs.write(&p.key, value, p.newest_seq, 0, kind)
 }
 
 /// Extra span workers this job may ask the DB-wide pool for: one fewer than
@@ -2223,8 +2418,10 @@ fn cf_writer_opts(
         // only exists on an extended table. A database holding
         // CAP_RANGE_DELETES therefore writes every new table extended, whether
         // or not this particular one ends up with a fragment — the alternative
-        // is knowing the answer before the merge has run.
-        extended_entries: cf.range_deletes_enabled(),
+        // is knowing the answer before the merge has run. A merge family needs
+        // the same layout for kind 4, and compaction is where an operand chain
+        // spends most of its life; same gate as flush.
+        extended_entries: cf.range_deletes_enabled() || cf.merge_writes_enabled(),
         prefix_delta,
     }
 }
@@ -2313,30 +2510,30 @@ mod tests {
         let mut bottom = VersionRetention::new(true, 10, 100, default_comparator());
 
         assert_eq!(
-            bottom.decide(b"a", 12, true, 0),
+            bottom.decide_point(b"a", 12, true, 0),
             Retention::Keep {
                 filter_eligible: false
             }
         );
         assert_eq!(
-            bottom.decide(b"a", 10, false, 0),
+            bottom.decide_point(b"a", 10, false, 0),
             Retention::Keep {
                 filter_eligible: true
             }
         );
-        assert_eq!(bottom.decide(b"a", 9, false, 0), Retention::Drop);
-        assert_eq!(bottom.decide(b"b", 8, true, 0), Retention::Drop);
-        assert_eq!(bottom.decide(b"c", 8, false, 99), Retention::Drop);
+        assert_eq!(bottom.decide_point(b"a", 9, false, 0), Retention::Drop);
+        assert_eq!(bottom.decide_point(b"b", 8, true, 0), Retention::Drop);
+        assert_eq!(bottom.decide_point(b"c", 8, false, 99), Retention::Drop);
 
         let mut upper = VersionRetention::new(false, 10, 100, default_comparator());
         assert_eq!(
-            upper.decide(b"a", 10, true, 0),
+            upper.decide_point(b"a", 10, true, 0),
             Retention::Keep {
                 filter_eligible: false
             }
         );
         assert_eq!(
-            upper.decide(b"b", 10, false, 99),
+            upper.decide_point(b"b", 10, false, 99),
             Retention::Keep {
                 filter_eligible: false
             }
@@ -2345,10 +2542,130 @@ mod tests {
         let folded: ComparatorRef = Arc::new(CaseInsensitive);
         let mut custom = VersionRetention::new(false, 10, 100, folded);
         assert!(matches!(
-            custom.decide(b"A", 10, false, 0),
+            custom.decide_point(b"A", 10, false, 0),
             Retention::Keep { .. }
         ));
-        assert_eq!(custom.decide(b"a", 9, false, 0), Retention::Drop);
+        assert_eq!(custom.decide_point(b"a", 9, false, 0), Retention::Drop);
+    }
+
+    // ---- 1.1: kind-aware retention ----------------------------------------
+
+    /// A merge operand at or below `oldest_snapshot` is not "the one version"
+    /// the retention rule keeps: run unmodified, the pre-1.1 rule would keep
+    /// the newest operand and drop every older one, truncating the chain with
+    /// no folding bug at all.
+    #[test]
+    fn decide_keeps_every_operand_below_snapshot() {
+        let merge = crate::format::KIND_MERGE;
+        for bottom in [false, true] {
+            let mut r = VersionRetention::new(bottom, 100, 0, default_comparator());
+            for seq in (1..=6).rev() {
+                assert!(
+                    matches!(r.decide(b"k", seq, merge, false, 0), Retention::Keep { .. }),
+                    "operand at seq {seq} dropped (bottom = {bottom})"
+                );
+            }
+            // The base that terminates the chain is kept once...
+            assert!(matches!(
+                r.decide_point(b"k", 0, false, 0),
+                Retention::Keep { .. }
+            ));
+        }
+    }
+
+    /// Everything *older* than the base still collapses exactly as before: the
+    /// base, not the operands, is what sets `emitted_at_or_below_snapshot`.
+    #[test]
+    fn decide_drops_versions_older_than_the_base() {
+        let merge = crate::format::KIND_MERGE;
+        let mut r = VersionRetention::new(false, 100, 0, default_comparator());
+        assert!(matches!(
+            r.decide(b"k", 9, merge, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert!(matches!(
+            r.decide_point(b"k", 8, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert_eq!(r.decide_point(b"k", 7, false, 0), Retention::Drop);
+        assert_eq!(r.decide(b"k", 6, merge, false, 0), Retention::Drop);
+    }
+
+    /// The pre-1.1 behaviour for point kinds, unchanged: a second put at or
+    /// below the snapshot is dropped.
+    #[test]
+    fn decide_drops_second_put_below_snapshot() {
+        let mut r = VersionRetention::new(false, 100, 0, default_comparator());
+        assert!(matches!(
+            r.decide_point(b"k", 9, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert_eq!(r.decide_point(b"k", 8, false, 0), Retention::Drop);
+    }
+
+    /// A delete terminating a chain whose operands are still live is that
+    /// chain's base; the bottom level must not reclaim it out from under them.
+    #[test]
+    fn decide_keeps_terminating_delete_while_operands_live() {
+        let merge = crate::format::KIND_MERGE;
+        let mut r = VersionRetention::new(true, 100, 0, default_comparator());
+        assert!(matches!(
+            r.decide(b"k", 9, merge, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert!(
+            matches!(r.decide_point(b"k", 8, true, 0), Retention::Keep { .. }),
+            "the base of a live chain is not bottom debris"
+        );
+        // A delete with no operands above it is still reclaimed at the bottom.
+        assert_eq!(r.decide_point(b"other", 8, true, 0), Retention::Drop);
+        // ...and so is one whose chain was terminated by an intervening base.
+        let mut r = VersionRetention::new(true, 100, 0, default_comparator());
+        assert!(matches!(
+            r.decide(b"k", 9, merge, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert!(matches!(
+            r.decide_point(b"k", 8, false, 0),
+            Retention::Keep { .. }
+        ));
+        assert_eq!(r.decide_point(b"k", 7, true, 0), Retention::Drop);
+    }
+
+    /// Operands carry no TTL in v1, so the bottom TTL drop cannot apply to one
+    /// even if a hand-edited byte claimed an expiry.
+    #[test]
+    fn decide_never_ttl_drops_an_operand() {
+        let merge = crate::format::KIND_MERGE;
+        let mut r = VersionRetention::new(true, 100, 1_000, default_comparator());
+        assert!(matches!(
+            r.decide(b"k", 9, merge, false, 1),
+            Retention::Keep { .. }
+        ));
+        // The same expiry on a point kind is reclaimed, as it always was.
+        assert_eq!(r.decide_point(b"other", 9, false, 1), Retention::Drop);
+    }
+
+    /// A merge operand is not filter-eligible: the bloom answers "is there a
+    /// version of this key", which the operand's base (or the newest operand)
+    /// already contributes, and a user compaction filter expects a value where
+    /// an operand is only half of one.
+    #[test]
+    fn operand_is_not_filter_eligible() {
+        let merge = crate::format::KIND_MERGE;
+        let mut r = VersionRetention::new(false, 100, 0, default_comparator());
+        assert_eq!(
+            r.decide(b"k", 9, merge, false, 0),
+            Retention::Keep {
+                filter_eligible: false
+            }
+        );
+        assert_eq!(
+            r.decide_point(b"k", 8, false, 0),
+            Retention::Keep {
+                filter_eligible: true
+            }
+        );
     }
 
     // ---- 0.2: minimum-overlap-ratio picking -------------------------------

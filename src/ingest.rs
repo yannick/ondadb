@@ -117,7 +117,13 @@ impl Ingestion {
             now_nanos().saturating_add(ttl.as_nanos() as i64)
         };
         let (w, _) = self.writer.as_mut().expect("writer created above");
-        w.add(key, value, self.seq, ttl_abs, tombstone, false)?;
+        w.add(
+            key,
+            value,
+            self.seq,
+            ttl_abs,
+            crate::format::point_kind(tombstone, false),
+        )?;
         self.last_key = Some(key.to_vec());
         self.written += 1;
         self.cur_bytes += (key.len() + value.len()) as u64;

@@ -137,6 +137,11 @@ struct Val {
     value: Vec<u8>,
     ttl: i64,
     flags: u8,
+    /// Record kind, narrowed to a byte: kinds are bounded by
+    /// [`MAX_ASSIGNABLE_KIND`](crate::format::MAX_ASSIGNABLE_KIND) (63), and
+    /// the byte lands in `Val`'s existing padding, so carrying it costs
+    /// nothing per entry.
+    kind: u8,
 }
 
 /// A decoded memtable record (snapshot copy).
@@ -146,17 +151,51 @@ pub struct Entry {
     pub value: Vec<u8>,
     pub seq: u64,
     pub ttl: i64,
-    pub tombstone: bool,
-    pub single_delete: bool,
+    /// Record kind; see [`crate::wal::Record::kind`].
+    pub kind: u64,
+}
+
+impl Entry {
+    #[inline]
+    pub fn tombstone(&self) -> bool {
+        self.kind == crate::format::KIND_DELETE || self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    #[inline]
+    pub fn single_delete(&self) -> bool {
+        self.kind == crate::format::KIND_SINGLE_DELETE
+    }
+    #[inline]
+    pub fn is_merge(&self) -> bool {
+        self.kind == crate::format::KIND_MERGE
+    }
 }
 
 /// Result of a memtable point read.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Lookup {
     pub value: Vec<u8>,
     pub seq: u64,
     pub found: bool,
     pub deleted: bool,
+    /// Kind of the version this lookup resolved to, or [`KIND_PUT`] when
+    /// nothing was found. A merge operand reports `deleted == false` and a
+    /// value that is an *operand*, not a record: only the merge-aware read path
+    /// (which asks for a whole chain instead) may interpret it.
+    ///
+    /// [`KIND_PUT`]: crate::format::KIND_PUT
+    pub kind: u64,
+}
+
+impl Default for Lookup {
+    fn default() -> Lookup {
+        Lookup {
+            value: Vec::new(),
+            seq: 0,
+            found: false,
+            deleted: false,
+            kind: crate::format::KIND_PUT,
+        }
+    }
 }
 
 /// A sharded MVCC memtable.
@@ -267,6 +306,21 @@ pub(crate) fn flag_bits(tombstone: bool, single_delete: bool, ttl: i64) -> u8 {
     crate::format::normalized_entry_flags(tombstone, single_delete, ttl != 0, false)
 }
 
+/// The flag byte for one record `kind`, with its TTL bit.
+///
+/// A merge operand carries no tombstone bit and (v1) no TTL, so it reduces to
+/// `0` — the same byte a plain put with no expiry produces. The kind is what
+/// tells the two apart, and it is stored beside the flags.
+#[inline]
+pub(crate) fn flag_bits_for_kind(kind: u64, ttl: i64) -> u8 {
+    use crate::format::{KIND_DELETE, KIND_SINGLE_DELETE};
+    flag_bits(
+        kind == KIND_DELETE || kind == KIND_SINGLE_DELETE,
+        kind == KIND_SINGLE_DELETE,
+        ttl,
+    )
+}
+
 impl Memtable {
     /// Create an empty memtable ordering user keys with `cmp`.
     pub fn new(cmp: ComparatorRef) -> Arc<Memtable> {
@@ -319,10 +373,9 @@ impl Memtable {
         value: Vec<u8>,
         seq: u64,
         ttl: i64,
-        tombstone: bool,
-        single_delete: bool,
+        kind: u64,
     ) {
-        let fl = flag_bits(tombstone, single_delete, ttl);
+        let fl = flag_bits_for_kind(kind, ttl);
         let h = key_hash(user_key);
         self.filter.get_or_init(MemFilter::new).insert(h);
         let shard = &self.shards[shard_of(h)];
@@ -334,10 +387,11 @@ impl Memtable {
                 value,
                 ttl,
                 flags: fl,
+                kind: kind as u8,
             },
         );
         #[cfg(feature = "arena-memtable")]
-        shard.put(user_key, &value, seq, ttl, fl);
+        shard.put(user_key, &value, seq, ttl, fl, kind as u8);
         self.after_insert(added, seq);
     }
 
@@ -349,10 +403,9 @@ impl Memtable {
         value: &[u8],
         seq: u64,
         ttl: i64,
-        tombstone: bool,
-        single_delete: bool,
+        kind: u64,
     ) {
-        let fl = flag_bits(tombstone, single_delete, ttl);
+        let fl = flag_bits_for_kind(kind, ttl);
         let h = key_hash(user_key);
         self.filter.get_or_init(MemFilter::new).insert(h);
         let shard = &self.shards[shard_of(h)];
@@ -364,10 +417,11 @@ impl Memtable {
                 value: value.to_vec(),
                 ttl,
                 flags: fl,
+                kind: kind as u8,
             },
         );
         #[cfg(feature = "arena-memtable")]
-        shard.put(user_key, value, seq, ttl, fl);
+        shard.put(user_key, value, seq, ttl, fl, kind as u8);
         self.after_insert(added, seq);
     }
 
@@ -398,7 +452,7 @@ impl Memtable {
         }
         if n == 1 {
             let r = &recs[0];
-            self.put_ref(r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+            self.put_ref(r.key, r.value, r.seq, r.ttl, r.kind);
             return;
         }
 
@@ -448,13 +502,14 @@ impl Memtable {
             #[cfg(not(feature = "arena-memtable"))]
             for &i in group {
                 let r = &recs[i as usize];
-                let fl = flag_bits(r.tombstone, r.single_delete, r.ttl);
+                let fl = flag_bits_for_kind(r.kind, r.ttl);
                 self.shards[s].insert(
                     IKey::new(r.key, r.seq, &self.cmp),
                     Val {
                         value: r.value.to_vec(),
                         ttl: r.ttl,
                         flags: fl,
+                        kind: r.kind as u8,
                     },
                 );
             }
@@ -513,6 +568,7 @@ impl Memtable {
                     seq,
                     found: true,
                     deleted: true,
+                    kind: u64::from(v.kind),
                     ..Default::default()
                 };
             }
@@ -521,6 +577,7 @@ impl Memtable {
                     seq,
                     found: true,
                     deleted: true,
+                    kind: u64::from(v.kind),
                     ..Default::default()
                 };
             }
@@ -529,6 +586,7 @@ impl Memtable {
                 seq,
                 found: true,
                 deleted: false,
+                kind: u64::from(v.kind),
             }
         }
     }
@@ -536,6 +594,58 @@ impl Memtable {
     /// Approximate in-memory footprint in bytes.
     pub fn approx_size(&self) -> i64 {
         self.approx_size.load(AtOrd::Relaxed)
+    }
+
+    /// Walk every version of `user_key` visible at `read_seq`, newest first,
+    /// calling `f(seq, kind, value)` until it returns `false` or the key's
+    /// versions run out. `value` is `None` for a tombstone or an expired entry.
+    ///
+    /// The merge-aware read path needs the *chain* of versions, not just the
+    /// newest one: an operand only becomes a value once folded against
+    /// everything below it, and one memtable can hold several operands of the
+    /// same key. [`get`](Self::get) stays exactly as it was — a family with no
+    /// merge operator never calls this.
+    #[cfg_attr(feature = "arena-memtable", allow(clippy::needless_return))]
+    pub fn chain(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+        now_nanos: i64,
+        f: impl FnMut(u64, u64, Option<&[u8]>) -> bool,
+    ) {
+        if self.num_entries.load(AtOrd::Relaxed) == 0 {
+            return;
+        }
+        let h = key_hash(user_key);
+        match self.filter.get() {
+            None => return,
+            Some(filter) if !filter.may_contain(h) => return,
+            _ => {}
+        }
+        let shard = &self.shards[shard_of(h)];
+        #[cfg(feature = "arena-memtable")]
+        {
+            return shard.chain(user_key, read_seq, now_nanos, f);
+        }
+        #[cfg(not(feature = "arena-memtable"))]
+        {
+            let mut f = f;
+            let probe = IKey::new(user_key, read_seq, &self.cmp);
+            let mut cursor = shard.lower_bound(std::ops::Bound::Included(&probe));
+            while let Some(entry) = cursor {
+                let (uk, seq) = format::split_internal_key(&entry.key().ik);
+                if self.cmp.compare(uk, user_key) != Ordering::Equal {
+                    return;
+                }
+                let v = entry.value();
+                let dead = v.flags & flags::TOMBSTONE != 0 || (v.ttl != 0 && v.ttl <= now_nanos);
+                let value = if dead { None } else { Some(v.value.as_slice()) };
+                if !f(seq, u64::from(v.kind), value) {
+                    return;
+                }
+                cursor = entry.next();
+            }
+        }
     }
 
     /// Number of versioned entries stored.
@@ -576,8 +686,7 @@ impl Memtable {
                     value: v.value.clone(),
                     seq,
                     ttl: v.ttl,
-                    tombstone: v.flags & flags::TOMBSTONE != 0,
-                    single_delete: v.flags & flags::SINGLE_DELETE != 0,
+                    kind: u64::from(v.kind),
                 });
             }
         }
@@ -1053,6 +1162,11 @@ impl LazyMemIter {
     pub fn is_tombstone(&self) -> bool {
         self.cell.borrow_dependent().top().val().flags & flags::TOMBSTONE != 0
     }
+    /// Record kind of the current entry; see [`crate::wal::Record::kind`].
+    #[inline]
+    pub fn kind(&self) -> u64 {
+        u64::from(self.cell.borrow_dependent().top().val().kind)
+    }
     pub fn value(&self) -> Vec<u8> {
         self.cell.borrow_dependent().top().val().value.clone()
     }
@@ -1458,6 +1572,11 @@ impl LazyArenaIter {
     pub fn is_tombstone(&self) -> bool {
         self.cell.borrow_dependent().top().tombstone()
     }
+    /// Record kind of the current entry; see [`crate::wal::Record::kind`].
+    #[inline]
+    pub fn kind(&self) -> u64 {
+        self.cell.borrow_dependent().top().kind()
+    }
     pub fn value(&self) -> Vec<u8> {
         self.cell.borrow_dependent().top().value().to_vec()
     }
@@ -1512,11 +1631,116 @@ mod tests {
         Memtable::new(default_comparator())
     }
 
+    /// The flush path must hand every operand of a chain to the writer, in
+    /// internal order, without collapsing any of them: it is the one merge over
+    /// memtable entries that is *not* `VersionRetention`, so its own pass-through
+    /// has to be pinned.
+    ///
+    /// `flush_merge` (the zero-materialization cursor merge) exists only under
+    /// `arena-memtable`; `snapshot` is the other build's flush input. Both are
+    /// asserted here so the two configurations cannot diverge.
+    #[test]
+    fn flush_merge_passes_operands_through() {
+        let m = mt();
+        m.put(b"k", b"base".to_vec(), 1, 0, crate::format::KIND_PUT);
+        for (i, operand) in [b"a", b"b", b"c"].iter().enumerate() {
+            m.put(
+                b"k",
+                operand.to_vec(),
+                2 + i as u64,
+                0,
+                crate::format::KIND_MERGE,
+            );
+        }
+        let mut seen: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+        #[cfg(feature = "arena-memtable")]
+        {
+            let mut merge = m.flush_merge();
+            while merge.valid() {
+                let c = merge.top();
+                seen.push((c.seq(), c.kind(), c.value().to_vec()));
+                merge.advance();
+            }
+        }
+        #[cfg(not(feature = "arena-memtable"))]
+        for e in m.snapshot() {
+            seen.push((e.seq, e.kind, e.value.clone()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (4, crate::format::KIND_MERGE, b"c".to_vec()),
+                (3, crate::format::KIND_MERGE, b"b".to_vec()),
+                (2, crate::format::KIND_MERGE, b"a".to_vec()),
+                (1, crate::format::KIND_PUT, b"base".to_vec()),
+            ]
+        );
+    }
+
+    /// `chain` walks the whole visible run of a key, newest first, and stops at
+    /// the caller's word — which is what the merge read path uses to gather
+    /// operands down to their base.
+    #[test]
+    fn chain_walks_every_visible_version_newest_first() {
+        let m = mt();
+        m.put(b"k", b"base".to_vec(), 1, 0, crate::format::KIND_PUT);
+        m.put(b"k", b"a".to_vec(), 2, 0, crate::format::KIND_MERGE);
+        m.put(b"k", b"b".to_vec(), 3, 0, crate::format::KIND_MERGE);
+        m.put(b"other", b"x".to_vec(), 4, 0, crate::format::KIND_PUT);
+
+        let mut seen = Vec::new();
+        m.chain(b"k", u64::MAX, 0, |seq, kind, value| {
+            seen.push((seq, kind, value.map(<[u8]>::to_vec)));
+            true
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (3, crate::format::KIND_MERGE, Some(b"b".to_vec())),
+                (2, crate::format::KIND_MERGE, Some(b"a".to_vec())),
+                (1, crate::format::KIND_PUT, Some(b"base".to_vec())),
+            ]
+        );
+
+        // An older read sequence sees only its own prefix...
+        let mut seen = Vec::new();
+        m.chain(b"k", 2, 0, |seq, _, _| {
+            seen.push(seq);
+            true
+        });
+        assert_eq!(seen, vec![2, 1]);
+
+        // ...and `false` stops the walk where the caller says.
+        let mut seen = Vec::new();
+        m.chain(b"k", u64::MAX, 0, |seq, kind, _| {
+            seen.push(seq);
+            kind == crate::format::KIND_MERGE
+        });
+        assert_eq!(seen, vec![3, 2, 1]);
+    }
+
+    /// A tombstone or an expired entry reports `None`: the chain walk carries
+    /// the same found/deleted split `get` does.
+    #[test]
+    fn chain_reports_deleted_and_expired_as_none() {
+        let m = mt();
+        m.put(b"d", b"".to_vec(), 1, 0, crate::format::KIND_DELETE);
+        m.put(b"e", b"stale".to_vec(), 1, 50, crate::format::KIND_PUT);
+        for key in [b"d".as_slice(), b"e".as_slice()] {
+            let mut seen = Vec::new();
+            m.chain(key, u64::MAX, 100, |_, _, value| {
+                seen.push(value.map(<[u8]>::to_vec));
+                true
+            });
+            assert_eq!(seen, vec![None], "{:?}", String::from_utf8_lossy(key));
+        }
+    }
+
     #[test]
     fn put_get_versions() {
         let m = mt();
-        m.put(b"k", b"v1".to_vec(), 1, 0, false, false);
-        m.put(b"k", b"v2".to_vec(), 5, 0, false, false);
+        m.put(b"k", b"v1".to_vec(), 1, 0, crate::format::KIND_PUT);
+        m.put(b"k", b"v2".to_vec(), 5, 0, crate::format::KIND_PUT);
         // read at seq 10 sees newest (v2)
         let r = m.get(b"k", 10, 0);
         assert!(r.found && !r.deleted);
@@ -1533,12 +1757,12 @@ mod tests {
     #[test]
     fn tombstone_and_ttl() {
         let m = mt();
-        m.put(b"a", b"x".to_vec(), 1, 0, false, false);
-        m.put(b"a", Vec::new(), 2, 0, true, false);
+        m.put(b"a", b"x".to_vec(), 1, 0, crate::format::KIND_PUT);
+        m.put(b"a", Vec::new(), 2, 0, crate::format::KIND_DELETE);
         let r = m.get(b"a", 10, 0);
         assert!(r.found && r.deleted);
 
-        m.put(b"b", b"y".to_vec(), 3, 100, false, false); // ttl=100ns
+        m.put(b"b", b"y".to_vec(), 3, 100, crate::format::KIND_PUT); // ttl=100ns
         assert!(m.get(b"b", 10, 50).found && !m.get(b"b", 10, 50).deleted); // not expired at now=50
         assert!(m.get(b"b", 10, 200).deleted); // expired at now=200
     }
@@ -1546,7 +1770,7 @@ mod tests {
     #[test]
     fn missing_key() {
         let m = mt();
-        m.put(b"a", b"1".to_vec(), 1, 0, false, false);
+        m.put(b"a", b"1".to_vec(), 1, 0, crate::format::KIND_PUT);
         assert!(!m.get(b"z", 10, 0).found);
     }
 
@@ -1554,7 +1778,7 @@ mod tests {
     fn iterator_forward_and_backward() {
         let m = mt();
         for (i, k) in [b"a", b"c", b"b", b"e", b"d"].iter().enumerate() {
-            m.put(k.as_slice(), vec![i as u8], (i + 1) as u64, 0, false, false);
+            m.put(k.as_slice(), vec![i as u8], (i + 1) as u64, 0, crate::format::KIND_PUT);
         }
         let mut it = m.iter();
         let mut fwd = Vec::new();
@@ -1578,7 +1802,7 @@ mod tests {
     fn iterator_seek() {
         let m = mt();
         for k in [b"a", b"c", b"e", b"g"] {
-            m.put(k.as_slice(), b"v".to_vec(), 1, 0, false, false);
+            m.put(k.as_slice(), b"v".to_vec(), 1, 0, crate::format::KIND_PUT);
         }
         let mut it = m.iter();
         it.seek(b"d");
@@ -1598,8 +1822,8 @@ mod tests {
     fn iterator_mvcc_ordering() {
         // Same key, multiple versions: newest (highest seq) first.
         let m = mt();
-        m.put(b"k", b"old".to_vec(), 1, 0, false, false);
-        m.put(b"k", b"new".to_vec(), 9, 0, false, false);
+        m.put(b"k", b"old".to_vec(), 1, 0, crate::format::KIND_PUT);
+        m.put(b"k", b"new".to_vec(), 9, 0, crate::format::KIND_PUT);
         let mut it = m.iter();
         it.seek_to_first();
         assert_eq!(it.seq(), 9);
@@ -1622,8 +1846,7 @@ mod tests {
                         b"v".to_vec(),
                         t * 1000 + i + 1,
                         0,
-                        false,
-                        false,
+                        crate::format::KIND_PUT,
                     );
                 }
             }));
@@ -1689,7 +1912,7 @@ mod tests {
                 let k = format!("key-{:05}", (i * 7 + round) % 400);
                 let tomb = round == 2 && i % 5 == 0;
                 let v = format!("v{seq}").into_bytes();
-                m.put(k.as_bytes(), v, seq, 0, tomb, false);
+                m.put(k.as_bytes(), v, seq, 0, crate::format::point_kind(tomb, false));
                 seq += 1;
             }
         }
@@ -1712,7 +1935,7 @@ mod tests {
     fn lazy_iter_seek_and_interleave() {
         let m = mt();
         for k in ["a", "c", "e", "g", "i"] {
-            m.put(k.as_bytes(), b"v".to_vec(), 1, 0, false, false);
+            m.put(k.as_bytes(), b"v".to_vec(), 1, 0, crate::format::KIND_PUT);
         }
         let mut it = m.iter();
 
@@ -1765,7 +1988,7 @@ mod tests {
         // One user key with several versions across the merge: newest seq first.
         let m = mt();
         for &s in &[3u64, 9, 1, 7, 5] {
-            m.put(b"k", format!("v{s}").into_bytes(), s, 0, false, false);
+            m.put(b"k", format!("v{s}").into_bytes(), s, 0, crate::format::KIND_PUT);
         }
         let mut it = m.iter();
         it.seek_to_first();
@@ -1784,7 +2007,7 @@ mod tests {
         let m = mt();
         for i in 0..100_000u64 {
             let k = format!("k{i:08}");
-            m.put(k.as_bytes(), b"value".to_vec(), i + 1, 0, false, false);
+            m.put(k.as_bytes(), b"value".to_vec(), i + 1, 0, crate::format::KIND_PUT);
         }
         // The work the OLD `.iter()` did: materialize + sort every entry.
         let mut snap_best = Duration::MAX;
@@ -1820,7 +2043,7 @@ mod tests {
         let m = mt();
         for i in 0..1000u64 {
             let k = format!("k{i:05}");
-            m.put(k.as_bytes(), b"old".to_vec(), i + 1, 0, false, false);
+            m.put(k.as_bytes(), b"old".to_vec(), i + 1, 0, crate::format::KIND_PUT);
         }
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
@@ -1833,7 +2056,7 @@ mod tests {
                 let mut seq = 1_000_000u64;
                 while !stop.load(O::Relaxed) && seq < 1_030_000 {
                     let k = format!("k{:05}", seq % 2000);
-                    m.put(k.as_bytes(), b"new".to_vec(), seq, 0, false, false);
+                    m.put(k.as_bytes(), b"new".to_vec(), seq, 0, crate::format::KIND_PUT);
                     seq += 1;
                 }
             })

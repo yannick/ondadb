@@ -514,7 +514,7 @@ mod tests {
         for i in 0..n {
             let k = format!("key{i:06}");
             writer
-                .add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+                .add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
                 .unwrap();
         }
         writer.finish().unwrap();

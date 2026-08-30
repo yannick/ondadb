@@ -126,6 +126,12 @@ impl UnifiedMemIter {
         self.inner.is_tombstone()
     }
 
+    /// Record kind of the current entry; see [`crate::wal::Record::kind`].
+    #[inline]
+    pub(crate) fn kind(&self) -> u64 {
+        self.inner.kind()
+    }
+
     pub(crate) fn value_ref(&self) -> &[u8] {
         self.inner.value_ref()
     }
@@ -228,7 +234,7 @@ impl UnifiedStore {
             let last = Wal::replay(&p, |rec| {
                 match rec {
                     crate::wal::ReplayRecord::Point(r) => {
-                        mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
+                        mem.put(&r.key, r.value, r.seq, r.ttl, r.kind);
                     }
                     // Schema 2: both bounds carry the 8-byte cf-id prefix and
                     // are stored prefixed, exactly as point keys are — the
@@ -379,7 +385,13 @@ impl UnifiedStore {
             }
 
             if let Some(w) = &wal {
-                if prefixed.is_empty() {
+                // Same split as the per-CF WAL: only a batch carrying a
+                // non-point kind — 1.1's operand, or a 1.2 range fragment —
+                // needs the kind-bearing envelope, so ordinary unified commits
+                // keep their legacy frame bytes.
+                if prefixed.is_empty()
+                    && recs.iter().all(|r| crate::format::is_point_kind(r.kind))
+                {
                     w.append_batch(&recs)?;
                 } else {
                     let mut batch: Vec<wal::EnvelopeRecord<'_>> =
@@ -491,6 +503,42 @@ impl UnifiedStore {
             );
         }
         out
+    }
+
+    /// Walk every version of `user_key` for column family `id` visible at
+    /// `read_seq`, newest first, across the active store and its immutables.
+    /// See [`crate::memtable::Memtable::chain`].
+    ///
+    /// Unlike [`get`](Self::get) this cannot stop at the first store that has
+    /// the key: an operand chain can straddle a rotation, so the older
+    /// immutables have to be walked too. Ordering across stores is restored by
+    /// the caller, which sorts the gathered versions by sequence.
+    pub(crate) fn chain(
+        &self,
+        id: u64,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        mut f: impl FnMut(u64, u64, Option<&[u8]>) -> bool,
+    ) {
+        let pk = prefixed(id, user_key);
+        let s = self.state.read();
+        let mut stop = false;
+        s.mem.chain(&pk, read_seq, now, |seq, kind, value| {
+            let go = f(seq, kind, value);
+            stop = !go;
+            go
+        });
+        for imm in s.imm.iter().rev() {
+            if stop {
+                return;
+            }
+            imm.mem.chain(&pk, read_seq, now, |seq, kind, value| {
+                let go = f(seq, kind, value);
+                stop = !go;
+                go
+            });
+        }
     }
 
     /// Extract a column family's entries (prefix stripped) for an iterator
@@ -690,8 +738,7 @@ mod tests {
             value: b"value",
             seq,
             ttl: 0,
-            tombstone: false,
-            single_delete: false,
+            kind: crate::format::KIND_PUT,
         }
     }
 
