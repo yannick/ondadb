@@ -34,6 +34,7 @@ use parking_lot::Mutex;
 use crate::config::SyncMode;
 use crate::encoding::{
     append_uvarint, append_varint, checksum, put_u32, read_u32, uvarint, uvarint_len, varint,
+    varint_len,
 };
 use crate::error::{OndaError, Result};
 use crate::format::flags;
@@ -88,6 +89,148 @@ impl Record {
 pub enum ReplayRecord {
     /// A put, delete or single-delete.
     Point(Record),
+}
+
+/// First payload byte of an **envelope** frame (`CAP_EXTENDED_RECORDS`).
+///
+/// Safe as a discriminator because a legacy payload starts with a flags byte
+/// and no writer-produced flags byte exceeds `KNOWN_ENTRY_FLAGS` (`0x17`) —
+/// strict decoding rejects anything above it regardless.
+pub const ENVELOPE_TAG: u8 = 0xFF;
+
+/// Envelope schema: per-CF WAL layout; record keys are user keys.
+pub const ENVELOPE_SCHEMA_PER_CF: u64 = 1;
+/// Envelope schema: unified WAL layout; record keys carry the 8-byte big-endian
+/// CF-id prefix **inside** the key, exactly as the legacy unified layout does.
+/// There is deliberately no separate cf-id field: a LEB128 id would cost more
+/// than the fixed 8 bytes already present, and recovery must be able to decode a
+/// detached artifact without consulting options.
+pub const ENVELOPE_SCHEMA_UNIFIED: u64 = 2;
+
+/// Encoded length of one envelope record, matching [`encode_envelope_record`]
+/// byte for byte.
+///
+/// The exact frame-size precompute is not an optimization detail: growth
+/// reallocations re-copy the whole payload and dominated large-value commits
+/// (see [`Wal::append_batch`]).
+fn envelope_record_len(r: RecordRef<'_>) -> usize {
+    let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
+    let mods = if r.ttl != 0 {
+        crate::format::modifiers::HAS_TTL
+    } else {
+        0
+    };
+    uvarint_len(kind)
+        + uvarint_len(mods)
+        + uvarint_len(r.key.len() as u64)
+        + uvarint_len(r.value.len() as u64)
+        + uvarint_len(r.seq)
+        + if r.ttl != 0 { varint_len(r.ttl) } else { 0 }
+        + r.key.len()
+        + r.value.len()
+}
+
+/// Append one envelope record to `dst`.
+///
+/// Field order matches the legacy record deliberately (`alen, blen, seq, ttl?,
+/// a, b`), so the size precompute above stays a one-line variation on the
+/// legacy one. The `a`/`b` slots are named generically because kind 5 (1.2)
+/// puts a range's `(start, end)` in them rather than `(key, value)`.
+fn encode_envelope_record(dst: &mut Vec<u8>, r: RecordRef<'_>) {
+    crate::format::debug_check_entry_flags(r.tombstone, r.single_delete, false);
+    let kind = crate::format::point_kind(r.tombstone || r.single_delete, r.single_delete);
+    let mods = if r.ttl != 0 {
+        crate::format::modifiers::HAS_TTL
+    } else {
+        0
+    };
+    append_uvarint(dst, kind);
+    append_uvarint(dst, mods);
+    append_uvarint(dst, r.key.len() as u64);
+    append_uvarint(dst, r.value.len() as u64);
+    append_uvarint(dst, r.seq);
+    if r.ttl != 0 {
+        append_varint(dst, r.ttl);
+    }
+    dst.extend_from_slice(r.key);
+    dst.extend_from_slice(r.value);
+}
+
+/// Decode one envelope record from the front of `p`, returning it and the bytes
+/// consumed.
+fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
+    let corrupt = || OndaError::Corruption("wal: malformed envelope record".into());
+    let (kind, n) = uvarint(p).ok_or_else(corrupt)?;
+    crate::format::check_kind(kind)?;
+    let mut off = n;
+    let (mods, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
+    crate::format::check_modifiers(mods)?;
+    off += n;
+    let (alen, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
+    off += n;
+    let (blen, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
+    off += n;
+    let (seq, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
+    off += n;
+    let mut ttl = 0i64;
+    if mods & crate::format::modifiers::HAS_TTL != 0 {
+        let (t, n) = varint(&p[off..]).ok_or_else(corrupt)?;
+        off += n;
+        ttl = t;
+    }
+    // HAS_VLOG describes an SSTable entry's value placement; a WAL record always
+    // carries its value inline, so the bit cannot appear here.
+    if mods & crate::format::modifiers::HAS_VLOG != 0 {
+        return Err(OndaError::Corruption(
+            "wal: envelope record sets HAS_VLOG".into(),
+        ));
+    }
+    let (alen, blen) = (alen as usize, blen as usize);
+    let need = alen.checked_add(blen).ok_or_else(corrupt)?;
+    if p.len() - off < need {
+        return Err(corrupt());
+    }
+    let rec = Record {
+        key: p[off..off + alen].to_vec(),
+        value: p[off + alen..off + need].to_vec(),
+        seq,
+        ttl,
+        tombstone: kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE,
+        single_delete: kind == crate::format::KIND_SINGLE_DELETE,
+    };
+    Ok((ReplayRecord::Point(rec), off + need))
+}
+
+/// Decode a whole envelope payload (its leading [`ENVELOPE_TAG`] included).
+///
+/// `count` is verified against the payload: a short payload or trailing bytes
+/// are `Corruption`, so a frame can never deliver a partial batch.
+fn decode_envelope(payload: &[u8], mut f: impl FnMut(ReplayRecord) -> Result<u64>) -> Result<u64> {
+    let corrupt = || OndaError::Corruption("wal: malformed envelope".into());
+    debug_assert_eq!(payload.first(), Some(&ENVELOPE_TAG));
+    let mut p = &payload[1..];
+    let (schema, n) = uvarint(p).ok_or_else(corrupt)?;
+    if schema != ENVELOPE_SCHEMA_PER_CF && schema != ENVELOPE_SCHEMA_UNIFIED {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "wal envelope schema {schema} is not implemented by this binary"
+        )));
+    }
+    p = &p[n..];
+    let (count, n) = uvarint(p).ok_or_else(corrupt)?;
+    p = &p[n..];
+    let mut last_seq = 0u64;
+    for _ in 0..count {
+        if p.is_empty() {
+            return Err(corrupt()); // count promised more records than exist
+        }
+        let (rec, used) = decode_envelope_record(p)?;
+        p = &p[used..];
+        last_seq = last_seq.max(f(rec)?);
+    }
+    if !p.is_empty() {
+        return Err(corrupt()); // records past the promised count
+    }
+    Ok(last_seq)
 }
 
 /// Append one record's body (no framing) to `dst`.
@@ -147,6 +290,64 @@ fn decode_record(p: &[u8]) -> Result<(Record, usize)> {
     r.key = p[off..off + klen].to_vec();
     r.value = p[off + klen..off + need].to_vec();
     Ok((r, off + need))
+}
+
+/// Exact encoded size of the payload of one frame, header excluded.
+///
+/// Kept beside [`encode_frame`] because the two must agree exactly: growth
+/// reallocations re-copy the whole payload and dominated large-value commits.
+fn frame_payload_len(schema: Option<u64>, recs: &[RecordRef<'_>]) -> usize {
+    match schema {
+        None => recs
+            .iter()
+            .map(|r| {
+                1 + uvarint_len(r.key.len() as u64)
+                    + uvarint_len(r.value.len() as u64)
+                    + uvarint_len(r.seq)
+                    + if r.ttl != 0 { varint_len(r.ttl) } else { 0 }
+                    + r.key.len()
+                    + r.value.len()
+            })
+            .sum(),
+        Some(schema) => {
+            1 + uvarint_len(schema)
+                + uvarint_len(recs.len() as u64)
+                + recs.iter().map(|r| envelope_record_len(*r)).sum::<usize>()
+        }
+    }
+}
+
+/// Encode one framed batch: `[payload_len u32][crc32c u32][payload]`.
+///
+/// `schema` selects the payload form — `None` is the legacy record stream,
+/// `Some(schema)` an envelope. (A lock-free pwrite append was tried on the
+/// write side and reverted: on macOS/APFS positional writes to one file
+/// serialize in the kernel anyway and lose the O_APPEND fast path.)
+fn encode_frame(schema: Option<u64>, recs: &[RecordRef<'_>]) -> Vec<u8> {
+    let body = frame_payload_len(schema, recs);
+    let mut buf = Vec::with_capacity(HEADER_SIZE + body);
+    buf.extend_from_slice(&[0u8; HEADER_SIZE]);
+    match schema {
+        None => {
+            for r in recs {
+                encode_record_body(&mut buf, *r);
+            }
+        }
+        Some(schema) => {
+            buf.push(ENVELOPE_TAG);
+            append_uvarint(&mut buf, schema);
+            append_uvarint(&mut buf, recs.len() as u64);
+            for r in recs {
+                encode_envelope_record(&mut buf, *r);
+            }
+        }
+    }
+    debug_assert_eq!(buf.len(), HEADER_SIZE + body, "frame size precompute");
+    let payload_len = (buf.len() - HEADER_SIZE) as u32;
+    let crc = checksum(&buf[HEADER_SIZE..]);
+    put_u32(&mut buf[0..], payload_len);
+    put_u32(&mut buf[4..], crc);
+    buf
 }
 
 struct QueueState {
@@ -318,31 +519,24 @@ impl Wal {
     /// thread): a single header + CRC per commit, and the whole batch replays
     /// atomically — a torn tail can never resurrect half a transaction.
     pub fn append_batch(&self, recs: &[RecordRef<'_>]) -> Result<()> {
-        // Exact frame size: growth reallocations re-copy the whole payload,
-        // which dominated large-value commits. (A lock-free pwrite append was
-        // tried here and reverted: on macOS/APFS positional writes to one file
-        // serialize in the kernel anyway and lose the O_APPEND fast path.)
-        let body: usize = recs
-            .iter()
-            .map(|r| {
-                1 + uvarint_len(r.key.len() as u64)
-                    + uvarint_len(r.value.len() as u64)
-                    + uvarint_len(r.seq)
-                    + if r.ttl != 0 { 10 } else { 0 }
-                    + r.key.len()
-                    + r.value.len()
-            })
-            .sum();
-        let mut buf = Vec::with_capacity(HEADER_SIZE + body);
-        buf.extend_from_slice(&[0u8; HEADER_SIZE]);
-        for r in recs {
-            encode_record_body(&mut buf, *r);
-        }
-        let payload_len = (buf.len() - HEADER_SIZE) as u32;
-        let crc = checksum(&buf[HEADER_SIZE..]);
-        put_u32(&mut buf[0..], payload_len);
-        put_u32(&mut buf[4..], crc);
+        self.submit_frame(encode_frame(None, recs))
+    }
 
+    /// Like [`append_batch`](Self::append_batch), but writes the batch as an
+    /// **envelope** frame under `schema` ([`ENVELOPE_SCHEMA_PER_CF`] or
+    /// [`ENVELOPE_SCHEMA_UNIFIED`]).
+    ///
+    /// A database may only emit envelopes once it has durably enabled
+    /// [`CAP_EXTENDED_RECORDS`](crate::format::CAP_EXTENDED_RECORDS), and from
+    /// then on every frame it writes is one — the form is a per-database
+    /// decision, never a per-frame one. Replay accepts both forms forever, so
+    /// a WAL written across an enable replays whole.
+    pub fn append_batch_enveloped(&self, schema: u64, recs: &[RecordRef<'_>]) -> Result<()> {
+        self.submit_frame(encode_frame(Some(schema), recs))
+    }
+
+    /// Durably write one already-framed batch.
+    fn submit_frame(&self, buf: Vec<u8>) -> Result<()> {
         // Group commit exists to amortize the fsync under `SyncMode::Full`.
         // Without a per-commit fsync there is nothing to batch: write directly
         // to this thread's stripe file, so concurrent committers don't convoy
@@ -525,6 +719,22 @@ impl Wal {
             // Decode every record in the (verified) frame.
             // Past this point the bytes are known-intact: any decode failure
             // is corruption, not a torn tail, and must not be swallowed.
+            //
+            // The first payload byte selects the form: an envelope frame
+            // (0xFF) or the legacy record stream. Both forms may appear in one
+            // file — enabling the capability changes what is written next, not
+            // what is already there.
+            if payload.first() == Some(&ENVELOPE_TAG) {
+                let seq = decode_envelope(&payload, |rec| {
+                    let seq = match &rec {
+                        ReplayRecord::Point(r) => r.seq,
+                    };
+                    f(rec)?;
+                    Ok(seq)
+                })?;
+                last_seq = last_seq.max(seq);
+                continue;
+            }
             let mut p = &payload[..];
             while !p.is_empty() {
                 let (rec, used) = decode_record(p)?;
@@ -778,6 +988,290 @@ mod tests {
                 single_delete: true,
             },
         );
+    }
+
+    // ---- envelope (CAP_EXTENDED_RECORDS) ------------------------------------
+
+    /// The three point kinds, one of each flag shape a writer produces.
+    fn envelope_point_records() -> Vec<Record> {
+        vec![
+            rec("put", "v1", 1),
+            Record {
+                key: b"ttl".to_vec(),
+                value: b"v2".to_vec(),
+                seq: 2,
+                ttl: 1_700_000_000_000_000_000,
+                ..Default::default()
+            },
+            Record {
+                key: b"del".to_vec(),
+                seq: 3,
+                tombstone: true,
+                ..Default::default()
+            },
+            Record {
+                key: b"sdel".to_vec(),
+                seq: 4,
+                tombstone: true,
+                single_delete: true,
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// Decode a hand-built envelope payload into its records.
+    fn decode_envelope_payload(payload: &[u8]) -> Result<Vec<Record>> {
+        let mut out = Vec::new();
+        decode_envelope(payload, |rec| {
+            let ReplayRecord::Point(r) = rec;
+            let seq = r.seq;
+            out.push(r);
+            Ok(seq)
+        })?;
+        Ok(out)
+    }
+
+    /// One envelope frame's payload, as `append_batch_enveloped` would write it.
+    fn envelope_payload(schema: u64, recs: &[Record]) -> Vec<u8> {
+        let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+        encode_frame(Some(schema), &refs)[HEADER_SIZE..].to_vec()
+    }
+
+    #[test]
+    fn envelope_schema1_round_trips_all_point_kinds() {
+        let want = envelope_point_records();
+        let payload = envelope_payload(ENVELOPE_SCHEMA_PER_CF, &want);
+        assert_eq!(payload[0], ENVELOPE_TAG);
+        let got = decode_envelope_payload(&payload).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.key, w.key);
+            assert_eq!(g.value, w.value);
+            assert_eq!(g.seq, w.seq);
+            assert_eq!(g.ttl, w.ttl);
+            assert_eq!(g.tombstone, w.tombstone);
+            assert_eq!(g.single_delete, w.single_delete);
+        }
+    }
+
+    /// Schema 2 keeps the 8-byte big-endian CF id inside the key; the decoder
+    /// hands the prefixed key back untouched, which is what the unified
+    /// memtable stores.
+    #[test]
+    fn envelope_schema2_keeps_cf_prefix_in_key() {
+        let cf_id = 0x0123_4567_89ab_cdefu64;
+        let mut key = cf_id.to_be_bytes().to_vec();
+        key.extend_from_slice(b"user-key");
+        let recs = vec![Record {
+            key: key.clone(),
+            value: b"v".to_vec(),
+            seq: 7,
+            ..Default::default()
+        }];
+        let payload = envelope_payload(ENVELOPE_SCHEMA_UNIFIED, &recs);
+        let got = decode_envelope_payload(&payload).unwrap();
+        assert_eq!(got[0].key, key);
+        assert_eq!(&got[0].key[..8], &cf_id.to_be_bytes());
+        // No separate cf-id field: the record costs exactly the prefixed key.
+        assert_eq!(payload[1], ENVELOPE_SCHEMA_UNIFIED as u8);
+    }
+
+    /// A file may hold both forms — enabling the capability changes what is
+    /// written next, not what is already on disk.
+    #[test]
+    fn legacy_and_envelope_frames_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        {
+            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            wal.append(rec("legacy", "a", 1)).unwrap();
+            let recs = envelope_point_records();
+            let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+            wal.append_batch_enveloped(ENVELOPE_SCHEMA_PER_CF, &refs)
+                .unwrap();
+            wal.append(rec("legacy2", "b", 9)).unwrap();
+        }
+        let mut keys = Vec::new();
+        let last = Wal::replay(&path, |r| {
+            let ReplayRecord::Point(r) = r;
+            keys.push(String::from_utf8(r.key).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(keys, vec!["legacy", "put", "ttl", "del", "sdel", "legacy2"]);
+        assert_eq!(last, 9);
+    }
+
+    /// Splice a hand-chosen record body into an otherwise well-formed
+    /// one-record envelope payload.
+    fn envelope_with_body(body: &[u8]) -> Vec<u8> {
+        let mut p = vec![ENVELOPE_TAG];
+        append_uvarint(&mut p, ENVELOPE_SCHEMA_PER_CF);
+        append_uvarint(&mut p, 1);
+        p.extend_from_slice(body);
+        p
+    }
+
+    /// A record body with the given kind and modifiers, and an empty key/value.
+    fn envelope_body(kind: u64, mods: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        append_uvarint(&mut b, kind);
+        append_uvarint(&mut b, mods);
+        append_uvarint(&mut b, 0); // alen
+        append_uvarint(&mut b, 0); // blen
+        append_uvarint(&mut b, 5); // seq
+        b
+    }
+
+    /// Kind 5 is assigned (1.2's range delete) but not implemented here: the
+    /// bytes are intact and name a real feature, so this binary is the one at
+    /// fault.
+    #[test]
+    fn envelope_unknown_kind_is_unsupported_format() {
+        let p = envelope_with_body(&envelope_body(crate::format::KIND_RANGE_DELETE, 0));
+        let err = decode_envelope_payload(&p).expect_err("kind 5 is not implemented here");
+        assert_eq!(err.kind(), "unsupported_format");
+    }
+
+    /// Kinds above 63 are never assigned to anything, so they cannot have come
+    /// from a newer writer.
+    #[test]
+    fn envelope_kind_above_63_is_corruption() {
+        let p = envelope_with_body(&envelope_body(64, 0));
+        let err = decode_envelope_payload(&p).expect_err("kind 64 is never assigned");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn envelope_unknown_modifier_is_corruption() {
+        let p = envelope_with_body(&envelope_body(crate::format::KIND_PUT, 0x08));
+        let err = decode_envelope_payload(&p).expect_err("unknown modifiers must fail closed");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn envelope_unknown_schema_is_unsupported_format() {
+        let mut p = vec![ENVELOPE_TAG];
+        append_uvarint(&mut p, 3); // never assigned
+        append_uvarint(&mut p, 0);
+        let err = decode_envelope_payload(&p).expect_err("schema 3 is not implemented");
+        assert_eq!(err.kind(), "unsupported_format");
+    }
+
+    /// `count` is verified against the payload in both directions, so an
+    /// envelope frame can never deliver a partial batch.
+    #[test]
+    fn envelope_count_mismatch_is_corruption() {
+        let recs = envelope_point_records();
+        let good = envelope_payload(ENVELOPE_SCHEMA_PER_CF, &recs);
+
+        let mut too_many = good.clone();
+        too_many[2] = 9; // count byte: promises more records than follow
+        assert_eq!(
+            decode_envelope_payload(&too_many).unwrap_err().kind(),
+            "corruption"
+        );
+
+        let mut too_few = good;
+        too_few[2] = 1; // records past the promised count
+        assert_eq!(
+            decode_envelope_payload(&too_few).unwrap_err().kind(),
+            "corruption"
+        );
+    }
+
+    #[test]
+    fn envelope_frame_size_precompute_is_exact() {
+        let recs = envelope_point_records();
+        let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+        for schema in [
+            None,
+            Some(ENVELOPE_SCHEMA_PER_CF),
+            Some(ENVELOPE_SCHEMA_UNIFIED),
+        ] {
+            let predicted = frame_payload_len(schema, &refs);
+            let buf = encode_frame(schema, &refs);
+            assert_eq!(buf.len(), HEADER_SIZE + predicted, "schema {schema:?}");
+        }
+        // The documented cost: +1 byte per point record versus legacy (the kind
+        // uvarint replaces nothing; modifiers replace the flags byte).
+        let legacy = frame_payload_len(None, &refs);
+        let env = frame_payload_len(Some(ENVELOPE_SCHEMA_PER_CF), &refs);
+        // +1 per record (the kind uvarint; modifiers replace the flags byte),
+        // plus the 3-byte envelope header (tag, schema, count).
+        assert_eq!(env - legacy, refs.len() + 3);
+    }
+
+    /// The frozen envelope fixtures pin the wire bytes, so a later change to
+    /// the field order or the discriminator is a test failure rather than a
+    /// silent format break.
+    #[test]
+    fn envelope_golden_bytes() {
+        for (name, schema, recs) in [
+            (
+                "wal_v2_envelope_schema1.bin",
+                ENVELOPE_SCHEMA_PER_CF,
+                envelope_point_records(),
+            ),
+            ("wal_v2_envelope_schema2.bin", ENVELOPE_SCHEMA_UNIFIED, {
+                let mut key = 0x0123_4567_89ab_cdefu64.to_be_bytes().to_vec();
+                key.extend_from_slice(b"user-key");
+                let mut del = 0x0123_4567_89ab_cdefu64.to_be_bytes().to_vec();
+                del.extend_from_slice(b"gone");
+                vec![
+                    Record {
+                        key,
+                        value: b"v".to_vec(),
+                        seq: 7,
+                        ..Default::default()
+                    },
+                    Record {
+                        key: del,
+                        seq: 8,
+                        tombstone: true,
+                        ..Default::default()
+                    },
+                ]
+            }),
+        ] {
+            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+            assert_eq!(encode_frame(Some(schema), &refs), bytes, "{name}");
+            // And the committed bytes decode back to the same records.
+            let got = decode_envelope_payload(&bytes[HEADER_SIZE..]).unwrap();
+            assert_eq!(got.len(), recs.len(), "{name}");
+            for (g, w) in got.iter().zip(recs.iter()) {
+                assert_eq!(g.key, w.key, "{name}");
+                assert_eq!(g.value, w.value, "{name}");
+                assert_eq!(g.seq, w.seq, "{name}");
+                assert_eq!(g.ttl, w.ttl, "{name}");
+                assert_eq!(g.tombstone, w.tombstone, "{name}");
+                assert_eq!(g.single_delete, w.single_delete, "{name}");
+            }
+        }
+    }
+
+    /// The envelope decoder must be total over arbitrary bytes, like every
+    /// other decoder in this feature.
+    #[test]
+    fn fuzz_decode_envelope_never_panics() {
+        let seeds = [
+            envelope_payload(ENVELOPE_SCHEMA_PER_CF, &envelope_point_records()),
+            envelope_payload(ENVELOPE_SCHEMA_UNIFIED, &envelope_point_records()),
+        ];
+        let mut rng = crate::util::FuzzRng::new(0x1234_5678_9ABC_DEF0);
+        for seed in &seeds {
+            for _ in 0..2000 {
+                let mut case = crate::util::fuzz_mutate(&mut rng, seed);
+                // decode_envelope is only ever called on a payload whose first
+                // byte is the tag (replay dispatches on it).
+                if case.is_empty() {
+                    case.push(ENVELOPE_TAG);
+                }
+                case[0] = ENVELOPE_TAG;
+                let _ = decode_envelope_payload(&case);
+            }
+        }
     }
 
     #[test]

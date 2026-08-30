@@ -51,13 +51,30 @@ pub(crate) const FOOTER_RESTARTS: u8 = 0x04;
 /// compressed; `alg = None` stores it raw). Absent on legacy files, whose
 /// frames are `[crc32c u32 LE][raw value]`.
 pub(crate) const FOOTER_VLOG_V2: u8 = 0x08;
-/// Mask of every footer flag bit this binary implements (`0x0F`).
+/// Footer flag: **every** data-block entry in this table uses the extended
+/// (kind-bearing) layout, and the 16 bytes immediately preceding the footer are
+/// the aux-block handle.
+///
+/// Table-level, not per-block: a block carries no flag byte of its own
+/// (`block.rs` frames it as `[alg][comp_len][raw_len][crc32c][payload]`), so a
+/// per-block decision would be its own format change. Entry boundaries still
+/// come from `decode_entry`'s returned `next`, which is why the restart
+/// trailer, the B+tree index and the block CRC all keep working unchanged.
+pub(crate) const FOOTER_EXTENDED_BLOCK: u8 = 0x10;
+/// Mask of every footer flag bit this binary implements (`0x1F`).
 ///
 /// A file setting a bit outside this mask was written by a newer binary and
 /// names a feature we do not implement — [`OndaError::UnsupportedFormat`], not
 /// `Corruption`.
 pub(crate) const KNOWN_FOOTER_FLAGS: u8 =
-    FOOTER_HAS_BLOOM | FOOTER_BTREE | FOOTER_RESTARTS | FOOTER_VLOG_V2;
+    FOOTER_HAS_BLOOM | FOOTER_BTREE | FOOTER_RESTARTS | FOOTER_VLOG_V2 | FOOTER_EXTENDED_BLOCK;
+/// Width of the aux-block handle written immediately before the footer of an
+/// extended table: `aux_off u64 LE | aux_len u64 LE`, both `0` when absent.
+///
+/// It lives outside the footer because the fixed 64 bytes are full — `0..48`
+/// fields, `48` flags, `49..56` unused, `56..64` magic — and seven spare bytes
+/// cannot hold a block handle.
+pub(crate) const AUX_HANDLE_LEN: usize = 16;
 /// Entries per restart interval written by default.
 pub(crate) const RESTART_INTERVAL: usize = 8;
 /// Default target data-block size used by low-level writers when their option
@@ -212,10 +229,23 @@ impl DecEntry {
     }
 }
 
-/// Append one data-block entry to `dst`.
+/// Which entry layout a table's data blocks use — a table-level property read
+/// once from the footer at [`Reader::open`] and threaded to every decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum EntryLayout {
+    /// `flags(1) | klen | vlen | seq | ttl? | key | value|vlog_off`.
+    #[default]
+    Legacy,
+    /// `kind uv | modifiers uv | klen | vlen | seq | ttl? | key | value|vlog_off`
+    /// ([`FOOTER_EXTENDED_BLOCK`]).
+    Extended,
+}
+
+/// Append one data-block entry to `dst` in `layout`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_entry(
     dst: &mut Vec<u8>,
+    layout: EntryLayout,
     user_key: &[u8],
     value: &[u8],
     seq: u64,
@@ -230,7 +260,21 @@ pub(crate) fn encode_entry(
     // Normalization may have cleared HAS_VLOG (a tombstone has no separated
     // value); the layout below must follow the byte that was actually written.
     let has_vlog = fl & flags::HAS_VLOG != 0;
-    dst.push(fl);
+    match layout {
+        EntryLayout::Legacy => dst.push(fl),
+        EntryLayout::Extended => {
+            // The modifier bits are the flag bits, so an extended entry and a
+            // legacy entry describe the same thing with the same numbers; the
+            // tombstone/single-delete distinction moves into the kind.
+            let kind = crate::format::point_kind(
+                fl & flags::TOMBSTONE != 0,
+                fl & flags::SINGLE_DELETE != 0,
+            );
+            let mods = u64::from(fl) & crate::format::modifiers::KNOWN;
+            append_uvarint(dst, kind);
+            append_uvarint(dst, mods);
+        }
+    }
     append_uvarint(dst, user_key.len() as u64);
     append_uvarint(dst, value.len() as u64);
     append_uvarint(dst, seq);
@@ -245,15 +289,44 @@ pub(crate) fn encode_entry(
     }
 }
 
-/// Decode the entry at `raw[off..]`, returning it and the offset just past it.
-pub(crate) fn decode_entry(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> {
+/// Decode the entry at `raw[off..]` in `layout`, returning it and the offset
+/// just past it.
+pub(crate) fn decode_entry(
+    raw: &[u8],
+    layout: EntryLayout,
+    off: usize,
+) -> Result<(DecEntry, usize)> {
     let corrupt = || OndaError::Corruption("sst: malformed entry".into());
     if off >= raw.len() {
         return Err(corrupt());
     }
-    let fl = raw[off];
-    crate::format::check_entry_flags(fl)?;
-    let mut p = off + 1;
+    let (fl, mut p) = match layout {
+        EntryLayout::Legacy => {
+            let fl = raw[off];
+            crate::format::check_entry_flags(fl)?;
+            (fl, off + 1)
+        }
+        EntryLayout::Extended => {
+            let (kind, n) = uvarint(&raw[off..]).ok_or_else(corrupt)?;
+            crate::format::check_kind(kind)?;
+            let mut p = off + n;
+            let (mods, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
+            crate::format::check_modifiers(mods)?;
+            p += n;
+            // Fold back into the legacy flags byte: every consumer of
+            // `DecEntry` (tombstone/TTL/vlog checks, compaction, iteration)
+            // reads that one representation.
+            let mut fl = mods as u8;
+            if kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE {
+                fl |= flags::TOMBSTONE;
+            }
+            if kind == crate::format::KIND_SINGLE_DELETE {
+                fl |= flags::SINGLE_DELETE;
+            }
+            crate::format::check_entry_flags(fl)?;
+            (fl, p)
+        }
+    };
     let (klen, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
     p += n;
     let (vlen, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
@@ -301,6 +374,50 @@ pub(crate) fn decode_entry(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> 
     ))
 }
 
+/// Decode the aux block's tagged section list, returning `(tag, payload)` pairs.
+///
+/// ```text
+/// aux payload := section_count uvarint | section x count
+/// section     := tag u8 | len uvarint | payload[len]
+/// tag 1 = range-delete fragments (defined by 1.2)
+/// tag 2.. reserved
+/// ```
+///
+/// The aux block is `block.rs`-framed like every other block, so its bytes are
+/// CRC-covered. 1.0 defines the container and writes no sections; an unknown
+/// section tag is [`OndaError::UnsupportedFormat`] — the block is intact and
+/// names a feature this binary does not implement.
+pub(crate) fn decode_aux_sections(payload: &[u8]) -> Result<Vec<(u8, &[u8])>> {
+    let corrupt = || OndaError::Corruption("sst: malformed aux block".into());
+    let (count, n) = uvarint(payload).ok_or_else(corrupt)?;
+    let mut p = &payload[n..];
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let (&tag, rest) = p.split_first().ok_or_else(corrupt)?;
+        if tag == 0 || tag > MAX_KNOWN_AUX_SECTION {
+            return Err(OndaError::UnsupportedFormat(format!(
+                "sst aux section tag {tag} is not implemented by this binary"
+            )));
+        }
+        let (len, n) = uvarint(rest).ok_or_else(corrupt)?;
+        let rest = &rest[n..];
+        let len = len as usize;
+        if rest.len() < len {
+            return Err(corrupt());
+        }
+        out.push((tag, &rest[..len]));
+        p = &rest[len..];
+    }
+    if !p.is_empty() {
+        return Err(corrupt());
+    }
+    Ok(out)
+}
+
+/// Highest aux section tag this binary knows. `0` because 1.0 defines only the
+/// container; 1.2 raises it to `1` when it adds range-delete fragments.
+const MAX_KNOWN_AUX_SECTION: u8 = 0;
+
 /// Order `(user_key, seq)` pairs: user key ascending (via `cmp`), seq descending.
 pub(crate) fn cmp_internal(
     cmp: &crate::comparator::ComparatorRef,
@@ -335,10 +452,12 @@ mod tests {
         }
         // A well-formed entry stream, so mutations start from valid framing.
         let mut buf = Vec::new();
-        encode_entry(&mut buf, b"k1", b"v", 1, 0, false, false, false, 0);
-        encode_entry(&mut buf, b"k2", b"", 2, 0, true, true, false, 0);
+        let lay = EntryLayout::Legacy;
+        encode_entry(&mut buf, lay, b"k1", b"v", 1, 0, false, false, false, 0);
+        encode_entry(&mut buf, lay, b"k2", b"", 2, 0, true, true, false, 0);
         encode_entry(
             &mut buf,
+            lay,
             b"k3",
             b"vvvv",
             3,
@@ -355,8 +474,10 @@ mod tests {
             for _ in 0..2000 {
                 let case = crate::util::fuzz_mutate(&mut rng, seed);
                 let at = rng.below(case.len().max(1));
-                let _ = decode_entry(&case, at);
-                let _ = decode_entry(&case, 0);
+                for layout in [EntryLayout::Legacy, EntryLayout::Extended] {
+                    let _ = decode_entry(&case, layout, at);
+                    let _ = decode_entry(&case, layout, 0);
+                }
             }
         }
     }
@@ -377,7 +498,8 @@ mod tests {
     #[test]
     fn decode_entry_rejects_unknown_flag_bit() {
         let raw = raw_entry(0x08, b"k", b"v");
-        let err = decode_entry(&raw, 0).expect_err("unknown flag bit must be rejected");
+        let err = decode_entry(&raw, EntryLayout::Legacy, 0)
+            .expect_err("unknown flag bit must be rejected");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -387,7 +509,8 @@ mod tests {
     fn decode_entry_rejects_tombstone_with_vlog() {
         let mut raw = raw_entry(flags::TOMBSTONE | flags::HAS_VLOG, b"k", b"");
         append_u64(&mut raw, 0x1234);
-        let err = decode_entry(&raw, 0).expect_err("TOMBSTONE with HAS_VLOG must be rejected");
+        let err = decode_entry(&raw, EntryLayout::Legacy, 0)
+            .expect_err("TOMBSTONE with HAS_VLOG must be rejected");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -401,14 +524,36 @@ mod tests {
             flags::TOMBSTONE
         );
         let mut buf = Vec::new();
-        encode_entry(&mut buf, b"k", b"v", 1, 0, false, false, true, 0x1234);
+        encode_entry(
+            &mut buf,
+            EntryLayout::Legacy,
+            b"k",
+            b"v",
+            1,
+            0,
+            false,
+            false,
+            true,
+            0x1234,
+        );
         assert_eq!(buf[0], flags::HAS_VLOG);
         // A tombstone written with a vlog pointer would be rejected by the
         // strict decoder; the normalized entry stores its (empty) value inline.
         let mut buf = Vec::new();
-        encode_entry(&mut buf, b"k", b"", 1, 0, true, true, false, 0);
+        encode_entry(
+            &mut buf,
+            EntryLayout::Legacy,
+            b"k",
+            b"",
+            1,
+            0,
+            true,
+            true,
+            false,
+            0,
+        );
         assert_eq!(buf[0], flags::TOMBSTONE | flags::SINGLE_DELETE);
-        let (dec, next) = decode_entry(&buf, 0).unwrap();
+        let (dec, next) = decode_entry(&buf, EntryLayout::Legacy, 0).unwrap();
         assert!(dec.tombstone() && dec.single_delete() && !dec.has_vlog());
         assert_eq!(next, buf.len());
     }
@@ -417,6 +562,17 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "TOMBSTONE")]
     fn sst_encode_debug_asserts_tombstone_has_no_vlog() {
-        encode_entry(&mut Vec::new(), b"k", b"v", 1, 0, true, false, true, 7);
+        encode_entry(
+            &mut Vec::new(),
+            EntryLayout::Legacy,
+            b"k",
+            b"v",
+            1,
+            0,
+            true,
+            false,
+            true,
+            7,
+        );
     }
 }

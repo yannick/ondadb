@@ -96,7 +96,7 @@ impl SstIterator {
             let bytes = raw.bytes();
             let mut off = 0usize;
             while off < self.entries_len {
-                match decode_entry(bytes, off) {
+                match decode_entry(bytes, self.r.entry_layout(), off) {
                     Ok((_, next)) => {
                         self.offsets.push(off as u32);
                         off = next;
@@ -115,7 +115,7 @@ impl SstIterator {
 
     fn decode_at(&mut self, off: usize) {
         let raw = self.raw.as_ref().unwrap().bytes();
-        match decode_entry(raw, off) {
+        match decode_entry(raw, self.r.entry_layout(), off) {
             Ok((e, next)) => {
                 self.cur_pfx = key_prefix8(e.user_key(raw));
                 self.cur = Some(e);
@@ -183,7 +183,8 @@ impl SstIterator {
         let (mut lo, mut hi) = (0usize, self.offsets.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let (e, _) = decode_entry(bytes, self.offsets[mid] as usize).unwrap();
+            let (e, _) = decode_entry(bytes, self.r.entry_layout(), self.offsets[mid] as usize)
+                .expect("load_block already decoded every offset in this block");
             if cmp_internal(&cmp, e.user_key(bytes), e.seq, user_key, seq).is_lt() {
                 lo = mid + 1;
             } else {

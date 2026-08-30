@@ -2404,3 +2404,188 @@ fn mixed_filter_tables_in_one_level_read_correctly() {
     assert_eq!(seen, expected, "the mixed level must scan completely");
     db.close().unwrap();
 }
+
+// ---- format capabilities (1.0-B) --------------------------------------------
+
+/// Version field of the manifest at `dir` (bytes 4..8, LE).
+fn manifest_version(dir: &std::path::Path) -> u32 {
+    let bytes = std::fs::read(dir.join("MANIFEST")).unwrap();
+    u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+}
+
+/// A database that enables nothing keeps writing VERSION-1 manifests forever —
+/// the lowest-version discipline, proven at the byte the old binary checks.
+#[test]
+fn legacy_db_keeps_writing_version_1_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (db, cf) = open(dir.path());
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.close().unwrap();
+    }
+    assert_eq!(manifest_version(dir.path()), 1);
+
+    // A reopen (which persists again) must not drift upward either.
+    {
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        assert_eq!(db.format_capabilities(), 0);
+        let cf = db.get_column_family("default").unwrap();
+        db.put(&cf, b"k2", b"v2", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.close().unwrap();
+    }
+    assert_eq!(manifest_version(dir.path()), 1);
+}
+
+/// Crash matrix row 1 — crash before the enable's persist: no new-format bytes
+/// exist, so the reopen is a plain legacy database and the capability must be
+/// enabled again to be used.
+#[test]
+fn caps_crash_before_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        // The "crash" is simply that `enable_format_capabilities` was never
+        // reached: the handle is dropped without closing.
+        let (db, cf) = open(dir.path());
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        drop(cf);
+        drop(db);
+    }
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    assert_eq!(db.format_capabilities(), 0, "no capability may survive");
+    assert_eq!(manifest_version(dir.path()), 1);
+    // The API is available again, and enabling now works.
+    db.enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
+        .unwrap();
+    assert_eq!(
+        db.format_capabilities(),
+        ondadb::format::CAP_EXTENDED_RECORDS
+    );
+    db.close().unwrap();
+}
+
+/// Crash matrix row 2 — crash after the persist: the bit is durable, no
+/// artifact using it exists yet, and the reopen sees it. Re-enabling is a no-op.
+#[test]
+fn caps_crash_after_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (db, cf) = open(dir.path());
+        db.enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
+            .unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        // Dropped without close: the manifest write already happened.
+        drop(cf);
+        drop(db);
+    }
+    assert_eq!(
+        manifest_version(dir.path()),
+        2,
+        "the bit bumped the version"
+    );
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    assert_eq!(
+        db.format_capabilities(),
+        ondadb::format::CAP_EXTENDED_RECORDS
+    );
+    // Idempotent: enabling an already-enabled capability persists nothing new.
+    db.enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
+        .unwrap();
+    assert_eq!(
+        db.format_capabilities(),
+        ondadb::format::CAP_EXTENDED_RECORDS
+    );
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+    db.close().unwrap();
+}
+
+/// Crash matrix row 3 — N threads racing the first enable. Every one of them
+/// must return only after the bit is durable, so no caller can observe the
+/// capability as active while the manifest still says otherwise.
+#[test]
+fn caps_race_first_enable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    let db = Arc::new(db);
+    let path: Arc<std::path::PathBuf> = Arc::new(dir.path().to_path_buf());
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let db = db.clone();
+        let path = path.clone();
+        handles.push(std::thread::spawn(move || {
+            db.enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
+                .unwrap();
+            // Whoever returned first still had to make it durable first.
+            assert_eq!(
+                db.format_capabilities(),
+                ondadb::format::CAP_EXTENDED_RECORDS
+            );
+            assert_eq!(manifest_version(&path), 2);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        db.format_capabilities(),
+        ondadb::format::CAP_EXTENDED_RECORDS
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+#[test]
+fn enable_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for _ in 0..3 {
+        db.enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
+            .unwrap();
+    }
+    // Enabling a second capability is additive, not replacing.
+    db.enable_format_capabilities(ondadb::format::CAP_PERIODIC_AGE)
+        .unwrap();
+    assert_eq!(
+        db.format_capabilities(),
+        ondadb::format::CAP_EXTENDED_RECORDS | ondadb::format::CAP_PERIODIC_AGE
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+#[test]
+fn enable_on_readonly_is_readonly_error() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (db, cf) = open(dir.path());
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.close().unwrap();
+        drop(cf);
+    }
+    let mut o = Options::new(dir.path().to_str().unwrap());
+    o.read_only = true;
+    let db = DB::open(o).unwrap();
+    let err = db
+        .enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
+        .expect_err("a read-only database cannot take a capability");
+    assert!(matches!(err, OndaError::ReadOnly(_)), "{err:?}");
+    assert_eq!(db.format_capabilities(), 0);
+    assert_eq!(manifest_version(dir.path()), 1);
+}
+
+#[test]
+fn enable_unknown_capability_is_invalid_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    let err = db
+        .enable_format_capabilities(1 << 40)
+        .expect_err("a bit this binary does not implement is a caller error");
+    assert!(matches!(err, OndaError::InvalidArgs(_)), "{err:?}");
+    assert_eq!(db.format_capabilities(), 0);
+    drop(cf);
+    db.close().unwrap();
+}

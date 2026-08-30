@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
 use std::sync::{Arc, OnceLock};
 
 use super::{
-    cmp_internal, decode_entry, vlog_path_for, Block, BlockHandle, IndexEntry, SstIterator,
-    FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
+    cmp_internal, decode_aux_sections, decode_entry, vlog_path_for, Block, BlockHandle,
+    EntryLayout, IndexEntry, SstIterator, AUX_HANDLE_LEN, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK,
+    FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
     KNOWN_FOOTER_FLAGS, VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
 };
 use crate::bloom::Bloom;
@@ -38,6 +39,13 @@ pub struct Reader {
     /// Vlog frames use the v2 (possibly compressed) layout
     /// ([`FOOTER_VLOG_V2`]).
     vlog_v2: bool,
+    /// Data-block entry layout, resolved once from the footer flags. Table-level
+    /// by construction ([`FOOTER_EXTENDED_BLOCK`]), so every block of this file
+    /// decodes the same way.
+    entry_layout: EntryLayout,
+    /// Aux-block handle of an extended table (`(0, 0)` when absent), `None` for
+    /// a legacy table that has no such prefix at all.
+    aux_handle: Option<BlockHandle>,
 
     /// Background-IO admission, or `None` when unlimited. Charged on the paths
     /// that actually issue device IO — a cache hit and an already-faulted mmap
@@ -238,6 +246,8 @@ impl Reader {
             bloom: None,
             has_restarts: false,
             vlog_v2: false,
+            entry_layout: EntryLayout::Legacy,
+            aux_handle: None,
             vlog_verified: OnceLock::new(),
             vlog_cache_limit,
             #[cfg(feature = "mmap-reads")]
@@ -271,6 +281,34 @@ impl Reader {
         }
         r.has_restarts = flags & FOOTER_RESTARTS != 0;
         r.vlog_v2 = flags & FOOTER_VLOG_V2 != 0;
+        if flags & FOOTER_EXTENDED_BLOCK != 0 {
+            r.entry_layout = EntryLayout::Extended;
+            // The 16 bytes ahead of the footer are the aux-block handle.
+            if size < (FOOTER_SIZE + AUX_HANDLE_LEN) as u64 {
+                return Err(corrupt());
+            }
+            let mut aux = [0u8; AUX_HANDLE_LEN];
+            f.read_exact_at(&mut aux, size - (FOOTER_SIZE + AUX_HANDLE_LEN) as u64)?;
+            let handle = BlockHandle {
+                offset: read_u64(&aux[0..8]),
+                length: read_u64(&aux[8..16]),
+            };
+            // The handle must address bytes that exist, and specifically bytes
+            // ahead of the prefix it was read from. Checking before the read
+            // keeps a garbage length from being turned into an allocation.
+            let limit = size - (FOOTER_SIZE + AUX_HANDLE_LEN) as u64;
+            if handle.offset > limit || handle.length > limit - handle.offset {
+                return Err(corrupt());
+            }
+            r.aux_handle = Some(handle);
+            if handle.length > 0 {
+                // Validate at open: an aux block naming a section this binary
+                // does not implement must fail the open, not surface later as a
+                // silently missing range delete.
+                let (payload, _) = read_block_at(&*f, handle.offset, handle.length)?;
+                decode_aux_sections(&payload)?;
+            }
+        }
 
         if flags & FOOTER_HAS_BLOOM != 0 && bloom_len > 0 {
             let (raw, _) = read_block_at(&*f, bloom_off, bloom_len)?;
@@ -449,6 +487,19 @@ impl Reader {
 
     pub(crate) fn comparator(&self) -> &ComparatorRef {
         &self.cmp
+    }
+
+    /// Data-block entry layout of this table (see [`EntryLayout`]).
+    #[inline]
+    pub(crate) fn entry_layout(&self) -> EntryLayout {
+        self.entry_layout
+    }
+
+    /// This table's aux-block handle as `(offset, length)`, or `None` for a
+    /// legacy table (one without [`FOOTER_EXTENDED_BLOCK`], which has no such
+    /// prefix at all). `Some((0, 0))` means an extended table with no aux block.
+    pub fn aux_block_handle(&self) -> Option<(u64, u64)> {
+        self.aux_handle.map(|h| (h.offset, h.length))
     }
 
     /// Read (and decompress if needed) data block `i`.
@@ -671,7 +722,7 @@ impl Reader {
         let (mut lo, mut hi) = (0usize, restarts.len() / 4);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let (entry, _) = decode_entry(raw, restart_off(mid))?;
+            let (entry, _) = decode_entry(raw, self.entry_layout, restart_off(mid))?;
             if cmp_internal(
                 &self.cmp,
                 entry.user_key(raw),
@@ -702,7 +753,7 @@ impl Reader {
         now: i64,
     ) -> Result<PointResult> {
         while offset < raw.len() {
-            let (entry, next) = decode_entry(raw, offset)?;
+            let (entry, next) = decode_entry(raw, self.entry_layout, offset)?;
             let entry_key = entry.user_key(raw);
             if cmp_internal(&self.cmp, entry_key, entry.seq, user_key, read_seq).is_lt() {
                 offset = next;
@@ -1021,6 +1072,7 @@ mod tests {
                 expected_entries: n,
                 use_btree: false,
                 restart_interval: 8,
+                extended_entries: false,
             },
         )
         .unwrap();
@@ -1076,6 +1128,7 @@ mod tests {
                 expected_entries: 300,
                 use_btree: false,
                 restart_interval: 0, // legacy: no trailer, no footer flag
+                extended_entries: false,
             },
         )
         .unwrap();
@@ -1156,6 +1209,7 @@ mod tests {
                 expected_entries: 200,
                 use_btree: false,
                 restart_interval: 4,
+                extended_entries: false,
             },
         )
         .unwrap();

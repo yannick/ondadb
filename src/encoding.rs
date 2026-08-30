@@ -114,6 +114,12 @@ pub fn append_varint(dst: &mut Vec<u8>, x: i64) {
     append_uvarint(dst, ux);
 }
 
+/// Encoded length of `x` as a zig-zag signed varint (1..=10 bytes).
+#[inline]
+pub fn varint_len(x: i64) -> usize {
+    uvarint_len(((x << 1) ^ (x >> 63)) as u64)
+}
+
 /// Decode a zig-zag signed varint from the front of `b`.
 pub fn varint(b: &[u8]) -> Option<(i64, usize)> {
     let (ux, n) = uvarint(b)?;

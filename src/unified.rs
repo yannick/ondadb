@@ -526,6 +526,55 @@ mod tests {
         }
     }
 
+    /// Schema 2 keeps the 8-byte big-endian CF id **inside** the key, so an
+    /// envelope-written unified WAL replays into the memtable byte-for-byte the
+    /// way the legacy one does — same prefixed key, same per-CF view.
+    #[test]
+    fn envelope_schema2_keeps_cf_prefix_in_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = cf_id("posts");
+        let path = wal_path(dir.path().to_str().unwrap(), 0);
+        {
+            let w = crate::wal::Wal::open(
+                &path,
+                crate::config::SyncMode::None,
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            let key = prefixed(id, b"hello");
+            w.append_batch_enveloped(crate::wal::ENVELOPE_SCHEMA_UNIFIED, &[record(&key, 5)])
+                .unwrap();
+            w.close().unwrap();
+        }
+
+        let opts = Options {
+            unified_memtable: true,
+            ..Options::new(dir.path().to_str().unwrap())
+        };
+        let (flush_tx, _flush_rx) = unbounded();
+        let (store, max_seq) = UnifiedStore::open(
+            dir.path().to_str().unwrap(),
+            &opts,
+            flush_tx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::util::Poison::new()),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+
+        assert_eq!(max_seq, 5);
+        // The replayed record reached the memtable under its prefixed key: the
+        // per-CF view finds it, and it belongs to no other family.
+        let hit = store.get(id, b"hello", u64::MAX, 0);
+        assert!(
+            hit.found,
+            "the prefixed key must reach the memtable unchanged"
+        );
+        assert_eq!(hit.value, b"value");
+        assert!(!store.get(cf_id("other"), b"hello", u64::MAX, 0).found);
+    }
+
     #[test]
     fn unified_writers_stall_at_the_immutable_threshold_and_resume_after_flush() {
         let dir = tempfile::tempdir().unwrap();

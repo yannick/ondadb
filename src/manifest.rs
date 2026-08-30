@@ -18,12 +18,21 @@ use crate::encoding::{
 use crate::error::{OndaError, Result};
 
 const MAGIC: u32 = 0x5756_4D46; // "WVMF"
-const VERSION: u32 = 1;
+/// Lowest manifest version, and the one still written whenever the database
+/// uses no format capability — the same lowest-version discipline the
+/// positional tails follow, so a legacy-only database stays readable by every
+/// binary that ever opened it.
+const VERSION_V1: u32 = 1;
+/// Manifest version written once a capability is enabled: it is the fence that
+/// makes an older binary refuse the file (the version is checked by equality
+/// there, so it fails closed without knowing why).
+const VERSION_V2: u32 = 2;
 /// Every manifest tail tag is this wide.
 const TAG_LEN: usize = 8;
 const WAL_LAYOUT_TAG: &[u8; 8] = b"ONDAWAL1";
 const OBJECT_TAG: &[u8; 8] = b"ONDAOBJ1";
 const INSTANCE_TAG: &[u8; 8] = b"ONDAINS1";
+const FORMAT_CAPS_TAG: &[u8; 8] = b"ONDACAP1";
 
 /// WAL/memtable layout persisted for the whole database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -100,6 +109,10 @@ pub struct Manifest {
     /// database with no shared tier never mints one, keeping its manifest
     /// readable by pre-A2 binaries.
     pub instance_nonce: Option<u64>,
+    /// Format capabilities this database has durably enabled (see
+    /// [`crate::format::KNOWN_CAPS`]). `0` — the default — means the database
+    /// writes only legacy artifacts, and its manifest stays VERSION 1.
+    pub caps: u64,
 }
 
 impl Default for Manifest {
@@ -110,6 +123,7 @@ impl Default for Manifest {
             cfs: Vec::new(),
             wal_layout: WalLayout::PerColumnFamily,
             instance_nonce: None,
+            caps: 0,
         }
     }
 }
@@ -169,16 +183,24 @@ impl Manifest {
     fn decode(data: &[u8]) -> Result<Manifest> {
         let body = verified_manifest_body(data)?;
         let mut cursor = ManifestCursor::new(body);
-        let (next_file_id, global_seq, column_family_count) = decode_manifest_header(&mut cursor)?;
-        let mut cfs = decode_manifest_column_families(&mut cursor, column_family_count)?;
+        let header = decode_manifest_header(&mut cursor)?;
+        let mut cfs = decode_manifest_column_families(&mut cursor, header.column_family_count)?;
         let p = decode_positional_tails(cursor.into_remaining(), &mut cfs)?;
         let tags = decode_tagged_tails(p, &mut cfs)?;
+        // Version gate, after the tail: a capability word may only appear in a
+        // manifest that already announces itself as v2, so an old binary's
+        // exact-equality version check is a complete fence.
+        if tags.caps != 0 && header.version == VERSION_V1 {
+            return Err(corrupt_manifest());
+        }
+        crate::format::check_caps(tags.caps)?;
         Ok(Manifest {
-            next_file_id,
-            global_seq,
+            next_file_id: header.next_file_id,
+            global_seq: header.global_seq,
             cfs,
             wal_layout: tags.wal_layout,
             instance_nonce: tags.instance_nonce,
+            caps: tags.caps,
         })
     }
 }
@@ -194,6 +216,7 @@ struct ManifestTailPresence {
     time: bool,
     object: bool,
     nonce: bool,
+    caps: bool,
     layout: bool,
 }
 
@@ -207,18 +230,34 @@ impl ManifestTailPresence {
             time: has(|sst| sst.max_entry_time.is_some()),
             object: has(|sst| sst.object.is_some()),
             nonce: manifest.instance_nonce.is_some(),
+            caps: manifest.caps != 0,
             layout: manifest.wal_layout == WalLayout::Unified,
         }
     }
 
+    /// Whether any tagged tail section is emitted.
+    ///
+    /// Load-bearing: the positional decoder is gated only on non-emptiness, so
+    /// a tag emitted without the three positional sections ahead of it would be
+    /// read as a partition name section — silent corruption rather than
+    /// rejection. Every new tag must be added here as well as to the encoder.
     fn tagged(self) -> bool {
-        self.object || self.nonce
+        self.object || self.nonce || self.caps
     }
 }
 
 fn encode_manifest_header(b: &mut Vec<u8>, manifest: &Manifest) {
     append_u32(b, MAGIC);
-    append_u32(b, VERSION);
+    // Lowest version that can express this manifest: a database using no
+    // capability keeps writing v1 bytes forever.
+    append_u32(
+        b,
+        if manifest.caps != 0 {
+            VERSION_V2
+        } else {
+            VERSION_V1
+        },
+    );
     append_u64(b, manifest.next_file_id);
     append_u64(b, manifest.global_seq);
     append_uvarint(b, manifest.cfs.len() as u64);
@@ -266,6 +305,10 @@ fn encode_tagged_tails(b: &mut Vec<u8>, manifest: &Manifest, presence: ManifestT
     if let Some(nonce) = manifest.instance_nonce {
         b.extend_from_slice(INSTANCE_TAG);
         append_u64(b, nonce);
+    }
+    if presence.caps {
+        b.extend_from_slice(FORMAT_CAPS_TAG);
+        append_u64(b, manifest.caps);
     }
     if presence.layout {
         b.extend_from_slice(WAL_LAYOUT_TAG);
@@ -326,14 +369,28 @@ fn verified_manifest_body(data: &[u8]) -> Result<&[u8]> {
     Ok(body)
 }
 
-fn decode_manifest_header(cursor: &mut ManifestCursor<'_>) -> Result<(u64, u64, usize)> {
-    if cursor.u32()? != MAGIC || cursor.u32()? != VERSION {
+/// The fixed part of a decoded manifest header.
+struct ManifestHeader {
+    version: u32,
+    next_file_id: u64,
+    global_seq: u64,
+    column_family_count: usize,
+}
+
+fn decode_manifest_header(cursor: &mut ManifestCursor<'_>) -> Result<ManifestHeader> {
+    if cursor.u32()? != MAGIC {
         return Err(corrupt_manifest());
     }
-    let next_file_id = cursor.u64()?;
-    let global_seq = cursor.u64()?;
-    let column_family_count = cursor.uvar()? as usize;
-    Ok((next_file_id, global_seq, column_family_count))
+    let version = cursor.u32()?;
+    if version != VERSION_V1 && version != VERSION_V2 {
+        return Err(corrupt_manifest());
+    }
+    Ok(ManifestHeader {
+        version,
+        next_file_id: cursor.u64()?,
+        global_seq: cursor.u64()?,
+        column_family_count: cursor.uvar()? as usize,
+    })
 }
 
 /// Cap what a count field may pre-allocate. The vector still grows to whatever
@@ -401,6 +458,7 @@ fn decode_positional_tails<'a>(mut p: &'a [u8], cfs: &mut [CfManifest]) -> Resul
 struct TaggedTails {
     wal_layout: WalLayout,
     instance_nonce: Option<u64>,
+    caps: u64,
 }
 
 /// Decode the tagged tail sections by dispatching on each 8-byte tag.
@@ -414,6 +472,7 @@ struct TaggedTails {
 fn decode_tagged_tails(mut p: &[u8], cfs: &mut [CfManifest]) -> Result<TaggedTails> {
     let mut out = TaggedTails::default();
     let mut seen_object = false;
+    let mut seen_caps = false;
     let mut seen_layout = false;
     while !p.is_empty() {
         if p.len() < TAG_LEN {
@@ -435,6 +494,15 @@ fn decode_tagged_tails(mut p: &[u8], cfs: &mut [CfManifest]) -> Result<TaggedTai
                 return Err(corrupt_manifest());
             }
             out.instance_nonce = Some(read_u64(rest));
+            &rest[8..]
+        } else if tag == FORMAT_CAPS_TAG {
+            if std::mem::replace(&mut seen_caps, true) {
+                return Err(corrupt_manifest());
+            }
+            if rest.len() < 8 {
+                return Err(corrupt_manifest());
+            }
+            out.caps = read_u64(rest);
             &rest[8..]
         } else if tag == WAL_LAYOUT_TAG {
             if std::mem::replace(&mut seen_layout, true) {
@@ -595,6 +663,7 @@ mod tests {
     fn fuzz_manifest_decode_never_panics() {
         let seeds: Vec<Vec<u8>> = V1_FIXTURES
             .iter()
+            .chain(std::iter::once(&V2_FIXTURE))
             .map(|n| std::fs::read(crate::util::phase1_fixture(n)).unwrap())
             .collect();
         let mut rng = crate::util::FuzzRng::new(0x2545_F491_4F6C_DD1D);
@@ -648,12 +717,121 @@ mod tests {
         assert_eq!(err.kind(), "corruption");
     }
 
+    /// The v2 fixture is the case the positional decoder gets wrong if
+    /// `ManifestTailPresence::tagged()` is not extended, so it is frozen too.
+    const V2_FIXTURE: &str = "manifest_v2_caps_only.bin";
+
+    /// Version field of an encoded manifest (bytes 4..8).
+    fn encoded_version(bytes: &[u8]) -> u32 {
+        read_u32(&bytes[4..8])
+    }
+
+    #[test]
+    fn caps_tail_round_trips() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_EXTENDED_RECORDS | crate::format::CAP_PERIODIC_AGE;
+        let enc = m.encode();
+        assert_eq!(encoded_version(&enc), VERSION_V2);
+        let d = Manifest::decode(&enc).unwrap();
+        assert_eq!(d.caps, m.caps);
+        // The tag sits between ONDAINS1 and ONDAWAL1, and the positional
+        // sections still round-trip beside it.
+        assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
+        assert_eq!(d.encode(), enc);
+    }
+
+    /// A caps word with no partition/tier/time data must still emit all three
+    /// positional sections ahead of the tag, or the positional decoder reads
+    /// `ONDACAP1` as a partition name section.
+    #[test]
+    fn caps_only_manifest_emits_all_positional_sections() {
+        let mut m = sample();
+        for s in &mut m.cfs[0].sstables {
+            s.partition = None;
+        }
+        m.caps = crate::format::CAP_EXTENDED_RECORDS;
+        let enc = m.encode();
+
+        // Three all-empty positional sections (one uvarint count per CF, and
+        // the sample has one CF) precede the tag.
+        let tag_at = enc
+            .windows(TAG_LEN)
+            .position(|w| w == FORMAT_CAPS_TAG)
+            .expect("the caps tag must be emitted");
+        assert_eq!(&enc[tag_at - 3..tag_at], &[0u8, 0, 0], "empty sections");
+
+        let d = Manifest::decode(&enc).unwrap();
+        assert_eq!(d.caps, crate::format::CAP_EXTENDED_RECORDS);
+        assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
+        assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
+        assert!(d.cfs[0].sstables.iter().all(|s| s.max_entry_time.is_none()));
+    }
+
+    #[test]
+    fn zero_caps_writes_version_1() {
+        let enc = sample().encode();
+        assert_eq!(encoded_version(&enc), VERSION_V1);
+        assert!(
+            !enc.windows(TAG_LEN).any(|w| w == FORMAT_CAPS_TAG),
+            "an unused caps tag must not leak into the encoding"
+        );
+    }
+
+    #[test]
+    fn unknown_caps_bit_is_unsupported_format() {
+        let mut m = sample();
+        m.caps = 1 << 40; // never assigned
+        let err = Manifest::decode(&m.encode()).expect_err("unknown caps must fail closed");
+        assert_eq!(err.kind(), "unsupported_format");
+    }
+
+    /// A caps tail in a v1 manifest is a contradiction: the encoder bumps the
+    /// version exactly when it emits the tag, so these bytes were tampered with.
+    #[test]
+    fn caps_tag_under_version_1_is_corruption() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_EXTENDED_RECORDS;
+        let mut enc = m.encode();
+        let body_len = enc.len() - 4;
+        enc.truncate(body_len);
+        enc[4..8].copy_from_slice(&VERSION_V1.to_le_bytes());
+        let crc = checksum(&enc);
+        append_u32(&mut enc, crc);
+        let err = Manifest::decode(&enc).expect_err("a v1 manifest may not carry caps");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn duplicate_caps_tag_is_corruption() {
+        let mut extra = FORMAT_CAPS_TAG.to_vec();
+        extra.extend_from_slice(&1u64.to_le_bytes());
+        let bytes = fixture_with_extra_tail(V2_FIXTURE, &extra);
+        let err = Manifest::decode(&bytes).expect_err("a repeated caps tag must fail closed");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    /// The frozen v2 fixture decodes to the documented value and re-encodes to
+    /// exactly the committed bytes.
+    #[test]
+    fn frozen_v2_caps_fixture_round_trips() {
+        let bytes = std::fs::read(crate::util::phase1_fixture(V2_FIXTURE)).unwrap();
+        assert_eq!(encoded_version(&bytes), VERSION_V2);
+        let m = Manifest::decode(&bytes).unwrap();
+        assert_eq!(m.caps, crate::format::CAP_EXTENDED_RECORDS);
+        assert!(m.cfs.iter().all(|cf| cf
+            .sstables
+            .iter()
+            .all(|s| s.partition.is_none() && s.tier.is_none() && s.max_entry_time.is_none())));
+        assert_eq!(m.encode(), bytes);
+    }
+
     fn sample() -> Manifest {
         Manifest {
             next_file_id: 42,
             global_seq: 99,
             wal_layout: WalLayout::PerColumnFamily,
             instance_nonce: None,
+            caps: 0,
             cfs: vec![CfManifest {
                 name: "default".into(),
                 config: vec![1, 2, 3, 4],
@@ -990,6 +1168,7 @@ mod tests {
                 global_seq: 1,
                 wal_layout: WalLayout::PerColumnFamily,
                 instance_nonce: None,
+                caps: 0,
                 cfs: vec![CfManifest {
                     name: "t_post".into(),
                     config: Vec::new(),

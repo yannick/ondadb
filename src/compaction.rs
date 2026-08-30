@@ -1167,6 +1167,7 @@ fn cf_writer_opts(
         expected_entries: 4096,
         use_btree: cf.opts.use_btree,
         restart_interval: crate::sst::RESTART_INTERVAL,
+        extended_entries: false,
     }
 }
 

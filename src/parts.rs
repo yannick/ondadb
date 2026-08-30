@@ -777,6 +777,13 @@ impl DB {
             // A frozen slice is a standalone database with no shared tiers;
             // it mints its own nonce if it ever configures one.
             instance_nonce: None,
+            // A frozen slice carries whatever capabilities its source database
+            // had durably enabled: the tables it references were written under
+            // them.
+            caps: self
+                .inner
+                .caps_durable
+                .load(std::sync::atomic::Ordering::SeqCst),
             wal_layout: if self.inner.opts.unified_memtable {
                 WalLayout::Unified
             } else {

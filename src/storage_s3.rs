@@ -506,6 +506,7 @@ mod tests {
                 expected_entries: n,
                 use_btree: false,
                 restart_interval: 8,
+                extended_entries: false,
             },
         )
         .unwrap();

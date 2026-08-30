@@ -20,7 +20,7 @@ use ondadb::encoding::{checksum, put_u32};
 use ondadb::manifest::{CfManifest, Manifest, SstMeta, WalLayout};
 use ondadb::sst::{Reader, Writer, WriterOptions};
 use ondadb::storage::LocalStorage;
-use ondadb::wal::{Record, ReplayRecord, Wal};
+use ondadb::wal::{Record, ReplayRecord, Wal, ENVELOPE_SCHEMA_PER_CF, ENVELOPE_SCHEMA_UNIFIED};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/phase1")
@@ -129,6 +129,7 @@ fn klog_options(use_btree: bool, restarts: bool, bloom: bool) -> WriterOptions {
         expected_entries: 64,
         use_btree,
         restart_interval: if restarts { 8 } else { 0 },
+        extended_entries: false,
     }
 }
 
@@ -186,6 +187,7 @@ fn manifest_base() -> Manifest {
         global_seq: 99,
         wal_layout: WalLayout::PerColumnFamily,
         instance_nonce: None,
+        caps: 0,
         cfs: vec![
             CfManifest {
                 name: "default".into(),
@@ -374,6 +376,97 @@ fn regenerate_phase1_fixtures() {
     }
 }
 
+// ---- 1.0-B generator (manifest v2, envelopes, extended klog) ----------------
+
+/// The point records the schema-1 envelope fixture holds: one of every writer
+/// shape (put, TTL, delete, single-delete).
+fn envelope_schema1_records() -> Vec<Record> {
+    wal_all_flags_records()
+}
+
+/// The schema-2 fixture's records: keys carry the 8-byte big-endian CF-id
+/// prefix inside the key, exactly as the unified layout writes them.
+fn envelope_schema2_records() -> Vec<Record> {
+    let cf_id = 0x0123_4567_89ab_cdefu64;
+    let with_prefix = |suffix: &[u8]| {
+        let mut k = cf_id.to_be_bytes().to_vec();
+        k.extend_from_slice(suffix);
+        k
+    };
+    vec![
+        Record {
+            key: with_prefix(b"user-key"),
+            value: b"v".to_vec(),
+            seq: 7,
+            ..Default::default()
+        },
+        Record {
+            key: with_prefix(b"gone"),
+            seq: 8,
+            tombstone: true,
+            ..Default::default()
+        },
+    ]
+}
+
+/// Extended-layout klog writer options: the legacy flat/restarts/bloom shape
+/// with [`FOOTER_EXTENDED_BLOCK`] set, so the fixture differs from
+/// `klog_legacy_flat_restarts_bloom.klog` in exactly the entry layout, the
+/// footer bit and the 16-byte aux prefix.
+fn klog_extended_options() -> WriterOptions {
+    WriterOptions {
+        extended_entries: true,
+        ..klog_options(false, true, true)
+    }
+}
+
+/// The 1.0-B fixtures, written by the *new* encoders and frozen on the same
+/// terms as the legacy corpus: committed once, read-only thereafter.
+#[test]
+#[ignore = "regenerates committed fixtures; run manually"]
+fn regenerate_phase1b_fixtures() {
+    let dir = fixture_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
+
+    // --- WAL envelopes (one frame each) ---
+    for (name, schema, recs) in [
+        (
+            "wal_v2_envelope_schema1.bin",
+            ENVELOPE_SCHEMA_PER_CF,
+            envelope_schema1_records(),
+        ),
+        (
+            "wal_v2_envelope_schema2.bin",
+            ENVELOPE_SCHEMA_UNIFIED,
+            envelope_schema2_records(),
+        ),
+    ] {
+        let bytes = wal_bytes(|w| {
+            let refs: Vec<_> = recs.iter().map(|r| r.as_ref()).collect();
+            w.append_batch_enveloped(schema, &refs).unwrap();
+        });
+        write(name, &bytes);
+    }
+
+    // --- manifest v2: caps and nothing else ---
+    let tmp = tempfile::tempdir().unwrap();
+    let mut m = manifest_base();
+    m.caps = ondadb::format::CAP_EXTENDED_RECORDS;
+    let path = tmp.path().join("manifest_v2_caps_only.bin");
+    m.save(&path).unwrap();
+    write("manifest_v2_caps_only.bin", &std::fs::read(&path).unwrap());
+
+    // --- extended klog ---
+    let path = tmp.path().join("klog_extended.klog");
+    write_klog(&path, klog_extended_options());
+    write("klog_extended.klog", &std::fs::read(&path).unwrap());
+    write(
+        "klog_extended.vlog",
+        &std::fs::read(path.with_extension("vlog")).unwrap(),
+    );
+}
+
 // ---- the pinning tests ------------------------------------------------------
 
 /// The gate for feature 1.0: every strictness check added later must leave all
@@ -450,4 +543,71 @@ fn legacy_corpus_decodes_unchanged() {
         got.save(&round).unwrap();
         assert_eq!(std::fs::read(&round).unwrap(), bytes, "{name}: re-encode");
     }
+}
+
+/// The 1.0-B corpus: the bytes the new encoders produce are frozen on the same
+/// terms as the legacy ones, and each decodes back to the value that built it.
+#[test]
+fn phase1b_corpus_decodes_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // --- WAL envelopes: both schemas replay as ordinary point records ---
+    for (name, recs) in [
+        ("wal_v2_envelope_schema1.bin", envelope_schema1_records()),
+        ("wal_v2_envelope_schema2.bin", envelope_schema2_records()),
+    ] {
+        let got = replay_fixture(tmp.path(), name).unwrap();
+        assert_eq!(got.len(), recs.len(), "{name}");
+        for (g, w) in got.iter().zip(recs.iter()) {
+            assert_eq!(g.key, w.key, "{name}");
+            assert_eq!(g.value, w.value, "{name}");
+            assert_eq!(g.seq, w.seq, "{name}");
+            assert_eq!(g.ttl, w.ttl, "{name}");
+            assert_eq!(g.tombstone, w.tombstone, "{name}");
+            assert_eq!(g.single_delete, w.single_delete, "{name}");
+        }
+    }
+    // Schema 2 keeps the CF-id prefix inside the key; replay hands it back whole.
+    let got = replay_fixture(tmp.path(), "wal_v2_envelope_schema2.bin").unwrap();
+    assert_eq!(&got[0].key[..8], &0x0123_4567_89ab_cdefu64.to_be_bytes());
+
+    // --- manifest v2: caps and nothing else ---
+    let bytes = fixture("manifest_v2_caps_only.bin");
+    assert_eq!(&bytes[4..8], &2u32.to_le_bytes(), "version field must be 2");
+    let path = tmp.path().join("manifest_v2_caps_only.bin");
+    std::fs::write(&path, &bytes).unwrap();
+    let m = Manifest::load(&path).unwrap();
+    assert_eq!(m.caps, ondadb::format::CAP_EXTENDED_RECORDS);
+    let round = tmp.path().join("manifest_v2.round");
+    m.save(&round).unwrap();
+    assert_eq!(std::fs::read(&round).unwrap(), bytes, "re-encode");
+
+    // --- extended klog: the same entries as the legacy corpus, new layout ---
+    let klog = tmp.path().join("klog_extended.klog");
+    std::fs::write(&klog, fixture("klog_extended.klog")).unwrap();
+    std::fs::write(klog.with_extension("vlog"), fixture("klog_extended.vlog")).unwrap();
+    let reader = Reader::open(
+        klog.to_str().unwrap(),
+        LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        1,
+        default_comparator(),
+        0,
+    )
+    .unwrap();
+    // 1.0 defines the aux container and writes it empty; 1.2 is the first producer.
+    assert_eq!(reader.aux_block_handle(), Some((0, 0)));
+    let mut it = reader.iter();
+    it.seek_to_first();
+    for (k, v, seq, ttl, tomb, sdel) in klog_entries() {
+        assert!(it.valid(), "iterator ended at {k}");
+        assert_eq!(it.user_key(), k.as_bytes());
+        assert_eq!(it.seq(), seq, "{k}");
+        assert_eq!(it.ttl(), ttl, "{k}");
+        assert_eq!(it.is_tombstone(), tomb, "{k}");
+        assert_eq!(it.is_single_delete(), sdel, "{k}");
+        assert_eq!(it.value().unwrap(), v, "{k}");
+        it.next();
+    }
+    assert!(!it.valid(), "extra entries");
 }

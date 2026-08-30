@@ -20,6 +20,7 @@ fn opts(alg: Compression, n: usize, klog_threshold: usize, block_size: usize) ->
         expected_entries: n,
         use_btree: false,
         restart_interval: 8,
+        extended_entries: false,
     }
 }
 
@@ -1167,5 +1168,252 @@ fn writer_writes_a_bloom_block_when_fpr_is_some() {
     for k in &keys {
         let (_v, _seq, found, _d) = reader.get(k.as_bytes(), u64::MAX, 0).unwrap();
         assert!(found, "{k} lost");
+    }
+}
+
+// ---- extended entry layout (FOOTER_EXTENDED_BLOCK, 1.0-B) -------------------
+
+/// Path of a frozen phase-1 fixture.
+fn phase1_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/phase1")
+        .join(name)
+}
+
+/// Every entry shape a writer produces, so the extended layout is exercised on
+/// tombstones, TTLs and vlog-separated values alike.
+fn extended_entries() -> Vec<(String, Vec<u8>, u64, i64, bool, bool)> {
+    let big = vec![b'V'; 64];
+    let mut v: Vec<(String, Vec<u8>, u64, i64, bool, bool)> = vec![
+        ("k01".into(), b"small".to_vec(), 11, 0, false, false),
+        (
+            "k02".into(),
+            b"small".to_vec(),
+            12,
+            1_700_000_000_000_000_000,
+            false,
+            false,
+        ),
+        ("k03".into(), Vec::new(), 13, 0, true, false),
+        ("k04".into(), Vec::new(), 14, 0, true, true),
+        ("k05".into(), big, 15, 0, false, false),
+    ];
+    for i in 6..40u64 {
+        v.push((
+            format!("k{i:02}"),
+            b"filler".to_vec(),
+            20 + i,
+            0,
+            false,
+            false,
+        ));
+    }
+    v
+}
+
+fn extended_opts(use_btree: bool, restarts: bool) -> WriterOptions {
+    WriterOptions {
+        compression: Compression::None,
+        compression_rules: Vec::new(),
+        cmp: default_comparator(),
+        enable_bloom: true,
+        bloom_fpr: Some(0.01),
+        klog_value_threshold: 32,
+        block_size: 256,
+        expected_entries: 64,
+        use_btree,
+        restart_interval: if restarts { 8 } else { 0 },
+        extended_entries: true,
+    }
+}
+
+fn open_klog(klog: &std::path::Path) -> ondadb::Result<Arc<Reader>> {
+    Reader::open(
+        klog.to_str().unwrap(),
+        LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        1,
+        default_comparator(),
+        0,
+    )
+}
+
+fn write_extended(klog: &std::path::Path, opts: WriterOptions) {
+    let mut w = Writer::new(klog.to_str().unwrap(), opts).unwrap();
+    for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
+        w.add(k.as_bytes(), &v, seq, ttl, tomb, sdel).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// The extended layout must carry exactly the same information as the legacy
+/// one, through both index shapes and with and without the restart trailer.
+#[test]
+fn extended_table_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, (btree, restarts)) in [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let klog = dir.path().join(format!("{i}.klog"));
+        write_extended(&klog, extended_opts(btree, restarts));
+        let r =
+            open_klog(&klog).unwrap_or_else(|e| panic!("btree={btree} restarts={restarts}: {e}"));
+        let mut it = r.iter();
+        it.seek_to_first();
+        for (k, v, seq, ttl, tomb, sdel) in extended_entries() {
+            assert!(it.valid(), "ended at {k}");
+            assert_eq!(it.user_key(), k.as_bytes());
+            assert_eq!(it.seq(), seq, "{k}");
+            assert_eq!(it.ttl(), ttl, "{k}");
+            assert_eq!(it.is_tombstone(), tomb, "{k}");
+            assert_eq!(it.is_single_delete(), sdel, "{k}");
+            assert_eq!(it.value().unwrap(), v, "{k}");
+            it.next();
+        }
+        assert!(!it.valid());
+        assert_eq!(r.num_entries(), extended_entries().len() as u64);
+    }
+}
+
+/// The aux-block handle is the 16 bytes immediately before the footer, and 1.0
+/// writes it empty. Asserted against the raw file so the *position* is pinned,
+/// not just the value the reader reports.
+#[test]
+fn extended_footer_prefix_is_16_bytes() {
+    const FOOTER_SIZE: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("ext.klog");
+    write_extended(&klog, extended_opts(false, true));
+    let bytes = std::fs::read(&klog).unwrap();
+    let at = bytes.len() - FOOTER_SIZE - 16;
+    assert_eq!(&bytes[at..at + 8], &[0u8; 8], "aux_off");
+    assert_eq!(&bytes[at + 8..at + 16], &[0u8; 8], "aux_len");
+    // Footer flag 0x10 is set, and the reader reports the handle it read.
+    assert_eq!(bytes[bytes.len() - FOOTER_SIZE + 48] & 0x10, 0x10);
+    assert_eq!(open_klog(&klog).unwrap().aux_block_handle(), Some((0, 0)));
+
+    // A legacy table has no such prefix at all.
+    let legacy = dir.path().join("legacy.klog");
+    write_extended(
+        &legacy,
+        WriterOptions {
+            extended_entries: false,
+            ..extended_opts(false, true)
+        },
+    );
+    assert_eq!(open_klog(&legacy).unwrap().aux_block_handle(), None);
+}
+
+/// The restart trailer indexes entry *offsets*, which still come from
+/// `decode_entry`'s returned `next` — so in-block binary search must land on
+/// exactly what a linear scan finds.
+#[test]
+fn extended_table_restart_search_matches_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("ext.klog");
+    write_extended(&klog, extended_opts(false, true));
+    let r = open_klog(&klog).unwrap();
+    for (k, v, seq, _ttl, tomb, _sdel) in extended_entries() {
+        // Point read: bloom, index, restart binary search, then the scan.
+        let (value, got_seq, found, deleted) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
+        assert!(found, "{k}");
+        assert_eq!(got_seq, seq, "{k}");
+        assert_eq!(deleted, tomb, "{k}");
+        if !tomb {
+            assert_eq!(value.unwrap(), v, "{k}");
+        }
+        // Iterator seek: the same entry, reached through the offsets index.
+        let mut it = r.iter();
+        it.seek(k.as_bytes(), u64::MAX);
+        assert!(it.valid(), "{k}");
+        assert_eq!(it.user_key(), k.as_bytes());
+        assert_eq!(it.seq(), seq, "{k}");
+    }
+}
+
+/// The frozen extended klog pins the wire bytes: a change to the entry layout,
+/// the footer bit or the aux prefix is a test failure, not a silent break.
+#[test]
+fn extended_golden_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("ext.klog");
+    let mut w = Writer::new(klog.to_str().unwrap(), extended_opts(false, true)).unwrap();
+    // Same entry set as the frozen legacy corpus (`klog_entries` there).
+    let big = vec![b'V'; 64];
+    let mut entries: Vec<(String, Vec<u8>, u64, i64, bool, bool)> = vec![
+        ("k01".into(), b"small".to_vec(), 11, 0, false, false),
+        (
+            "k02".into(),
+            b"small".to_vec(),
+            12,
+            1_700_000_000_000_000_000,
+            false,
+            false,
+        ),
+        ("k03".into(), Vec::new(), 13, 0, true, false),
+        ("k04".into(), Vec::new(), 14, 0, true, true),
+        ("k05".into(), big.clone(), 15, 0, false, false),
+        (
+            "k06".into(),
+            big,
+            16,
+            1_700_000_000_000_000_001,
+            false,
+            false,
+        ),
+    ];
+    for i in 7..40u64 {
+        entries.push((
+            format!("k{i:02}"),
+            b"filler".to_vec(),
+            20 + i,
+            0,
+            false,
+            false,
+        ));
+    }
+    for (k, v, seq, ttl, tomb, sdel) in &entries {
+        w.add(k.as_bytes(), v, *seq, *ttl, *tomb, *sdel).unwrap();
+    }
+    w.finish().unwrap();
+    assert_eq!(
+        std::fs::read(&klog).unwrap(),
+        std::fs::read(phase1_fixture("klog_extended.klog")).unwrap(),
+        "the extended klog bytes are frozen"
+    );
+    assert_eq!(
+        std::fs::read(klog.with_extension("vlog")).unwrap(),
+        std::fs::read(phase1_fixture("klog_extended.vlog")).unwrap(),
+    );
+}
+
+/// Compiling the extended layout in must not change how a legacy table reads:
+/// the flag is table-level and absent, so every frozen legacy klog still
+/// decodes through the legacy path.
+#[test]
+fn legacy_table_still_decodes_with_extended_support_compiled() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "klog_legacy_flat_restarts_bloom.klog",
+        "klog_legacy_btree_norestarts_nobloom.klog",
+    ] {
+        let klog = dir.path().join(name);
+        std::fs::write(&klog, std::fs::read(phase1_fixture(name)).unwrap()).unwrap();
+        std::fs::write(
+            klog.with_extension("vlog"),
+            std::fs::read(phase1_fixture(&name.replace(".klog", ".vlog"))).unwrap(),
+        )
+        .unwrap();
+        let r = open_klog(&klog).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(r.aux_block_handle(), None, "{name}: no aux prefix");
+        let mut it = r.iter();
+        it.seek_to_first();
+        let mut n = 0;
+        while it.valid() {
+            n += 1;
+            it.next();
+        }
+        assert_eq!(n, r.num_entries(), "{name}");
     }
 }

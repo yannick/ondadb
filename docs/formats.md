@@ -49,11 +49,68 @@ refuse to read would turn a caller's mistake into an unopenable database.
 | Error | Meaning | Examples |
 |---|---|---|
 | `Corruption` (code `-5`) | the bytes contradict a format this binary *does* implement | unknown entry-flag bit, `SINGLE_DELETE` without `TOMBSTONE`, unknown or duplicated manifest tail tag, a record that fails to decode inside a CRC-valid WAL frame |
-| `UnsupportedFormat` (code `-16`) | the bytes are well-formed but name a feature this binary does not implement | a footer flag bit outside `KNOWN_FOOTER_FLAGS` |
+| `UnsupportedFormat` (code `-16`) | the bytes are well-formed but name a feature this binary does not implement | a footer flag bit outside `KNOWN_FOOTER_FLAGS`, a manifest capability bit outside `KNOWN_CAPS`, an assigned-but-unimplemented record kind (`< 64`), an unknown WAL envelope schema, an unknown SST aux-section tag |
+
+A record kind **≥ 64 is `Corruption`, not `UnsupportedFormat`**: that range is
+never assigned to anything, so those bytes cannot have come from a newer writer.
 
 A **torn tail** is neither: a short header, a short payload or a frame CRC
 mismatch is the expected residue of a crash mid-write and ends that WAL stripe
 cleanly (`Ok`).
+
+### Format capabilities (`format.rs`)
+
+A capability is the durable *permission* to write a newer artifact, taken once —
+before the first byte using it exists — through
+`DB::enable_format_capabilities`. The word lives in the manifest's `ONDACAP1`
+tail and bumps the manifest to VERSION 2, which pre-1.0 binaries refuse outright.
+
+| Bit | Symbol | Owner feature |
+|---:|---|---|
+| `1 << 0` | `CAP_EXTENDED_RECORDS` | 1.0 — kind-bearing record envelopes |
+| `1 << 1` | `CAP_MERGE_OPERANDS` | 1.1 |
+| `1 << 2` | `CAP_RANGE_DELETES` | 1.2 |
+| `1 << 3` | `CAP_PREFIX_DELTA` | 2.1 |
+| `1 << 4` | `CAP_MANIFEST_EDITS` | 2.2 |
+| `1 << 5` | `CAP_PERIODIC_AGE` | 0.3 |
+| `1 << 6` | `CAP_TXN_DECISIONS` | 3.2 |
+
+`KNOWN_CAPS = 0x7F`. The values are an interoperability contract with wavesdb:
+a bit is never renumbered, only retired. Enabling is **one-way and idempotent**;
+a database that enables nothing keeps writing VERSION-1 manifests and legacy
+artifacts forever.
+
+The enable protocol (`DbInner::enable_capability`) is persist-before-use:
+refuse a poisoned or read-only database → return `Ok` if the bits are already
+active → stage them into `caps_durable` and `persist_manifest` → only then flip
+the `caps` word write paths check. The two words exist precisely so the encoder
+never writes a bit the database is already using, and never omits one it is.
+A failed persist fail-stops the database, leaves `caps` untouched, and rolls the
+staged word back: a reopen sees the pre-enable state.
+
+### Record kinds and modifiers (`format.rs`)
+
+The legacy flags byte is nearly exhausted (five of eight bits), so extended
+records carry a **kind** instead:
+
+| Kind | Meaning | Owner |
+|---:|---|---|
+| 1 | put | 1.0 |
+| 2 | delete | 1.0 |
+| 3 | single_delete | 1.0 |
+| 4 | merge operand | 1.1 |
+| 5 | range delete | 1.2 |
+| 6–15 | reserved (data kinds) | — |
+| 16–31 | transaction control | 3.2 |
+| 32–63 | reserved | — |
+| ≥ 64 | **never assigned** | — |
+
+Modifiers keep the legacy bit values so an extended entry and a legacy entry
+describe the same thing with the same numbers: `HAS_TTL = 0x02`,
+`HAS_VLOG = 0x04` (SSTable only), `modifiers::KNOWN = 0x06`. `TOMBSTONE` and
+`SINGLE_DELETE` are *not* modifiers — they are kinds 2 and 3. An unknown
+modifier bit is `Corruption`: modifiers are not capability-gated, so no writer
+of any vintage may set one.
 
 Every legacy byte pattern these rules must keep accepting is pinned by the
 frozen corpus in `tests/fixtures/phase1/` (see
@@ -105,6 +162,55 @@ Replay callbacks receive a `wal::ReplayRecord`, not a bare `Record`: later
 record kinds are not all point writes, so callers match on the kind rather than
 assume one.
 
+### Envelope payload (`CAP_EXTENDED_RECORDS`)
+
+The frame is unchanged; the **first payload byte** selects the form:
+
+```
+payload[0] == 0xFF  →  envelope
+otherwise           →  legacy record stream (strictly masked flags byte)
+```
+
+`0xFF` is safe as a discriminator: a legacy payload starts with a flags byte and
+no writer produces one above `KNOWN_ENTRY_FLAGS` (`0x17`).
+
+```
+envelope := 0xFF | schema uvarint | count uvarint | record × count
+
+schema 1 = per-CF layout   (keys are user keys)
+schema 2 = unified layout  (keys carry the 8-byte big-endian CF-id prefix
+                            INSIDE the key, exactly as the legacy unified
+                            layout writes them — there is no separate cf-id
+                            field: a LEB128 id would cost more than the fixed
+                            8 bytes already there)
+
+record := kind uvarint | modifiers uvarint
+        | alen uvarint          ← legacy klen slot
+        | blen uvarint          ← legacy vlen slot
+        | seq uvarint
+        | ttl varint            (only if modifiers & HAS_TTL)
+        | a bytes               ← legacy key slot
+        | b bytes               ← legacy value slot
+```
+
+The legacy field order is preserved deliberately, so `append_batch`'s exact
+frame-size precompute survives as a one-line variation. The slots are named
+generically because kind 5 puts a range's `(start, end)` in them rather than
+`(key, value)`; for kinds 1–4 they are `(key, value)`, and a delete has
+`blen = 0`. A point record costs **+1 byte** versus legacy (the kind uvarint;
+modifiers replace the flags byte), plus 3 bytes of envelope header per frame.
+
+Writer rule: envelopes are emitted iff `caps & CAP_EXTENDED_RECORDS != 0` — a
+per-database decision, never a per-frame one — and **replay accepts both forms
+forever**, so a file written across an enable replays whole. Decode errors:
+unknown `schema` → `UnsupportedFormat`; `kind > 63` → `Corruption`; an assigned
+but unimplemented kind → `UnsupportedFormat`; unknown modifier bit →
+`Corruption`; a `count` that disagrees with the payload in either direction →
+`Corruption`, so an envelope frame can never deliver a partial batch.
+
+As of 1.0-B the engine enables no capability by default and therefore writes no
+envelopes; `Wal::append_batch_enveloped` is the codec entry point.
+
 ## SSTable (`sst/`)
 
 Two files: `<id>.klog` (always) and `<id>.vlog` (created lazily on the first
@@ -139,6 +245,50 @@ flags u8 | key_len uvarint | val_len uvarint | seq uvarint
 
 Entries are appended in internal order; each block's index separator is the
 block's **last** `(user_key, seq)`.
+
+#### Extended entry layout (`FOOTER_EXTENDED_BLOCK = 0x10`)
+
+When the footer sets `FOOTER_EXTENDED_BLOCK`, **every** data-block entry in the
+table uses the kind-bearing layout instead:
+
+```
+kind uvarint | modifiers uvarint | key_len uvarint | val_len uvarint
+| seq uvarint | ttl varint (if modifiers & HAS_TTL) | key bytes
+| value bytes | vlog_off u64   (as above, on modifiers & HAS_VLOG)
+```
+
+The flag is **table-level**, not per-block: a block carries no flag byte of its
+own, so a per-block decision would be its own format change. `Reader::open`
+resolves the layout once from `footer[48]` and threads it to every
+`decode_entry`. Block framing, compression, the restart trailer and the index
+are untouched — entry boundaries still come from `decode_entry`'s returned
+`next`, so restart binary search, the B+tree index and the block CRC all keep
+working unchanged.
+
+**Extended footer prefix.** The 64-byte footer is full, so the aux-block handle
+lives in the 16 bytes immediately preceding it:
+
+```
+[size-80 .. size-72)  aux_off u64   (0 when absent)
+[size-72 .. size-64)  aux_len u64   (0 when absent)
+[size-64 .. size)     the fixed 64-byte footer
+```
+
+Read at open and bounds-checked against the file before any allocation. The aux
+block is `block.rs`-framed like every other block (so it is CRC-covered) and its
+payload is a tagged section list:
+
+```
+aux payload := section_count uvarint | section × count
+section     := tag u8 | len uvarint | payload[len]
+tag 1 = range-delete fragments (defined by 1.2)
+tag 2..  reserved
+```
+
+An unknown section tag is `UnsupportedFormat`, raised at `Reader::open` rather
+than surfacing later as a silently missing section. 1.0 defines the container
+and writes `aux_off = aux_len = 0`; 1.2 is the first producer. A legacy table
+has no prefix at all (`Reader::aux_block_handle()` returns `None`).
 
 ### vlog layout
 
@@ -195,12 +345,13 @@ offset  field
 32..40  num_entries
 40..48  max_seq
 48      flags: FOOTER_HAS_BLOOM=0x01, FOOTER_BTREE=0x02,
-               FOOTER_RESTARTS=0x04, FOOTER_VLOG_V2=0x08
+               FOOTER_RESTARTS=0x04, FOOTER_VLOG_V2=0x08,
+               FOOTER_EXTENDED_BLOCK=0x10
 49..56  unused
 56..64  FOOTER_MAGIC = 0x5741_5645_5353_5431
 ```
 
-`KNOWN_FOOTER_FLAGS = 0x0F`. A bit outside that mask was written by a newer
+`KNOWN_FOOTER_FLAGS = 0x1F`. A bit outside that mask was written by a newer
 binary and names a feature this one does not implement, so `Reader::open`
 refuses the file with `OndaError::UnsupportedFormat` (code `-16`) rather than
 `Corruption` — the file is intact, this binary is simply too old.
@@ -216,7 +367,7 @@ stored as a meta block, referenced by the footer.
 Whole file, CRC32-C over everything before the trailing 4-byte CRC:
 
 ```
-magic u32 = 0x5756_4D46 ("WVMF") | version u32 = 1
+magic u32 = 0x5756_4D46 ("WVMF") | version u32 ∈ {1, 2}
 | next_file_id u64 | global_seq u64 | cf_count uvarint
 | per CF: name bytes* | config blob bytes* | sst_count uvarint
   | per SST: id, level, num_entries, num_tombstones, max_seq,
@@ -377,3 +528,37 @@ When any tagged section is present the encoder emits ALL positional sections
 first (possibly all-empty), which is what lets the positional decoder consume
 greedily without misreading a tag. Manifests carrying neither tag are
 byte-identical to pre-A2 encodings.
+
+## Capability tail tag (1.0)
+
+```
+ONDACAP1 | caps u64        (16 bytes total)
+```
+
+Decoded **after `ONDAINS1`, before `ONDAWAL1`** — the full emitted tail order is
+
+```
+[positional: partition | tier | max_entry_time]
+[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDAWAL1 layout]
+[crc32c u32]
+```
+
+`ManifestTailPresence::tagged()` includes `caps`, and this wiring is
+**load-bearing**: the positional decoder is gated only on non-emptiness, so a
+caps tag emitted without the three positional sections ahead of it would be read
+as a partition name section — silent corruption rather than rejection.
+
+Version coupling, both directions:
+
+- the header carries `2` **iff** `caps != 0`, and `1` otherwise (the same
+  lowest-version discipline the positional tails follow), so a legacy-only
+  database keeps writing bytes every previous binary can read;
+- `ONDACAP1` in a VERSION-1 manifest is `Corruption` (the encoder bumps the
+  version exactly when it emits the tag, so those bytes contradict themselves);
+- `caps & !KNOWN_CAPS != 0` is `UnsupportedFormat`;
+- a duplicate `ONDACAP1` is `Corruption`, like every other repeated tag.
+
+A pre-1.0 binary checks the version by exact equality against `1` and therefore
+refuses a v2 manifest outright. That refusal is proven by
+`tests/frozen_decoder.rs`, which vendors a copy of the 0.8.2 header decode path
+rather than trusting a constant this repository still owns.

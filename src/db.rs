@@ -234,6 +234,25 @@ pub struct DbInner {
     /// object names embed it.
     pub(crate) instance_nonce: Mutex<Option<u64>>,
 
+    /// Format capabilities this database may **use right now** — the word every
+    /// API entry point checks before writing a newer artifact.
+    ///
+    /// Split from `caps_durable` on purpose. `persist_manifest` encodes
+    /// `caps_durable`, so `enable_capability` can stage a bit, make it durable,
+    /// and only then flip `caps`. One word could not express that ordering: the
+    /// encoder would either write a bit the database is already using
+    /// (persist-after-use — a crash then leaves artifacts no reopen can read)
+    /// or never write it at all.
+    pub(crate) caps: AtomicU64,
+    /// Capability word the manifest encoder writes — the durable intent, which
+    /// leads `caps` for exactly the duration of one `persist_manifest`.
+    pub(crate) caps_durable: AtomicU64,
+    /// Serializes `enable_capability`, so N concurrent first-enables persist
+    /// once and all observe the bit. Never held across `manifest_mu`'s
+    /// acquisition order in the other direction: this lock is only ever taken
+    /// first.
+    enable_mu: Mutex<()>,
+
     /// Count of successful manifest persists over this DB's lifetime. Cheap
     /// (a single relaxed increment on an already fsync-bound path); exists so
     /// batch operations can assert they collapse N per-item persists into one.
@@ -450,6 +469,9 @@ impl DbInner {
             cfs: Vec::new(),
             wal_layout: *self.wal_layout.lock(),
             instance_nonce: self.instance_nonce.lock().to_owned(),
+            // The staged word, not the active one: `enable_capability` must
+            // make the bit durable BEFORE anything may write bytes using it.
+            caps: self.caps_durable.load(Ordering::SeqCst),
         };
         for cf in cfs.values() {
             m.cfs.push(CfManifest {
@@ -471,6 +493,55 @@ impl DbInner {
             }
         }
         res
+    }
+
+    /// Format capabilities this database may use right now.
+    pub(crate) fn caps(&self) -> u64 {
+        self.caps.load(Ordering::SeqCst)
+    }
+
+    /// Durably enable `bits`, then start honoring them.
+    ///
+    /// The ordering is the whole contract — **persist before use**:
+    ///
+    /// 1. refuse a poisoned or read-only database, before taking any lock;
+    /// 2. return `Ok` immediately if every bit is already active (idempotent —
+    ///    a reopen of an enabled database re-enables nothing);
+    /// 3. stage the bits into `caps_durable` and persist the manifest;
+    /// 4. only then flip `caps`, which is what write paths check.
+    ///
+    /// A `persist_manifest` failure fail-stops the whole database (see
+    /// [`persist_manifest`](Self::persist_manifest)), so a failed enable is not
+    /// a recoverable no-op the caller can retry against the same handle: `caps`
+    /// is untouched, the handle is dead, and a reopen sees the pre-enable state.
+    /// The staged word is rolled back so no later persist can publish a bit
+    /// this database never started using.
+    pub(crate) fn enable_capability(&self, bits: u64) -> Result<()> {
+        self.poison.check()?;
+        if self.opts.read_only {
+            return Err(OndaError::ReadOnly(
+                "cannot enable format capabilities on a read-only database".into(),
+            ));
+        }
+        if bits & !crate::format::KNOWN_CAPS != 0 {
+            return Err(OndaError::InvalidArgs(format!(
+                "capabilities {bits:#x} outside known mask {:#x}",
+                crate::format::KNOWN_CAPS
+            )));
+        }
+        let _mu = self.enable_mu.lock();
+        let active = self.caps.load(Ordering::SeqCst);
+        if active & bits == bits {
+            return Ok(());
+        }
+        let previous = self.caps_durable.load(Ordering::SeqCst);
+        self.caps_durable.store(previous | bits, Ordering::SeqCst);
+        if let Err(e) = self.persist_manifest() {
+            self.caps_durable.store(previous, Ordering::SeqCst);
+            return Err(e);
+        }
+        self.caps.store(active | bits, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Number of successful manifest persists so far (see `manifest_persists`).
@@ -735,6 +806,12 @@ fn build_db_inner(
         manifest_mu: Mutex::new(()),
         wal_layout: Mutex::new(requested_layout),
         instance_nonce: Mutex::new(manifest.instance_nonce),
+        // A capability recorded in the manifest is already durable, so both
+        // words start from it: a reopen after a crash between persist and flip
+        // simply sees an enabled database.
+        caps: AtomicU64::new(manifest.caps),
+        caps_durable: AtomicU64::new(manifest.caps),
+        enable_mu: Mutex::new(()),
         manifest_persists: AtomicU64::new(0),
         file_deletion: FileDeletionState::new(opts),
         workers: Mutex::new(Vec::new()),
@@ -1204,6 +1281,36 @@ impl DB {
         Ok(())
     }
 
+    /// Durably enable one or more format capabilities
+    /// ([`CAP_EXTENDED_RECORDS`](crate::format::CAP_EXTENDED_RECORDS) and
+    /// friends), then start honoring them.
+    ///
+    /// A capability is a permission taken **once and durably, before the first
+    /// byte using it exists**: the bit reaches the manifest — bumping it to
+    /// VERSION 2, which older binaries refuse outright — before any write path
+    /// may produce the newer artifact. Enabling is idempotent and safe to call
+    /// on every open; a database that enables nothing keeps writing VERSION-1
+    /// manifests and legacy artifacts forever.
+    ///
+    /// **This is one-way.** Once a capability is enabled, every reader of the
+    /// database must understand it; there is no disable.
+    ///
+    /// Fails with `ReadOnly` on a read-only handle, `Poisoned` on a
+    /// fail-stopped one, and `InvalidArgs` for a bit this binary does not
+    /// implement. If the manifest write itself fails the database fail-stops
+    /// (like any durability failure) and the capability is *not* enabled — a
+    /// reopen sees the pre-enable state.
+    pub fn enable_format_capabilities(&self, bits: u64) -> Result<()> {
+        self.inner.enable_capability(bits)
+    }
+
+    /// Format capabilities this database has durably enabled (a mask of
+    /// [`KNOWN_CAPS`](crate::format::KNOWN_CAPS) bits); `0` for a database that
+    /// has enabled none.
+    pub fn format_capabilities(&self) -> u64 {
+        self.inner.caps()
+    }
+
     /// Compact a column family and wait for it to settle: runs every
     /// triggered round, then sweeps all populated levels to the bottom so
     /// tombstones and shadowed versions are reclaimed even when no size
@@ -1664,8 +1771,7 @@ mod tests {
         assert!(db.inner.file_deletion.worker.is_none());
         let victim = dir.path().join("1.klog");
         std::fs::write(&victim, b"x").unwrap();
-        db.inner
-            .remove_sst_file(victim.to_str().unwrap(), 1 << 20);
+        db.inner.remove_sst_file(victim.to_str().unwrap(), 1 << 20);
         assert!(!victim.exists(), "unpaced deletion must unlink inline");
         db.close().unwrap();
     }
@@ -1722,7 +1828,10 @@ mod tests {
         while victim.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!victim.exists(), "the last guard drop must drain the pending list");
+        assert!(
+            !victim.exists(),
+            "the last guard drop must drain the pending list"
+        );
         db.close().unwrap();
     }
 
@@ -1741,7 +1850,10 @@ mod tests {
         db.inner.remove_sst_file(victim.to_str().unwrap(), 1 << 20);
         // Give the worker time to actually park on the bucket.
         std::thread::sleep(Duration::from_millis(50));
-        assert!(victim.exists(), "the worker should still be waiting on credit");
+        assert!(
+            victim.exists(),
+            "the worker should still be waiting on credit"
+        );
 
         let started = std::time::Instant::now();
         db.inner.fail_stop("test-induced".to_string());
@@ -1913,6 +2025,27 @@ mod tests {
         // Reads keep working on a poisoned DB; only new commits are refused.
         assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
         db.close().unwrap();
+    }
+
+    /// The enable path refuses a fail-stopped database *before* taking any
+    /// lock, matching `Txn::commit`'s gate: a poisoned handle's manifest write
+    /// would be the very failure that poisoned it.
+    #[test]
+    fn enable_on_poisoned_db_is_poisoned_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        db.inner.poison.set("simulated fsync failure".into());
+
+        let err = db
+            .enable_format_capabilities(crate::format::CAP_EXTENDED_RECORDS)
+            .expect_err("a poisoned database cannot take a capability");
+        assert!(matches!(err, OndaError::Poisoned(_)), "{err:?}");
+        assert_eq!(db.format_capabilities(), 0);
+        assert_eq!(db.inner.caps_durable.load(Ordering::SeqCst), 0);
+        drop(cf);
     }
 
     /// A comparable engine's batch commit discarded the journal write error

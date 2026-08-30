@@ -96,6 +96,132 @@ pub fn check_entry_flags(fl: u8) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Format capabilities a database may enable, persisted as a single `u64` word
+/// in the manifest's `ONDACAP1` tail (see [`crate::manifest`]).
+///
+/// A capability is the *permission* to write a newer artifact, taken once and
+/// durably, before the first byte using it exists. The values are pinned here
+/// and golden-pinned in `tests/fixtures/phase1/`: they are the interoperability
+/// contract with wavesdb, so a bit is never renumbered, only retired.
+///
+/// A manifest naming a bit outside [`KNOWN_CAPS`] was written by a newer binary:
+/// the bytes are well-formed and describe a feature this one does not implement,
+/// so the open fails with [`OndaError::UnsupportedFormat`](crate::OndaError).
+pub const CAP_EXTENDED_RECORDS: u64 = 1 << 0; // kind-bearing envelopes (1.0)
+/// Merge operands (1.1).
+pub const CAP_MERGE_OPERANDS: u64 = 1 << 1;
+/// Range deletes (1.2).
+pub const CAP_RANGE_DELETES: u64 = 1 << 2;
+/// Prefix-delta key encoding (2.1).
+pub const CAP_PREFIX_DELTA: u64 = 1 << 3;
+/// Incremental (edit-log) manifest (2.2).
+pub const CAP_MANIFEST_EDITS: u64 = 1 << 4;
+/// Periodic-age compaction stamps (0.3).
+pub const CAP_PERIODIC_AGE: u64 = 1 << 5;
+/// Persisted transaction decisions (3.2).
+pub const CAP_TXN_DECISIONS: u64 = 1 << 6;
+/// Mask of every capability bit this roadmap has assigned (`0x7F`).
+pub const KNOWN_CAPS: u64 = CAP_EXTENDED_RECORDS
+    | CAP_MERGE_OPERANDS
+    | CAP_RANGE_DELETES
+    | CAP_PREFIX_DELTA
+    | CAP_MANIFEST_EDITS
+    | CAP_PERIODIC_AGE
+    | CAP_TXN_DECISIONS;
+
+/// Reject a capability word naming a bit this binary does not implement.
+pub fn check_caps(caps: u64) -> crate::error::Result<()> {
+    if caps & !KNOWN_CAPS != 0 {
+        return Err(crate::error::OndaError::UnsupportedFormat(format!(
+            "manifest capabilities {caps:#x} outside known mask {KNOWN_CAPS:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Record kind, the leading field of an extended (envelope) record.
+///
+/// Kinds replace the exhausted entry-flag bits as the extension point: the
+/// legacy flags byte has three free bits, while the roadmap needs merge, range
+/// delete and transaction-control records. Values are pinned for wavesdb
+/// compatibility exactly as the capability bits are.
+pub const KIND_PUT: u64 = 1;
+/// Delete tombstone.
+pub const KIND_DELETE: u64 = 2;
+/// Single-delete tombstone.
+pub const KIND_SINGLE_DELETE: u64 = 3;
+/// Merge operand (1.1); assigned, not yet implemented.
+pub const KIND_MERGE: u64 = 4;
+/// Range delete (1.2); assigned, not yet implemented.
+pub const KIND_RANGE_DELETE: u64 = 5;
+// 6..15   reserved for future data kinds
+// 16..31  transaction control (3.2)
+// 32..63  reserved
+/// Highest value that may ever be assigned a meaning. Anything above this is
+/// never written by any writer, so it cannot have come from a newer binary.
+pub const MAX_ASSIGNABLE_KIND: u64 = 63;
+
+/// Per-record modifiers of an extended record.
+///
+/// The bit values deliberately match [`flags`], so an extended entry and a
+/// legacy entry describe the same thing with the same numbers. `TOMBSTONE` and
+/// `SINGLE_DELETE` are *not* modifiers — they are kinds 2 and 3.
+pub mod modifiers {
+    /// A TTL field follows (`== flags::HAS_TTL`).
+    pub const HAS_TTL: u64 = 0x02;
+    /// Value lives in the vlog (`== flags::HAS_VLOG`); SSTable entries only.
+    pub const HAS_VLOG: u64 = 0x04;
+    /// Mask of every modifier bit this binary implements.
+    pub const KNOWN: u64 = HAS_TTL | HAS_VLOG;
+}
+
+/// Reject a record kind this binary cannot honor.
+///
+/// Two classes, and the split is the whole point of the `>= 64` reservation:
+/// a kind above [`MAX_ASSIGNABLE_KIND`] is never assigned to anything, so it
+/// cannot have been written by a newer binary and is `Corruption`; an assigned
+/// but unimplemented kind (merge, range delete, transaction control) is
+/// [`OndaError::UnsupportedFormat`](crate::OndaError) — those bytes are intact,
+/// this binary is simply too old to read them.
+pub fn check_kind(kind: u64) -> crate::error::Result<()> {
+    if kind > MAX_ASSIGNABLE_KIND {
+        return Err(crate::error::OndaError::Corruption(format!(
+            "record kind {kind} is above the never-assigned bound {MAX_ASSIGNABLE_KIND}"
+        )));
+    }
+    match kind {
+        KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE => Ok(()),
+        _ => Err(crate::error::OndaError::UnsupportedFormat(format!(
+            "record kind {kind} is not implemented by this binary"
+        ))),
+    }
+}
+
+/// Reject a modifier word naming a bit this binary does not implement.
+///
+/// `Corruption`, not `UnsupportedFormat`: modifiers are not capability-gated,
+/// so no writer — of any vintage — may set a bit outside [`modifiers::KNOWN`].
+pub fn check_modifiers(mods: u64) -> crate::error::Result<()> {
+    if mods & !modifiers::KNOWN != 0 {
+        return Err(crate::error::OndaError::Corruption(format!(
+            "record modifiers {mods:#x} outside known mask {:#x}",
+            modifiers::KNOWN
+        )));
+    }
+    Ok(())
+}
+
+/// The kind naming a point record's `(tombstone, single_delete)` pair.
+pub fn point_kind(tombstone: bool, single_delete: bool) -> u64 {
+    if single_delete {
+        KIND_SINGLE_DELETE
+    } else if tombstone {
+        KIND_DELETE
+    } else {
+        KIND_PUT
+    }
+}
+
 /// Width of the internal-key sequence trailer.
 pub const TRAILER_SIZE: usize = 8;
 
@@ -133,6 +259,70 @@ pub fn split_internal_key(ik: &[u8]) -> (&[u8], u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capability word is a cross-engine contract (wavesdb is reconciled to
+    /// these numbers), so every literal is asserted rather than derived.
+    #[test]
+    fn capability_bits_are_pinned() {
+        assert_eq!(CAP_EXTENDED_RECORDS, 0x01);
+        assert_eq!(CAP_MERGE_OPERANDS, 0x02);
+        assert_eq!(CAP_RANGE_DELETES, 0x04);
+        assert_eq!(CAP_PREFIX_DELTA, 0x08);
+        assert_eq!(CAP_MANIFEST_EDITS, 0x10);
+        assert_eq!(CAP_PERIODIC_AGE, 0x20);
+        assert_eq!(CAP_TXN_DECISIONS, 0x40);
+    }
+
+    #[test]
+    fn known_caps_is_0x7f() {
+        assert_eq!(KNOWN_CAPS, 0x7F);
+        assert!(check_caps(KNOWN_CAPS).is_ok());
+        let err = check_caps(1 << 7).expect_err("an unassigned capability bit must fail closed");
+        assert_eq!(err.kind(), "unsupported_format");
+    }
+
+    #[test]
+    fn record_kinds_are_pinned() {
+        assert_eq!(KIND_PUT, 1);
+        assert_eq!(KIND_DELETE, 2);
+        assert_eq!(KIND_SINGLE_DELETE, 3);
+        assert_eq!(KIND_MERGE, 4);
+        assert_eq!(KIND_RANGE_DELETE, 5);
+        assert_eq!(MAX_ASSIGNABLE_KIND, 63);
+        assert_eq!(point_kind(false, false), KIND_PUT);
+        assert_eq!(point_kind(true, false), KIND_DELETE);
+        assert_eq!(point_kind(true, true), KIND_SINGLE_DELETE);
+    }
+
+    /// An assigned-but-unimplemented kind names a real feature (`UnsupportedFormat`);
+    /// a kind in the never-assigned range cannot have come from any writer
+    /// (`Corruption`).
+    #[test]
+    fn kind_check_splits_unsupported_from_corruption() {
+        for k in [KIND_PUT, KIND_DELETE, KIND_SINGLE_DELETE] {
+            assert!(check_kind(k).is_ok());
+        }
+        for k in [0, KIND_MERGE, KIND_RANGE_DELETE, 16, 63] {
+            assert_eq!(check_kind(k).unwrap_err().kind(), "unsupported_format");
+        }
+        for k in [64u64, 1000] {
+            assert_eq!(check_kind(k).unwrap_err().kind(), "corruption");
+        }
+    }
+
+    /// An extended entry and a legacy entry must describe the same thing with
+    /// the same numbers, so the modifier bits mirror the flag bits.
+    #[test]
+    fn modifier_bits_match_legacy_flags() {
+        assert_eq!(modifiers::HAS_TTL, u64::from(flags::HAS_TTL));
+        assert_eq!(modifiers::HAS_VLOG, u64::from(flags::HAS_VLOG));
+        assert_eq!(modifiers::KNOWN, 0x06);
+        assert!(check_modifiers(modifiers::KNOWN).is_ok());
+        // TOMBSTONE/SINGLE_DELETE are kinds, never modifiers.
+        for m in [u64::from(flags::TOMBSTONE), u64::from(flags::SINGLE_DELETE)] {
+            assert_eq!(check_modifiers(m).unwrap_err().kind(), "corruption");
+        }
+    }
 
     #[test]
     fn internal_key_round_trip() {

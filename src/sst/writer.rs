@@ -6,9 +6,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{
-    data_block_alg, encode_entry, vlog_path_for, BlockHandle, FileMeta, IndexEntry,
-    DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE,
-    FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
+    data_block_alg, encode_entry, vlog_path_for, BlockHandle, EntryLayout, FileMeta, IndexEntry,
+    AUX_HANDLE_LEN, DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK, FOOTER_HAS_BLOOM,
+    FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
 };
 use crate::block::write_block;
 use crate::bloom::Bloom;
@@ -44,6 +44,12 @@ pub struct WriterOptions {
     /// Entries per in-block restart point (`0` disables the restart trailer,
     /// producing legacy blocks). See [`super::RESTART_INTERVAL`].
     pub restart_interval: usize,
+    /// Write every data-block entry in the extended (kind-bearing) layout and
+    /// set [`FOOTER_EXTENDED_BLOCK`]. Table-level: the flag describes the whole
+    /// file, so this is fixed for the writer's lifetime. Off by default —
+    /// nothing in the engine enables it yet, and a table written this way is
+    /// unreadable by binaries older than 1.0.
+    pub extended_entries: bool,
 }
 
 /// Fan-out (entries per node) for the B+tree index.
@@ -240,6 +246,16 @@ impl Writer {
         }
     }
 
+    /// Entry layout this table's data blocks use, fixed for its lifetime — the
+    /// footer flag describes the whole file.
+    fn entry_layout(&self) -> EntryLayout {
+        if self.opts.extended_entries {
+            EntryLayout::Extended
+        } else {
+            EntryLayout::Legacy
+        }
+    }
+
     /// Append one entry. `value` is ignored for tombstones.
     pub fn add(
         &mut self,
@@ -285,8 +301,10 @@ impl Writer {
             self.cur_restarts.push(self.cur_block.len() as u32);
         }
         self.cur_entries += 1;
+        let layout = self.entry_layout();
         encode_entry(
             &mut self.cur_block,
+            layout,
             user_key,
             value,
             seq,
@@ -508,6 +526,9 @@ impl Writer {
         if self.opts.restart_interval > 0 {
             footer_flags |= FOOTER_RESTARTS;
         }
+        if self.opts.extended_entries {
+            footer_flags |= FOOTER_EXTENDED_BLOCK;
+        }
         let mut bloom_handle = BlockHandle::default();
         // Size the filter from the keys actually written, not from a hint. Both
         // halves are matched together so there is no default rate to fall back
@@ -541,6 +562,15 @@ impl Writer {
         put_u64(&mut footer[56..64], FOOTER_MAGIC);
 
         let mut klog = self.klog.take().unwrap();
+        if self.opts.extended_entries {
+            // Aux-block handle, immediately before the footer. 1.0 defines the
+            // container and produces no sections, so both fields are zero; 1.2
+            // is the first writer to fill them in.
+            let mut aux = [0u8; AUX_HANDLE_LEN];
+            put_u64(&mut aux[0..8], 0);
+            put_u64(&mut aux[8..16], 0);
+            klog.write_all(&aux)?;
+        }
         klog.write_all(&footer)?;
         klog.flush()?;
         let mut klog = klog.into_inner().map_err(|e| e.into_error())?;
@@ -700,6 +730,7 @@ mod tests {
                 expected_entries: n,
                 use_btree: false,
                 restart_interval: 8,
+                extended_entries: false,
             },
         )
         .unwrap();

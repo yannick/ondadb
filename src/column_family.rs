@@ -990,6 +990,9 @@ impl ColumnFamily {
             expected_entries: expected,
             use_btree: self.opts.use_btree,
             restart_interval: crate::sst::RESTART_INTERVAL,
+            // No engine path writes extended entries yet (1.0-B ships the
+            // codec; 1.1/1.2 are the first producers).
+            extended_entries: false,
         }
     }
 
