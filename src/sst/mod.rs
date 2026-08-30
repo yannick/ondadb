@@ -125,6 +125,10 @@ impl FileMeta {
             // Age is stamped by the caller that knows the context: flush/ingest
             // uses the write time, compaction carries the max over its inputs.
             max_entry_time: None,
+            // Likewise for the periodic-compaction stamp: only a caller holding
+            // CAP_PERIODIC_AGE may set it, and only flush/ingest and compaction
+            // output know which clock reading applies.
+            last_compaction_time: None,
         }
     }
 }

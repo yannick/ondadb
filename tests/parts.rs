@@ -1290,3 +1290,113 @@ fn moving_a_part_to_another_tier_does_not_change_its_identity() {
     // And the data is still readable through the moved part.
     assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
 }
+
+// ---------------------------------------------------------------------------
+// 0.3 — periodic compaction and attached parts
+// ---------------------------------------------------------------------------
+
+/// Failure matrix, last row: a part attached from elsewhere carries **no** age
+/// state and is never eligible.
+///
+/// The table was written by another database, whose compaction history this one
+/// does not own, so its age here is unknown — and unknown is ineligible, the
+/// same convention `max_entry_time` already uses for the part mover. Note the
+/// contrast the test pins deliberately: `attach_part` *does* stamp
+/// `max_entry_time` (so the mover treats the part as freshly arrived) and
+/// leaves `last_compaction_time` alone. The two clocks are separate on purpose.
+#[test]
+fn periodic_ignores_attached_parts() {
+    use ondadb::format::CAP_PERIODIC_AGE;
+    use ondadb::manifest::{manifest_path, Manifest};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                periodic_compaction_interval: Duration::from_secs(4),
+                ..parts_cfg()
+            },
+        )
+        .unwrap();
+
+    let clock = Arc::new(AtomicI64::new(1_000_000_000_000));
+    let handle = clock.clone();
+    db.set_clock_for_tests(Arc::new(move || handle.load(Ordering::SeqCst)));
+
+    materialize_parts(&db, &cf);
+    // Enable FIRST, so the enable-time stamping cannot be what leaves the
+    // attached table below unstamped.
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+    let detached = db.detach_part(&cf, "img").unwrap();
+    db.attach_part(&cf, &detached.dir).unwrap();
+
+    let tables = Manifest::load(manifest_path(dir.path())).unwrap().cfs[0]
+        .sstables
+        .clone();
+    let attached: Vec<_> = tables
+        .iter()
+        .filter(|t| t.partition.as_deref() == Some("img"))
+        .collect();
+    assert!(!attached.is_empty(), "the part came back");
+    assert!(
+        attached.iter().all(|t| t.last_compaction_time.is_none()),
+        "an attached part is never stamped: {:?}",
+        attached
+            .iter()
+            .map(|t| t.last_compaction_time)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        attached.iter().all(|t| t.max_entry_time.is_some()),
+        "the mover's age IS set on attach — the two clocks are separate"
+    );
+    let owned: Vec<_> = tables
+        .iter()
+        .filter(|t| t.partition.as_deref() != Some("img"))
+        .collect();
+    assert!(!owned.is_empty());
+    assert!(
+        owned.iter().all(|t| t.last_compaction_time.is_some()),
+        "this database's own tables were stamped at enable time"
+    );
+
+    // Far past the interval: the owned tables are revisited, the attached one
+    // never is, however long it sits there.
+    let attached_ids: Vec<u64> = attached.iter().map(|t| t.id).collect();
+    clock.store(1_000_000_000_000 + 3_600_000_000_000, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && cf.stats().periodic_compactions == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        cf.stats().periodic_compactions >= 1,
+        "the database's own aged tables are still revisited"
+    );
+    // Give any further scan a chance to (wrongly) pick the attached table.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let after = Manifest::load(manifest_path(dir.path())).unwrap().cfs[0]
+        .sstables
+        .clone();
+    for id in &attached_ids {
+        let table = after
+            .iter()
+            .find(|t| t.id == *id)
+            .unwrap_or_else(|| panic!("attached table {id} must not have been rewritten"));
+        assert!(
+            table.last_compaction_time.is_none(),
+            "the attached table must still carry no age state"
+        );
+    }
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+    }
+    drop(cf);
+    db.close().unwrap();
+}

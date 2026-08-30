@@ -420,6 +420,7 @@ precede it, even if those are all-empty counts:
 | any `tier`, no `max_entry_time`     | sections 1 + 2 (P3 layout) |
 | any `max_entry_time`                | sections 1 + 2 + 3 |
 | unified WAL layout                  | sections 1 + 2 + 3 + tagged section 4 |
+| any tagged section (`ONDAOBJ1`, `ONDAINS1`, `ONDACAP1`, `ONDAAGE1`) | sections 1 + 2 + 3 (possibly all-empty) + the tags |
 
 **Decoding** is positional for sections 1–3: after the CF loop, if bytes remain
 before the CRC the first section is the partition section, the next (if bytes
@@ -493,7 +494,13 @@ ONDABLK1 | data_block_size u64                  per-CF block target
 ONDAVVC1 | max_cached_vlog_value_bytes u64      per-CF vlog value cache limit
 ONDABLM1 | count u64 | fpr f64-bits x count
           | optimize_filters_for_hits u8        per-level bloom policy
+ONDAPRD1 | periodic_compaction_interval u64     microseconds; 0 = disabled (0.3)
 ```
+
+`ONDAPRD1` is elided at the default (zero, disabled), so a family that never
+sets it encodes byte-for-byte as earlier releases wrote it; it is refused by
+`ColumnFamilyConfig::validate` on a `CompactionStyle::Fifo` family, which evicts
+by age through `fifo_ttl` instead.
 
 `ONDABLM1` is all-or-nothing: a truncated tail, or one holding a rate outside
 `(0, 1)`, leaves both fields at their defaults (empty vector, `false`) rather
@@ -562,3 +569,60 @@ A pre-1.0 binary checks the version by exact equality against `1` and therefore
 refuses a v2 manifest outright. That refusal is proven by
 `tests/frozen_decoder.rs`, which vendors a copy of the 0.8.2 header decode path
 rather than trusting a constant this repository still owns.
+
+## Periodic-age tail tag (0.3)
+
+```
+ONDAAGE1 | per CF, in manifest CF order:
+             count uvarint
+             { table_index uvarint | value uvarint } × count
+```
+
+The same `(table_index, u64)` section shape as the positional max-entry-time
+section, carrying `SstMeta::last_compaction_time` — the wall-clock nanoseconds
+at which a table was last *written by a compaction*. Tables not listed decode
+that field as `None`, which the picker reads as **unknown, therefore never
+eligible**.
+
+Deliberately a **new** field rather than a reuse of `max_entry_time`. That field
+carries the maximum forward over a compaction's inputs so re-compacting cold
+data does not make it look freshly written — which is exactly what the part
+mover's `TierRule::min_age` gate needs, and exactly what a periodic trigger must
+not have: carrying it forward would leave a just-rewritten table instantly
+re-eligible (a loop), and resetting it would break tier placement.
+
+Decoded **after `ONDACAP1`, before `ONDAWAL1`**; the full emitted tail order is
+
+```
+[positional: partition | tier | max_entry_time]
+[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDAAGE1 …] [ONDAWAL1 layout]
+[crc32c u32]
+```
+
+Order in the byte stream is a convention, not a requirement: the tag dispatch
+loop is order-independent. `ManifestTailPresence::tagged()` includes this
+section, for the same load-bearing reason `ONDACAP1` does.
+
+Capability coupling, both directions:
+
+- the section is emitted **iff** `caps & CAP_PERIODIC_AGE != 0` *and* some table
+  carries a stamp, so a database that has not taken the capability writes the
+  same bytes it always did (and, transitively, still writes VERSION 1);
+- `ONDAAGE1` without `CAP_PERIODIC_AGE` in the same manifest is `Corruption`:
+  nothing stamps a table before the bit is durable, so those bytes were
+  truncated, hand-edited, or written by something that skipped the enable;
+- a duplicate `ONDAAGE1` is `Corruption`, like every other repeated tag.
+
+Who sets the field:
+
+| Site | Stamp |
+|---|---|
+| `ColumnFamily::finish_writer_to_handle` (flush + ingest) | the injectable clock's reading |
+| every output of one compaction (`CompactionOutputBuilder`) | one reading taken at job freeze, shared by all outputs |
+| `parts.rs::relocate_part` (tier move/copy) | unchanged — the meta is cloned, the stamp rides along |
+| `DB::attach_part` / `attach_part_by_ref` | left `None`, and therefore never eligible |
+| the `CAP_PERIODIC_AGE` enable transition | `None` → the enable time, for local non-mounted tables, **in the same manifest write** that persists the capability |
+
+The enable-time stamping is what makes the trigger restart-safe. "Eligible one
+interval after open" is not: open time is not durable, so a database restarted
+more often than its interval would never become eligible at all.

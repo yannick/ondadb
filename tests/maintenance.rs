@@ -2,10 +2,14 @@
 
 use std::time::Duration;
 
-use ondadb::{ColumnFamilyConfig, Options, PartitionRule, TierDef, DB};
+use ondadb::{ColumnFamilyConfig, OndaError, Options, PartitionRule, TierDef, DB};
 
 fn fill(db: &DB, cf: &std::sync::Arc<ondadb::ColumnFamily>, n: u32) {
-    for i in 0..n {
+    fill_range(db, cf, 0, n);
+}
+
+fn fill_range(db: &DB, cf: &std::sync::Arc<ondadb::ColumnFamily>, from: u32, to: u32) {
+    for i in from..to {
         db.put(cf, format!("k{i:05}").as_bytes(), b"value", Duration::ZERO)
             .unwrap();
     }
@@ -1171,4 +1175,655 @@ fn close_drains_deletion_queue_before_lock_release() {
     let reopened = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
     assert!(reopened.get_column_family("default").is_some());
     reopened.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 0.3 — periodic compaction with durable age state
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use ondadb::format::CAP_PERIODIC_AGE;
+use ondadb::manifest::{manifest_path, Manifest};
+
+/// A fixed base reading, far from any real clock, so a stamp taken from the
+/// fake can never be confused for one taken from `now_nanos`.
+const T0: i64 = 1_000_000_000_000;
+/// The interval every periodic test below configures. Four seconds derives a
+/// one-second scan cadence — the floor — which is what bounds these tests'
+/// wall-clock cost while leaving eligibility entirely on the fake clock.
+const INTERVAL: Duration = Duration::from_secs(4);
+
+/// Install a clock the test drives, returning the handle that moves it.
+fn fake_clock(db: &DB) -> Arc<AtomicI64> {
+    let now = Arc::new(AtomicI64::new(T0));
+    let handle = now.clone();
+    db.set_clock_for_tests(Arc::new(move || handle.load(Ordering::SeqCst)));
+    now
+}
+
+fn periodic_cfg() -> ColumnFamilyConfig {
+    ColumnFamilyConfig {
+        periodic_compaction_interval: INTERVAL,
+        l1_file_count_trigger: 2,
+        ..ColumnFamilyConfig::default()
+    }
+}
+
+/// Every table's age state, straight out of the persisted catalog.
+fn persisted_stamps(dir: &Path) -> Vec<Option<i64>> {
+    Manifest::load(manifest_path(dir))
+        .unwrap()
+        .cfs
+        .iter()
+        .flat_map(|cf| {
+            cf.sstables
+                .iter()
+                .map(|s| s.last_compaction_time)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Total on-disk bytes of a database's SSTables.
+fn sst_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "klog" || x == "vlog") {
+                total += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+/// Poll `f` until it holds or the deadline passes. Periodic work runs on the
+/// compaction worker's own cadence, so the test waits for the effect rather
+/// than assuming a timing.
+fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f()
+}
+
+/// Make the next manifest write fail, by occupying the temp path
+/// `Manifest::save` needs. Returns the path so the caller can free it again.
+fn block_manifest_writes(dir: &Path) -> std::path::PathBuf {
+    let tmp = manifest_path(dir).with_extension("tmp");
+    std::fs::create_dir(&tmp).expect("MANIFEST.tmp must not already exist");
+    tmp
+}
+
+fn shared_tier_options(dir: &Path, shared_root: &Path) -> Options {
+    let mut opts = Options::new(dir.to_str().unwrap());
+    opts.tiers = vec![TierDef::new("cas", shared_root.to_str().unwrap().to_string()).shared()];
+    opts
+}
+
+/// Task 2: the enable transition stamps every local, non-mounted table in the
+/// same manifest write that persists the capability — and stamps nothing else.
+#[test]
+fn periodic_enable_stamps_local_tables_once() {
+    let shared = tempfile::tempdir().unwrap();
+    let publisher = tempfile::tempdir().unwrap();
+    let sharer = tempfile::tempdir().unwrap();
+
+    // A published part on a shared tier, so the sharer below has something to
+    // mount by reference — a table it may never rewrite and must never stamp.
+    let shared_cfg = ColumnFamilyConfig {
+        partition_rules: vec![PartitionRule {
+            prefix: b"img/".to_vec(),
+            name: "img".into(),
+        }],
+        min_levels: 2,
+        l1_file_count_trigger: 1,
+        ..ColumnFamilyConfig::default()
+    };
+    let db1 = DB::open(shared_tier_options(publisher.path(), shared.path())).unwrap();
+    let cf1 = db1
+        .create_column_family("default", shared_cfg.clone())
+        .unwrap();
+    for i in 0..8u32 {
+        db1.put(
+            &cf1,
+            format!("img/{i:03}").as_bytes(),
+            b"IMG",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    db1.flush_memtable(&cf1).unwrap();
+    db1.compact(&cf1).unwrap();
+    db1.move_part_to_tier(&cf1, "img", "cas").unwrap();
+    let part = db1.export_part(&cf1, "img").unwrap();
+    drop(cf1);
+    db1.close().unwrap();
+
+    let db = DB::open(shared_tier_options(sharer.path(), shared.path())).unwrap();
+    let cf = db.create_column_family("default", shared_cfg).unwrap();
+    db.attach_part_by_ref(&cf, &part, "cas").unwrap();
+    // Two local tables of the sharer's own.
+    for i in 0..4u32 {
+        db.put(
+            &cf,
+            format!("log/{i:03}").as_bytes(),
+            b"LOG",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    for i in 4..8u32 {
+        db.put(
+            &cf,
+            format!("log/{i:03}").as_bytes(),
+            b"LOG",
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+
+    let clock = fake_clock(&db);
+    assert!(
+        persisted_stamps(sharer.path()).iter().all(Option::is_none),
+        "nothing carries age state before the capability exists"
+    );
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+
+    let manifest = Manifest::load(manifest_path(sharer.path())).unwrap();
+    assert_eq!(manifest.caps & CAP_PERIODIC_AGE, CAP_PERIODIC_AGE);
+    let tables = &manifest.cfs[0].sstables;
+    let mounted: Vec<_> = tables.iter().filter(|t| t.object.is_some()).collect();
+    let local: Vec<_> = tables.iter().filter(|t| t.object.is_none()).collect();
+    assert_eq!(mounted.len(), 1, "one mounted part table");
+    assert!(local.len() >= 2, "the sharer's own tables: {}", local.len());
+    assert!(
+        local.iter().all(|t| t.last_compaction_time == Some(T0)),
+        "every local table takes the enable time in the same manifest write"
+    );
+    assert!(
+        mounted.iter().all(|t| t.last_compaction_time.is_none()),
+        "a foreign mount is never stamped and never eligible"
+    );
+
+    // Re-enabling is a no-op: the bit is already active, so nothing is
+    // re-stamped even though the clock has moved on.
+    clock.store(T0 + 100 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+    let after = Manifest::load(manifest_path(sharer.path())).unwrap();
+    assert_eq!(
+        after.cfs[0]
+            .sstables
+            .iter()
+            .map(|t| t.last_compaction_time)
+            .collect::<Vec<_>>(),
+        tables
+            .iter()
+            .map(|t| t.last_compaction_time)
+            .collect::<Vec<_>>(),
+        "a second enable must not re-stamp"
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Failure matrix, row 1: a crash during the enable-time stamping leaves the
+/// old manifest. Reopen shows neither the capability nor any stamp, and the
+/// enable can simply be retried.
+#[test]
+fn periodic_enable_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.create_column_family("default", periodic_cfg()).unwrap();
+        fill(&db, &cf, 32);
+        db.flush_memtable(&cf).unwrap();
+        assert!(
+            !persisted_stamps(dir.path()).is_empty(),
+            "one flushed table"
+        );
+
+        let _clock = fake_clock(&db);
+        let blocked = block_manifest_writes(dir.path());
+        let error = db
+            .enable_format_capabilities(CAP_PERIODIC_AGE)
+            .expect_err("the manifest write cannot succeed");
+        assert!(
+            !matches!(error, OndaError::InvalidArgs(_)),
+            "a durability failure, not a caller error: {error:?}"
+        );
+        assert_eq!(
+            db.format_capabilities(),
+            0,
+            "the bit is not active when its manifest write failed"
+        );
+        assert!(db.poisoned().is_some(), "a failed persist fail-stops");
+        drop(cf);
+        let _ = db.close();
+        std::fs::remove_dir(&blocked).unwrap();
+    }
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    assert_eq!(db.format_capabilities(), 0, "no capability survived");
+    assert!(
+        persisted_stamps(dir.path()).iter().all(Option::is_none),
+        "no stamp survived either"
+    );
+    // The retry is clean.
+    let cf = db.get_column_family("default").unwrap();
+    let clock = fake_clock(&db);
+    clock.store(T0, Ordering::SeqCst);
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+    assert!(persisted_stamps(dir.path()).iter().all(|s| *s == Some(T0)));
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Failure matrix, row 2: stamps are durable. A database restarted more often
+/// than its interval still becomes eligible, because the clock the trigger
+/// reads is on disk rather than in the process.
+#[test]
+fn periodic_stamp_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        // No compaction workers: this test is about the persisted state, not
+        // about the scheduler acting on it.
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.num_compaction_threads = 1;
+        let db = DB::open(opts).unwrap();
+        let cf = db.create_column_family("default", periodic_cfg()).unwrap();
+        let _clock = fake_clock(&db);
+        fill(&db, &cf, 32);
+        db.flush_memtable(&cf).unwrap();
+        db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+        drop(cf);
+        db.close().unwrap();
+    }
+    let stamps = persisted_stamps(dir.path());
+    assert!(!stamps.is_empty());
+    assert!(stamps.iter().all(|s| *s == Some(T0)), "{stamps:?}");
+
+    // Reopen: the capability comes back with the manifest, the stamps with it,
+    // and one interval past the STAMP (not past this open) makes it eligible.
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    assert_eq!(db.format_capabilities(), CAP_PERIODIC_AGE);
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(cf.stats().periodic_compactions, 0);
+    let clock = fake_clock(&db);
+    clock.store(T0 + 10 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(20), || cf.stats().periodic_compactions
+            >= 1),
+        "a stamp that predates this open by an interval is eligible now"
+    );
+    let after = persisted_stamps(dir.path());
+    assert!(
+        after
+            .iter()
+            .all(|s| *s == Some(T0 + 10 * INTERVAL.as_nanos() as i64)),
+        "the rewrite re-stamps at the current reading: {after:?}"
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Failure matrix, row 3: a periodic job whose manifest write fails rolls back
+/// exactly like any other compaction — the reopened database shows the old
+/// view, and the table keeps its old stamp, so it stays eligible.
+#[test]
+fn periodic_job_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocked;
+    {
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db.create_column_family("default", periodic_cfg()).unwrap();
+        let clock = fake_clock(&db);
+        fill(&db, &cf, 64);
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+
+        blocked = block_manifest_writes(dir.path());
+        clock.store(T0 + 10 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_secs(20), || cf.stats().compaction_failures
+                >= 1),
+            "the periodic job's manifest write must fail"
+        );
+        assert_eq!(
+            cf.stats().periodic_compactions,
+            0,
+            "a failed job is not counted"
+        );
+        drop(cf);
+        let _ = db.close();
+    }
+    std::fs::remove_dir(&blocked).unwrap();
+
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    // The old view: the pre-job stamp, so the table is still eligible.
+    let stamps = persisted_stamps(dir.path());
+    assert!(
+        stamps.iter().all(|s| *s == Some(T0)),
+        "the failed job published nothing: {stamps:?}"
+    );
+    for i in 0..64u32 {
+        assert_eq!(
+            db.get(&cf, format!("k{i:05}").as_bytes()).unwrap(),
+            b"value",
+            "no data was lost by the rollback"
+        );
+    }
+    // And it is picked up again, now that the manifest can be written.
+    let clock = fake_clock(&db);
+    clock.store(T0 + 20 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(20), || cf.stats().periodic_compactions
+            >= 1),
+        "the table stayed eligible and the retry succeeds"
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Task 7: a bottom-level table is rewritten **in place**. No level is created
+/// for age reasons alone.
+#[test]
+fn periodic_rewrites_bottom_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", periodic_cfg()).unwrap();
+    let clock = fake_clock(&db);
+    fill(&db, &cf, 200);
+    db.flush_memtable(&cf).unwrap();
+    // Sweep everything to the bottom, so the only eligible table below is a
+    // bottom one and the pick must be the in-place shape.
+    db.compact(&cf).unwrap();
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+
+    let levels_before = cf.stats().num_levels;
+    let bottom_before: Vec<u64> = Manifest::load(manifest_path(dir.path())).unwrap().cfs[0]
+        .sstables
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(!bottom_before.is_empty());
+
+    clock.store(T0 + 10 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(20), || cf.stats().periodic_compactions
+            >= 1),
+        "an aged bottom table must be revisited"
+    );
+
+    assert_eq!(
+        cf.stats().num_levels,
+        levels_before,
+        "an age trigger must never create a deeper level"
+    );
+    let manifest = Manifest::load(manifest_path(dir.path())).unwrap();
+    let after: Vec<u64> = manifest.cfs[0].sstables.iter().map(|t| t.id).collect();
+    assert_ne!(after, bottom_before, "the table really was rewritten");
+    assert!(
+        manifest.cfs[0]
+            .sstables
+            .iter()
+            .all(|t| t.level as usize == levels_before - 1),
+        "the rewrite stayed in the bottom level"
+    );
+    for i in 0..200u32 {
+        assert_eq!(
+            db.get(&cf, format!("k{i:05}").as_bytes()).unwrap(),
+            b"value"
+        );
+    }
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Task 9: the counter distinguishes age work from capacity work.
+#[test]
+fn periodic_compactions_counter_increments() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", periodic_cfg()).unwrap();
+    let clock = fake_clock(&db);
+
+    // Capacity work first: enough L0 files to trip the file-count trigger.
+    for round in 0..6u32 {
+        fill_range(&db, &cf, round * 100, (round + 1) * 100);
+        db.flush_memtable(&cf).unwrap();
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || cf.stats().compaction_count >= 1),
+        "the L0 trigger must produce capacity work"
+    );
+    assert_eq!(
+        cf.stats().periodic_compactions,
+        0,
+        "capacity work is never counted as periodic"
+    );
+
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+    clock.store(T0 + 10 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(20), || cf.stats().periodic_compactions
+            >= 1),
+        "one aged table takes the counter to one"
+    );
+    assert!(
+        cf.stats().compaction_count >= cf.stats().periodic_compactions,
+        "periodic jobs are a subset of all compactions"
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Task 10 (acceptance): an idle database with no writes at all reclaims the
+/// space its expired TTL entries hold — and then stops, rather than looping.
+///
+/// The fixture is deliberately quiescent: one flushed L0 file, a file-count
+/// trigger it cannot reach, and no manual compaction. Nothing here produces
+/// capacity work, so every compaction after the enable has to be the age
+/// trigger's — which is asserted, not assumed.
+#[test]
+fn idle_ttl_database_reclaims_without_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                periodic_compaction_interval: INTERVAL,
+                // One L0 file can never reach this, so no capacity trigger can
+                // fire while the age trigger is under test.
+                l1_file_count_trigger: 16,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    let clock = fake_clock(&db);
+
+    // TTL is evaluated on the REAL clock (`now_nanos`), deliberately: the fake
+    // drives the periodic trigger only. So the data is written with a genuine
+    // short TTL and the test waits it out once.
+    let payload = vec![b'x'; 512];
+    for i in 0..1000u32 {
+        db.put(
+            &cf,
+            format!("exp{i:05}").as_bytes(),
+            &payload,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    }
+    for i in 0..100u32 {
+        db.put(
+            &cf,
+            format!("keep{i:05}").as_bytes(),
+            &payload,
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+
+    let compactions_before = cf.stats().compaction_count;
+    let bytes_before = sst_bytes(dir.path());
+    let entries_before = cf.stats().num_entries;
+    assert_eq!(entries_before, 1100, "the whole fixture is on disk");
+    assert!(bytes_before > 0);
+
+    // No writes from here on. Wait for the TTL to actually expire on the real
+    // clock, then move the periodic clock past the interval.
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        cf.stats().num_entries,
+        entries_before,
+        "nothing reclaims before the age trigger fires — that is the gap this \
+         feature exists to close"
+    );
+    clock.store(T0 + 10 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            cf.stats().periodic_compactions >= 1
+                && cf.stats().num_entries <= 100
+                && sst_bytes(dir.path()) < bytes_before / 2
+        }),
+        "an idle database must reclaim expired TTL space: {} bytes / {} entries -> {} / {}",
+        bytes_before,
+        entries_before,
+        sst_bytes(dir.path()),
+        cf.stats().num_entries
+    );
+    assert_eq!(
+        cf.stats().compaction_count - compactions_before,
+        cf.stats().periodic_compactions,
+        "every compaction since the enable was age-triggered, so the reclaim \
+         is this feature's and not a trigger that would have fired anyway"
+    );
+
+    // The surviving data is intact...
+    for i in 0..100u32 {
+        assert_eq!(
+            db.get(&cf, format!("keep{i:05}").as_bytes()).unwrap(),
+            payload
+        );
+    }
+    // ...and the trigger settles: the rewrite re-stamped its output, so a
+    // stationary clock produces no further work. This is the "no repeated
+    // immediate job loop" half of the acceptance criterion.
+    let settled = cf.stats().periodic_compactions;
+    std::thread::sleep(Duration::from_secs(5));
+    let later = cf.stats().periodic_compactions;
+    assert_eq!(
+        later, settled,
+        "periodic work must not loop on its own output: {settled} -> {later}"
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Task 10, second half: the trigger adds **no new drop rule**. Data hidden
+/// behind a live snapshot is retained exactly as it is under capacity work.
+#[test]
+fn snapshots_retain_hidden_data_under_periodic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db.create_column_family("default", periodic_cfg()).unwrap();
+    let clock = fake_clock(&db);
+
+    for i in 0..100u32 {
+        db.put(&cf, format!("k{i:05}").as_bytes(), b"old", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let mut snapshot = db.begin();
+    assert_eq!(snapshot.get(&cf, b"k00000").unwrap(), b"old");
+
+    // Shadow every key and delete half, then push it all to the bottom.
+    for i in 0..100u32 {
+        let key = format!("k{i:05}");
+        if i % 2 == 0 {
+            db.delete(&cf, key.as_bytes()).unwrap();
+        } else {
+            db.put(&cf, key.as_bytes(), b"new", Duration::ZERO).unwrap();
+        }
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+
+    clock.store(T0 + 10 * INTERVAL.as_nanos() as i64, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(20), || cf.stats().periodic_compactions
+            >= 1),
+        "the aged bottom table is revisited"
+    );
+
+    // The snapshot still sees what it saw. A periodic rewrite is an ordinary
+    // compaction: it may drop nothing the oldest live snapshot can still read.
+    for i in 0..100u32 {
+        assert_eq!(
+            snapshot.get(&cf, format!("k{i:05}").as_bytes()).unwrap(),
+            b"old",
+            "key {i} was hidden from the snapshot by a periodic rewrite"
+        );
+    }
+    drop(snapshot);
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// The one wall-clock test: no fake anywhere, a two-second interval, and the
+/// engine's own clock. Everything above pins semantics; this pins that the
+/// wiring works when nothing is injected.
+#[test]
+fn periodic_reclaims_on_the_real_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                periodic_compaction_interval: Duration::from_secs(2),
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    fill(&db, &cf, 100);
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || cf.stats().periodic_compactions
+            >= 1),
+        "the real clock must reach the interval on its own"
+    );
+    for i in 0..100u32 {
+        assert_eq!(
+            db.get(&cf, format!("k{i:05}").as_bytes()).unwrap(),
+            b"value"
+        );
+    }
+    drop(cf);
+    db.close().unwrap();
 }

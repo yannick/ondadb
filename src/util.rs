@@ -29,6 +29,46 @@ pub fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// A source of Unix-nanosecond readings, so a test can drive time instead of
+/// waiting for it.
+pub type ClockFn = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// The database's injectable wall clock (0.3).
+///
+/// Read by **periodic-compaction stamping and eligibility only**. Every other
+/// timestamp in the engine — `max_entry_time`, TTL evaluation, FIFO age
+/// eviction — keeps calling [`now_nanos`] / [`coarse_now_nanos`] directly, so
+/// injecting a fake here cannot move tier placement or expiry out from under a
+/// test that was not asking for it.
+pub(crate) struct Clock {
+    f: Mutex<ClockFn>,
+}
+
+impl Clock {
+    pub(crate) fn new() -> Self {
+        Self {
+            f: Mutex::new(std::sync::Arc::new(now_nanos)),
+        }
+    }
+
+    /// Current reading. The closure is cloned out before it is called, so a
+    /// clock that reaches back into the database cannot deadlock on this lock.
+    pub(crate) fn now(&self) -> i64 {
+        let f = self.f.lock().clone();
+        f()
+    }
+
+    pub(crate) fn set(&self, f: ClockFn) {
+        *self.f.lock() = f;
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clock").finish()
+    }
+}
+
 /// Coarse wall-clock nanos for the READ path's TTL checks.
 ///
 /// `now_nanos()` is a precise clock read on every `get`/`peek_seq`/iterator —

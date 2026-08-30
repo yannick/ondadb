@@ -33,6 +33,9 @@ const WAL_LAYOUT_TAG: &[u8; 8] = b"ONDAWAL1";
 const OBJECT_TAG: &[u8; 8] = b"ONDAOBJ1";
 const INSTANCE_TAG: &[u8; 8] = b"ONDAINS1";
 const FORMAT_CAPS_TAG: &[u8; 8] = b"ONDACAP1";
+/// Per-table periodic-compaction age state (0.3), written only by a database
+/// that has enabled [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE).
+const LAST_COMPACTION_TAG: &[u8; 8] = b"ONDAAGE1";
 
 /// WAL/memtable layout persisted for the whole database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,6 +88,23 @@ pub struct SstMeta {
     /// [`attach_part_by_ref`](crate::DB::attach_part_by_ref), so the name a
     /// table was published under never changes, whichever database reads it.
     pub object: Option<String>,
+    /// Wall-clock time (nanoseconds since the Unix epoch) at which this table
+    /// was last *written by a compaction* — the age state periodic compaction
+    /// (0.3) revisits tables against
+    /// ([`ColumnFamilyConfig::periodic_compaction_interval`](crate::config::ColumnFamilyConfig::periodic_compaction_interval)).
+    ///
+    /// Deliberately **not** [`max_entry_time`](Self::max_entry_time): that field
+    /// carries the maximum forward over a compaction's inputs so cold data does
+    /// not look freshly written, which is what the part mover's age gate needs
+    /// and exactly what a periodic trigger must not have — carrying it forward
+    /// would leave a just-rewritten table instantly re-eligible.
+    ///
+    /// `None` means *unknown*, and unknown is never eligible: a legacy manifest,
+    /// a table written before the capability was enabled, a foreign mount, or a
+    /// part attached from another database whose compaction history this one
+    /// does not own. Persisted only behind
+    /// [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE).
+    pub last_compaction_time: Option<i64>,
 }
 
 /// Persisted state of one column family.
@@ -193,6 +213,13 @@ impl Manifest {
         if tags.caps != 0 && header.version == VERSION_V1 {
             return Err(corrupt_manifest());
         }
+        // Same fence one level down: the age tail is written only by a database
+        // that holds CAP_PERIODIC_AGE, so a file carrying stamps without the bit
+        // was truncated, hand-edited, or produced by a writer that skipped the
+        // enable — none of which may be read as valid age state.
+        if tags.last_compaction && tags.caps & crate::format::CAP_PERIODIC_AGE == 0 {
+            return Err(corrupt_manifest());
+        }
         crate::format::check_caps(tags.caps)?;
         Ok(Manifest {
             next_file_id: header.next_file_id,
@@ -217,6 +244,7 @@ struct ManifestTailPresence {
     object: bool,
     nonce: bool,
     caps: bool,
+    last_compaction: bool,
     layout: bool,
 }
 
@@ -231,6 +259,13 @@ impl ManifestTailPresence {
             object: has(|sst| sst.object.is_some()),
             nonce: manifest.instance_nonce.is_some(),
             caps: manifest.caps != 0,
+            // Gated on the capability, not just on the data: the stamp is a
+            // capability-bearing artifact, so a manifest that carries it must
+            // also carry the bit that tells an older binary to refuse the file.
+            // Nothing stamps a table before the bit is durable, so the
+            // conjunction never silently drops a stamp.
+            last_compaction: manifest.caps & crate::format::CAP_PERIODIC_AGE != 0
+                && has(|sst| sst.last_compaction_time.is_some()),
             layout: manifest.wal_layout == WalLayout::Unified,
         }
     }
@@ -242,7 +277,7 @@ impl ManifestTailPresence {
     /// read as a partition name section — silent corruption rather than
     /// rejection. Every new tag must be added here as well as to the encoder.
     fn tagged(self) -> bool {
-        self.object || self.nonce || self.caps
+        self.object || self.nonce || self.caps || self.last_compaction
     }
 }
 
@@ -309,6 +344,12 @@ fn encode_tagged_tails(b: &mut Vec<u8>, manifest: &Manifest, presence: ManifestT
     if presence.caps {
         b.extend_from_slice(FORMAT_CAPS_TAG);
         append_u64(b, manifest.caps);
+    }
+    if presence.last_compaction {
+        b.extend_from_slice(LAST_COMPACTION_TAG);
+        encode_u64_section(b, &manifest.cfs, |sst| {
+            sst.last_compaction_time.map(|time| time as u64)
+        });
     }
     if presence.layout {
         b.extend_from_slice(WAL_LAYOUT_TAG);
@@ -437,6 +478,7 @@ fn decode_sstable(cursor: &mut ManifestCursor<'_>) -> Result<SstMeta> {
         tier: None,
         max_entry_time: None,
         object: None,
+        last_compaction_time: None,
     })
 }
 
@@ -459,6 +501,9 @@ struct TaggedTails {
     wal_layout: WalLayout,
     instance_nonce: Option<u64>,
     caps: u64,
+    /// Whether [`LAST_COMPACTION_TAG`] was present, checked against `caps`
+    /// after the loop — the tag may legally precede or follow the caps word.
+    last_compaction: bool,
 }
 
 /// Decode the tagged tail sections by dispatching on each 8-byte tag.
@@ -504,6 +549,13 @@ fn decode_tagged_tails(mut p: &[u8], cfs: &mut [CfManifest]) -> Result<TaggedTai
             }
             out.caps = read_u64(rest);
             &rest[8..]
+        } else if tag == LAST_COMPACTION_TAG {
+            if std::mem::replace(&mut out.last_compaction, true) {
+                return Err(corrupt_manifest());
+            }
+            decode_u64_section(rest, cfs, |sst, value| {
+                sst.last_compaction_time = Some(value as i64)
+            })?
         } else if tag == WAL_LAYOUT_TAG {
             if std::mem::replace(&mut seen_layout, true) {
                 return Err(corrupt_manifest());
@@ -825,6 +877,91 @@ mod tests {
         assert_eq!(m.encode(), bytes);
     }
 
+    // ---- 0.3: periodic-compaction age state -------------------------------
+
+    /// Task 1's first test: the stamp survives a save/load, per table, with
+    /// `Some` and `None` mixed inside one column family — and the encoding is
+    /// stable enough to re-emit byte-identically.
+    #[test]
+    fn last_compaction_time_round_trips() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_PERIODIC_AGE;
+        m.cfs[0].sstables[0].last_compaction_time = Some(1_700_000_000_000_000_000);
+        m.cfs[0].sstables[1].last_compaction_time = None;
+        let enc = m.encode();
+        assert_eq!(encoded_version(&enc), VERSION_V2);
+        assert!(enc.windows(TAG_LEN).any(|w| w == LAST_COMPACTION_TAG));
+
+        let d = Manifest::decode(&enc).unwrap();
+        assert_eq!(
+            d.cfs[0].sstables[0].last_compaction_time,
+            Some(1_700_000_000_000_000_000)
+        );
+        assert_eq!(d.cfs[0].sstables[1].last_compaction_time, None);
+        // The age stamp must not have leaked into the mover's field.
+        assert!(d.cfs[0].sstables.iter().all(|s| s.max_entry_time.is_none()));
+        assert_eq!(d.encode(), enc);
+
+        // All-`None` under the same capability emits no tail at all.
+        let mut none = sample();
+        none.caps = crate::format::CAP_PERIODIC_AGE;
+        let enc = none.encode();
+        assert!(!enc.windows(TAG_LEN).any(|w| w == LAST_COMPACTION_TAG));
+        let d = Manifest::decode(&enc).unwrap();
+        assert!(d.cfs[0]
+            .sstables
+            .iter()
+            .all(|s| s.last_compaction_time.is_none()));
+    }
+
+    /// Every manifest written before 0.3 decodes to `None`, which the picker
+    /// reads as "unknown, therefore never eligible".
+    #[test]
+    fn legacy_manifest_decodes_last_compaction_time_as_none() {
+        for name in V1_FIXTURES.iter().chain(std::iter::once(&V2_FIXTURE)) {
+            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                m.cfs
+                    .iter()
+                    .all(|cf| cf.sstables.iter().all(|s| s.last_compaction_time.is_none())),
+                "{name}: a pre-0.3 manifest carries no age state"
+            );
+            // And the field's mere existence must not change the bytes.
+            assert_eq!(m.encode(), bytes, "{name}: re-encode must be identical");
+        }
+    }
+
+    /// The stamp is capability-bearing: bytes carrying it without
+    /// `CAP_PERIODIC_AGE` were tampered with, and must fail closed rather than
+    /// be read as valid age state.
+    #[test]
+    fn last_compaction_tail_without_capability_is_corruption() {
+        let mut extra = LAST_COMPACTION_TAG.to_vec();
+        // One CF in the fixture, one table carrying a stamp.
+        append_uvarint(&mut extra, 1);
+        append_uvarint(&mut extra, 0);
+        append_uvarint(&mut extra, 7);
+        let bytes = fixture_with_extra_tail(V2_FIXTURE, &extra);
+        let err = Manifest::decode(&bytes).expect_err("age state needs its capability bit");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn duplicate_last_compaction_tag_is_corruption() {
+        let mut m = sample();
+        m.caps = crate::format::CAP_PERIODIC_AGE;
+        m.cfs[0].sstables[0].last_compaction_time = Some(5);
+        let enc = m.encode();
+        let mut body = enc[..enc.len() - 4].to_vec();
+        body.extend_from_slice(LAST_COMPACTION_TAG);
+        append_uvarint(&mut body, 0);
+        let crc = checksum(&body);
+        append_u32(&mut body, crc);
+        let err = Manifest::decode(&body).expect_err("a repeated age tag must fail closed");
+        assert_eq!(err.kind(), "corruption");
+    }
+
     fn sample() -> Manifest {
         Manifest {
             next_file_id: 42,
@@ -850,6 +987,7 @@ mod tests {
                         tier: None,
                         max_entry_time: None,
                         object: None,
+                        last_compaction_time: None,
                     },
                     SstMeta {
                         id: 2,
@@ -865,6 +1003,7 @@ mod tests {
                         tier: None,
                         max_entry_time: None,
                         object: None,
+                        last_compaction_time: None,
                     },
                 ],
             }],
@@ -1161,6 +1300,7 @@ mod tests {
                     tier: Some("s3".to_string()),
                     max_entry_time: Some(1_700_000_000_000_000),
                     object: None,
+                    last_compaction_time: Some(1_700_000_000_000_000),
                 })
                 .collect();
             let m = Manifest {

@@ -133,6 +133,13 @@ pub(crate) struct CfCtx {
     /// DB-wide counter of successful physical WAL `sync_data` calls; wired into
     /// every WAL this DB opens (see [`crate::DB::wal_sync_count`]).
     pub wal_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// The same `Arc` `DbInner::caps` holds, so a flush landing an L0 table can
+    /// see whether `CAP_PERIODIC_AGE` is active without reaching for the whole
+    /// database.
+    pub caps: Arc<AtomicU64>,
+    /// The database's injectable clock (0.3) — read here only to stamp
+    /// [`SstMeta::last_compaction_time`](crate::manifest::SstMeta::last_compaction_time).
+    pub clock: Arc<crate::util::Clock>,
 }
 
 impl std::fmt::Debug for CfCtx {
@@ -302,6 +309,10 @@ pub struct ColumnFamily {
 
     pub(crate) flush_count: AtomicU64,
     pub(crate) compaction_count: AtomicU64,
+    /// Subset of `compaction_count` picked by the periodic (age) trigger rather
+    /// than by a capacity trigger — see
+    /// [`CfStats::periodic_compactions`](crate::maintenance::CfStats::periodic_compactions).
+    pub(crate) periodic_compactions: AtomicU64,
     pub(crate) compaction_failures: AtomicU64,
     pub(crate) last_compaction_error: Mutex<Option<String>>,
 
@@ -464,6 +475,7 @@ impl ColumnFamily {
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
+            periodic_compactions: AtomicU64::new(0),
             compaction_failures: AtomicU64::new(0),
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
@@ -600,6 +612,7 @@ impl ColumnFamily {
             hook_set: AtomicBool::new(false),
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
+            periodic_compactions: AtomicU64::new(0),
             compaction_failures: AtomicU64::new(0),
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
@@ -891,6 +904,14 @@ impl ColumnFamily {
         // holds freshly committed data, so the file's finish time approximates
         // the newest entry's commit time (see `SstMeta::max_entry_time`).
         meta.max_entry_time = Some(now_nanos());
+        // Age state for the periodic trigger (0.3), from the injectable clock
+        // rather than `now_nanos` — the two are deliberately separate sources
+        // so a test driving periodic time cannot move tier placement. Only a
+        // database holding CAP_PERIODIC_AGE may stamp: the manifest must never
+        // carry a field a reopen could not attribute to an enabled capability.
+        if self.ctx.caps.load(Ordering::SeqCst) & crate::format::CAP_PERIODIC_AGE != 0 {
+            meta.last_compaction_time = Some(self.ctx.clock.now());
+        }
         Ok(self.handle_for(meta))
     }
 

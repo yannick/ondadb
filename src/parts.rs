@@ -473,6 +473,11 @@ impl DB {
                 // age so the mover treats it as freshly written (it must age
                 // `min_age` again before qualifying for a tier move).
                 meta.max_entry_time = Some(crate::util::now_nanos());
+                // `last_compaction_time` is deliberately left None (0.3): this
+                // table was written by ANOTHER database, whose compaction
+                // history this one does not own, so its age here is unknown —
+                // and unknown is never eligible for a periodic rewrite.
+                debug_assert!(meta.last_compaction_time.is_none());
                 staged.push((cf.handle_for(meta), at_bottom));
             }
             Ok(())
@@ -617,6 +622,9 @@ impl DB {
             // a shared-tier part is never moved by a sharer anyway (the mover
             // skips off-default parts by the tier filter).
             meta.max_entry_time = Some(crate::util::now_nanos());
+            // No periodic age state (0.3), for the same reason a foreign mount
+            // has none: this database neither wrote nor may rewrite it.
+            debug_assert!(meta.last_compaction_time.is_none());
             staged.push((cf.handle_for(meta), at_bottom));
         }
 

@@ -699,6 +699,30 @@ pub struct ColumnFamilyConfig {
     /// FIFO only: evict tables whose klog file is older than this
     /// (zero = no age limit).
     pub fifo_ttl: Duration,
+    /// Revisit a table this long after the compaction that wrote it, even when
+    /// no size or file-count trigger fires (feature 0.3). `Duration::ZERO` —
+    /// the default — disables periodic compaction entirely.
+    ///
+    /// The point is an **idle** database: today reclamation only happens inside
+    /// a compaction, and background compactions are triggered by L0 file count
+    /// or level bytes, so a family that stops taking writes keeps its expired
+    /// TTL entries, tombstones and shadowed versions forever (short of a manual
+    /// [`DB::compact`](crate::DB::compact)). With this set, the compaction
+    /// worker scans every `interval / 4` (clamped to `[1s, 15m]`) and enqueues
+    /// a family holding a table whose
+    /// [`last_compaction_time`](crate::manifest::SstMeta::last_compaction_time)
+    /// is at least `interval` old.
+    ///
+    /// Requires [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE): without
+    /// it no table carries the stamp and nothing is ever eligible. Invalid on a
+    /// [`CompactionStyle::Fifo`] family, which has its own age eviction
+    /// ([`fifo_ttl`](Self::fifo_ttl)).
+    ///
+    /// Periodic work is strictly the **lowest** priority: it is picked only
+    /// when no level is over capacity, and it adds **no new retention rule** —
+    /// the same snapshot/TTL/tombstone logic every other compaction uses
+    /// decides what a periodic rewrite may drop.
+    pub periodic_compaction_interval: Duration,
     /// Size at which compaction cuts an output SSTable.
     ///
     /// This is what makes a compaction's work *bounded*. Compaction picks one
@@ -782,6 +806,7 @@ impl Default for ColumnFamilyConfig {
             compaction_style: CompactionStyle::Leveled,
             fifo_max_bytes: 0,
             fifo_ttl: Duration::ZERO,
+            periodic_compaction_interval: Duration::ZERO,
             target_file_size: 16 << 20,             // 16 MiB
             l1_base_bytes: 256 << 20,               // 256 MiB => ~16 files in L1
             soft_pending_compaction_bytes: 2 << 30, // 2 GiB
@@ -1159,6 +1184,19 @@ impl ColumnFamilyConfig {
                 self.soft_pending_compaction_bytes, self.hard_pending_compaction_bytes
             ));
         }
+        // FIFO never merges — it evicts whole tables by size and file age
+        // (`fifo_ttl`). A periodic *rewrite* has nothing to do there, and
+        // accepting the option would silently do nothing, reading as a tuning
+        // that took effect.
+        if !self.periodic_compaction_interval.is_zero()
+            && self.compaction_style == CompactionStyle::Fifo
+        {
+            return Err(
+                "periodic_compaction_interval is invalid for CompactionStyle::Fifo; \
+                 FIFO evicts by age through fifo_ttl"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -1173,6 +1211,7 @@ impl ColumnFamilyConfig {
         encode_block_size(&mut b, self);
         encode_vlog_cache(&mut b, self);
         encode_bloom_policy(&mut b, self);
+        encode_periodic_interval(&mut b, self);
         b
     }
 
@@ -1210,6 +1249,8 @@ const CONFIG_BLOCK_SIZE_MAGIC: &[u8; 8] = b"ONDABLK1";
 const CONFIG_VLOG_CACHE_MAGIC: &[u8; 8] = b"ONDAVVC1";
 /// Tag introducing the per-level bloom-policy tail (0.1).
 const CONFIG_BLOOM_POLICY_MAGIC: &[u8; 8] = b"ONDABLM1";
+/// Tag introducing the periodic-compaction interval tail (0.3).
+const CONFIG_PERIODIC_MAGIC: &[u8; 8] = b"ONDAPRD1";
 /// Reserved for a future geometric (Monkey-style) auto-allocation policy. It is
 /// mutually exclusive with the explicit `bloom_fpr_per_level` vector, so the tag
 /// is claimed here to keep the two from ever sharing one; nothing writes or
@@ -1490,7 +1531,8 @@ fn decode_into(p: &[u8], cfg: &mut ColumnFamilyConfig) -> Option<()> {
     let p = read_compaction_tail(p, cfg);
     let p = read_block_size_tail(p, cfg);
     let p = read_vlog_cache_tail(p, cfg);
-    read_bloom_policy_tail(p, cfg);
+    let p = read_bloom_policy_tail(p, cfg);
+    read_periodic_interval_tail(p, cfg);
     Some(())
 }
 
@@ -1739,14 +1781,19 @@ fn read_vlog_cache_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u
 /// All-or-nothing, like the compaction tail: a truncated tail leaves both
 /// fields at their defaults rather than applying a half-read policy that would
 /// silently filter some levels and not others.
-fn read_bloom_policy_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+///
+/// Returns the unconsumed remainder so later tails can be chained behind it. A
+/// rejected (absent, short or invalid) tail returns `p` untouched — the next
+/// reader then fails its own `strip_prefix` and also falls back to defaults,
+/// which is the intended all-or-nothing behaviour for a damaged blob.
+fn read_bloom_policy_tail<'a>(p: &'a [u8], cfg: &mut ColumnFamilyConfig) -> &'a [u8] {
     use crate::encoding::read_u64;
 
     let Some(rest) = p.strip_prefix(CONFIG_BLOOM_POLICY_MAGIC) else {
-        return;
+        return p;
     };
     if rest.len() < 8 {
-        return;
+        return p;
     }
     let count = read_u64(rest) as usize;
     let rest = &rest[8..];
@@ -1754,10 +1801,10 @@ fn read_bloom_policy_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
     // arithmetic — a lying count must fail the bounds check, not wrap past it —
     // and the bytes must actually be present before anything is reserved.
     let Some(needed) = count.checked_mul(8).and_then(|n| n.checked_add(1)) else {
-        return;
+        return p;
     };
     if rest.len() < needed {
-        return;
+        return p;
     }
     let mut per_level = Vec::with_capacity(count);
     for i in 0..count {
@@ -1766,12 +1813,40 @@ fn read_bloom_policy_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
         // been written: fall back to uniform rather than hand a NaN to the
         // filter sizer.
         if !fpr.is_finite() || fpr <= 0.0 || fpr >= 1.0 {
-            return;
+            return p;
         }
         per_level.push(fpr);
     }
     cfg.bloom_fpr_per_level = per_level;
     cfg.optimize_filters_for_hits = rest[count * 8] != 0;
+    &rest[needed..]
+}
+
+/// The 0.3 periodic-compaction interval tail: one `u64` of microseconds.
+/// Elided at the default (zero, disabled) so a family that never sets it
+/// encodes byte-for-byte as earlier releases wrote it.
+fn encode_periodic_interval(b: &mut Vec<u8>, cfg: &ColumnFamilyConfig) {
+    use crate::encoding::append_u64;
+
+    if cfg.periodic_compaction_interval.is_zero() {
+        return;
+    }
+    b.extend_from_slice(CONFIG_PERIODIC_MAGIC);
+    append_u64(b, cfg.periodic_compaction_interval.as_micros() as u64);
+}
+
+/// Consume the periodic-compaction tail if present. Absent (every blob written
+/// before 0.3, and any family that left the option at zero), the default stands
+/// — `Duration::ZERO`, which disables the trigger.
+fn read_periodic_interval_tail(p: &[u8], cfg: &mut ColumnFamilyConfig) {
+    let Some(rest) = p.strip_prefix(CONFIG_PERIODIC_MAGIC) else {
+        return;
+    };
+    if rest.len() < 8 {
+        return;
+    }
+    cfg.periodic_compaction_interval =
+        std::time::Duration::from_micros(crate::encoding::read_u64(rest));
 }
 
 #[cfg(test)]
@@ -2587,5 +2662,93 @@ mod bloom_policy_tests {
         let decoded = ColumnFamilyConfig::decode(&blob);
         assert!(decoded.bloom_fpr_per_level.is_empty());
         assert!(!decoded.optimize_filters_for_hits);
+    }
+}
+
+#[cfg(test)]
+mod periodic_tests {
+    use super::*;
+
+    /// FIFO evicts by age already (`fifo_ttl`); a periodic *rewrite* has no
+    /// meaning there, so the combination is refused rather than silently
+    /// ignored.
+    #[test]
+    fn periodic_refuses_fifo() {
+        let cfg = ColumnFamilyConfig {
+            compaction_style: CompactionStyle::Fifo,
+            periodic_compaction_interval: Duration::from_secs(3600),
+            ..ColumnFamilyConfig::default()
+        };
+        let error = cfg
+            .validate()
+            .expect_err("periodic compaction is invalid on a FIFO family");
+        assert!(error.contains("periodic_compaction_interval"), "{error}");
+
+        // Zero is the default and stays legal on FIFO...
+        ColumnFamilyConfig {
+            compaction_style: CompactionStyle::Fifo,
+            ..ColumnFamilyConfig::default()
+        }
+        .validate()
+        .expect("a FIFO family that leaves the option alone validates");
+        // ...and a leveled family accepts the interval.
+        ColumnFamilyConfig {
+            periodic_compaction_interval: Duration::from_secs(3600),
+            ..ColumnFamilyConfig::default()
+        }
+        .validate()
+        .expect("periodic compaction is a leveled-family option");
+    }
+
+    #[test]
+    fn periodic_interval_blob_omits_default_and_round_trips() {
+        let default = ColumnFamilyConfig::default();
+        assert!(
+            !default
+                .encode()
+                .windows(CONFIG_PERIODIC_MAGIC.len())
+                .any(|w| w == CONFIG_PERIODIC_MAGIC),
+            "the default must stay byte-identical to a pre-0.3 blob"
+        );
+
+        let cfg = ColumnFamilyConfig {
+            periodic_compaction_interval: Duration::from_secs(7 * 24 * 3600),
+            // Set alongside the bloom tail so the two chain correctly: the
+            // periodic tail is decoded from the bloom tail's remainder.
+            bloom_fpr_per_level: vec![0.001, 0.01],
+            optimize_filters_for_hits: true,
+            ..ColumnFamilyConfig::default()
+        };
+        let decoded = ColumnFamilyConfig::decode(&cfg.encode());
+        assert_eq!(
+            decoded.periodic_compaction_interval,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+        assert_eq!(decoded.bloom_fpr_per_level, vec![0.001, 0.01]);
+        assert!(decoded.optimize_filters_for_hits);
+
+        // And without the bloom tail ahead of it.
+        let alone = ColumnFamilyConfig {
+            periodic_compaction_interval: Duration::from_secs(60),
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(
+            ColumnFamilyConfig::decode(&alone.encode()).periodic_compaction_interval,
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A blob written before 0.3 has no tail, so the option decodes to its
+    /// disabled default rather than to garbage read off the end.
+    #[test]
+    fn legacy_blob_decodes_periodic_interval_as_disabled() {
+        let legacy = ColumnFamilyConfig {
+            write_buffer_size: 7 << 20,
+            ..ColumnFamilyConfig::default()
+        };
+        let blob = legacy.encode();
+        let decoded = ColumnFamilyConfig::decode(&blob);
+        assert_eq!(decoded.write_buffer_size, 7 << 20);
+        assert!(decoded.periodic_compaction_interval.is_zero());
     }
 }

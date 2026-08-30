@@ -61,6 +61,15 @@ pub struct CfStats {
     pub approximate_len: u64,
     pub flush_count: u64,
     pub compaction_count: u64,
+    /// Subset of `compaction_count` that the periodic (age) trigger picked
+    /// rather than a capacity trigger — see
+    /// [`ColumnFamilyConfig::periodic_compaction_interval`](crate::config::ColumnFamilyConfig::periodic_compaction_interval).
+    ///
+    /// Zero for every database that leaves the option at its default, and the
+    /// number an operator watches to tell idle reclamation from ingest-driven
+    /// compaction. Counts completed jobs only: a job that failed leaves its
+    /// input's stamp untouched, so the table stays eligible and is retried.
+    pub periodic_compactions: u64,
     /// Number of manual or background compaction attempts that returned an
     /// error since this column family was opened.
     pub compaction_failures: u64,
@@ -126,6 +135,9 @@ impl ColumnFamily {
             flush_count: self.flush_count.load(std::sync::atomic::Ordering::Relaxed),
             compaction_count: self
                 .compaction_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            periodic_compactions: self
+                .periodic_compactions
                 .load(std::sync::atomic::Ordering::Relaxed),
             compaction_failures: self
                 .compaction_failures

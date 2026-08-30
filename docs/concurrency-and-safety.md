@@ -396,6 +396,17 @@ first changes the re-snapshot; a move that wins blocks overlapping compaction
 for copy + manifest flip. Disjoint ranges remain concurrent. `mover_running`
 serializes scheduled/manual mover passes.
 
+The periodic-compaction scan (0.3, `DbInner::run_periodic_scan`) shares the same
+worker and the same shape: `periodic_running` is an `AtomicBool` guarded by
+`compare_exchange(false, true, SeqCst, SeqCst)` before the pass and
+`store(false, SeqCst)` after, mirroring `mover_running` field for field. Without
+it every compaction worker would independently walk the same levels and enqueue
+the same column family each derived interval. The pass holds no lock of its own:
+it reads level snapshots through `with_levels` and only *sends* on the compact
+channel, so the picker re-derives eligibility under its normal locks. The
+`DbInner::clock` it reads is a `Mutex<ClockFn>` whose closure is cloned out
+before it is called, so a clock cannot deadlock on its own lock.
+
 `DB::move_part_to_tier_observed` is the deterministic crash-test form of the
 same mover. Its synchronous `MovePhaseObserver` runs under the partition range lock at four
 semantic boundaries: copied bytes before each destination writer finishes, all

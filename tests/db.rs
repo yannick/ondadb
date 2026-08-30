@@ -2589,3 +2589,144 @@ fn enable_unknown_capability_is_invalid_args() {
     drop(cf);
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 0.3 — periodic compaction: stamping sites and the persisted option
+// ---------------------------------------------------------------------------
+
+/// Task 4: flush and compaction both stamp, and every output file of ONE job
+/// shares a single reading — the whole point of freezing the clock when the job
+/// starts rather than reading it per output file.
+///
+/// It also pins the direction the design turns on: the stamp is a fresh reading
+/// and NOT `max_entry_time`'s max-over-inputs, so a rewritten table is not
+/// instantly eligible again.
+#[test]
+fn flush_and_compaction_stamp_last_compaction_time() {
+    use ondadb::format::CAP_PERIODIC_AGE;
+    use ondadb::manifest::{manifest_path, Manifest};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                // Cut several output files out of one compaction, so "all
+                // outputs of one job share a stamp" has something to say.
+                target_file_size: 8 << 10,
+                l1_file_count_trigger: 16,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    let clock = Arc::new(AtomicI64::new(1_000_000_000_000));
+    let handle = clock.clone();
+    db.set_clock_for_tests(Arc::new(move || handle.load(Ordering::SeqCst)));
+    db.enable_format_capabilities(CAP_PERIODIC_AGE).unwrap();
+
+    // Flush: the write time, from the injected clock.
+    let payload = vec![b'v'; 256];
+    for i in 0..400u32 {
+        db.put(&cf, format!("k{i:05}").as_bytes(), &payload, Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+
+    let tables = || {
+        Manifest::load(manifest_path(dir.path())).unwrap().cfs[0]
+            .sstables
+            .clone()
+    };
+    let flushed = tables();
+    assert!(!flushed.is_empty());
+    assert!(
+        flushed
+            .iter()
+            .all(|t| t.last_compaction_time == Some(1_000_000_000_000)),
+        "flush output is stamped: {:?}",
+        flushed
+            .iter()
+            .map(|t| t.last_compaction_time)
+            .collect::<Vec<_>>()
+    );
+
+    // Compaction, at a strictly later reading.
+    clock.store(2_000_000_000_000, Ordering::SeqCst);
+    db.compact(&cf).unwrap();
+    let compacted = tables();
+    assert!(compacted.len() > 1, "the job cut several output files");
+    let stamps: Vec<Option<i64>> = compacted.iter().map(|t| t.last_compaction_time).collect();
+    assert!(
+        stamps.iter().all(|s| *s == Some(2_000_000_000_000)),
+        "every output of one job shares one stamp, taken at job freeze: {stamps:?}"
+    );
+    assert!(
+        stamps
+            .iter()
+            .all(|s| s.unwrap() >= flushed[0].last_compaction_time.unwrap()),
+        "an output is never older than its inputs"
+    );
+    drop(cf);
+    db.close().unwrap();
+}
+
+/// Task 5: the option is durable, and a family that leaves it alone still
+/// encodes a byte-identical pre-0.3 config blob.
+#[test]
+fn periodic_interval_round_trips_through_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let aged = db
+            .create_column_family(
+                "aged",
+                ColumnFamilyConfig {
+                    periodic_compaction_interval: Duration::from_secs(6 * 3600),
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        let plain = db
+            .create_column_family("plain", ColumnFamilyConfig::default())
+            .unwrap();
+        drop(aged);
+        drop(plain);
+        db.close().unwrap();
+    }
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let aged = db.get_column_family("aged").unwrap();
+    let plain = db.get_column_family("plain").unwrap();
+    assert_eq!(
+        aged.config().periodic_compaction_interval,
+        Duration::from_secs(6 * 3600)
+    );
+    assert!(
+        plain.config().periodic_compaction_interval.is_zero(),
+        "a family that never set the option decodes to disabled"
+    );
+    drop(aged);
+    drop(plain);
+    db.close().unwrap();
+}
+
+/// Task 5, the refusal half, end to end: a FIFO family may not take the option.
+#[test]
+fn periodic_refuses_fifo_at_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let error = db
+        .create_column_family(
+            "fifo",
+            ColumnFamilyConfig {
+                compaction_style: ondadb::CompactionStyle::Fifo,
+                periodic_compaction_interval: Duration::from_secs(3600),
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .expect_err("FIFO has its own age eviction");
+    assert!(matches!(error, OndaError::InvalidArgs(_)), "{error:?}");
+    db.close().unwrap();
+}

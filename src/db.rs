@@ -16,7 +16,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 
 use crate::cache::{BlockCache, FileCache};
-use crate::column_family::{CfCtx, ColumnFamily, FlushJob, ImmMemtable};
+use crate::column_family::{CfCtx, ColumnFamily, FlushJob, ImmMemtable, SstHandle};
 use crate::compaction;
 use crate::comparator::comparator_by_name;
 use crate::config::{ColumnFamilyConfig, Options};
@@ -25,6 +25,22 @@ use crate::manifest::{manifest_path, CfManifest, Manifest, WalLayout};
 
 const MAX_CF_NAME_LEN: usize = 128;
 const WORKER_TICK: Duration = Duration::from_millis(50);
+
+/// [`DbInner::periodic_check`] value meaning "no column family enables periodic
+/// compaction" — the default, and a single relaxed load's worth of cost.
+pub(crate) const PERIODIC_DISABLED: u64 = u64::MAX;
+/// Floor of the derived periodic-scan cadence: an interval of a few seconds
+/// must not turn the compaction worker into a spin loop.
+const PERIODIC_CHECK_MIN: Duration = Duration::from_secs(1);
+/// Ceiling of the derived cadence. A month-long interval still gets looked at
+/// four times an hour, so the reclaim lag stays bounded by `interval + check +
+/// one job` as the acceptance criterion states.
+const PERIODIC_CHECK_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// Derived scan cadence for one family's interval: a quarter of it, clamped.
+pub(crate) fn periodic_check_interval(interval: Duration) -> Duration {
+    (interval / 4).clamp(PERIODIC_CHECK_MIN, PERIODIC_CHECK_MAX)
+}
 static NEXT_DB_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 struct PublishState {
@@ -221,6 +237,23 @@ pub struct DbInner {
     /// Guards the scheduled part-mover pass so only one compaction worker runs
     /// it at a time.
     pub(crate) mover_running: AtomicBool,
+    /// Guards the scheduled periodic-compaction scan, mirroring
+    /// [`mover_running`](Self::mover_running) field for field. With
+    /// `num_compaction_threads` workers, an unguarded scan would have every one
+    /// of them walk the same levels and enqueue the same column family each
+    /// derived interval.
+    pub(crate) periodic_running: AtomicBool,
+    /// Derived periodic-scan cadence in nanoseconds — the minimum over every
+    /// column family of `periodic_compaction_interval / 4`, clamped to
+    /// `[1s, 15m]` — or [`PERIODIC_DISABLED`] when no family enables the
+    /// feature.
+    ///
+    /// Cached as one atomic so the compaction worker's default path is a single
+    /// relaxed load per tick rather than a lock on the CF map: a database that
+    /// never sets the option must gain no per-tick work at all. Per-CF configs
+    /// are immutable once opened, so this only ever moves when a family is
+    /// created or opened.
+    pub(crate) periodic_check: AtomicU64,
 
     /// Admission for the **extra** threads a compaction job spawns to run its
     /// spans in parallel (0.8). See [`SpanPermits`].
@@ -247,7 +280,7 @@ pub struct DbInner {
     /// encoder would either write a bit the database is already using
     /// (persist-after-use — a crash then leaves artifacts no reopen can read)
     /// or never write it at all.
-    pub(crate) caps: AtomicU64,
+    pub(crate) caps: Arc<AtomicU64>,
     /// Capability word the manifest encoder writes — the durable intent, which
     /// leads `caps` for exactly the duration of one `persist_manifest`.
     pub(crate) caps_durable: AtomicU64,
@@ -274,6 +307,12 @@ pub struct DbInner {
     /// Fail-stop flag: tripped by any durability failure (WAL fsync, background
     /// flush, manifest persist); checked at every write commit.
     pub(crate) poison: Arc<crate::util::Poison>,
+
+    /// Injectable wall clock, read **only** by periodic-compaction stamping and
+    /// eligibility (see [`crate::util::Clock`]). Shared with every
+    /// [`CfCtx`](crate::column_family::CfCtx) so flush output stamps from the
+    /// same source the picker measures against.
+    pub(crate) clock: Arc<crate::util::Clock>,
 
     /// Count of successful physical WAL `sync_data` calls across every WAL this
     /// DB has opened (per-CF, unified, and post-rotation). Observability/test
@@ -577,6 +616,58 @@ impl DbInner {
         self.caps.load(Ordering::SeqCst)
     }
 
+    /// Current reading of the injectable clock (0.3). Read only by periodic
+    /// stamping and eligibility; see [`crate::util::Clock`].
+    pub(crate) fn now(&self) -> i64 {
+        self.clock.now()
+    }
+
+    /// Fold `cf`'s periodic interval into the cached scan cadence. Called from
+    /// every site that registers a column family, so a family created after
+    /// open starts the scan just as one recovered at open does.
+    pub(crate) fn note_periodic_cf(&self, cf: &ColumnFamily) {
+        let interval = cf.opts.periodic_compaction_interval;
+        if interval.is_zero() {
+            return;
+        }
+        let check = periodic_check_interval(interval).as_nanos() as u64;
+        self.periodic_check.fetch_min(check, Ordering::Relaxed);
+    }
+
+    /// One pass of the periodic scan: enqueue every column family holding a
+    /// table older than its interval.
+    ///
+    /// The pass only *sends*; [`compaction::pick_compaction`] re-derives
+    /// eligibility under its normal locks, so a family that stops qualifying
+    /// between the scan and the job simply produces no work. `try_send` on the
+    /// unbounded channel cannot block, and a disconnected channel (a closing
+    /// database) is a benign miss.
+    pub(crate) fn run_periodic_scan(&self) -> usize {
+        if self.opts.read_only || self.poison.check().is_err() {
+            return 0;
+        }
+        if self.caps() & crate::format::CAP_PERIODIC_AGE == 0 {
+            return 0;
+        }
+        let now = self.now();
+        let cfs: Vec<Arc<ColumnFamily>> = self.cfs.read().values().cloned().collect();
+        let mut queued = 0usize;
+        for cf in &cfs {
+            if cf.opts.periodic_compaction_interval.is_zero()
+                || cf.opts.compaction_style == crate::config::CompactionStyle::Fifo
+            {
+                continue;
+            }
+            if compaction::periodic_candidate(self, cf, now).is_none() {
+                continue;
+            }
+            if self.ctx.compact_tx.try_send(cf.clone()).is_ok() {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
     /// Durably enable `bits`, then start honoring them.
     ///
     /// The ordering is the whole contract — **persist before use**:
@@ -613,12 +704,54 @@ impl DbInner {
         }
         let previous = self.caps_durable.load(Ordering::SeqCst);
         self.caps_durable.store(previous | bits, Ordering::SeqCst);
+        // Prepare hook: a capability whose enable transition carries a one-time
+        // catalog change stages it HERE, so the change and the bit that
+        // authorizes it reach disk in the same manifest write. Two writes would
+        // leave a crash window in which one exists without the other.
+        let undo = self.prepare_capability(bits);
         if let Err(e) = self.persist_manifest() {
             self.caps_durable.store(previous, Ordering::SeqCst);
+            undo_capability_prepare(undo);
             return Err(e);
         }
         self.caps.store(active | bits, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Stage the in-memory catalog changes `bits` implies, returning what the
+    /// levels looked like before so a failed manifest write can put them back.
+    ///
+    /// Only `CAP_PERIODIC_AGE` has one today: it stamps every local,
+    /// non-mounted table whose age state is `None` with the enable time.
+    ///
+    /// The alternative — "eligible one interval after open" — is not
+    /// restart-safe: open time is not durable, so a database restarted more
+    /// often than its interval would never become eligible at all. Stamping at
+    /// enable time makes the clock durable from the first moment the feature
+    /// exists, at the cost of one catalog rewrite and no table IO.
+    ///
+    /// Foreign mounts are skipped: this database must never rewrite bytes it
+    /// did not publish, so giving one an age would create a candidate the
+    /// picker is obliged to veto. A table that already carries a stamp is left
+    /// alone, which is what makes a re-enable a no-op.
+    fn prepare_capability(&self, bits: u64) -> CapabilityPrepareUndo {
+        if bits & crate::format::CAP_PERIODIC_AGE == 0 {
+            return Vec::new();
+        }
+        let at = self.now();
+        let cfs: Vec<Arc<ColumnFamily>> = self.cfs.read().values().cloned().collect();
+        let mut undo = Vec::new();
+        for cf in cfs {
+            let stamped = restamp(&cf, |table| {
+                (table.meta.last_compaction_time.is_none()
+                    && !compaction::is_foreign_mount(self, &table.meta))
+                .then_some(Some(at))
+            });
+            if !stamped.is_empty() {
+                undo.push((cf.clone(), stamped));
+            }
+        }
+        undo
     }
 
     /// Number of successful manifest persists so far (see `manifest_persists`).
@@ -710,6 +843,59 @@ impl DbInner {
     /// open inherits a file no manifest names.
     pub(crate) fn drain_deletions(&self) {
         self.file_deletion.drain();
+    }
+}
+
+/// Which tables [`DbInner::prepare_capability`] stamped, per column family, so
+/// a failed manifest write can put exactly those back.
+type CapabilityPrepareUndo = Vec<(Arc<ColumnFamily>, std::collections::HashSet<u64>)>;
+
+/// Rewrite the age state of every table `pick` selects, atomically over one
+/// level snapshot, returning the ids that changed.
+///
+/// `pick` returns the new value for a table it wants changed, or `None` to
+/// leave it alone. Handles are rebuilt rather than mutated because `SstMeta`
+/// lives inside an `Arc<SstHandle>`; rebuilding keeps the table's reader-cache
+/// entry, which is keyed by file id, so this costs no reader re-open.
+fn restamp(
+    cf: &Arc<ColumnFamily>,
+    pick: impl Fn(&SstHandle) -> Option<Option<i64>>,
+) -> std::collections::HashSet<u64> {
+    let mut changed = std::collections::HashSet::new();
+    cf.update_levels(|levels| {
+        levels
+            .iter()
+            .map(|level| {
+                level
+                    .iter()
+                    .map(|table| match pick(table) {
+                        Some(stamp) => {
+                            changed.insert(table.meta.id);
+                            let mut meta = table.meta.clone();
+                            meta.last_compaction_time = stamp;
+                            cf.handle_for(meta)
+                        }
+                        None => table.clone(),
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+    changed
+}
+
+/// Undo a [`DbInner::prepare_capability`] staging after a failed manifest write.
+///
+/// The write failed, so nothing durable changed; leaving the stamps in memory
+/// would let this handle behave as if the capability were on, and a later
+/// persist could publish age state whose capability bit was rolled back.
+///
+/// Restores by id rather than by reinstating the saved level vectors: a flush
+/// that installed into L0 in between must not be discarded (that wholesale
+/// overwrite is a past data-loss bug — see `ColumnFamily::update_levels`).
+fn undo_capability_prepare(undo: CapabilityPrepareUndo) {
+    for (cf, ids) in undo {
+        restamp(&cf, |table| ids.contains(&table.meta.id).then_some(None));
     }
 }
 
@@ -844,6 +1030,10 @@ fn build_db_inner(
         opts.background_io_burst_bytes,
         opts.io_limiter.clone(),
     );
+    // One `Arc` each, shared with `DbInner` below: a flush stamping a table and
+    // `enable_capability` flipping the bit must be looking at the same words.
+    let caps: Arc<AtomicU64> = Arc::new(AtomicU64::new(manifest.caps));
+    let clock = Arc::new(crate::util::Clock::new());
     let ctx = Arc::new(CfCtx {
         tiers,
         bc: block_cache,
@@ -857,6 +1047,8 @@ fn build_db_inner(
         unified: unified.clone(),
         poison: poison.clone(),
         wal_syncs: wal_syncs.clone(),
+        caps: caps.clone(),
+        clock: clock.clone(),
     });
     let inner = Arc::new(DbInner {
         opts: opts.clone(),
@@ -884,13 +1076,15 @@ fn build_db_inner(
             0 => opts.num_compaction_threads.max(1),
             n => n,
         }),
+        periodic_running: AtomicBool::new(false),
+        periodic_check: AtomicU64::new(PERIODIC_DISABLED),
         manifest_mu: Mutex::new(()),
         wal_layout: Mutex::new(requested_layout),
         instance_nonce: Mutex::new(manifest.instance_nonce),
         // A capability recorded in the manifest is already durable, so both
         // words start from it: a reopen after a crash between persist and flip
         // simply sees an enabled database.
-        caps: AtomicU64::new(manifest.caps),
+        caps,
         caps_durable: AtomicU64::new(manifest.caps),
         enable_mu: Mutex::new(()),
         manifest_persists: AtomicU64::new(0),
@@ -899,6 +1093,7 @@ fn build_db_inner(
         lock_file: Mutex::new(Some(lock_file)),
         handles: Arc::new(AtomicUsize::new(1)),
         poison,
+        clock,
         wal_syncs,
     });
     inner.observe_seq(unified_max_seq);
@@ -955,6 +1150,7 @@ fn recover_column_families(
             &persisted.sstables,
         )?;
         inner.observe_seq(max_seq);
+        inner.note_periodic_cf(&cf);
         inner.cf_by_id.write().insert(cf.id(), cf.clone());
         inner.cfs.write().insert(persisted.name.clone(), cf);
     }
@@ -1124,6 +1320,7 @@ impl DB {
         cfs.insert(name.to_string(), cf.clone());
         drop(cfs);
         self.inner.cf_by_id.write().insert(cf.id(), cf.clone());
+        self.inner.note_periodic_cf(&cf);
         self.inner.persist_manifest()?;
         Ok(cf)
     }
@@ -1205,6 +1402,9 @@ impl DB {
             for cf in &created {
                 by_id.insert(cf.id(), cf.clone());
             }
+        }
+        for cf in &created {
+            self.inner.note_periodic_cf(cf);
         }
         // One manifest persist for the entire batch.
         self.inner.persist_manifest()?;
@@ -1323,6 +1523,7 @@ impl DB {
         drop(cfs);
         // Same name => same stable id, so this replaces the old routing entry.
         self.inner.cf_by_id.write().insert(cf.id(), cf.clone());
+        self.inner.note_periodic_cf(&cf);
         self.inner.persist_manifest()?;
         Ok(cf)
     }
@@ -1390,6 +1591,20 @@ impl DB {
     /// has enabled none.
     pub fn format_capabilities(&self) -> u64 {
         self.inner.caps()
+    }
+
+    /// Replace the clock periodic compaction (0.3) stamps and measures against.
+    ///
+    /// A test lever, not a supported knob — hence `doc(hidden)`. It exists
+    /// because the whole feature is a *time* trigger: without it every
+    /// eligibility test would have to sleep through a real interval, and the
+    /// acceptance soak could not be run at all. The clock is read **only** by
+    /// periodic stamping and the periodic picker; TTL evaluation, FIFO age
+    /// eviction and `SstMeta::max_entry_time` keep reading the real clock, so
+    /// injecting here cannot move tier placement or expiry.
+    #[doc(hidden)]
+    pub fn set_clock_for_tests(&self, clock: crate::util::ClockFn) {
+        self.inner.clock.set(clock);
     }
 
     /// Compact a column family and wait for it to settle: runs every
@@ -1779,6 +1994,10 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
     // tier rules and an aged, mis-placed part). ZERO disables the scheduled pass.
     let mover_interval = db.opts.part_mover_interval;
     let mut last_mover = std::time::Instant::now();
+    // The periodic-compaction scan (0.3) shares the worker the same way, on its
+    // own cadence and its own CAS. `PERIODIC_DISABLED` is the default, so a
+    // database that never sets the option pays one relaxed load per tick.
+    let mut last_periodic = std::time::Instant::now();
     loop {
         match rx.recv_timeout(WORKER_TICK) {
             Ok(cf) => {
@@ -1816,12 +2035,305 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
             let _ = db.run_part_mover();
             db.mover_running.store(false, Ordering::SeqCst);
         }
+        // One periodic scan at a time, for exactly the reason the mover has its
+        // own guard: with `num_compaction_threads` workers, every one of them
+        // would otherwise walk the same levels and enqueue the same family each
+        // interval. The cadence timer is per-worker, the exclusion is DB-wide.
+        let check = db.periodic_check.load(Ordering::Relaxed);
+        if check != PERIODIC_DISABLED
+            && !db.closing.load(Ordering::Relaxed)
+            && last_periodic.elapsed() >= Duration::from_nanos(check)
+            && db
+                .periodic_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            last_periodic = std::time::Instant::now();
+            db.run_periodic_scan();
+            db.periodic_running.store(false, Ordering::SeqCst);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 0.3: periodic compaction -----------------------------------------
+
+    /// The injected clock must reach periodic age state and NOTHING else. If it
+    /// leaked into `max_entry_time`, a test driving periodic time by days would
+    /// silently move tier placement (`TierRule::min_age`) under itself.
+    #[test]
+    fn injected_clock_drives_periodic_eligibility_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", Default::default())
+            .unwrap();
+        db.enable_format_capabilities(crate::format::CAP_PERIODIC_AGE)
+            .unwrap();
+
+        // A fixed reading far enough from the real clock that the two can never
+        // be confused for one another.
+        const FAKE: i64 = 1_000_000_000;
+        db.set_clock_for_tests(Arc::new(|| FAKE));
+        let before = crate::util::now_nanos();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        let after = crate::util::now_nanos();
+
+        let tables = cf.snapshot_ssts();
+        assert_eq!(tables.len(), 1, "one flushed table");
+        assert_eq!(
+            tables[0].last_compaction_time,
+            Some(FAKE),
+            "periodic age state comes from the injected clock"
+        );
+        let entry_time = tables[0]
+            .max_entry_time
+            .expect("flush output always carries a mover age");
+        assert!(
+            entry_time >= before && entry_time <= after,
+            "max_entry_time must still come from the real clock: {entry_time} \
+             outside [{before}, {after}]"
+        );
+        assert_ne!(entry_time, FAKE);
+        drop(cf);
+        db.close().unwrap();
+    }
+
+    /// Without the capability there is no stamp at all: the manifest may not
+    /// carry a field a reopen could not attribute to an enabled capability.
+    #[test]
+    fn flush_leaves_age_state_unset_without_the_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", Default::default())
+            .unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        assert!(cf
+            .snapshot_ssts()
+            .iter()
+            .all(|t| t.last_compaction_time.is_none()));
+        assert_eq!(db.format_capabilities(), 0);
+        drop(cf);
+        db.close().unwrap();
+    }
+
+    /// `num_compaction_threads` workers share one scan. Without this CAS every
+    /// one of them would walk the same levels and enqueue the same family each
+    /// derived interval — exactly the mistake the part mover's guard prevents.
+    #[test]
+    fn periodic_running_cas_admits_one_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let inner = db.inner.clone();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(4));
+        // Every thread has attempted the CAS before any winner releases, which
+        // is what makes this test about exclusion rather than about timing.
+        let attempted = Arc::new(std::sync::Barrier::new(4));
+
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let inner = inner.clone();
+            let entered = entered.clone();
+            let start = start.clone();
+            let attempted = attempted.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let won = inner
+                    .periodic_running
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+                if won {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                }
+                attempted.wait();
+                if won {
+                    inner.periodic_running.store(false, Ordering::SeqCst);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "exactly one worker may run the pass at a time"
+        );
+        // And the guard is released, so the next interval can scan again.
+        assert!(!inner.periodic_running.load(Ordering::SeqCst));
+        db.close().unwrap();
+    }
+
+    /// Task 8: with `num_compaction_threads` workers racing the guarded block,
+    /// one interval produces ONE enqueue, not one per worker.
+    ///
+    /// A unit test, because the observation is what `run_periodic_scan` puts on
+    /// the compact channel and no integration test can see that. The interval
+    /// is an hour, so the derived cadence is fifteen minutes and the real
+    /// worker cannot scan underneath the race; eligibility comes from the fake
+    /// clock instead.
+    #[test]
+    fn periodic_scan_enqueues_cf_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.num_compaction_threads = 4;
+        let db = DB::open(opts).unwrap();
+        let cf = db
+            .create_column_family(
+                "default",
+                crate::config::ColumnFamilyConfig {
+                    periodic_compaction_interval: Duration::from_secs(3600),
+                    // One L0 file never trips the capacity trigger, so the only
+                    // thing that can enqueue this family is the periodic scan.
+                    l1_file_count_trigger: 16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000_000_000_000));
+        let handle = clock.clone();
+        db.set_clock_for_tests(Arc::new(move || handle.load(Ordering::SeqCst)));
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.enable_format_capabilities(crate::format::CAP_PERIODIC_AGE)
+            .unwrap();
+        // Two hours on: the flushed table is an interval past its stamp.
+        clock.fetch_add(7_200_000_000_000, Ordering::SeqCst);
+
+        // Four workers reach the guarded block at the same instant, exactly as
+        // `compact_worker` runs it.
+        let inner = db.inner.clone();
+        let enqueued = Arc::new(AtomicUsize::new(0));
+        let scans = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let attempted = Arc::new(std::sync::Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let inner = inner.clone();
+            let enqueued = enqueued.clone();
+            let scans = scans.clone();
+            let start = start.clone();
+            let attempted = attempted.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let won = inner
+                    .periodic_running
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+                if won {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                    enqueued.fetch_add(inner.run_periodic_scan(), Ordering::SeqCst);
+                }
+                attempted.wait();
+                if won {
+                    inner.periodic_running.store(false, Ordering::SeqCst);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one scan, not four");
+        assert_eq!(
+            enqueued.load(Ordering::SeqCst),
+            1,
+            "one interval enqueues the family once, not once per worker"
+        );
+        drop(cf);
+        db.close().unwrap();
+    }
+
+    /// Without the capability the scan enqueues nothing at all, whatever the
+    /// interval says: no table can carry a stamp, so nothing is eligible.
+    #[test]
+    fn periodic_scan_enqueues_nothing_without_the_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family(
+                "default",
+                crate::config::ColumnFamilyConfig {
+                    periodic_compaction_interval: Duration::from_secs(3600),
+                    l1_file_count_trigger: 16,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        db.put(&cf, b"k", b"v", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.set_clock_for_tests(Arc::new(|| i64::MAX / 2));
+        assert_eq!(db.inner.run_periodic_scan(), 0);
+        drop(cf);
+        db.close().unwrap();
+    }
+
+    /// The derived cadence is `interval / 4`, clamped so a seconds-long
+    /// interval cannot spin the worker and a month-long one still gets looked
+    /// at often enough to bound the reclaim lag.
+    #[test]
+    fn periodic_check_interval_is_a_clamped_quarter() {
+        assert_eq!(
+            periodic_check_interval(Duration::from_secs(3600)),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            periodic_check_interval(Duration::from_secs(600)),
+            Duration::from_secs(150)
+        );
+        // Below the floor.
+        assert_eq!(
+            periodic_check_interval(Duration::from_secs(2)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            periodic_check_interval(Duration::from_millis(1)),
+            Duration::from_secs(1)
+        );
+        // Above the ceiling.
+        assert_eq!(
+            periodic_check_interval(Duration::from_secs(30 * 24 * 3600)),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            periodic_check_interval(Duration::from_secs(4 * 3600)),
+            Duration::from_secs(15 * 60)
+        );
+    }
+
+    /// The default costs one relaxed atomic load per worker tick and nothing
+    /// else: no scan, no lock on the CF map.
+    #[test]
+    fn periodic_scan_is_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        assert_eq!(
+            db.inner.periodic_check.load(Ordering::Relaxed),
+            PERIODIC_DISABLED
+        );
+        let cf = db
+            .create_column_family(
+                "aged",
+                crate::config::ColumnFamilyConfig {
+                    periodic_compaction_interval: Duration::from_secs(600),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            db.inner.periodic_check.load(Ordering::Relaxed),
+            Duration::from_secs(150).as_nanos() as u64,
+            "creating a family arms the scan at its derived cadence"
+        );
+        drop(cf);
+        db.close().unwrap();
+    }
 
     #[test]
     fn no_limiter_object_when_disabled() {

@@ -138,6 +138,83 @@ reopen to serve point reads immediately. It costs a longer close (~3.2 s after
 5M records, against ~1.1 s abandoning) and buys a fully merged tree. For a
 long-running database, compaction keeps up and the distinction does not arise.
 
+## Periodic compaction (0.3) — the age trigger
+
+Both triggers above are about **size**: L0 file count, or a level over its byte
+capacity. Neither fires on a database that has stopped taking writes, so an idle
+column family keeps its expired TTL entries, its tombstones and its shadowed
+versions indefinitely — reclamation only ever happened inside a compaction, and
+short of a manual `DB::compact` no compaction was due.
+
+`ColumnFamilyConfig::periodic_compaction_interval` adds a third trigger:
+revisit a table this long after the compaction that wrote it. `Duration::ZERO`
+— the default — disables it entirely, and a database that leaves it alone gains
+no thread, no ticker and no disk artifact: the compaction worker's default path
+is one relaxed atomic load per tick.
+
+**Durable age state.** Eligibility is measured against
+`SstMeta::last_compaction_time`, a manifest field written only behind the
+`CAP_PERIODIC_AGE` format capability. It is emphatically **not**
+`max_entry_time`: that field carries the maximum forward over a compaction's
+inputs so cold data does not look freshly written, which is what the part
+mover's `TierRule::min_age` gate needs. Carrying it forward here would make a
+just-rewritten table instantly re-eligible; resetting it would break tier
+placement. `None` means *unknown*, and unknown is never eligible — a legacy
+table, a table written before the capability was taken, a foreign mount, or a
+part attached from another database.
+
+Enabling the capability stamps every local, non-mounted table that has no age
+state yet with the enable time, **inside the same manifest write** that persists
+the bit — one catalog rewrite, no table IO. The alternative ("eligible one
+interval after open") is not restart-safe: open time is not durable, so a
+database restarted more often than its interval would never become eligible at
+all.
+
+**Scheduling.** The scan piggybacks on the compaction worker, like the part
+mover, on a derived cadence of `interval / 4` clamped to `[1s, 15m]`, and under
+its own `periodic_running` CAS. The guard is not optional: with
+`num_compaction_threads` workers, an unguarded scan would have every one of them
+walk the same levels and enqueue the same family each interval. The pass only
+*sends* on the compact channel; the picker rechecks eligibility under its normal
+locks.
+
+**Picking.** Age work is the **lowest** priority — `pick_compaction` consults it
+only after the scored capacity levels yield no job. A level over capacity is a
+backlog that grows; a stale table is space that does not, so capacity never
+waits behind age. Among eligible tables the oldest stamp wins, ties resolving to
+the shallower level. Then:
+
+- **non-bottom**: an ordinary bounded push-down, source plus the target tables
+  it overlaps, with the foreign-mount and range-lock vetoes as usual. An
+  eligible L0 table defers to L0's oldest-first window, which is a correctness
+  invariant rather than a cost choice;
+- **bottom**: an **in-place rewrite** (`target == level`) — the only way a
+  bottom table that overlaps no incoming data ever sees the compaction filter or
+  drops its tombstones again. A deeper level is never created for age reasons
+  alone. When the bottom *is* L0 (a one-level family) the rewrite takes the
+  whole level, because L0's files overlap and only a whole-level merge leaves
+  the outputs disjoint.
+
+The rewrite stamps its outputs with the current reading, so the trigger settles
+instead of looping on its own output.
+
+**No new drop rule.** A periodic job is an ordinary compaction: the same
+snapshot, TTL and tombstone retention decides what it may drop. Data hidden
+behind a live snapshot survives a periodic rewrite exactly as it survives a
+capacity one.
+
+**Observability.** `CfStats::periodic_compactions` counts the subset of
+`compaction_count` that the age trigger picked — zero for every database that
+leaves the option at its default, and the number to watch to tell idle
+reclamation from ingest-driven work. Only completed jobs count: a failed job
+leaves its input's stamp untouched, so the table stays eligible and is retried.
+
+**Rollback** is setting the option back to `0`. Scheduling stops; the persisted
+stamps stay readable and are simply never consulted.
+
+The option is invalid on a `CompactionStyle::Fifo` family (`validate` returns
+`Err`), which evicts by age through `fifo_ttl` and never merges at all.
+
 ## Concurrency
 
 Jobs on disjoint key ranges share no inputs and no outputs, so they run at once;
@@ -238,7 +315,9 @@ rather than by many small ones, and measure.
 | `close()` takes seconds | Expected with `finish_compactions_on_close = true`; otherwise check debt at close |
 | Point reads slow right after opening | L0 depth. `cf.stats().levels[0]` — see § Closing |
 | Point reads slow in steady state | Level count and bloom settings, not this document — see `docs/performance.md` |
-| Compaction never seems to run on a mostly-idle CF | Size triggers do not fire below capacity; `DB::compact` sweeps explicitly (this is what reclaims tombstones from a fully deleted CF) |
+| Compaction never seems to run on a mostly-idle CF | Size triggers do not fire below capacity; `DB::compact` sweeps explicitly (this is what reclaims tombstones from a fully deleted CF), or set `periodic_compaction_interval` so the engine revisits stale tables on its own — see § Periodic compaction |
+| Space is not reclaimed although TTLs have expired | Same cause: nothing was due. `periodic_compaction_interval` plus `CAP_PERIODIC_AGE`; watch `CfStats::periodic_compactions` |
+| `periodic_compactions` stays at zero with the option set | The capability is not enabled (`DB::enable_format_capabilities(CAP_PERIODIC_AGE)`), so no table carries age state |
 
 ## What 0.7.x did wrong
 

@@ -1,0 +1,18 @@
+   Compiling ondadb v0.8.2 (/Volumes/HOME/code/storage-engines/ondadb/.claude/worktrees/agent-a72d1263d7be46cd0)
+    Finished `release` profile [optimized] target(s) in 25.86s
+     Running tests/periodic_soak_bench.rs (/Volumes/cargo/cargo-build/ee/ea2247c838de3d/release/deps/periodic_soak_bench-e4b80f6827e1008c)
+
+running 1 test
+
+0.3 TTL-write + idle-soak: 20000 expiring + 2000 surviving entries of 512B, TTL 5s, soak 20s
+
+test periodic_ttl_write_then_idle_soak has been running for over 60 seconds
+interval = 0 (control) bytes   12221393 ->   12221393 (  0.0% reclaimed)  entries  22000 ->  22000  periodic_compactions   0  idle CPU   0.04s over 20s
+interval = 4s          bytes   12221393 ->    1097990 ( 91.0% reclaimed)  entries  22000 ->   2000  periodic_compactions   1  idle CPU   0.07s over 20s
+
+reclaimed delta: 91.0 pp   idle CPU delta: +0.03s
+
+test periodic_ttl_write_then_idle_soak ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 62.99s
+

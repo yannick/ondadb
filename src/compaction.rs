@@ -143,13 +143,20 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     while let Some((job, guard)) = pick_compaction(db, cf) {
         cf.compacting
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let reason = job.reason;
         let res = compact_inputs_spanned(db, cf, job.level, job.target, job.inputs);
         cf.compacting
             .store(false, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
+        // A failed job is not counted, for either reason code: the table it
+        // would have rewritten keeps its old stamp and stays eligible.
         res?;
         cf.compaction_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if reason == CompactionReason::Periodic {
+            cf.periodic_compactions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         refresh_compaction_debt(db, cf);
         // A closing DB stops between jobs; the debt it leaves is legal LSM
         // state that the next open recovers from.
@@ -162,11 +169,25 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     Ok(())
 }
 
+/// Why a job was picked. Capacity work and age work are the same merge with
+/// the same retention rules; the code exists so an operator can tell them apart
+/// in [`CfStats`](crate::maintenance::CfStats) rather than infer periodic
+/// activity from a compaction count that never stops rising.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionReason {
+    /// A level is over its byte capacity, or L0 over its file-count trigger.
+    Capacity,
+    /// A table has not been rewritten within
+    /// [`periodic_compaction_interval`](crate::config::ColumnFamilyConfig::periodic_compaction_interval).
+    Periodic,
+}
+
 /// One unit of compaction work: a bounded input set and the span it covers.
 pub(crate) struct CompactionJob {
     pub(crate) level: usize,
     pub(crate) target: usize,
     pub(crate) inputs: Vec<Arc<SstHandle>>,
+    pub(crate) reason: CompactionReason,
 }
 
 /// Byte capacity of `level` (>= 1). Held apart from `write_buffer_size` since
@@ -270,11 +291,152 @@ fn pick_compaction(
     });
 
     for (_, level) in scored {
-        if let Some(job) = build_job(db, cf, level) {
+        if let Some(job) = build_job(db, cf, level, CompactionReason::Capacity) {
             return Some(job);
         }
     }
-    None
+
+    // Age work is the LOWEST priority: it is consulted only once every level is
+    // within capacity and every triggered candidate was unusable. A level over
+    // capacity is a backlog that grows; a table past its interval is stale
+    // space that does not, so capacity must never wait behind it.
+    periodic_pick(db, cf)
+}
+
+/// The periodic pre-pass: pick the oldest eligible table and shape a job for it.
+///
+/// Gated on the capability as well as the interval. Without `CAP_PERIODIC_AGE`
+/// no table carries a stamp and the walk would find nothing anyway — the check
+/// is here to state that the trigger is off, rather than to rely on the absence
+/// of data for it.
+fn periodic_pick(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    if cf.opts.periodic_compaction_interval.is_zero()
+        || db.caps() & crate::format::CAP_PERIODIC_AGE == 0
+    {
+        return None;
+    }
+    let (level, pick) = periodic_candidate(db, cf, db.now())?;
+    build_periodic_job(db, cf, level, pick)
+}
+
+/// The oldest table past its family's periodic interval, with the level holding
+/// it, or `None` when nothing qualifies.
+///
+/// Pure over the level snapshot it takes. Three exclusions, all of them
+/// "unknown, therefore ineligible":
+///
+/// * `last_compaction_time == None` — a legacy table, a table written before
+///   the capability was enabled, or a part attached from another database
+///   (`attach_part`/`attach_part_by_ref`), whose compaction history this
+///   database does not own;
+/// * a foreign mount, which this database must never rewrite at all;
+/// * a stamp in the future (`now < stamp`), which is clock skew: the age is not
+///   negative, the table is simply not eligible yet.
+pub(crate) fn periodic_candidate(
+    db: &DbInner,
+    cf: &Arc<ColumnFamily>,
+    now: i64,
+) -> Option<(usize, Arc<SstHandle>)> {
+    let interval = cf.opts.periodic_compaction_interval;
+    if interval.is_zero() {
+        return None;
+    }
+    // A configured interval is always positive here, so a non-positive age can
+    // never pass the gate below — which is what makes skew safe.
+    let interval = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
+    cf.with_levels(|levels| oldest_eligible_table(db, levels, interval, now))
+}
+
+/// [`periodic_candidate`] over an explicit level snapshot.
+fn oldest_eligible_table(
+    db: &DbInner,
+    levels: &[Vec<Arc<SstHandle>>],
+    interval: i64,
+    now: i64,
+) -> Option<(usize, Arc<SstHandle>)> {
+    let mut best: Option<(usize, Arc<SstHandle>, i64)> = None;
+    // Top-down, so a tie between two equally old tables resolves to the
+    // shallower level — the one whose rewrite also unblocks the levels above.
+    for (level, tables) in levels.iter().enumerate() {
+        for table in tables {
+            let Some(stamp) = table.meta.last_compaction_time else {
+                continue;
+            };
+            if is_foreign_mount(db, &table.meta) {
+                continue;
+            }
+            // Saturating, and compared against a strictly positive interval:
+            // a reading behind the stamp yields an age of at most zero and is
+            // simply not eligible. No panic, no negative age.
+            if now.saturating_sub(stamp) < interval {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, _, oldest)| stamp < *oldest) {
+                best = Some((level, table.clone(), stamp));
+            }
+        }
+    }
+    best.map(|(level, table, _)| (level, table))
+}
+
+/// Shape a job around one age-eligible table.
+///
+/// Non-bottom is an ordinary bounded push-down through
+/// [`gather_target`]/[`lock_job`], with the foreign-mount and range-lock vetoes
+/// as usual. Bottom is an **in-place rewrite** — the `compact_into(last, last)`
+/// shape [`run_manual`] uses, which is the only way a bottom table that
+/// overlaps no incoming data ever sees the compaction filter or drops its
+/// tombstones again. A deeper level is never created for age reasons alone.
+fn build_periodic_job(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    pick: Arc<SstHandle>,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    if !is_bottom_target(cf, level) {
+        // L0's files overlap each other, so periodic may NOT push down an
+        // arbitrary one — that would reorder versions of a key. Defer to the
+        // oldest-first window `build_job` already enforces and relabel the
+        // reason; the eligible table is in L0, so the window covers it.
+        if level == 0 {
+            return build_job(db, cf, 0, CompactionReason::Periodic);
+        }
+        let cmp = cf.cmp();
+        let (min_key, max_key) = key_span(std::slice::from_ref(&pick), &cmp);
+        let inputs = gather_target(db, cf, level + 1, &min_key, &max_key, vec![pick])?;
+        return lock_job(cf, level, level + 1, inputs, CompactionReason::Periodic);
+    }
+
+    let inputs = if level == 0 {
+        // A one-level family: its bottom IS L0, whose tables overlap, so the
+        // in-place rewrite must take the whole level exactly as
+        // `compact_into(0, 0)` does. That is what makes the outputs disjoint,
+        // and therefore what makes `install_compaction_outputs`' sort of the
+        // rebuilt level correct.
+        cf.with_levels(|levels| {
+            levels
+                .first()
+                .map(|l| {
+                    l.iter()
+                        .filter(|t| !is_foreign_mount(db, &t.meta))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+    } else {
+        // Levels >= 1 are key-sorted and disjoint, so one table is rewritten on
+        // its own. Taking the whole bottom level here instead would make the
+        // single largest job in the engine an untriggered background one.
+        vec![pick]
+    };
+    if inputs.is_empty() {
+        return None;
+    }
+    lock_job(cf, level, level, inputs, CompactionReason::Periodic)
 }
 
 /// Assemble a job for `level`, or `None` if every candidate there is blocked
@@ -283,6 +445,7 @@ fn build_job(
     db: &Arc<DbInner>,
     cf: &Arc<ColumnFamily>,
     level: usize,
+    reason: CompactionReason,
 ) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
     let cmp = cf.cmp();
     let target = level + 1;
@@ -317,7 +480,7 @@ fn build_job(
         }
         let (min_key, max_key) = key_span(&inputs, &cmp);
         let with_target = gather_target(db, cf, target, &min_key, &max_key, inputs)?;
-        return lock_job(cf, level, target, with_target);
+        return lock_job(cf, level, target, with_target, reason);
     }
 
     // Levels >= 1 are sorted by key and disjoint, so one file can be taken on
@@ -363,7 +526,7 @@ fn build_job(
         else {
             continue; // a foreign mount overlaps: try the next file
         };
-        if let Some(job) = lock_job(cf, level, target, inputs) {
+        if let Some(job) = lock_job(cf, level, target, inputs, reason) {
             // Next job starts after this file.
             cf.compact_cursor
                 .lock()
@@ -511,6 +674,7 @@ fn lock_job(
     level: usize,
     target: usize,
     inputs: Vec<Arc<SstHandle>>,
+    reason: CompactionReason,
 ) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
     let cmp = cf.cmp();
     let spans: Vec<(&[u8], &[u8])> = inputs
@@ -524,6 +688,7 @@ fn lock_job(
             level,
             target,
             inputs,
+            reason,
         },
         guard,
     ))
@@ -571,7 +736,7 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
 /// original "and cannot" claim missed local re-materialization by
 /// background compaction, which silently rebuilt whole mounted parts as
 /// local tables). They are excluded from compaction triggers and inputs.
-fn is_foreign_mount(db: &DbInner, meta: &crate::manifest::SstMeta) -> bool {
+pub(crate) fn is_foreign_mount(db: &DbInner, meta: &crate::manifest::SstMeta) -> bool {
     let Some(object) = &meta.object else {
         return false;
     };
@@ -730,6 +895,14 @@ struct CompactionOutputBuilder<'a> {
     bottom: bool,
     target_bytes: u64,
     carry_entry_time: Option<i64>,
+    /// One clock reading taken when the job froze, so every output file of one
+    /// compaction shares a stamp. `None` unless `CAP_PERIODIC_AGE` is active —
+    /// the manifest may not carry age state a reopen could not attribute.
+    ///
+    /// Deliberately NOT `carry_entry_time`'s max-over-inputs: carrying the
+    /// oldest input's age forward would leave the output instantly eligible
+    /// again, which is the loop the design calls out.
+    last_compaction_time: Option<i64>,
     partitioner: Option<crate::config::PartitionResolver>,
     current: Option<CurrentOutput>,
     outputs: Vec<SstMeta>,
@@ -757,6 +930,8 @@ impl<'a> CompactionOutputBuilder<'a> {
             bottom,
             target_bytes: (cf.opts.target_file_size as u64).max(1),
             carry_entry_time,
+            last_compaction_time: (db.caps() & crate::format::CAP_PERIODIC_AGE != 0)
+                .then(|| db.now()),
             partitioner,
             current: None,
             outputs: Vec::new(),
@@ -789,6 +964,7 @@ impl<'a> CompactionOutputBuilder<'a> {
         let mut meta = file_meta.to_sst_meta(id, self.target as u32);
         meta.partition = partition;
         meta.max_entry_time = self.carry_entry_time;
+        meta.last_compaction_time = self.last_compaction_time;
         self.outputs.push(meta);
         Ok(())
     }
@@ -1775,9 +1951,9 @@ mod tests {
     use std::ops::Bound;
 
     use super::{
-        build_job, gather_target, key_span, overlap_bytes, plan_spans, rank_candidates,
-        target_is_bottom, FrozenJob, Retention, VersionRetention, COMPACTION_OUTPUT_BYTES,
-        FIRST_FIT_ORDER,
+        build_job, gather_target, key_span, oldest_eligible_table, overlap_bytes,
+        periodic_candidate, plan_spans, rank_candidates, target_is_bottom, CompactionReason,
+        FrozenJob, Retention, VersionRetention, COMPACTION_OUTPUT_BYTES, FIRST_FIT_ORDER,
     };
     use crate::comparator::{default_comparator, CaseInsensitive, ComparatorRef};
 
@@ -1913,6 +2089,333 @@ mod tests {
             object: Some(format!("cf-default/{:016x}-{id}", 0xfeedu64)),
             ..crate::manifest::SstMeta::default()
         })
+    }
+
+    // ---- 0.3: periodic-compaction eligibility -----------------------------
+
+    /// One hour, the interval every eligibility test below measures against.
+    const HOUR: i64 = 3_600_000_000_000;
+
+    /// A table carrying periodic age state.
+    fn aged_handle(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        id: u64,
+        level: u32,
+        min: &[u8],
+        max: &[u8],
+        stamp: Option<i64>,
+    ) -> Arc<crate::column_family::SstHandle> {
+        cf.handle_for(crate::manifest::SstMeta {
+            id,
+            level,
+            klog_size: 1024,
+            min_key: min.to_vec(),
+            max_key: max.to_vec(),
+            last_compaction_time: stamp,
+            ..crate::manifest::SstMeta::default()
+        })
+    }
+
+    /// [`aged_handle`] with an explicit klog size, for the picker tests that
+    /// need a level to be over or under its capacity.
+    fn aged_handle_sized(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        id: u64,
+        level: u32,
+        min: &[u8],
+        max: &[u8],
+        klog: u64,
+        stamp: Option<i64>,
+    ) -> Arc<crate::column_family::SstHandle> {
+        cf.handle_for(crate::manifest::SstMeta {
+            id,
+            level,
+            klog_size: klog,
+            min_key: min.to_vec(),
+            max_key: max.to_vec(),
+            last_compaction_time: stamp,
+            ..crate::manifest::SstMeta::default()
+        })
+    }
+
+    /// A foreign mount that is also old enough to qualify on age alone — the
+    /// combination the veto exists for.
+    fn aged_foreign_handle(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        id: u64,
+        level: u32,
+        min: &[u8],
+        max: &[u8],
+        stamp: i64,
+    ) -> Arc<crate::column_family::SstHandle> {
+        cf.handle_for(crate::manifest::SstMeta {
+            id,
+            level,
+            klog_size: 1024,
+            min_key: min.to_vec(),
+            max_key: max.to_vec(),
+            object: Some(format!("cf-default/{:016x}-{id}", 0xfeedu64)),
+            last_compaction_time: Some(stamp),
+            ..crate::manifest::SstMeta::default()
+        })
+    }
+
+    /// [`oldest_eligible_table`] over a live column family's levels.
+    fn oldest(
+        db: &crate::DB,
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        interval: i64,
+        now: i64,
+    ) -> Option<(usize, Arc<crate::column_family::SstHandle>)> {
+        cf.with_levels(|levels| oldest_eligible_table(&db.inner, levels, interval, now))
+    }
+
+    #[test]
+    fn periodic_candidate_picks_oldest_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let now = 100 * HOUR;
+        cf.replace_levels(vec![
+            vec![
+                // Fresh: half an interval old.
+                aged_handle(&cf, 1, 0, b"a", b"b", Some(now - HOUR / 2)),
+                // Unknown age (legacy table / attached part): never eligible,
+                // however long ago it might actually have been written.
+                aged_handle(&cf, 2, 0, b"c", b"d", None),
+            ],
+            vec![
+                // Eligible, but not the oldest.
+                aged_handle(&cf, 3, 1, b"a", b"b", Some(now - 3 * HOUR)),
+                // The oldest LOCAL table — the expected pick.
+                aged_handle(&cf, 4, 1, b"c", b"d", Some(now - 9 * HOUR)),
+                // Older still, but a foreign mount: this database may not
+                // rewrite bytes it did not publish.
+                aged_foreign_handle(&cf, 5, 1, b"e", b"f", now - 50 * HOUR),
+            ],
+        ]);
+
+        let (level, pick) = oldest(&db, &cf, HOUR, now).expect("eligible");
+        assert_eq!(level, 1);
+        assert_eq!(pick.meta.id, 4);
+
+        // Rewind to just before the third table qualifies and the pick moves to
+        // the only remaining eligible one.
+        let (level, pick) =
+            oldest(&db, &cf, 5 * HOUR, now).expect("one table is still older than five hours");
+        assert_eq!((level, pick.meta.id), (1, 4));
+        // With an interval nothing has reached, there is no candidate at all.
+        assert!(oldest(&db, &cf, 20 * HOUR, now).is_none());
+    }
+
+    /// A tie between two levels resolves to the shallower one, whose rewrite
+    /// also unblocks what sits above it.
+    #[test]
+    fn periodic_candidate_breaks_level_ties_top_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let now = 100 * HOUR;
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle(&cf, 1, 1, b"a", b"b", Some(now - 4 * HOUR))],
+            vec![aged_handle(&cf, 2, 2, b"c", b"d", Some(now - 4 * HOUR))],
+        ]);
+        let (level, pick) = oldest(&db, &cf, HOUR, now).expect("eligible");
+        assert_eq!((level, pick.meta.id), (1, 1));
+    }
+
+    /// Failure-matrix row: `clock() < stamp`. A clock that steps backwards must
+    /// yield no candidate, no panic, and no negative age treated as huge.
+    #[test]
+    fn periodic_clock_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let stamp = 100 * HOUR;
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle(&cf, 1, 1, b"a", b"b", Some(stamp))],
+        ]);
+
+        // A reading one whole interval BEFORE the stamp.
+        assert!(
+            oldest(&db, &cf, HOUR, stamp - HOUR).is_none(),
+            "a stamp in the future is not eligible"
+        );
+        // And the extreme: saturating arithmetic, not a wrap into a huge age.
+        assert!(
+            oldest(&db, &cf, HOUR, i64::MIN).is_none(),
+            "an absurdly skewed clock must not wrap into eligibility"
+        );
+        // Exactly at the stamp is an age of zero, still short of the interval.
+        assert!(oldest(&db, &cf, HOUR, stamp).is_none());
+        // The boundary itself is inclusive.
+        assert!(oldest(&db, &cf, HOUR, stamp + HOUR).is_some());
+    }
+
+    /// Zero is the documented "disabled" value, and it disables the walk
+    /// entirely — even for a table stamped at the epoch.
+    #[test]
+    fn periodic_candidate_none_when_interval_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        assert!(
+            cf.opts.periodic_compaction_interval.is_zero(),
+            "the default"
+        );
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle(&cf, 1, 1, b"a", b"b", Some(0))],
+        ]);
+        assert!(periodic_candidate(&db.inner, &cf, 1_000 * HOUR).is_none());
+
+        // The same levels under a configured interval do yield a candidate, so
+        // the assertion above is about the option and not about the fixture.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (db2, cf2) = picker_db(
+            &dir2,
+            crate::config::ColumnFamilyConfig {
+                periodic_compaction_interval: std::time::Duration::from_secs(3600),
+                ..crate::config::ColumnFamilyConfig::default()
+            },
+        );
+        cf2.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle(&cf2, 1, 1, b"a", b"b", Some(0))],
+        ]);
+        assert!(periodic_candidate(&db2.inner, &cf2, 1_000 * HOUR).is_some());
+    }
+
+    /// Task 7: age work is the lowest priority. With a level over capacity AND
+    /// an eligible old table, the capacity job is the one that runs — a backlog
+    /// grows, stale space does not.
+    ///
+    /// A picker test rather than an end-to-end one: `pick_compaction`'s choice
+    /// is the whole claim, and observing it through the background worker would
+    /// be a race between two jobs that are both going to happen.
+    #[test]
+    fn periodic_does_not_preempt_capacity_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(
+            &dir,
+            crate::config::ColumnFamilyConfig {
+                periodic_compaction_interval: std::time::Duration::from_secs(3600),
+                l1_base_bytes: 1 << 10,
+                ..crate::config::ColumnFamilyConfig::default()
+            },
+        );
+        // Enable BEFORE installing the fixture, so the enable-time stamping
+        // cannot overwrite the stamps this test depends on.
+        db.enable_format_capabilities(crate::format::CAP_PERIODIC_AGE)
+            .unwrap();
+        let now = 100 * HOUR;
+        db.set_clock_for_tests(Arc::new(move || now));
+
+        // L1 is far over its 1 KiB capacity; L2's table is a day past its
+        // interval and would be the periodic pick if nothing else were due.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle_sized(
+                &cf,
+                1,
+                1,
+                b"a",
+                b"m",
+                1 << 20,
+                Some(now - HOUR / 2),
+            )],
+            vec![aged_handle_sized(
+                &cf,
+                2,
+                2,
+                b"n",
+                b"z",
+                16,
+                Some(now - 24 * HOUR),
+            )],
+        ]);
+
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("a job is due");
+        assert_eq!(job.reason, CompactionReason::Capacity);
+        assert_eq!((job.level, job.target), (1, 2));
+        assert_eq!(job.inputs[0].meta.id, 1);
+        drop(guard);
+
+        // Bring L1 back inside its capacity and the same call now returns the
+        // age-triggered job — so the assertion above is about priority, not
+        // about the periodic path being unreachable.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle_sized(
+                &cf,
+                1,
+                1,
+                b"a",
+                b"m",
+                16,
+                Some(now - HOUR / 2),
+            )],
+            vec![aged_handle_sized(
+                &cf,
+                2,
+                2,
+                b"n",
+                b"z",
+                16,
+                Some(now - 24 * HOUR),
+            )],
+        ]);
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("the age job is due");
+        assert_eq!(job.reason, CompactionReason::Periodic);
+        assert_eq!(
+            (job.level, job.target),
+            (2, 2),
+            "a bottom candidate is rewritten in place, never into a new level"
+        );
+        assert_eq!(job.inputs.len(), 1);
+        assert_eq!(job.inputs[0].meta.id, 2);
+        drop(guard);
+    }
+
+    /// A non-bottom age candidate is an ordinary bounded push-down: source plus
+    /// the target tables it overlaps, exactly as capacity work would build it.
+    #[test]
+    fn periodic_non_bottom_candidate_is_a_bounded_push_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(
+            &dir,
+            crate::config::ColumnFamilyConfig {
+                periodic_compaction_interval: std::time::Duration::from_secs(3600),
+                ..crate::config::ColumnFamilyConfig::default()
+            },
+        );
+        db.enable_format_capabilities(crate::format::CAP_PERIODIC_AGE)
+            .unwrap();
+        let now = 100 * HOUR;
+        db.set_clock_for_tests(Arc::new(move || now));
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![aged_handle_sized(
+                &cf,
+                1,
+                1,
+                b"c",
+                b"f",
+                16,
+                Some(now - 9 * HOUR),
+            )],
+            vec![
+                aged_handle_sized(&cf, 2, 2, b"a", b"d", 16, Some(now)),
+                aged_handle_sized(&cf, 3, 2, b"e", b"g", 16, Some(now)),
+                // Disjoint from the source span: must NOT be pulled in.
+                aged_handle_sized(&cf, 4, 2, b"x", b"z", 16, Some(now)),
+            ],
+        ]);
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("the age job is due");
+        assert_eq!(job.reason, CompactionReason::Periodic);
+        assert_eq!((job.level, job.target), (1, 2));
+        let mut ids: Vec<u64> = job.inputs.iter().map(|t| t.meta.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3], "only the overlapping target tables");
+        drop(guard);
     }
 
     #[test]
@@ -2082,8 +2585,8 @@ mod tests {
             ],
         ]);
 
-        let (job, _guard) =
-            build_job(&db.inner, &cf, 1).expect("the next-best candidate is usable");
+        let (job, _guard) = build_job(&db.inner, &cf, 1, CompactionReason::Capacity)
+            .expect("the next-best candidate is usable");
         assert_eq!((job.level, job.target), (1, 2));
         let ids: Vec<u64> = job.inputs.iter().map(|t| t.meta.id).collect();
         assert_eq!(ids, vec![101, 201], "picked the vetoed minimum, or gave up");
@@ -2116,7 +2619,8 @@ mod tests {
             Vec::new(),
         ]);
 
-        let (job, _guard) = build_job(&db.inner, &cf, 0).expect("L0 is compactable");
+        let (job, _guard) =
+            build_job(&db.inner, &cf, 0, CompactionReason::Capacity).expect("L0 is compactable");
         assert_eq!((job.level, job.target), (0, 1));
         let ids: Vec<u64> = job.inputs.iter().map(|t| t.meta.id).collect();
         assert_eq!(ids, vec![1, 2, 10, 11], "L0 input selection changed");
@@ -2138,7 +2642,7 @@ mod tests {
             ],
             vec![foreign_handle(&cf, 200, 2, b"a000", b"b099", 10, 0)],
         ]);
-        assert!(build_job(&db.inner, &cf, 1).is_none());
+        assert!(build_job(&db.inner, &cf, 1, CompactionReason::Capacity).is_none());
         assert!(
             cf.compact_cursor.lock().get(&1).is_none(),
             "the cursor advanced past a level that produced no job"
@@ -2157,7 +2661,8 @@ mod tests {
                 handle(&cf, 201, 2, b"b000", b"b099", 10, 0),
             ],
         ]);
-        let (job, _guard) = build_job(&db.inner, &cf, 1).expect("a usable candidate exists");
+        let (job, _guard) = build_job(&db.inner, &cf, 1, CompactionReason::Capacity)
+            .expect("a usable candidate exists");
         assert_eq!(job.inputs[0].meta.id, 101);
         assert_eq!(
             cf.compact_cursor.lock().get(&1).cloned(),
@@ -3438,7 +3943,7 @@ mod tests {
                 })
                 .collect();
 
-            match build_job(&db.inner, &cf, 1) {
+            match build_job(&db.inner, &cf, 1, CompactionReason::Capacity) {
                 None => assert!(usable.is_empty(), "seed {seed}: gave up on a usable level"),
                 Some((job, guard)) => {
                     let picked = job.inputs[0].meta.id;
