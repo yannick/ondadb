@@ -1,0 +1,6 @@
+A run1 ops=40000 threads=8 elapsed_ms=24190.9 ops_per_sec=1654 p50_ns=90500 p99_ns=26940500 p999_ns=56210917
+B run1 ops=40000 threads=8 elapsed_ms=54791.7 ops_per_sec=730 p50_ns=24542 p99_ns=82806041 p999_ns=154465958
+A run2 ops=40000 threads=8 elapsed_ms=18132.7 ops_per_sec=2206 p50_ns=26042 p99_ns=20090000 p999_ns=34384292
+B run2 ops=40000 threads=8 elapsed_ms=52368.0 ops_per_sec=764 p50_ns=18167 p99_ns=79996667 p999_ns=156999916
+A run3 ops=40000 threads=8 elapsed_ms=12614.5 ops_per_sec=3171 p50_ns=24208 p99_ns=18820791 p999_ns=29295000
+B run3 ops=40000 threads=8 elapsed_ms=66593.4 ops_per_sec=601 p50_ns=25125 p99_ns=90754667 p999_ns=218625500

@@ -1,12 +1,20 @@
-//! Merge operators (1.1) composed with range tombstones (1.2).
+//! Cross-feature composition: merge operators (1.1) against range tombstones
+//! (1.2) and prepared transactions (3.2).
 //!
-//! Nothing in either feature's own tests exercises the pair, and the pair has a
-//! rule of its own: **a range delete is, for one key, a deleted base at its
-//! sequence**. Operands above the span fold onto nothing; operands at or below
-//! it — and the base under them — are masked. The three read paths (point,
-//! batch and both scan directions) must all say the same thing, before and
-//! after a flush and a compaction, because each resolves the chain with
-//! different code.
+//! Each feature's own test file exercises it alone. These are the rules that
+//! only exist where two of them meet, and that no single feature's author was
+//! in a position to write:
+//!
+//!   * a range delete is, for one key, a **deleted base at its sequence** —
+//!     operands above the span fold onto nothing, operands at or below it and
+//!     the base under them are masked;
+//!   * a merge operand is a one-key write, so a **prepare frame carries it**
+//!     exactly as it carries a put; a range delete, with two keys and no value,
+//!     still cannot be prepared.
+//!
+//! The three read paths (point, batch and both scan directions) must agree on
+//! every one of them, before and after a flush and a compaction, because each
+//! resolves a chain with different code.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -225,5 +233,85 @@ fn a_fully_masked_chain_is_absent_from_the_scan() {
             _ => {}
         }
     }
+    db.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 1.1 composed with 3.2: a prepared transaction holding a merge operand
+// ---------------------------------------------------------------------------
+
+/// A merge operand is a one-key, one-value write, so a prepare frame carries it
+/// exactly as it carries a put. Nothing else in the tree covers this pair, and
+/// getting it wrong is not a wrong answer but an **unreadable WAL**: the writer
+/// would emit kind 4 inside a control frame that replay refuses as corruption.
+#[test]
+fn a_prepared_merge_operand_survives_a_crash_and_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let id = [7u8; 16];
+    {
+        let mut opts = Options::new(&path);
+        opts.unified_memtable = true;
+        opts.merge_fns = vec![Arc::new(Concat)];
+        let db = DB::open(opts).unwrap();
+        db.enable_format_capabilities(
+            ondadb::format::CAP_TXN_DECISIONS | CAP_RANGE_DELETES,
+        )
+        .unwrap();
+        let cf = db
+            .create_column_family(
+                "m",
+                ColumnFamilyConfig {
+                    merge_operator_name: Some(Concat.name().to_string()),
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        db.put(&cf, b"k", b"base", Duration::ZERO).unwrap();
+        let mut t = db.begin();
+        t.merge(&cf, b"k", b"prepared").unwrap();
+        t.prepare(&id).unwrap();
+        // Uncommitted: the operand must not be visible yet.
+        assert_eq!(db.get(&cf, b"k").unwrap(), b"base");
+        drop(db); // crash
+    }
+
+    let mut opts = Options::new(&path);
+    opts.unified_memtable = true;
+    opts.merge_fns = vec![Arc::new(Concat)];
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("m").unwrap();
+    assert_eq!(
+        db.list_prepared().len(),
+        1,
+        "the reservation must survive the crash"
+    );
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"base");
+    db.commit_prepared(&id).unwrap();
+    assert_eq!(
+        db.get(&cf, b"k").unwrap(),
+        b"base|prepared",
+        "the recovered operand must fold, not land as a plain put"
+    );
+    db.close().unwrap();
+}
+
+/// A range delete still cannot be prepared: two keys and no value have no shape
+/// in the frame, and the refusal is at the API rather than at replay.
+#[test]
+fn a_prepared_range_delete_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.unified_memtable = true;
+    let db = DB::open(opts).unwrap();
+    db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS | CAP_RANGE_DELETES)
+        .unwrap();
+    let cf = db
+        .create_column_family("d", ColumnFamilyConfig::default())
+        .unwrap();
+    let mut t = db.begin();
+    t.delete_range(&cf, b"a", b"z").unwrap();
+    let err = t.prepare(&[9u8; 16]).expect_err("a range cannot be prepared");
+    assert_eq!(err.kind(), "invalid_args", "{err}");
     db.close().unwrap();
 }

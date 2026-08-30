@@ -290,6 +290,25 @@ pub struct DbInner {
     /// only touched once `CAP_RANGE_DELETES` is active, so a database that
     /// never issues a range delete pays one relaxed capability load per commit.
     pub(crate) span_index: Arc<crate::span_index::SpanIndex>,
+    /// Reservation registry for durable prepared transactions (3.2).
+    ///
+    /// Taken **inside** `commit_mu` on every write path, and never while
+    /// `wal_gens` is held. Empty in every database with no prepared
+    /// transaction, which is why `prepared_live` exists beside it.
+    pub(crate) prepared: Mutex<crate::prepared::PreparedRegistry>,
+    /// Whether the registry reserves anything, as one relaxed word.
+    ///
+    /// Rule 5 puts the reservation check on *every* commit — including the
+    /// single-op `put`/`delete` path, which took no lock at all before 3.2. In
+    /// the steady state (no prepared transaction) that check must cost a load,
+    /// not a mutex acquisition. Written only under `commit_mu`, so a commit
+    /// that reads it under the same lock cannot observe a stale zero.
+    pub(crate) prepared_live: AtomicUsize,
+    /// WAL generation pins and the retirement sweep (3.2).
+    ///
+    /// A leaf lock: flush workers take it holding nothing, and no path holds it
+    /// while taking `prepared` or `commit_mu`.
+    pub(crate) wal_gens: Mutex<crate::prepared::WalGenState>,
 
     next_file_id: AtomicU64,
     pub(crate) closing: Arc<AtomicBool>,
@@ -720,6 +739,181 @@ impl DbInner {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    // ---- durable prepared transactions (3.2) -------------------------------
+
+    /// Whether any prepared transaction reserves anything.
+    ///
+    /// The reservation check every commit performs (phase rule 5) begins here,
+    /// and in the steady state — no prepared transaction anywhere — ends here
+    /// too: one relaxed load rather than a mutex acquisition on a path that
+    /// previously took no lock at all. Written only under `commit_mu`, which
+    /// every caller holds, so a commit cannot read a stale zero.
+    pub(crate) fn has_reservations(&self) -> bool {
+        self.prepared_live.load(Ordering::Relaxed) != 0
+    }
+
+    /// Republish the registry's live count. Called under `commit_mu`.
+    pub(crate) fn note_prepared_count(&self, reg: &crate::prepared::PreparedRegistry) {
+        self.prepared_live.store(reg.len(), Ordering::Relaxed);
+    }
+
+    /// Hand a flush's WAL paths to the pin registry instead of unlinking them
+    /// directly, then run the sweep (3.2).
+    ///
+    /// **Per path, not per immutable.** `imm.wal_paths` is a `Vec`, and the
+    /// first immutable after an open carries *every* replayed generation plus
+    /// the new one, so one immutable routinely bundles a pinned generation with
+    /// unpinned ones. A path whose name does not parse as a unified generation
+    /// is unlinked as before — nothing else can pin it.
+    pub(crate) fn retire_wal_paths(&self, paths: &[String]) {
+        let mut direct = Vec::new();
+        {
+            let mut g = self.wal_gens.lock();
+            for path in paths {
+                match crate::prepared::WalGenState::gen_of_path(path) {
+                    Some(gen) => g.mark_flushed(gen, path.clone()),
+                    None => direct.push(path.clone()),
+                }
+            }
+        }
+        for path in direct {
+            crate::wal::remove_wal_files(path);
+        }
+        self.sweep_wal_gens();
+    }
+
+    /// Unlink every WAL generation whose pins have cleared, in the order the
+    /// sweep returns — the prepare's generation strictly before its decision's.
+    ///
+    /// Runs after every flush, resolve and abort, so a generation withheld by a
+    /// flush is unlinked as soon as its pin clears rather than waiting for the
+    /// next flush to come round.
+    pub(crate) fn sweep_wal_gens(&self) {
+        let (unlink, retired) = self.wal_gens.lock().sweep();
+        // Unlink outside the lock: a flush worker must never wait on a `Drop`
+        // path's filesystem calls.
+        for path in unlink {
+            crate::wal::remove_wal_files(path);
+        }
+        if !retired.is_empty() {
+            let mut reg = self.prepared.lock();
+            for id in retired {
+                reg.forget(&id);
+            }
+        }
+    }
+
+    /// Pass 2 of prepared-state recovery: match every collected decision to its
+    /// prepare and resolve the pair (3.2).
+    ///
+    /// Order-free, because pass 1's input is: the unified WAL is four-striped
+    /// and a prepare and its decision routinely land in different stripe files
+    /// with no recoverable relative order.
+    pub(crate) fn resolve_recovered_prepares(
+        &self,
+        mut recovered: crate::prepared::RecoveredPrepares,
+    ) -> Result<()> {
+        // A decision naming an id no prepare frame carries is a no-op: the pair
+        // was already retired, which by the retirement ordering means its
+        // records are durable in L0. The watermark is still observed — it is a
+        // no-op below the recovered one, and the alternative is to trust that
+        // the manifest's `global_seq` covered a sequence block no surviving
+        // record mentions.
+        for d in &recovered.decisions {
+            if let Some((commit_seq, count)) = d.commit {
+                if count > 0 {
+                    self.observe_seq(commit_seq + count - 1);
+                }
+            }
+        }
+        let now = crate::util::now_nanos();
+        // The prepares move out; `recovered` keeps its decisions, which is what
+        // `decision_for` reads.
+        let prepares = std::mem::take(&mut recovered.prepares);
+        for p in prepares {
+            let decision = recovered.decision_for(&p.id);
+            match decision.map(|d| (d.commit, d.gen)) {
+                Some((Some((commit_seq, count)), decision_gen)) => {
+                    // Watermark BEFORE data: a decision whose records fail to
+                    // apply must still have reserved its sequences, or the next
+                    // ordinary commit reuses them (invariant 5).
+                    if count > 0 {
+                        self.observe_seq(commit_seq + count - 1);
+                    }
+                    self.apply_recovered_prepare(&p, commit_seq)?;
+                    // `record_pair`, not `resolved`: this prepare was never
+                    // registered and never pinned, so releasing a pin here
+                    // would take one another transaction holds on the same
+                    // generation — and that generation would then be unlinked
+                    // with a live prepare still in it.
+                    self.wal_gens.lock().record_pair(p.id, p.gen, decision_gen);
+                }
+                Some((None, decision_gen)) => {
+                    // Aborted before the crash: nothing to register and no gap
+                    // to close, since no sequence was ever reserved.
+                    self.wal_gens.lock().record_pair(p.id, p.gen, decision_gen);
+                }
+                None => {
+                    let entry = recovered_entry(&p, now);
+                    let mut reg = self.prepared.lock();
+                    reg.register_recovered(entry);
+                    if reg.over_capacity() {
+                        // The cap governs new prepares, never recovery. Say so
+                        // rather than refusing to open: `list_prepared` is how
+                        // the operator finds and resolves this.
+                        crate::util::log_warn(&format!(
+                            "recovered prepared transactions hold {} bytes, over \
+                             max_prepared_bytes ({}); new prepares will be refused \
+                             until these are resolved — see DB::list_prepared",
+                            reg.bytes(),
+                            self.opts.max_prepared_bytes
+                        ));
+                    }
+                    self.note_prepared_count(&reg);
+                    drop(reg);
+                    self.wal_gens.lock().pin(p.gen);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a recovered prepare's writeset at `commit_seq + slot`, through the
+    /// same memtable-only path `commit_prepared` uses.
+    fn apply_recovered_prepare(
+        &self,
+        p: &crate::prepared::RecoveredPrepare,
+        commit_seq: u64,
+    ) -> Result<()> {
+        let Some(unified) = &self.unified else {
+            return Ok(());
+        };
+        // Recovered keys are still cf-id prefixed, exactly as the frame carried
+        // them; `apply_memtable_only` re-prefixes, so strip once here.
+        let items: Vec<(u64, crate::wal::RecordRef<'_>)> = p
+            .records
+            .iter()
+            .filter(|r| r.key.len() >= 8)
+            .map(|r| {
+                let cf_id = u64::from_be_bytes(r.key[..8].try_into().unwrap());
+                (
+                    cf_id,
+                    crate::wal::RecordRef {
+                        key: &r.key[8..],
+                        value: &r.value,
+                        seq: 0,
+                        ttl: r.ttl,
+                        kind: r.kind,
+                    },
+                )
+            })
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        unified.apply_memtable_only(&items, commit_seq)
+    }
+
     pub(crate) fn observe_seq(&self, seq: u64) {
         if seq == 0 {
             return;
@@ -1081,7 +1275,14 @@ impl DbInner {
         // let a writer produce bytes the manifest does not authorize. Expanding
         // here keeps the caller's contract simple (`enable(CAP_RANGE_DELETES)`)
         // and the durability rule exact (both bits land in one manifest write).
-        let bits = if bits & crate::format::CAP_RANGE_DELETES != 0 {
+        // ...and 3.2's transaction control records for the same reason: kinds
+        // 16-18 exist only in the kind-bearing envelope, so authorizing them
+        // without authorizing the envelope would let a writer emit bytes the
+        // manifest does not describe.
+        let bits = if bits
+            & (crate::format::CAP_RANGE_DELETES | crate::format::CAP_TXN_DECISIONS)
+            != 0
+        {
             bits | crate::format::CAP_EXTENDED_RECORDS
         } else {
             bits
@@ -1495,7 +1696,7 @@ fn build_db_inner(
     let snapshot_bytes = std::fs::metadata(manifest_path(&dir))
         .map(|md| md.len())
         .unwrap_or(0);
-    let (unified, unified_max_seq) = open_unified_store(
+    let (unified, unified_max_seq, recovered_prepares) = open_unified_store(
         opts,
         &dir,
         &flush_tx,
@@ -1557,6 +1758,11 @@ fn build_db_inner(
         snapshots: Mutex::new(BTreeMap::new()),
         commit_mu: Mutex::new(()),
         span_index: span_index.clone(),
+        prepared: Mutex::new(crate::prepared::PreparedRegistry::new(
+            opts.max_prepared_bytes,
+        )),
+        prepared_live: AtomicUsize::new(0),
+        wal_gens: Mutex::new(crate::prepared::WalGenState::default()),
         next_file_id: AtomicU64::new(manifest.next_file_id.max(1)),
         closing,
         stop,
@@ -1596,6 +1802,11 @@ fn build_db_inner(
         parts_in_flight: AtomicU64::new(0),
     });
     inner.observe_seq(unified_max_seq);
+    // Pass 2 of prepared-state recovery (3.2), here because this is the first
+    // point at which `DbInner` exists — so `observe_seq` and the unified
+    // memtable are both callable — and still before any worker is spawned or
+    // `DB::open` returns. It invokes no application code.
+    inner.resolve_recovered_prepares(recovered_prepares)?;
     Ok((
         inner,
         WorkerReceivers {
@@ -1603,6 +1814,146 @@ fn build_db_inner(
             compact: compact_rx,
         },
     ))
+}
+
+/// Steps 3 and 4 of `commit_prepared`: the durable decision, then the
+/// memtable-only apply. Returns the outcome and the generation the decision
+/// landed in.
+///
+/// Split out so the caller reads like `Txn::commit` does — compute the result
+/// into a local, publish the reserved range unconditionally, *then* return the
+/// error. Every early return in here is a return the caller must still publish
+/// behind, which is exactly why they are not returns in the caller.
+fn commit_prepared_durably(
+    unified: &Arc<crate::unified::UnifiedStore>,
+    entry: &crate::prepared::PreparedEntry,
+    id: &[u8; 16],
+    start: u64,
+    n: u64,
+) -> (Result<()>, u64) {
+    // The handle and its generation in one acquisition, per phase rule 2: a
+    // frame written just before a rotation cannot be synced through the store's
+    // `sync_wal`, which re-clones the *current* WAL.
+    let (wal, decision_gen) = unified.wal_handle();
+    let Some(wal) = wal else {
+        return (Err(OndaError::InvalidDb("unified wal closed".into())), 0);
+    };
+    let durable = wal
+        .append_decision(
+            crate::wal::ENVELOPE_SCHEMA_UNIFIED,
+            id,
+            Some((start, n)),
+        )
+        .and_then(|()| wal.sync());
+    if let Err(error) = durable {
+        return (Err(error), decision_gen);
+    }
+    if n == 0 {
+        return (Ok(()), decision_gen);
+    }
+    let items: Vec<(u64, crate::wal::RecordRef<'_>)> = entry
+        .records()
+        .map(|(cf_id, key, value, w)| {
+            (
+                cf_id,
+                crate::wal::RecordRef {
+                    key,
+                    value,
+                    seq: 0, // assigned by `apply_memtable_only` as `start + slot`
+                    ttl: w.ttl,
+                    kind: w.kind,
+                },
+            )
+        })
+        .collect();
+    // NOT `UnifiedStore::apply`: that writes the WAL as well, and a second full
+    // copy of the writeset would leave recovery reconciling a decision against
+    // an ordinary frame. The decision above is this batch's durable record.
+    (unified.apply_memtable_only(&items, start), decision_gen)
+}
+
+/// Deliver commit hooks for a prepared commit, rebuilding the `CommitOp` values
+/// from the registry's records for the column families that installed one.
+fn run_prepared_hooks(
+    db: &Arc<DbInner>,
+    entry: &crate::prepared::PreparedEntry,
+    commit_seq: u64,
+) {
+    let mut groups: HashMap<u64, (Arc<ColumnFamily>, Vec<crate::column_family::CommitOp>)> =
+        HashMap::new();
+    for (cf_id, key, value, w) in entry.records() {
+        let slot = match groups.entry(cf_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let Some(cf) = db.cf_by_id.read().get(&cf_id).cloned() else {
+                    continue; // the family was dropped; nothing to notify
+                };
+                if !cf.has_commit_hook() {
+                    continue;
+                }
+                e.insert((cf, Vec::new()))
+            }
+        };
+        slot.1.push(crate::column_family::CommitOp {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            tombstone: w.kind == crate::format::KIND_DELETE
+                || w.kind == crate::format::KIND_SINGLE_DELETE,
+            ttl: w.ttl,
+        });
+    }
+    for (cf, ops) in groups.values() {
+        cf.run_commit_hook(commit_seq, ops);
+    }
+}
+
+/// Rebuild a registry entry from a recovered prepare frame.
+///
+/// The arena is rebuilt with the cf-id prefix **stripped**, so a recovered
+/// entry and a live one have exactly the same shape and every downstream path
+/// — resolve, apply, `list_prepared`, the reservation check — sees one type.
+fn recovered_entry(
+    p: &crate::prepared::RecoveredPrepare,
+    now: i64,
+) -> crate::prepared::PreparedEntry {
+    let mut buf = Vec::new();
+    let mut writes = Vec::with_capacity(p.records.len());
+    for r in &p.records {
+        if r.key.len() < 8 {
+            continue; // a schema-2 key always carries the 8-byte cf id
+        }
+        let cf_id = u64::from_be_bytes(r.key[..8].try_into().unwrap());
+        let koff = buf.len();
+        buf.extend_from_slice(&r.key[8..]);
+        let voff = buf.len();
+        buf.extend_from_slice(&r.value);
+        writes.push(crate::prepared::PreparedWrite {
+            cf_id,
+            key: (koff, r.key.len() - 8),
+            value: (voff, r.value.len()),
+            ttl: r.ttl,
+            kind: r.kind,
+        });
+    }
+    crate::prepared::PreparedEntry {
+        id: p.id,
+        cf_ids: p.cf_ids.clone(),
+        bytes: prepared_bytes(buf.len(), writes.len()),
+        buf,
+        writes,
+        // The prepare's own timestamp is not durable, so a recovered prepare's
+        // age restarts at the open. Stating it here is the honest option:
+        // inventing a persisted clock would make `age` look authoritative
+        // across restarts when it cannot be.
+        prepared_at: now,
+        prepare_gen: p.gen,
+    }
+}
+
+/// Bytes one prepare charges against `max_prepared_bytes`: its arena plus
+/// per-write bookkeeping.
+pub(crate) fn prepared_bytes(arena: usize, writes: usize) -> usize {
+    arena + writes * std::mem::size_of::<crate::prepared::PreparedWrite>()
 }
 
 fn open_unified_store(
@@ -1613,11 +1964,15 @@ fn open_unified_store(
     closing: &Arc<AtomicBool>,
     poison: &Arc<crate::util::Poison>,
     wal_syncs: &Arc<AtomicU64>,
-) -> Result<(Option<Arc<crate::unified::UnifiedStore>>, u64)> {
+) -> Result<(
+    Option<Arc<crate::unified::UnifiedStore>>,
+    u64,
+    crate::prepared::RecoveredPrepares,
+)> {
     if !opts.unified_memtable {
-        return Ok((None, 0));
+        return Ok((None, 0, crate::prepared::RecoveredPrepares::default()));
     }
-    let (store, max_seq) = crate::unified::UnifiedStore::open(
+    let (store, max_seq, recovered) = crate::unified::UnifiedStore::open(
         dir,
         opts,
         flush_tx.clone(),
@@ -1626,7 +1981,7 @@ fn open_unified_store(
         poison.clone(),
         wal_syncs.clone(),
     )?;
-    Ok((Some(store), max_seq))
+    Ok((Some(store), max_seq, recovered))
 }
 
 fn recover_column_families(
@@ -2096,6 +2451,15 @@ impl DB {
             .get(name)
             .cloned()
             .ok_or(OndaError::NotFound)?;
+        // A prepared transaction naming THIS family blocks the drop; one naming
+        // another does not. In unified mode the WAL is database-wide, so a
+        // prepare on CF `a` must not stop an operator dropping CF `b`.
+        if self.inner.prepared.lock().touches_cf(cf.id()) {
+            return Err(OndaError::Busy(format!(
+                "column family {name:?} is named by an unresolved prepared transaction; \
+                 resolve it with commit_prepared or abort_prepared (see list_prepared)"
+            )));
+        }
         // The `DropCF` edit is durable BEFORE any file is unlinked. Before 2.2
         // the directory went first, so a crash in that window left a manifest
         // naming a directory that no longer existed; this is the same shape as
@@ -2306,8 +2670,357 @@ impl DB {
         self.inner.poison.reason()
     }
 
+    // ---- durable prepared transactions (3.2) -------------------------------
+
+    /// Commit a prepared transaction by id — the second phase of two-phase
+    /// commit.
+    ///
+    /// Runs the transaction the coordinator prepared: reserves its sequence
+    /// block, makes the **decision** durable, applies the writeset to the
+    /// memtable, publishes, and releases the reservation. It cannot return
+    /// [`Conflict`](OndaError::Conflict): every conflict was decided at
+    /// [`Txn::prepare`], and the reservation has held the keys since. Only
+    /// durability can fail here.
+    ///
+    /// The decision frame is written and fsynced **before** the apply, on the
+    /// WAL handle it was appended to. Recovery must never find applied data
+    /// without a durable decision naming the sequences it was applied at.
+    ///
+    /// Idempotent for a coordinator retry: a second call for an id this
+    /// database has already resolved returns `Ok` and applies nothing. An id it
+    /// has never seen — or one whose resolved pair has since been fully retired
+    /// — is [`NotFound`](OndaError::NotFound).
+    ///
+    /// Normally called from a different thread than the `prepare`. The
+    /// read-your-own-writes floor is recorded on **this** thread, so the
+    /// preparing thread does not see its own prepared write through the read
+    /// floor until the ordinary watermark catches up.
+    pub fn commit_prepared(&self, id: &[u8; 16]) -> Result<()> {
+        let db = &self.inner;
+        db.poison.check()?;
+        if db.opts.read_only {
+            return Err(OndaError::ReadOnly(
+                "cannot commit a prepared transaction on a read-only database".into(),
+            ));
+        }
+        let Some(unified) = db.unified.clone() else {
+            return Err(OndaError::InvalidArgs(
+                "prepared transactions require unified_memtable=true for atomic commit".into(),
+            ));
+        };
+
+        let guard = db.commit_mu.lock();
+        // The registry lock is held across the decision fsync, deliberately. A
+        // resolve-then-write order would leave a failed decision with the
+        // reservation already gone — a same-process retry would then find the
+        // id "retiring" and answer `Ok` for a transaction that never committed.
+        // The entry therefore stays registered until the decision is durable.
+        // `list_prepared` blocks for the fsync's duration; every *commit*
+        // already does, because `commit_mu` is held.
+        let mut reg = db.prepared.lock();
+        let Some(entry) = reg.get(id) else {
+            let retry = reg.is_retiring(id);
+            drop(reg);
+            drop(guard);
+            return if retry { Ok(()) } else { Err(OndaError::NotFound) };
+        };
+        let n = entry.writes.len() as u64;
+        // A prepare with no writes reserves nothing, exactly as an empty
+        // ordinary commit does: `publish_range(start, start)` would insert an
+        // empty range and freeze the gap-free cursor (invariant 5) rather than
+        // advance it.
+        let start = if n > 0 { db.reserve_seq(n) } else { 0 };
+        let (result, decision_gen) = commit_prepared_durably(&unified, entry, id, start, n);
+        if n > 0 {
+            // UNCONDITIONAL, on every exit path after `reserve_seq` — decision
+            // write failure, fsync failure, apply failure, poison. Skipping it
+            // would freeze `visible_seq` permanently: the gap-free cursor never
+            // advances past an unpublished range, hiding every later commit,
+            // persisting a stale `global_seq`, and reusing sequences after a
+            // reopen. Publishing a failed range is safe — its records reached
+            // neither the WAL nor the memtable.
+            db.publish_range(start, start + n);
+            db.note_thread_commit(start + n - 1);
+        }
+        if let Err(error) = result {
+            // The reservation survives: the coordinator may retry, and the
+            // sequences published above are simply empty of data.
+            drop(reg);
+            drop(guard);
+            return Err(error);
+        }
+        // A prepared commit installs point writes but records no span markers:
+        // the marker set is reserved and inserted by `Txn::commit`, and a
+        // prepare has no reservation to hand forward across an unbounded wait.
+        // So the window it opened is not describable, and every range writer
+        // reading at or below `commit_seq` must conflict — the same
+        // conservative fallback a point commit takes when the index is full.
+        // Inert unless `CAP_RANGE_DELETES` is enabled.
+        if n > 0 {
+            if let Some(index) = db.span_index() {
+                index.note_overflow(start + n - 1);
+            }
+        }
+        let entry = reg.resolve(id).expect("borrowed above");
+        db.note_prepared_count(&reg);
+        drop(reg);
+        db.wal_gens
+            .lock()
+            .resolved(*id, entry.prepare_gen, decision_gen);
+        drop(guard);
+
+        // Hooks run outside `commit_mu`, matching `Txn::commit`. Dropping hook
+        // delivery for prepared commits would be a silent regression, so the
+        // ops are rebuilt from the registry's records.
+        if n > 0 {
+            run_prepared_hooks(db, &entry, start + n - 1);
+        }
+        // A resolve is the moment a pin can clear, so sweep here as well as
+        // after a flush: otherwise a withheld generation would wait for the
+        // next flush to come round.
+        db.sweep_wal_gens();
+        Ok(())
+    }
+
+    /// Abort a prepared transaction by id, releasing its reservation.
+    ///
+    /// Writes and fsyncs a durable abort decision first, so a crash cannot
+    /// resurrect the prepare. **No sequence is reserved and none is
+    /// published** — the prepare never reserved one, so there is no gap to
+    /// close.
+    ///
+    /// On a poisoned database this returns [`Poisoned`](OndaError::Poisoned)
+    /// and the prepare stays on disk, resolvable after a reopen: an abort has
+    /// to write a durable record, and a fail-stopped database cannot. Losing
+    /// the prepare instead would discard state a coordinator is still tracking.
+    ///
+    /// Idempotent for a retry, and [`NotFound`](OndaError::NotFound) for an
+    /// unknown id, exactly as [`commit_prepared`](Self::commit_prepared).
+    pub fn abort_prepared(&self, id: &[u8; 16]) -> Result<()> {
+        let db = &self.inner;
+        db.poison.check()?;
+        if db.opts.read_only {
+            return Err(OndaError::ReadOnly(
+                "cannot abort a prepared transaction on a read-only database".into(),
+            ));
+        }
+        let Some(unified) = db.unified.clone() else {
+            return Err(OndaError::InvalidArgs(
+                "prepared transactions require unified_memtable=true for atomic commit".into(),
+            ));
+        };
+        let guard = db.commit_mu.lock();
+        let mut reg = db.prepared.lock();
+        if reg.get(id).is_none() {
+            let retry = reg.is_retiring(id);
+            drop(reg);
+            drop(guard);
+            return if retry { Ok(()) } else { Err(OndaError::NotFound) };
+        }
+        let (wal, decision_gen) = unified.wal_handle();
+        let Some(wal) = wal else {
+            drop(reg);
+            drop(guard);
+            return Err(OndaError::InvalidDb("unified wal closed".into()));
+        };
+        // Durable BEFORE the registration goes: an abort the WAL does not know
+        // about would come back as an unresolved prepare on the next open.
+        let durable = wal
+            .append_decision(crate::wal::ENVELOPE_SCHEMA_UNIFIED, id, None)
+            .and_then(|()| wal.sync());
+        if let Err(error) = durable {
+            drop(reg);
+            drop(guard);
+            return Err(error);
+        }
+        let entry = reg.resolve(id).expect("checked present above");
+        db.note_prepared_count(&reg);
+        drop(reg);
+        db.wal_gens
+            .lock()
+            .resolved(*id, entry.prepare_gen, decision_gen);
+        drop(guard);
+        // The entry's arena and writes are dropped here, freeing the byte
+        // budget. It is never recycled into `txn::BUF_POOL`: the aborting
+        // thread is usually not the preparing one.
+        drop(entry);
+        db.sweep_wal_gens();
+        Ok(())
+    }
+
+    /// Every prepared transaction this database has not resolved.
+    ///
+    /// The operator's whole view of abandoned prepared state: id, age, bytes
+    /// held, and the column families involved. **Nothing is ever aborted
+    /// automatically** — not on a timeout, not at close, not at open — so an
+    /// entry here persists until a coordinator (or a human running
+    /// [`abort_prepared`](Self::abort_prepared)) decides.
+    ///
+    /// Works on a read-only handle and on a poisoned one, where it reports what
+    /// recovery found. Sorted by id, so two calls that observe the same state
+    /// print the same list.
+    ///
+    /// Note that a checkpoint or backup contains **no** prepared state (see
+    /// [`checkpoint`](Self::checkpoint)), so this is empty on a database opened
+    /// from one.
+    pub fn list_prepared(&self) -> Vec<crate::prepared::PreparedInfo> {
+        self.inner
+            .prepared
+            .lock()
+            .list(crate::util::now_nanos())
+    }
+
+    /// The highest fully-published (visible) sequence.
+    ///
+    /// A test lever — hence `doc(hidden)`. The gap-free publication contract
+    /// (invariant 5) is a claim about this number, and several 3.2 tests assert
+    /// that a prepare moves it by zero and that a *failed* prepared commit
+    /// still moves it by its reserved block.
+    #[doc(hidden)]
+    pub fn visible_seq_for_tests(&self) -> u64 {
+        self.inner.visible_seq()
+    }
+
+    /// Trip the fail-stop flag, as a durability failure would.
+    ///
+    /// A test lever. Production code reaches this only through
+    /// `DbInner::fail_stop`, on a real failure.
+    #[doc(hidden)]
+    pub fn fail_stop_for_tests(&self, why: &str) {
+        self.inner.poison.set(why.to_string());
+    }
+
+    /// Close the unified WAL's files underneath the store, so the next append
+    /// fails with [`InvalidDb`](OndaError::InvalidDb).
+    ///
+    /// A test lever for the "decision write or fsync fails (no crash)" row of
+    /// the 3.2 crash matrix: it is the one durability failure that has to be
+    /// injected rather than arranged, and the reserved-range publication is
+    /// only observable through it. Pair with
+    /// [`rotate_unified_for_tests`](Self::rotate_unified_for_tests) to get a
+    /// working WAL back.
+    #[doc(hidden)]
+    pub fn close_unified_wal_for_tests(&self) {
+        if let Some(u) = &self.inner.unified {
+            u.close_wal_for_tests();
+        }
+    }
+
+    /// Seal the unified memtable and open a fresh WAL generation.
+    ///
+    /// A test lever; the same rotation a full memtable performs.
+    #[doc(hidden)]
+    pub fn rotate_unified_for_tests(&self) {
+        if let Some(u) = &self.inner.unified {
+            u.rotate(true);
+        }
+    }
+
+    /// Flushes enqueued but not yet completed. A test lever, so a test can wait
+    /// for a rotation's flush rather than sleep for it.
+    #[doc(hidden)]
+    pub fn pending_flushes_for_tests(&self) -> usize {
+        self.inner.pending_flush.load(Ordering::SeqCst)
+    }
+
+    /// Run [`commit_prepared`](Self::commit_prepared) up to and including the
+    /// decision fsync, then stop — the memtable is never touched and the
+    /// registration is left in place.
+    ///
+    /// A test lever for the "crash after decision fsync, before apply" row of
+    /// the 3.2 crash matrix. That window is a single unbroken sequence in
+    /// production, so it can only be entered deliberately.
+    #[doc(hidden)]
+    pub fn commit_prepared_stop_after_decision_for_tests(&self, id: &[u8; 16]) -> Result<()> {
+        let db = &self.inner;
+        db.poison.check()?;
+        let unified = db
+            .unified
+            .clone()
+            .ok_or_else(|| OndaError::InvalidArgs("unified layout only".into()))?;
+        let guard = db.commit_mu.lock();
+        let reg = db.prepared.lock();
+        let entry = reg.get(id).ok_or(OndaError::NotFound)?;
+        let n = entry.writes.len() as u64;
+        let start = if n > 0 { db.reserve_seq(n) } else { 0 };
+        let (wal, _gen) = unified.wal_handle();
+        let wal = wal.ok_or_else(|| OndaError::InvalidDb("unified wal closed".into()))?;
+        let durable = wal
+            .append_decision(
+                crate::wal::ENVELOPE_SCHEMA_UNIFIED,
+                id,
+                Some((start, n)),
+            )
+            .and_then(|()| wal.sync());
+        drop(reg);
+        if n > 0 {
+            db.publish_range(start, start + n);
+        }
+        drop(guard);
+        durable
+    }
+
+    /// Append and fsync an **abort** decision for an arbitrary id, resolving
+    /// nothing.
+    ///
+    /// A test lever for the "decision without prepare" recovery row: that state
+    /// arises from a crash between unlinking the prepare's generation and
+    /// unlinking the decision's, which no API can otherwise produce.
+    #[doc(hidden)]
+    pub fn append_abort_decision_for_tests(&self, id: &[u8; 16]) -> Result<()> {
+        let unified = self
+            .inner
+            .unified
+            .clone()
+            .ok_or_else(|| OndaError::InvalidArgs("unified layout only".into()))?;
+        let (wal, _gen) = unified.wal_handle();
+        let wal = wal.ok_or_else(|| OndaError::InvalidDb("unified wal closed".into()))?;
+        wal.append_decision(crate::wal::ENVELOPE_SCHEMA_UNIFIED, id, None)?;
+        wal.sync()
+    }
+
+    /// Number of unified WAL generations whose files a prepared-transaction pin
+    /// is currently withholding from deletion (3.2).
+    ///
+    /// A test and diagnostic lever — hence `doc(hidden)`. The acceptance
+    /// criterion "WAL pins provably released" is this returning zero, together
+    /// with no `unified-wal-*.log` surviving a resolve-then-flush cycle.
+    #[doc(hidden)]
+    pub fn withheld_wal_generations(&self) -> usize {
+        self.inner.wal_gens.lock().withheld()
+    }
+
+    /// Whether unified WAL generation `gen`'s files are currently withheld by a
+    /// pin (3.2). A test lever, like
+    /// [`withheld_wal_generations`](Self::withheld_wal_generations).
+    #[doc(hidden)]
+    pub fn wal_generation_is_withheld(&self, gen: u64) -> bool {
+        self.inner.wal_gens.lock().is_withheld(gen)
+    }
+
     /// Close the database: flush all memtables, stop workers, fsync, persist.
+    ///
+    /// Refuses with [`Busy`](OndaError::Busy) while any prepared transaction is
+    /// unresolved, **before** anything is closed, so the handle stays fully
+    /// usable and the caller can resolve them (or list them with
+    /// [`list_prepared`](Self::list_prepared)) and close again. Dropping the
+    /// last handle closes anyway — `Drop` cannot return an error — leaving the
+    /// pinned WAL files on disk for the next open to recover.
     pub fn close(&self) -> Result<()> {
+        let unresolved = self.inner.prepared.lock().len();
+        if unresolved > 0 {
+            return Err(OndaError::Busy(format!(
+                "{unresolved} unresolved prepared transaction(s); resolve them with \
+                 commit_prepared or abort_prepared, or drop the handle to leave them \
+                 on disk for the next open (see list_prepared)"
+            )));
+        }
+        self.close_inner()
+    }
+
+    /// [`close`](Self::close) without the prepared-state refusal — the path
+    /// `Drop` takes, which has no way to report one.
+    fn close_inner(&self) -> Result<()> {
         if self.inner.closing.swap(true, Ordering::SeqCst) {
             return Ok(()); // already closing
         }
@@ -2511,7 +3224,21 @@ impl Drop for DB {
         // exited. Reopening a directory in the same process (restore, fork,
         // restart, or any test doing so) then failed with `Locked`.
         if self.inner.handles.fetch_sub(1, Ordering::SeqCst) == 1 {
-            let _ = self.close();
+            // `close_inner`, not `close`: `Drop` cannot return an error, so an
+            // unresolved prepare must not be able to abandon the shutdown. The
+            // WAL files its pins withhold are simply left on disk — workers
+            // still stop, the manifest is still persisted, and the directory
+            // lock is still released, which `tests/lock_release_on_drop.rs`
+            // depends on. The next open recovers the prepared state.
+            let unresolved = self.inner.prepared.lock().len();
+            if unresolved > 0 {
+                crate::util::log_warn(&format!(
+                    "closing with {unresolved} unresolved prepared transaction(s); \
+                     their WAL generations are left on disk and recovered on the \
+                     next open"
+                ));
+            }
+            let _ = self.close_inner();
         }
     }
 }
@@ -2674,9 +3401,12 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
             })
             .is_ok()
         {
-            for path in &imm.wal_paths {
-                crate::wal::remove_wal_files(path);
-            }
+            // Not a bare `remove_wal_files`: a generation holding an unresolved
+            // prepare, or a decision whose prepare is not yet unlinked, must be
+            // withheld (3.2). `imm.wal_paths` is a list — the first immutable
+            // after an open carries every replayed generation plus the new one
+            // — so the decision is per path, not per immutable.
+            db.retire_wal_paths(&imm.wal_paths);
         }
         for cf in &published {
             schedule_compaction_after_flush(db, cf);

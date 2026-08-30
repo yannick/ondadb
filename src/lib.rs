@@ -61,6 +61,7 @@ pub mod memtable;
 pub mod memtable_arena;
 pub mod parts;
 pub mod perf;
+pub mod prepared;
 pub(crate) mod range_lock;
 pub mod range_tombstone;
 pub(crate) mod span_index;
@@ -94,8 +95,9 @@ pub use parts::{
     PartitionInfo,
 };
 pub use perf::PerfContext;
+pub use prepared::PreparedInfo;
 pub use storage::{LocalStorage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;
 pub use tailing::TailingIterator;
-pub use txn::Txn;
+pub use txn::{PreparedTxn, Txn};

@@ -199,8 +199,17 @@ fn wal_path(dir: &str, gen: u64) -> String {
 }
 
 impl UnifiedStore {
-    /// Open (and replay) the unified store. Returns the store and the highest
-    /// sequence seen during replay.
+    /// Open (and replay) the unified store. Returns the store, the highest
+    /// sequence seen during replay, and everything **pass 1** of prepared-state
+    /// recovery collected (3.2).
+    ///
+    /// Pass 1 only collects: it inserts no prepared record into the memtable and
+    /// raises no watermark. The unified WAL is four-striped in every mode but
+    /// `SyncMode::Full` and `prepare`/`commit_prepared` are separate API calls
+    /// that commonly run on different threads, so a prepare and its decision
+    /// have no recoverable relative order — matching them is
+    /// `DbInner::resolve_recovered_prepares`'s job, once `DbInner` exists and
+    /// `observe_seq` is callable.
     pub(crate) fn open(
         dir: &str,
         opts: &Options,
@@ -209,9 +218,10 @@ impl UnifiedStore {
         closing: Arc<AtomicBool>,
         poison: Arc<crate::util::Poison>,
         wal_syncs: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Result<(Arc<UnifiedStore>, u64)> {
+    ) -> Result<(Arc<UnifiedStore>, u64, crate::prepared::RecoveredPrepares)> {
         let mem = Memtable::new(default_comparator());
         let mut max_seq = 0;
+        let mut recovered = crate::prepared::RecoveredPrepares::default();
         let mut gens = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -242,6 +252,27 @@ impl UnifiedStore {
                     // nothing is stripped here.
                     crate::wal::ReplayRecord::RangeDelete { start, end, seq } => {
                         mem.add_range(&start, &end, seq);
+                    }
+                    // Pass 1. NOTHING is inserted into the memtable here: a
+                    // prepared writeset is uncommitted and may yet be aborted.
+                    crate::wal::ReplayRecord::Prepare {
+                        id,
+                        cf_ids,
+                        records,
+                    } => {
+                        recovered.add_prepare(crate::prepared::RecoveredPrepare {
+                            id,
+                            cf_ids,
+                            records,
+                            gen: *g,
+                        })?;
+                    }
+                    crate::wal::ReplayRecord::Decision { id, commit } => {
+                        recovered.add_decision(crate::prepared::RecoveredDecision {
+                            id,
+                            commit,
+                            gen: *g,
+                        });
                     }
                 }
                 Ok(())
@@ -295,7 +326,21 @@ impl UnifiedStore {
             poison,
             wal_syncs,
         });
-        Ok((store, max_seq))
+        Ok((store, max_seq, recovered))
+    }
+
+    /// The current WAL handle **and** the generation it belongs to, read in one
+    /// acquisition.
+    ///
+    /// Both halves must come from the same `state.read()`: rotation replaces the
+    /// handle and bumps the generation together, so reading them separately can
+    /// name a generation the frame did not land in — and the pin bookkeeping
+    /// would then withhold the wrong file. The handle is returned so the caller
+    /// can `sync()` **it** rather than whatever `sync_wal` would re-clone; a
+    /// frame written just before a rotation cannot be synced through the store.
+    pub(crate) fn wal_handle(&self) -> (Option<Arc<Wal>>, u64) {
+        let s = self.state.read();
+        (s.wal.clone(), s.wal_gen)
     }
 
     /// Apply a committed batch (records carry their CF id) to the WAL + memtable.
@@ -413,6 +458,81 @@ impl UnifiedStore {
             self.cond.notify_all();
         }
         res?;
+        if mem.approx_size() >= self.write_buffer_size as i64 {
+            self.rotate(false);
+        }
+        Ok(())
+    }
+
+    /// Apply an already-durable batch to the **memtable only**, at sequences
+    /// `start + slot` (3.2).
+    ///
+    /// The one apply path a prepared commit uses — both `DB::commit_prepared`
+    /// and recovery pass 2 go through here, so there is one code path and one
+    /// set of tests. It is not [`apply_with_ranges`](Self::apply_with_ranges)
+    /// with the WAL switched off: that method writes the WAL *and* the
+    /// memtable, and replaying a prepared writeset through it would append a
+    /// second full copy of the writeset, which recovery would then have to
+    /// reconcile against the decision that already describes it. The durable
+    /// record here is the decision frame the caller has already fsynced.
+    ///
+    /// The rotation gate and `active_writers` bookkeeping are the same as the
+    /// ordinary apply's, because invariant 9 is the same: a rotation may not
+    /// swap the memtable out from under a writer mid-batch.
+    ///
+    /// The `seq` field of each [`wal::RecordRef`] is ignored — a prepared
+    /// record carries the `0` sentinel on disk, and its real sequence is the
+    /// one the decision names.
+    pub(crate) fn apply_memtable_only(
+        self: &Arc<Self>,
+        items: &[(u64, wal::RecordRef<'_>)],
+        start: u64,
+    ) -> Result<()> {
+        {
+            let mut g = self.rot.lock();
+            loop {
+                let stalled = g.rotating
+                    || (self.state.read().imm.len() >= self.stall_threshold
+                        && !self.closing.load(Ordering::Relaxed));
+                if stalled {
+                    self.cond.wait(&mut g);
+                } else {
+                    break;
+                }
+            }
+            g.active_writers += 1;
+        }
+        let mem = self.state.read().mem.clone();
+        // No fallible step here — unlike `apply_with_ranges`, which wraps its
+        // body in a closure so a WAL append failure still reaches the
+        // `active_writers` decrement below. The memtable insert cannot fail, so
+        // the body runs straight through.
+        {
+            let total: usize = items.iter().map(|(_, r)| 8 + r.key.len()).sum();
+            let mut scratch = Vec::with_capacity(total);
+            let mut ends = Vec::with_capacity(items.len());
+            for (id, r) in items {
+                scratch.extend_from_slice(&id.to_be_bytes());
+                scratch.extend_from_slice(r.key);
+                ends.push(scratch.len());
+            }
+            let mut at = 0usize;
+            let mut recs = Vec::with_capacity(items.len());
+            for (slot, ((_, r), &end)) in items.iter().zip(&ends).enumerate() {
+                recs.push(wal::RecordRef {
+                    key: &scratch[at..end],
+                    seq: start + slot as u64,
+                    ..*r
+                });
+                at = end;
+            }
+            mem.put_batch(&recs);
+        }
+        {
+            let mut g = self.rot.lock();
+            g.active_writers -= 1;
+            self.cond.notify_all();
+        }
         if mem.approx_size() >= self.write_buffer_size as i64 {
             self.rotate(false);
         }
@@ -662,6 +782,15 @@ impl UnifiedStore {
         }
     }
 
+    /// Close the active WAL's files while leaving the handle in place, so the
+    /// next append fails with `InvalidDb` rather than being routed to a fresh
+    /// WAL. Test lever; see `DB::close_unified_wal_for_tests`.
+    pub(crate) fn close_wal_for_tests(&self) {
+        if let Some(w) = self.state.read().wal.as_ref() {
+            let _ = w.close();
+        }
+    }
+
     /// Close the active WAL (called on database close, after the queue drains).
     pub(crate) fn close(&self) {
         let mut s = self.state.write();
@@ -768,7 +897,7 @@ mod tests {
             ..Options::new(dir.path().to_str().unwrap())
         };
         let (flush_tx, _flush_rx) = unbounded();
-        let (store, max_seq) = UnifiedStore::open(
+        let (store, max_seq, _) = UnifiedStore::open(
             dir.path().to_str().unwrap(),
             &opts,
             flush_tx,
@@ -791,6 +920,126 @@ mod tests {
         assert!(!store.get(cf_id("other"), b"hello", u64::MAX, 0).found);
     }
 
+    /// Build a store with a large write buffer, so nothing rotates by accident.
+    fn test_store(dir: &tempfile::TempDir) -> Arc<UnifiedStore> {
+        let opts = Options {
+            unified_memtable: true,
+            ..Options::new(dir.path().to_str().unwrap())
+        };
+        let (flush_tx, flush_rx) = unbounded();
+        // The receiver outlives the store, so a rotation's send cannot fail
+        // silently and skew a test that is about the WAL rather than the flush.
+        std::mem::forget(flush_rx);
+        let (store, _, _) = UnifiedStore::open(
+            dir.path().to_str().unwrap(),
+            &opts,
+            flush_tx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::util::Poison::new()),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        store
+    }
+
+    fn wal_len(dir: &tempfile::TempDir, gen: u64) -> u64 {
+        let base = wal_path(dir.path().to_str().unwrap(), gen);
+        (0..8)
+            .map(|k| {
+                let p = if k == 0 {
+                    base.clone()
+                } else {
+                    format!("{base}.s{k}")
+                };
+                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// The whole reason `apply_memtable_only` exists: it must NOT append to the
+    /// WAL. Replaying a prepared writeset through the ordinary apply would put a
+    /// second full copy of it in the log, which recovery would then have to
+    /// reconcile against the decision that already describes it.
+    #[test]
+    fn apply_memtable_only_writes_no_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        // An ordinary apply first, so the file is non-empty and a later append
+        // would be visible as growth rather than as creation.
+        store
+            .apply_with_ranges(&[(7, record(b"committed", 1))], &[])
+            .unwrap();
+        let before = wal_len(&dir, 0);
+        assert!(before > 0, "the ordinary apply wrote to the WAL");
+
+        store
+            .apply_memtable_only(&[(7, record(b"prepared", 0))], 2)
+            .unwrap();
+        assert_eq!(wal_len(&dir, 0), before, "the memtable-only apply wrote WAL");
+
+        // ...and it did reach the memtable, at the sequence the caller named.
+        let hit = store.get(7, b"prepared", u64::MAX, 0);
+        assert!(hit.found);
+        assert_eq!(hit.seq, 2, "the record lands at `start + slot`");
+        assert!(!store.get(7, b"prepared", 1, 0).found, "and not below it");
+    }
+
+    /// Invariant 9: a writer holds `active_writers` for its whole apply, and a
+    /// rotation waits for the drain before swapping the memtable. The
+    /// memtable-only path does the same bookkeeping as the ordinary one, so a
+    /// concurrent rotation blocks until it returns.
+    #[test]
+    fn apply_memtable_only_holds_active_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        store
+            .apply_with_ranges(&[(7, record(b"seed", 1))], &[])
+            .unwrap();
+
+        // Occupy the writer slot the way an in-flight apply does, then check
+        // that a rotation cannot proceed.
+        store.rot.lock().active_writers += 1;
+        let rotator = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            rotator.rotate(true);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a rotation must wait for the active writer to drain"
+        );
+        {
+            let mut g = store.rot.lock();
+            g.active_writers -= 1;
+            store.cond.notify_all();
+        }
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("the rotation proceeds once the writer drains");
+        join.join().unwrap();
+    }
+
+    /// The records are in the memtable at their assigned sequences, so they
+    /// become visible exactly when the caller publishes the range — not before.
+    #[test]
+    fn apply_memtable_only_is_visible_after_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        store
+            .apply_memtable_only(&[(7, record(b"a", 0)), (7, record(b"b", 0))], 10)
+            .unwrap();
+
+        // A reader at the pre-publication watermark sees nothing...
+        assert!(!store.get(7, b"a", 9, 0).found);
+        assert!(!store.get(7, b"b", 9, 0).found);
+        // ...and one at the published watermark sees the whole block.
+        assert!(store.get(7, b"a", 11, 0).found);
+        assert!(store.get(7, b"b", 11, 0).found);
+        assert_eq!(store.get(7, b"a", 11, 0).seq, 10);
+        assert_eq!(store.get(7, b"b", 11, 0).seq, 11);
+    }
+
     #[test]
     fn unified_writers_stall_at_the_immutable_threshold_and_resume_after_flush() {
         let dir = tempfile::tempdir().unwrap();
@@ -801,7 +1050,7 @@ mod tests {
             unified_memtable_stall_threshold: 6,
             ..Options::new(dir.path().to_str().unwrap())
         };
-        let (store, _) = UnifiedStore::open(
+        let (store, _, _) = UnifiedStore::open(
             dir.path().to_str().unwrap(),
             &opts,
             flush_tx,

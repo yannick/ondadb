@@ -167,7 +167,14 @@ pub const KIND_MERGE: u64 = 4;
 /// Range delete (1.2).
 pub const KIND_RANGE_DELETE: u64 = 5;
 // 6..15   reserved for future data kinds
-// 16..31  transaction control (3.2)
+/// Durable prepare record (3.2): the transaction id, its column families, and
+/// the writeset that follows it in the same frame.
+pub const KIND_PREPARE: u64 = 16;
+/// Commit decision for a prepared transaction (3.2).
+pub const KIND_COMMIT_DECISION: u64 = 17;
+/// Abort decision for a prepared transaction (3.2).
+pub const KIND_ABORT_DECISION: u64 = 18;
+// 19..31  reserved for further transaction control
 // 32..63  reserved
 /// Highest value that may ever be assigned a meaning. Anything above this is
 /// never written by any writer, so it cannot have come from a newer binary.
@@ -202,26 +209,49 @@ pub fn check_kind(kind: u64) -> crate::error::Result<()> {
         )));
     }
     match kind {
-        KIND_PUT | KIND_DELETE | KIND_SINGLE_DELETE | KIND_MERGE | KIND_RANGE_DELETE => Ok(()),
+        KIND_PUT
+        | KIND_DELETE
+        | KIND_SINGLE_DELETE
+        | KIND_MERGE
+        | KIND_RANGE_DELETE
+        | KIND_PREPARE
+        | KIND_COMMIT_DECISION
+        | KIND_ABORT_DECISION => Ok(()),
         _ => Err(crate::error::OndaError::UnsupportedFormat(format!(
             "record kind {kind} is not implemented by this binary"
         ))),
     }
 }
 
+/// Whether `kind` is a transaction-control kind (3.2), i.e. one that may only
+/// appear in a control frame and never in a data stream.
+pub fn is_control_kind(kind: u64) -> bool {
+    matches!(
+        kind,
+        KIND_PREPARE | KIND_COMMIT_DECISION | KIND_ABORT_DECISION
+    )
+}
+
 /// Reject a record kind that may not appear in a data-block **point** stream.
 ///
 /// Range deletes (kind 5) live in the aux block's fragment section, never
 /// between two point entries: a fragment has two keys and no value, so a
-/// decoder that accepted one here would have to invent a value slot. The bytes
-/// are intact and name a placement no writer produces, so this is `Corruption`
-/// rather than `UnsupportedFormat`.
+/// decoder that accepted one here would have to invent a value slot. The
+/// transaction-control kinds (16–18) never reach an SSTable at all — a prepare
+/// is applied through its decision, and only the resulting point records are
+/// flushed. The bytes are intact and name a placement no writer produces, so
+/// this is `Corruption` rather than `UnsupportedFormat`.
 pub fn check_point_kind(kind: u64) -> crate::error::Result<()> {
     check_kind(kind)?;
     if kind == KIND_RANGE_DELETE {
         return Err(crate::error::OndaError::Corruption(
             "sst: range-delete kind in the point-entry stream".into(),
         ));
+    }
+    if is_control_kind(kind) {
+        return Err(crate::error::OndaError::Corruption(format!(
+            "sst: transaction-control kind {kind} in the point-entry stream"
+        )));
     }
     Ok(())
 }
@@ -329,6 +359,9 @@ mod tests {
         assert_eq!(KIND_SINGLE_DELETE, 3);
         assert_eq!(KIND_MERGE, 4);
         assert_eq!(KIND_RANGE_DELETE, 5);
+        assert_eq!(KIND_PREPARE, 16);
+        assert_eq!(KIND_COMMIT_DECISION, 17);
+        assert_eq!(KIND_ABORT_DECISION, 18);
         assert_eq!(MAX_ASSIGNABLE_KIND, 63);
         assert_eq!(point_kind(false, false), KIND_PUT);
         assert_eq!(point_kind(true, false), KIND_DELETE);
@@ -351,14 +384,40 @@ mod tests {
             KIND_SINGLE_DELETE,
             KIND_MERGE,
             KIND_RANGE_DELETE,
+            KIND_PREPARE,
+            KIND_COMMIT_DECISION,
+            KIND_ABORT_DECISION,
         ] {
             assert!(check_kind(k).is_ok());
         }
-        for k in [0, 6, 16, 63] {
+        for k in [0, 6, 19, 63] {
             assert_eq!(check_kind(k).unwrap_err().kind(), "unsupported_format");
         }
         for k in [64u64, 1000] {
             assert_eq!(check_kind(k).unwrap_err().kind(), "corruption");
+        }
+    }
+
+    /// 1.0 reserved 16..31 for transaction control; 3.2 assigns three of them
+    /// and leaves the rest *assigned-but-unimplemented*, which stays
+    /// `UnsupportedFormat` — a binary without those kinds is the one at fault,
+    /// not the bytes. The taxonomy is what this pins, in both directions.
+    #[test]
+    fn txn_kinds_without_feature_are_unsupported_format() {
+        for k in [KIND_PREPARE, KIND_COMMIT_DECISION, KIND_ABORT_DECISION] {
+            assert!(is_control_kind(k));
+            assert!(check_kind(k).is_ok(), "3.2 implements kind {k}");
+            // Implemented in the WAL envelope only: an SSTable point entry
+            // naming one is a placement no writer produces.
+            assert_eq!(check_point_kind(k).unwrap_err().kind(), "corruption");
+        }
+        for k in 19..=31u64 {
+            assert!(!is_control_kind(k));
+            assert_eq!(
+                check_kind(k).unwrap_err().kind(),
+                "unsupported_format",
+                "reserved transaction kind {k}"
+            );
         }
     }
 

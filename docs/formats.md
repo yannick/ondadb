@@ -73,7 +73,7 @@ tail and bumps the manifest to VERSION 2, which pre-1.0 binaries refuse outright
 | `1 << 3` | `CAP_PREFIX_DELTA` | 2.1 |
 | `1 << 4` | `CAP_MANIFEST_EDITS` | 2.2 |
 | `1 << 5` | `CAP_PERIODIC_AGE` | 0.3 |
-| `1 << 6` | `CAP_TXN_DECISIONS` | 3.2 |
+| `1 << 6` | `CAP_TXN_DECISIONS` | 3.2 — prepare/decision records; implies `CAP_EXTENDED_RECORDS` |
 
 `KNOWN_CAPS = 0x7F`. The values are an interoperability contract with wavesdb:
 a bit is never renumbered, only retired. Enabling is **one-way and idempotent**;
@@ -101,7 +101,10 @@ records carry a **kind** instead:
 | 4 | merge operand | 1.1 |
 | 5 | range delete | 1.2 |
 | 6–15 | reserved (data kinds) | — |
-| 16–31 | transaction control | 3.2 |
+| 16 | prepare | 3.2 |
+| 17 | commit decision | 3.2 |
+| 18 | abort decision | 3.2 |
+| 19–31 | reserved (transaction control) | — |
 | 32–63 | reserved | — |
 | ≥ 64 | **never assigned** | — |
 
@@ -238,6 +241,74 @@ call on one column family, and that is asserted at encode rather than assumed.
 A commit holding a range delete writes **one** envelope frame carrying both
 kinds. One frame, because WAL batch atomicity (invariant 3) is per frame — two
 frames could replay half a commit.
+
+#### Kinds 16–18 — transaction control (3.2)
+
+Durable prepared transactions write three frame shapes, all **schema 2**
+(unified layout only: per-CF WALs cannot atomically establish a record across
+independent logs). They are gated by `CAP_TXN_DECISIONS`, which
+`enable_format_capabilities` expands to include `CAP_EXTENDED_RECORDS` — a
+control record *is* a kind-bearing envelope record, so enabling one without the
+other would authorize bytes the manifest does not describe. Both land in one
+manifest write. With the bit unset, `Txn::prepare` is refused with
+`InvalidArgs` naming the call that turns it on, and **no control frame is ever
+written**: that is what makes the feature inert on disk before it is enabled.
+
+**Every control record carries `seq = 0`.** `Wal::replay_file` derives its
+high-water mark from record sequences, and that value becomes
+`inner.observe_seq(unified_max_seq)`. A prepare frame must never raise the
+watermark: its records are not committed and may yet be aborted. `0` is an
+unambiguous sentinel — a real record can never carry it (`next_seq` starts at
+`manifest.global_seq + 1 ≥ 1`) and `observe_seq` already returns early on it.
+The watermark for a *committed* prepare comes from the decision instead, in
+recovery pass 2, via an explicit `observe_seq(commit_seq + count - 1)`.
+
+**Kind 16 — prepare.** One frame, `count = 1 + N`:
+
+| # | kind | modifiers | alen | blen | seq | a | b |
+|---|---|---|---|---|---|---|---|
+| 0 | 16 | 0 | 16 | `8*C` | 0 | the 16-byte transaction id | `C` CF ids, `u64` **LE** each |
+| 1..N | 1 / 2 / 3 | `HAS_TTL`? | `8+len(uk)` | value len | 0 | `cf_id` **BE** ‖ user key | value |
+
+One frame for the id and the whole writeset, because a prepare is atomic exactly
+as a commit is: a torn tail must drop both together, never leave a registered
+reservation with half a writeset behind it. The cf-id list is little-endian
+because it is a *payload* integer list; the prefix inside each key stays
+big-endian because that is what orders the unified memtable.
+
+**Kind 17 — commit decision.** One frame, `count = 1`:
+
+| # | kind | modifiers | alen | blen | seq | a | b |
+|---|---|---|---|---|---|---|---|
+| 0 | 17 | 0 | 16 | 16 | 0 | id | `commit_seq u64 LE` ‖ `count u64 LE` |
+
+`commit_seq` is the **first** sequence of the reserved block and `count` the
+record count. Carrying both makes the decision self-sufficient: replay can raise
+the watermark to `commit_seq + count - 1` without having found the prepare
+frame. Without that, a crash between the decision fsync and the memtable apply
+would leave no record carrying those sequences, `next_seq` would restart below
+`commit_seq`, and the next ordinary commit would **reuse** them — a direct
+violation of invariant 5.
+
+**Kind 18 — abort decision.** One frame, `count = 1`: kind 18, `alen = 16`
+(the id), `blen = 0`.
+
+**Frame-shape rules, enforced at decode.** A control frame is decoded as a
+*unit*, so recovery never infers grouping from callback adjacency:
+
+- a frame whose first record is kind 16 holds exactly one kind-16 record
+  followed by records of kinds 1/2/3 only, every record with `seq == 0` — any
+  other kind, or any non-zero sequence, is `Corruption`;
+- a frame whose first record is kind 17 or 18 has `count == 1` and `seq == 0`,
+  and its `b` slot is exactly 16 bytes (17) or empty (18);
+- a control kind appearing anywhere but as a frame's **first** record is
+  `Corruption` — it names a placement no writer produces;
+- an id that is not 16 bytes, or a cf-id list whose length is not a multiple of
+  8, is `Corruption`.
+
+The dispatch costs one uvarint peek per frame on the data path: the decoder
+reads the first record's kind and only then chooses the control path, rather
+than materializing every frame's records before classifying it.
 
 ## SSTable (`sst/`)
 

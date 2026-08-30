@@ -130,6 +130,26 @@ is implemented), range compaction, `Serializable` phantom protection (point-read
 validation only — documented on `IsolationLevel::Serializable`),
 rename/hot-reconfig of column families, write-amp statistics.
 
+**Two-phase commit (3.2) is implemented** and is no longer a non-goal:
+`Txn::prepare` / `DB::commit_prepared` / `abort_prepared` / `list_prepared`,
+behind `CAP_TXN_DECISIONS` (which implies `CAP_EXTENDED_RECORDS`), unified
+layout only. ondaDB is a **participant**,
+never a coordinator — it holds durable prepared state and resolves it by a
+stable external id; election, consensus and timeout decisions are ayu's layer,
+and **nothing is ever aborted automatically**. Two consequences bind every
+change to the write path: every commit now takes `commit_mu` and probes the
+reservation registry (phase rule 5 — including the single-op `put`/`delete`
+path, which took no lock before), and a unified WAL generation may not be
+unlinked while a prepare or a not-yet-durable decision lives in it. See
+`docs/concurrency-and-safety.md` § Prepared transactions.
+
+**Known cost, measured:** rule 5 is free for a single writer but costs **~3×
+write throughput at 8 concurrent writers** (`bench-results/3.2/2026-08-30/`),
+because `commit_mu` is held across the whole apply and the three low isolation
+levels never took it before. Do not "fix" this by moving the reservation check
+outside the lock — that is the TOCTOU the rule exists to close. Shrinking the
+critical section is RV-M3's job.
+
 **S3 tiering (P7, behind the `s3` feature)** is implemented: `S3Storage`
 (`storage_s3.rs`) is a no-mmap `Storage` backend that reads SSTable blocks with
 HTTP range GETs (fronted by the block cache — a cold block is one GET, a warm one

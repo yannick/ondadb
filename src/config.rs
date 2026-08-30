@@ -389,6 +389,26 @@ pub struct Options {
     /// an embedder can enforce a policy the engine has no view of (a
     /// device-wide budget shared with another process, say). Not persisted.
     pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+    /// Total bytes unresolved prepared transactions (3.2) may hold in memory,
+    /// summed across every prepare this database has not yet resolved.
+    ///
+    /// A **byte** cap, not a count, because that is what the resource actually
+    /// is: `Txn::prepare` moves the transaction's whole write arena into the
+    /// registry and holds it until a coordinator resolves the transaction, for
+    /// an unbounded time. A prepare that would take the database past this
+    /// fails with [`OndaError::TooLarge`](crate::OndaError::TooLarge) and
+    /// registers nothing.
+    ///
+    /// The cap governs **new** prepares only. Prepared state recovered from the
+    /// WAL is admitted whatever its size — refusing to open a database because
+    /// of durable state on disk would leave an operator no way to see, let
+    /// alone abort, what is holding it. Use
+    /// [`DB::list_prepared`](crate::DB::list_prepared) for that.
+    ///
+    /// **Not persisted.** It describes this host's memory, not the stored data
+    /// — the same rule [`max_subcompactions`](Self::max_subcompactions)
+    /// follows.
+    pub max_prepared_bytes: usize,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -584,6 +604,7 @@ impl Default for Options {
             max_subcompactions: 1,               // one span: today's behavior, no extra thread
             max_subcompaction_workers: 0,        // derive num_compaction_threads
             io_limiter: None,
+            max_prepared_bytes: 64 << 20,
         }
     }
 }

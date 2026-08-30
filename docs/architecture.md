@@ -76,8 +76,12 @@ in the database directory; only bottom-level parts may live on a named tier
    writes that fall inside one of its own spans (v1 restriction — see
    `Txn::check_own_range_overlap`), then reserves span-index capacity **with no
    lock held**.
-4. Snapshot/Serializable — **and every commit holding a range delete, at any
-   isolation level** — take `DbInner::commit_mu` and run the write-write
+4. **Every** commit takes `DbInner::commit_mu` (3.2 phase rule 5) and first
+   probes the prepared-transaction reservation registry: a key another
+   transaction has prepared refuses this commit with `Conflict`, at every
+   isolation level, including the single-op `DB::put`/`DB::delete` path. With
+   no prepared transaction outstanding that probe is one relaxed load. Then
+   Snapshot/Serializable run the write-write
    conflict check via `ColumnFamily::peek_seq`; Serializable additionally
    validates the point-read set (`read_cfs`). Snapshot/Serializable also ask
    the committed-span index: a range writer conflicts with any overlapping
@@ -121,6 +125,47 @@ In per-CF WAL mode, commit rejects a transaction touching more than one column
 family: independent WAL frames cannot provide crash or partial-I/O atomicity.
 Unified mode encodes every touched CF in one shared WAL frame and is the
 supported atomic cross-CF layout.
+
+### Prepared transactions (`prepared.rs`, 3.2)
+
+Unified layout only, for the same reason cross-CF commits are.
+
+`Txn::prepare(id)` consumes the transaction, validates it at its own isolation
+level, reserves every key it writes, appends **one** prepare frame (kind 16,
+the id + cf ids + the whole writeset, every record at `seq = 0`) and fsyncs
+**the handle it appended to** — a rotation can replace the store's current WAL,
+so `UnifiedStore::sync_wal` would miss the frame. Nothing is applied, nothing is
+published, and **no sequence is reserved**: a prepare that never commits leaves
+no gap. The arena is *moved* into the registry, never recycled into
+`txn::BUF_POOL`.
+
+`DB::commit_prepared(id)` is the seven-step second phase, and the order is the
+whole correctness argument — decision **first**, then the apply, because
+recovery must never find applied data without a durable decision naming the
+sequences it was applied at:
+
+1. `commit_mu`, then the registry lock (held across the fsync, so a failed
+   decision cannot leave a retry answering `Ok`);
+2. reserve the sequence block;
+3. append + fsync the kind-17 decision on the **captured** handle, recording the
+   generation it landed in from the same `state.read()`;
+4. `UnifiedStore::apply_memtable_only` — a path that writes the memtable and
+   **not** the WAL; the decision is already this batch's durable record, and a
+   second copy of the writeset in the log would leave recovery reconciling it
+   against the decision. The same path recovery pass 2 uses;
+5. `publish_range`, **unconditionally**, on every exit path after the
+   reservation — a failed decision, fsync or apply still publishes its block, or
+   the gap-free cursor freezes permanently (invariant 5);
+6. resolve the registration and record the generation pair;
+7. drop `commit_mu`, run commit hooks, sweep retirable WAL generations.
+
+`DB::abort_prepared(id)` writes and fsyncs a kind-18 decision, then drops the
+registration. No sequence is reserved and none is published.
+
+`DB::list_prepared()` reports id, age, bytes and cf ids. Nothing is ever aborted
+automatically. See `docs/concurrency-and-safety.md` for the registry's lock
+position, the WAL generation pins and their retirement predicate, and the
+RV-M3 latency contract this makes worse.
 
 ## Read path
 
@@ -848,9 +893,33 @@ would make the next open replay more than it should).
    numbers define visibility; each frame (= one committed batch) applies
    atomically; a torn/corrupt tail cleanly ends that stripe.
 3. `observe_seq` bumps `next_seq`/`visible` past the highest replayed seq.
-4. Fresh WAL generation opened; replayed WALs stay on disk until their
-   memtable flushes (they are listed in `pending_wals`).
-5. Read-write opens only: `sweep_move_orphans` deletes unreferenced default-tier
+   Control frames (3.2) contribute nothing to that mark: a prepared record
+   carries the `seq = 0` sentinel, because it has not committed and may yet be
+   aborted.
+4. **Prepared-transaction recovery, two passes, order-free** (3.2). The unified
+   WAL is four-striped in every mode but `SyncMode::Full`, and `prepare` and
+   `commit_prepared` are separate API calls that commonly run on different
+   threads, so a prepare frame and its decision have no recoverable relative
+   order. **Pass 1** runs inside `UnifiedStore::open` alongside the replay above
+   and only *collects* — every kind-16 prepare and every kind-17/18 decision,
+   with the generation each landed in, and nothing inserted into the memtable.
+   Two unresolved prepares sharing an id are `Corruption`. `UnifiedStore::open`
+   returns them as its third element, and `build_db_inner` moves them into
+   `DbInner::prepared`. **Pass 2** is `DbInner::resolve_recovered_prepares`,
+   called immediately after step 3 — the first point at which `DbInner` exists
+   and `observe_seq` is callable, and still before any worker is spawned. Per
+   prepare: a commit decision raises the watermark to `commit_seq + count - 1`
+   **first** and then applies the writeset at `commit_seq + slot` through
+   `apply_memtable_only` (watermark before data, so a decision whose records
+   fail to apply has still reserved its sequences); an abort decision drops it;
+   no decision leaves it registered, its keys reserved and its generation
+   pinned. A decision for an unknown id is a no-op — the pair was already
+   retired, and the retirement ordering guarantees its records are durable in
+   L0. Recovery invokes no application code and repeated opens are idempotent.
+5. Fresh WAL generation opened; replayed WALs stay on disk until their
+   memtable flushes (they are listed in `pending_wals`) — and, if a prepared
+   transaction pins one, until the sweep releases it.
+6. Read-write opens only: `sweep_move_orphans` deletes unreferenced default-tier
    SST output and local tier-move residue a crash left behind (see § Part
    mover), then the workers start — so no background move races the sweep.
 

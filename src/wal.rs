@@ -150,6 +150,43 @@ pub enum ReplayRecord {
         end: Vec<u8>,
         seq: u64,
     },
+    /// A durable prepare (kind 16, 3.2): the whole frame decoded as a unit, so
+    /// recovery never has to infer the grouping from callback adjacency.
+    ///
+    /// Every `records` entry carries `seq == 0` — a prepared writeset has not
+    /// committed and must never raise the replay watermark. Its keys carry the
+    /// 8-byte CF-id prefix, exactly as a committed unified point record's do.
+    Prepare {
+        id: [u8; 16],
+        cf_ids: Vec<u64>,
+        records: Vec<Record>,
+    },
+    /// A decision for a prepared transaction (kinds 17 and 18, 3.2).
+    ///
+    /// `commit` is `Some((commit_seq, count))` for a commit decision — the
+    /// first sequence of the reserved block and the record count, which is what
+    /// lets replay raise the watermark to `commit_seq + count - 1` without
+    /// reading the prepare frame — and `None` for an abort.
+    Decision {
+        id: [u8; 16],
+        commit: Option<(u64, u64)>,
+    },
+}
+
+impl ReplayRecord {
+    /// Sequence this record contributes to a replay's high-water mark.
+    ///
+    /// Control records contribute nothing: a prepare is uncommitted (its
+    /// records carry the `seq == 0` sentinel) and a decision's sequences are
+    /// raised explicitly in recovery pass 2, after the decision is matched to
+    /// its prepare.
+    pub fn replay_seq(&self) -> u64 {
+        match self {
+            ReplayRecord::Point(r) => r.seq,
+            ReplayRecord::RangeDelete { seq, .. } => *seq,
+            ReplayRecord::Prepare { .. } | ReplayRecord::Decision { .. } => 0,
+        }
+    }
 }
 
 /// A range delete as the commit path hands it to the WAL: bounds borrowed from
@@ -175,6 +212,20 @@ pub struct RangeRef<'a> {
 pub enum EnvelopeRecord<'a> {
     Point(RecordRef<'a>),
     Range(RangeRef<'a>),
+    /// A transaction-control record (kinds 16–18, 3.2). The generic `a`/`b`
+    /// slots carry whatever the kind defines; `seq` is always the `0` sentinel,
+    /// so a control frame can never raise the replay watermark.
+    Control(ControlRef<'a>),
+}
+
+/// A transaction-control record as the prepare/decision paths hand it to the
+/// WAL: the kind plus the two generic slots, borrowed from a caller scratch
+/// buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlRef<'a> {
+    pub kind: u64,
+    pub a: &'a [u8],
+    pub b: &'a [u8],
 }
 
 impl EnvelopeRecord<'_> {
@@ -183,6 +234,7 @@ impl EnvelopeRecord<'_> {
         match self {
             EnvelopeRecord::Point(r) => r.seq,
             EnvelopeRecord::Range(r) => r.seq,
+            EnvelopeRecord::Control(_) => 0,
         }
     }
 }
@@ -214,6 +266,9 @@ fn legacy_point<'a>(rec: &EnvelopeRecord<'a>) -> RecordRef<'a> {
         EnvelopeRecord::Point(r) => *r,
         EnvelopeRecord::Range(_) => {
             unreachable!("a range delete requires an envelope frame (kind 5)")
+        }
+        EnvelopeRecord::Control(_) => {
+            unreachable!("a transaction-control record requires an envelope frame (kinds 16-18)")
         }
     }
 }
@@ -261,6 +316,17 @@ fn envelope_record_len(rec: EnvelopeRecord<'_>) -> usize {
                 + r.start.len()
                 + r.end.len()
         }
+        // Kinds 16–18: no modifiers, no TTL, and the `seq = 0` sentinel — one
+        // byte, since `uvarint_len(0) == 1`.
+        EnvelopeRecord::Control(r) => {
+            uvarint_len(r.kind)
+                + uvarint_len(0)
+                + uvarint_len(r.a.len() as u64)
+                + uvarint_len(r.b.len() as u64)
+                + uvarint_len(0)
+                + r.a.len()
+                + r.b.len()
+        }
     }
 }
 
@@ -303,12 +369,41 @@ fn encode_envelope_record(dst: &mut Vec<u8>, rec: EnvelopeRecord<'_>) {
             dst.extend_from_slice(r.start);
             dst.extend_from_slice(r.end);
         }
+        EnvelopeRecord::Control(r) => {
+            debug_assert!(crate::format::is_control_kind(r.kind));
+            append_uvarint(dst, r.kind);
+            append_uvarint(dst, 0); // no modifiers: control records have no TTL
+            append_uvarint(dst, r.a.len() as u64);
+            append_uvarint(dst, r.b.len() as u64);
+            // The `seq = 0` sentinel. `Wal::replay_file` derives its high-water
+            // mark from record sequences, and a prepared writeset must never
+            // raise it: those records are uncommitted and may yet be aborted.
+            append_uvarint(dst, 0);
+            dst.extend_from_slice(r.a);
+            dst.extend_from_slice(r.b);
+        }
     }
 }
 
-/// Decode one envelope record from the front of `p`, returning it and the bytes
-/// consumed.
-fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
+/// One envelope record with its slots still borrowed from the frame payload.
+///
+/// Split out of [`decode_envelope_record`] because a control frame (3.2) is
+/// decoded as a *unit* — the shape rules relate its records to each other — and
+/// re-deriving the field order in a second decoder is exactly how the two would
+/// drift apart.
+struct RawRecord<'a> {
+    kind: u64,
+    mods: u64,
+    seq: u64,
+    ttl: i64,
+    a: &'a [u8],
+    b: &'a [u8],
+}
+
+/// Decode one record's fields from the front of `p`, returning it and the bytes
+/// consumed. Field-level validity only: nothing here knows which frame the
+/// record sits in.
+fn decode_raw_record(p: &[u8]) -> Result<(RawRecord<'_>, usize)> {
     let corrupt = || OndaError::Corruption("wal: malformed envelope record".into());
     let (kind, n) = uvarint(p).ok_or_else(corrupt)?;
     crate::format::check_kind(kind)?;
@@ -340,6 +435,33 @@ fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
     if p.len() - off < need {
         return Err(corrupt());
     }
+    Ok((
+        RawRecord {
+            kind,
+            mods,
+            seq,
+            ttl,
+            a: &p[off..off + alen],
+            b: &p[off + alen..off + need],
+        },
+        off + need,
+    ))
+}
+
+/// Decode one **data** envelope record from the front of `p`, returning it and
+/// the bytes consumed.
+fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
+    let (r, used) = decode_raw_record(p)?;
+    let (kind, mods, seq) = (r.kind, r.mods, r.seq);
+    let (alen, blen) = (r.a.len(), r.b.len());
+    // A control kind is only meaningful as the FIRST record of its own frame,
+    // where `decode_envelope` dispatches on it. Reaching it here means it was
+    // spliced into a data stream — bytes no writer produces.
+    if crate::format::is_control_kind(kind) {
+        return Err(OndaError::Corruption(format!(
+            "wal: transaction-control kind {kind} outside a control frame"
+        )));
+    }
     if kind == crate::format::KIND_RANGE_DELETE {
         // No value to separate and no TTL, so any modifier here is bytes no
         // writer produces.
@@ -357,21 +479,128 @@ fn decode_envelope_record(p: &[u8]) -> Result<(ReplayRecord, usize)> {
         }
         return Ok((
             ReplayRecord::RangeDelete {
-                start: p[off..off + alen].to_vec(),
-                end: p[off + alen..off + need].to_vec(),
+                start: r.a.to_vec(),
+                end: r.b.to_vec(),
                 seq,
             },
-            off + need,
+            used,
         ));
     }
-    let rec = Record {
-        key: p[off..off + alen].to_vec(),
-        value: p[off + alen..off + need].to_vec(),
-        seq,
-        ttl,
-        kind,
-    };
-    Ok((ReplayRecord::Point(rec), off + need))
+    Ok((ReplayRecord::Point(raw_to_point(&r)), used))
+}
+
+/// The [`Record`] a data raw record describes. The kind is carried through
+/// verbatim — 1.1's operand has no other spelling.
+fn raw_to_point(r: &RawRecord<'_>) -> Record {
+    Record {
+        key: r.a.to_vec(),
+        value: r.b.to_vec(),
+        seq: r.seq,
+        ttl: r.ttl,
+        kind: r.kind,
+    }
+}
+
+/// The 16-byte transaction id in a control record's `a` slot.
+fn control_id(a: &[u8]) -> Result<[u8; 16]> {
+    a.try_into().map_err(|_| {
+        OndaError::Corruption(format!(
+            "wal: transaction-control id is {} bytes, not 16",
+            a.len()
+        ))
+    })
+}
+
+/// Decode a **control** frame (3.2) as a unit: its records relate to each
+/// other, so the shape rules are enforced here rather than inferred by a caller
+/// from callback adjacency.
+///
+/// Every record must carry the `seq == 0` sentinel and no modifiers. Anything
+/// else is `Corruption`: these bytes are only ever written by this crate's
+/// prepare and decision paths, which produce exactly one shape each.
+fn decode_control_frame(payload: &[u8], count: u64) -> Result<ReplayRecord> {
+    let corrupt = |why: &str| OndaError::Corruption(format!("wal: control frame {why}"));
+    let mut p = payload;
+    let mut raws = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if p.is_empty() {
+            return Err(corrupt("promises more records than exist"));
+        }
+        let (r, used) = decode_raw_record(p)?;
+        if r.seq != 0 {
+            return Err(corrupt("record carries a non-zero sequence"));
+        }
+        if r.mods & !crate::format::modifiers::HAS_TTL != 0 {
+            return Err(corrupt("record carries an unexpected modifier"));
+        }
+        raws.push((r, used));
+        p = &p[used..];
+    }
+    if !p.is_empty() {
+        return Err(corrupt("has records past the promised count"));
+    }
+    let head = &raws[0].0;
+    match head.kind {
+        crate::format::KIND_PREPARE => {
+            if head.mods != 0 {
+                return Err(corrupt("prepare record carries modifiers"));
+            }
+            let id = control_id(head.a)?;
+            if head.b.len() % 8 != 0 {
+                return Err(corrupt("prepare cf-id list is not a whole number of ids"));
+            }
+            let cf_ids: Vec<u64> = head
+                .b
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let mut records = Vec::with_capacity(raws.len() - 1);
+            for (r, _) in &raws[1..] {
+                // The writeset is replayed through the same memtable path a
+                // commit uses, so it may hold exactly what that path has a
+                // shape for: the three point kinds and 1.1's merge operand,
+                // which is one key and one value like any of them. A range
+                // delete (two keys, no value) and a nested control record are
+                // refused — `Txn::prepare` refuses them at the API too, so
+                // these bytes are ones no writer produces.
+                if !crate::format::is_point_kind(r.kind) && r.kind != crate::format::KIND_MERGE {
+                    return Err(corrupt("prepare holds a record that is not a point write"));
+                }
+                records.push(raw_to_point(r));
+            }
+            Ok(ReplayRecord::Prepare {
+                id,
+                cf_ids,
+                records,
+            })
+        }
+        kind @ (crate::format::KIND_COMMIT_DECISION | crate::format::KIND_ABORT_DECISION) => {
+            if raws.len() != 1 {
+                return Err(corrupt("decision is not a single record"));
+            }
+            if head.mods != 0 {
+                return Err(corrupt("decision record carries modifiers"));
+            }
+            let id = control_id(head.a)?;
+            if kind == crate::format::KIND_ABORT_DECISION {
+                if !head.b.is_empty() {
+                    return Err(corrupt("abort decision carries a payload"));
+                }
+                return Ok(ReplayRecord::Decision { id, commit: None });
+            }
+            if head.b.len() != 16 {
+                return Err(corrupt("commit decision payload is not 16 bytes"));
+            }
+            let commit_seq = u64::from_le_bytes(head.b[..8].try_into().unwrap());
+            let count = u64::from_le_bytes(head.b[8..].try_into().unwrap());
+            Ok(ReplayRecord::Decision {
+                id,
+                commit: Some((commit_seq, count)),
+            })
+        }
+        // Unreachable: `decode_envelope` only routes here on a control kind.
+        kind => Err(corrupt(&format!("leads with kind {kind}"))),
+    }
 }
 
 /// Decode a whole envelope payload (its leading [`ENVELOPE_TAG`] included).
@@ -391,6 +620,20 @@ fn decode_envelope(payload: &[u8], mut f: impl FnMut(ReplayRecord) -> Result<u64
     p = &p[n..];
     let (count, n) = uvarint(p).ok_or_else(corrupt)?;
     p = &p[n..];
+    // A control frame (3.2) is decoded as a unit. Dispatching on the FIRST
+    // record's kind costs one uvarint peek on the data path — the alternative,
+    // materializing every frame's records before classifying it, would put an
+    // allocation on every replayed commit.
+    if let Some((kind, _)) = uvarint(p) {
+        if crate::format::is_control_kind(kind) {
+            if count == 0 {
+                return Err(corrupt());
+            }
+            f(decode_control_frame(p, count)?)?;
+            // Control records never raise the watermark; see `replay_seq`.
+            return Ok(0);
+        }
+    }
     let mut last_seq = 0u64;
     for _ in 0..count {
         if p.is_empty() {
@@ -728,6 +971,81 @@ impl Wal {
         self.submit_frame(encode_frame(Some(schema), recs))
     }
 
+    /// Append a durable **prepare** frame (kind 16, 3.2): the transaction id,
+    /// the column families it touches, and its whole writeset, as ONE frame.
+    ///
+    /// One frame because a prepare is atomic exactly as a commit is (invariant
+    /// 3): a torn tail must drop the id and its records together, never leave a
+    /// registered reservation with half a writeset behind it. Every record
+    /// carries `seq = 0` — nothing here has committed.
+    ///
+    /// The caller is responsible for the durability half: `append` does not
+    /// fsync, so a prepare must `sync()` **this same handle** before it returns
+    /// `Ok` (a rotation can replace the store's current handle in between).
+    pub fn append_prepare(
+        &self,
+        schema: u64,
+        id: &[u8; 16],
+        cf_ids: &[u64],
+        recs: &[RecordRef<'_>],
+    ) -> Result<()> {
+        let mut ids = Vec::with_capacity(cf_ids.len() * 8);
+        for cf in cf_ids {
+            ids.extend_from_slice(&cf.to_le_bytes());
+        }
+        let mut frame: Vec<EnvelopeRecord<'_>> = Vec::with_capacity(1 + recs.len());
+        frame.push(EnvelopeRecord::Control(ControlRef {
+            kind: crate::format::KIND_PREPARE,
+            a: id,
+            b: &ids,
+        }));
+        frame.extend(recs.iter().map(|r| {
+            EnvelopeRecord::Point(RecordRef {
+                // The sentinel is applied here rather than trusted from the
+                // caller: a prepared record that kept a real sequence would
+                // raise the replay watermark for a transaction that may abort.
+                seq: 0,
+                ..*r
+            })
+        }));
+        self.append_batch_envelope(schema, &frame)
+    }
+
+    /// Append a **decision** frame for a prepared transaction (3.2):
+    /// `Some((commit_seq, count))` writes the commit decision (kind 17),
+    /// `None` the abort decision (kind 18).
+    ///
+    /// The commit decision carries both the first reserved sequence and the
+    /// record count so it is self-sufficient: replay can raise the watermark to
+    /// `commit_seq + count - 1` without having found the prepare frame.
+    ///
+    /// As with [`append_prepare`](Self::append_prepare), the caller must
+    /// `sync()` this handle before treating the decision as durable.
+    pub fn append_decision(
+        &self,
+        schema: u64,
+        id: &[u8; 16],
+        commit: Option<(u64, u64)>,
+    ) -> Result<()> {
+        let mut payload = Vec::new();
+        let kind = match commit {
+            Some((commit_seq, count)) => {
+                payload.extend_from_slice(&commit_seq.to_le_bytes());
+                payload.extend_from_slice(&count.to_le_bytes());
+                crate::format::KIND_COMMIT_DECISION
+            }
+            None => crate::format::KIND_ABORT_DECISION,
+        };
+        self.append_batch_envelope(
+            schema,
+            &[EnvelopeRecord::Control(ControlRef {
+                kind,
+                a: id,
+                b: &payload,
+            })],
+        )
+    }
+
     /// Durably write one already-framed batch.
     fn submit_frame(&self, buf: Vec<u8>) -> Result<()> {
         // Group commit exists to amortize the fsync under `SyncMode::Full`.
@@ -921,11 +1239,9 @@ impl Wal {
                 let seq = decode_envelope(&payload, |rec| {
                     // `last_seq` accounting covers range records too: a WAL
                     // whose newest record is a range delete must still restore
-                    // the sequence it committed at.
-                    let seq = match &rec {
-                        ReplayRecord::Point(r) => r.seq,
-                        ReplayRecord::RangeDelete { seq, .. } => *seq,
-                    };
+                    // the sequence it committed at. Control records (3.2)
+                    // contribute nothing — see `ReplayRecord::replay_seq`.
+                    let seq = rec.replay_seq();
                     f(rec)?;
                     Ok(seq)
                 })?;
@@ -1226,6 +1542,7 @@ mod tests {
             ReplayRecord::RangeDelete { start, end, seq } => {
                 panic!("unexpected range delete {start:?}..{end:?}@{seq}")
             }
+            other => panic!("unexpected control record {other:?}"),
         }
     }
 
@@ -1267,10 +1584,7 @@ mod tests {
     fn decode_envelope_any(payload: &[u8]) -> Result<Vec<ReplayRecord>> {
         let mut out = Vec::new();
         decode_envelope(payload, |rec| {
-            let seq = match &rec {
-                ReplayRecord::Point(r) => r.seq,
-                ReplayRecord::RangeDelete { seq, .. } => *seq,
-            };
+            let seq = rec.replay_seq();
             out.push(rec);
             Ok(seq)
         })?;
@@ -1512,6 +1826,7 @@ mod tests {
             match rec {
                 ReplayRecord::Point(r) => points.push(r.seq),
                 ReplayRecord::RangeDelete { .. } => ranges += 1,
+                other => panic!("unexpected control record {other:?}"),
             }
             Ok(())
         })
@@ -1651,6 +1966,435 @@ mod tests {
                 let mut case = crate::util::fuzz_mutate(&mut rng, seed);
                 // decode_envelope is only ever called on a payload whose first
                 // byte is the tag (replay dispatches on it).
+                if case.is_empty() {
+                    case.push(ENVELOPE_TAG);
+                }
+                case[0] = ENVELOPE_TAG;
+                let _ = decode_envelope_any(&case);
+            }
+        }
+    }
+
+    // ---- transaction control (kinds 16-18, 3.2) ----------------------------
+
+    /// The fixture id every control-frame test uses: 16 distinguishable bytes,
+    /// so a mis-sliced id shows up as wrong content rather than wrong length.
+    const TXN_ID: [u8; 16] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10,
+    ];
+
+    /// Wrap a hand-built record stream as a schema-2 envelope payload.
+    fn control_payload(count: u64, body: &[u8]) -> Vec<u8> {
+        let mut p = vec![ENVELOPE_TAG];
+        append_uvarint(&mut p, ENVELOPE_SCHEMA_UNIFIED);
+        append_uvarint(&mut p, count);
+        p.extend_from_slice(body);
+        p
+    }
+
+    /// The payload `append_prepare` writes for a two-CF, two-record prepare.
+    fn prepare_fixture() -> (Vec<u64>, Vec<Record>) {
+        let cf_ids = vec![0x0123_4567_89ab_cdefu64, 7];
+        let mut put = 0x0123_4567_89ab_cdefu64.to_be_bytes().to_vec();
+        put.extend_from_slice(b"k1");
+        let mut del = 7u64.to_be_bytes().to_vec();
+        del.extend_from_slice(b"k2");
+        let recs = vec![
+            Record {
+                key: put,
+                value: b"v1".to_vec(),
+                // A real (non-zero) sequence here is deliberate: the encoder
+                // must overwrite it with the sentinel.
+                seq: 99,
+                ..Default::default()
+            },
+            Record {
+                key: del,
+                seq: 99,
+                kind: crate::format::KIND_DELETE,
+                ..Default::default()
+            },
+        ];
+        (cf_ids, recs)
+    }
+
+    /// One frame as `append_prepare`/`append_decision` submit it, without a WAL.
+    fn prepare_frame(id: &[u8; 16], cf_ids: &[u64], recs: &[Record]) -> Vec<u8> {
+        let mut ids = Vec::new();
+        for cf in cf_ids {
+            ids.extend_from_slice(&cf.to_le_bytes());
+        }
+        let mut frame = vec![EnvelopeRecord::Control(ControlRef {
+            kind: crate::format::KIND_PREPARE,
+            a: id,
+            b: &ids,
+        })];
+        frame.extend(recs.iter().map(|r| {
+            EnvelopeRecord::Point(RecordRef {
+                seq: 0,
+                ..r.as_ref()
+            })
+        }));
+        encode_frame(Some(ENVELOPE_SCHEMA_UNIFIED), &frame)
+    }
+
+    fn decision_frame(id: &[u8; 16], commit: Option<(u64, u64)>) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let kind = match commit {
+            Some((seq, count)) => {
+                payload.extend_from_slice(&seq.to_le_bytes());
+                payload.extend_from_slice(&count.to_le_bytes());
+                crate::format::KIND_COMMIT_DECISION
+            }
+            None => crate::format::KIND_ABORT_DECISION,
+        };
+        encode_frame(
+            Some(ENVELOPE_SCHEMA_UNIFIED),
+            &[EnvelopeRecord::Control(ControlRef {
+                kind,
+                a: id,
+                b: &payload,
+            })],
+        )
+    }
+
+    /// The kind-16 frame's bytes, spelled out field by field exactly as the
+    /// feature document's wire-format table does. Written as a literal rather
+    /// than derived from the encoder, so a change to the field order or the
+    /// sentinel is a test failure instead of a silent format break.
+    #[test]
+    fn prepare_frame_golden_bytes() {
+        let (cf_ids, recs) = prepare_fixture();
+        // Envelope header: tag, schema 2 (unified), count = 1 + 2 records.
+        let mut want = vec![ENVELOPE_TAG, 2, 3];
+        // record 0: the prepare header.
+        want.push(16); // kind
+        want.push(0); // modifiers
+        want.push(16); // alen: the id
+        want.push(16); // blen: two cf ids, 8 bytes each
+        want.push(0); // seq sentinel
+        want.extend_from_slice(&TXN_ID);
+        want.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        want.extend_from_slice(&7u64.to_le_bytes());
+        // record 1: a put, key = cf id BE || user key.
+        want.push(1); // kind
+        want.push(0); // modifiers
+        want.push(10); // alen: 8 + len("k1")
+        want.push(2); // blen: len("v1")
+        want.push(0); // seq sentinel
+        want.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_be_bytes());
+        want.extend_from_slice(b"k1");
+        want.extend_from_slice(b"v1");
+        // record 2: a delete.
+        want.push(2); // kind
+        want.push(0); // modifiers
+        want.push(10); // alen
+        want.push(0); // blen
+        want.push(0); // seq sentinel
+        want.extend_from_slice(&7u64.to_be_bytes());
+        want.extend_from_slice(b"k2");
+
+        let frame = prepare_frame(&TXN_ID, &cf_ids, &recs);
+        assert_eq!(&frame[HEADER_SIZE..], &want[..]);
+        assert_eq!(read_u32(&frame[0..4]) as usize, want.len());
+        assert_eq!(read_u32(&frame[4..8]), checksum(&want));
+    }
+
+    #[test]
+    fn commit_decision_golden_bytes() {
+        let mut want = vec![ENVELOPE_TAG, 2, 1];
+        want.push(17); // kind
+        want.push(0); // modifiers
+        want.push(16); // alen: the id
+        want.push(16); // blen: commit_seq || count
+        want.push(0); // seq sentinel
+        want.extend_from_slice(&TXN_ID);
+        want.extend_from_slice(&41u64.to_le_bytes());
+        want.extend_from_slice(&3u64.to_le_bytes());
+
+        let frame = decision_frame(&TXN_ID, Some((41, 3)));
+        assert_eq!(&frame[HEADER_SIZE..], &want[..]);
+    }
+
+    #[test]
+    fn abort_decision_golden_bytes() {
+        let mut want = vec![ENVELOPE_TAG, 2, 1];
+        want.push(18); // kind
+        want.push(0); // modifiers
+        want.push(16); // alen: the id
+        want.push(0); // blen: an abort carries no payload
+        want.push(0); // seq sentinel
+        want.extend_from_slice(&TXN_ID);
+
+        let frame = decision_frame(&TXN_ID, None);
+        assert_eq!(&frame[HEADER_SIZE..], &want[..]);
+    }
+
+    /// The `seq == 0` sentinel is what keeps a prepared writeset out of the
+    /// replay watermark, so it is asserted on the decoded records and on the
+    /// frame's contribution to `last_seq` — the two ways it can be lost.
+    #[test]
+    fn control_frame_seq_is_zero() {
+        let (cf_ids, recs) = prepare_fixture();
+        for frame in [
+            prepare_frame(&TXN_ID, &cf_ids, &recs),
+            decision_frame(&TXN_ID, Some((41, 3))),
+            decision_frame(&TXN_ID, None),
+        ] {
+            let mut last = 0u64;
+            decode_envelope(&frame[HEADER_SIZE..], |rec| {
+                assert_eq!(rec.replay_seq(), 0, "a control frame raises no watermark");
+                if let ReplayRecord::Prepare { records, .. } = &rec {
+                    for r in records {
+                        assert_eq!(r.seq, 0, "prepared records carry the sentinel");
+                    }
+                }
+                last = last.max(rec.replay_seq());
+                Ok(rec.replay_seq())
+            })
+            .unwrap();
+            assert_eq!(last, 0);
+        }
+    }
+
+    #[test]
+    fn control_frame_roundtrip() {
+        let cf_ids = vec![11u64, 22, 33];
+        let recs: Vec<Record> = (0..5u64)
+            .map(|i| {
+                let mut key = cf_ids[(i % 3) as usize].to_be_bytes().to_vec();
+                key.extend_from_slice(format!("key-{i}").as_bytes());
+                Record {
+                    key,
+                    value: format!("value-{i}").into_bytes(),
+                    seq: 0,
+                    ttl: if i == 2 { 1_700_000_000_000_000_000 } else { 0 },
+                    kind: if i == 3 {
+                        crate::format::KIND_DELETE
+                    } else {
+                        crate::format::KIND_PUT
+                    },
+                }
+            })
+            .collect();
+        let frame = prepare_frame(&TXN_ID, &cf_ids, &recs);
+        let got = decode_envelope_any(&frame[HEADER_SIZE..]).unwrap();
+        assert_eq!(got.len(), 1, "a control frame decodes as ONE record");
+        match &got[0] {
+            ReplayRecord::Prepare {
+                id,
+                cf_ids: got_ids,
+                records,
+            } => {
+                assert_eq!(id, &TXN_ID);
+                assert_eq!(got_ids, &cf_ids);
+                assert_eq!(records.len(), recs.len());
+                for (g, w) in records.iter().zip(&recs) {
+                    assert_eq!(g.key, w.key);
+                    assert_eq!(g.value, w.value);
+                    assert_eq!(g.ttl, w.ttl);
+                    assert_eq!(g.kind, w.kind);
+                    assert_eq!(g.seq, 0);
+                }
+            }
+            other => panic!("expected a prepare, got {other:?}"),
+        }
+        for commit in [Some((41u64, 3u64)), None] {
+            let frame = decision_frame(&TXN_ID, commit);
+            let got = decode_envelope_any(&frame[HEADER_SIZE..]).unwrap();
+            assert!(matches!(
+                &got[0],
+                ReplayRecord::Decision { id, commit: c } if id == &TXN_ID && *c == commit
+            ));
+        }
+    }
+
+    /// A record body with an explicit sequence, for the shape-rule tests.
+    fn control_body(kind: u64, mods: u64, a: &[u8], b: &[u8], seq: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        append_uvarint(&mut out, kind);
+        append_uvarint(&mut out, mods);
+        append_uvarint(&mut out, a.len() as u64);
+        append_uvarint(&mut out, b.len() as u64);
+        append_uvarint(&mut out, seq);
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out
+    }
+
+    /// A prepared record carrying a real sequence would raise the replay
+    /// watermark for a transaction that may still abort — the exact bug the
+    /// sentinel exists to prevent, so the decoder refuses the bytes.
+    #[test]
+    fn prepare_frame_with_nonzero_seq_is_corruption() {
+        let mut body = control_body(crate::format::KIND_PREPARE, 0, &TXN_ID, &[], 0);
+        body.extend_from_slice(&control_body(crate::format::KIND_PUT, 0, b"k", b"v", 7));
+        let err = decode_envelope_any(&control_payload(2, &body))
+            .expect_err("a prepared record may not carry a sequence");
+        assert_eq!(err.kind(), "corruption");
+
+        // The header record itself, too.
+        let head = control_body(crate::format::KIND_PREPARE, 0, &TXN_ID, &[], 4);
+        assert_eq!(
+            decode_envelope_any(&control_payload(1, &head))
+                .unwrap_err()
+                .kind(),
+            "corruption"
+        );
+    }
+
+    /// A frame led by kind 16 holds exactly one kind-16 record followed by
+    /// point writes. A range delete, a second prepare, or a decision spliced in
+    /// is `Corruption`; so is a control kind appearing inside a data frame.
+    #[test]
+    fn prepare_frame_with_foreign_kind_is_corruption() {
+        let head = control_body(crate::format::KIND_PREPARE, 0, &TXN_ID, &[], 0);
+        for foreign in [
+            crate::format::KIND_RANGE_DELETE,
+            crate::format::KIND_PREPARE,
+            crate::format::KIND_ABORT_DECISION,
+        ] {
+            let mut body = head.clone();
+            body.extend_from_slice(&control_body(foreign, 0, b"aaaa", b"bbbb", 0));
+            let err = decode_envelope_any(&control_payload(2, &body))
+                .expect_err("only point writes may follow a prepare header");
+            assert_eq!(err.kind(), "corruption", "kind {foreign} inside a prepare");
+        }
+        // And the mirror: a control kind in the middle of a data frame.
+        let mut body = control_body(crate::format::KIND_PUT, 0, b"k", b"v", 1);
+        body.extend_from_slice(&control_body(
+            crate::format::KIND_COMMIT_DECISION,
+            0,
+            &TXN_ID,
+            &[0u8; 16],
+            0,
+        ));
+        assert_eq!(
+            decode_envelope_any(&control_payload(2, &body))
+                .unwrap_err()
+                .kind(),
+            "corruption"
+        );
+    }
+
+    /// A decision is one record and nothing else, and its payload width is
+    /// fixed by the kind.
+    #[test]
+    fn decision_frame_shape_is_enforced() {
+        // Two records under a decision head.
+        let mut body = control_body(
+            crate::format::KIND_ABORT_DECISION,
+            0,
+            &TXN_ID,
+            &[],
+            0,
+        );
+        body.extend_from_slice(&control_body(crate::format::KIND_PUT, 0, b"k", b"v", 0));
+        assert_eq!(
+            decode_envelope_any(&control_payload(2, &body))
+                .unwrap_err()
+                .kind(),
+            "corruption"
+        );
+        // A commit decision whose payload is not exactly 16 bytes.
+        let body = control_body(
+            crate::format::KIND_COMMIT_DECISION,
+            0,
+            &TXN_ID,
+            &[0u8; 8],
+            0,
+        );
+        assert_eq!(
+            decode_envelope_any(&control_payload(1, &body))
+                .unwrap_err()
+                .kind(),
+            "corruption"
+        );
+        // An abort decision that carries one.
+        let body = control_body(
+            crate::format::KIND_ABORT_DECISION,
+            0,
+            &TXN_ID,
+            &[0u8; 16],
+            0,
+        );
+        assert_eq!(
+            decode_envelope_any(&control_payload(1, &body))
+                .unwrap_err()
+                .kind(),
+            "corruption"
+        );
+        // An id that is not 16 bytes.
+        let body = control_body(crate::format::KIND_ABORT_DECISION, 0, b"short", &[], 0);
+        assert_eq!(
+            decode_envelope_any(&control_payload(1, &body))
+                .unwrap_err()
+                .kind(),
+            "corruption"
+        );
+    }
+
+    /// Control frames go through `Wal::append_prepare`/`append_decision` and
+    /// come back out of `Wal::replay` unchanged, interleaved with ordinary
+    /// data frames — which is how a real unified WAL holds them.
+    #[test]
+    fn control_frames_replay_beside_data_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let (cf_ids, recs) = prepare_fixture();
+        {
+            let wal = Wal::open(&path, SyncMode::Full, Duration::ZERO).unwrap();
+            wal.append(rec("committed", "v", 12)).unwrap();
+            let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+            wal.append_prepare(ENVELOPE_SCHEMA_UNIFIED, &TXN_ID, &cf_ids, &refs)
+                .unwrap();
+            wal.append_decision(ENVELOPE_SCHEMA_UNIFIED, &TXN_ID, Some((13, 2)))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+        let mut prepares = 0;
+        let mut decisions = Vec::new();
+        let mut points = 0;
+        let last = Wal::replay(&path, |r| {
+            match r {
+                ReplayRecord::Point(_) => points += 1,
+                ReplayRecord::Prepare { id, cf_ids: c, records } => {
+                    assert_eq!(id, TXN_ID);
+                    assert_eq!(c, cf_ids);
+                    assert_eq!(records.len(), 2);
+                    prepares += 1;
+                }
+                ReplayRecord::Decision { id, commit } => {
+                    assert_eq!(id, TXN_ID);
+                    decisions.push(commit);
+                }
+                ReplayRecord::RangeDelete { .. } => panic!("no range delete was written"),
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((points, prepares), (1, 1));
+        assert_eq!(decisions, vec![Some((13, 2))]);
+        // The committed point record sets the watermark; the prepare's records
+        // and the decision contribute nothing.
+        assert_eq!(last, 12, "a control frame must not raise the watermark");
+    }
+
+    /// The control decoder must be total over arbitrary bytes, like every other
+    /// decoder in this crate.
+    #[test]
+    fn fuzz_decode_control_frame_never_panics() {
+        let (cf_ids, recs) = prepare_fixture();
+        let seeds = [
+            prepare_frame(&TXN_ID, &cf_ids, &recs)[HEADER_SIZE..].to_vec(),
+            decision_frame(&TXN_ID, Some((41, 3)))[HEADER_SIZE..].to_vec(),
+            decision_frame(&TXN_ID, None)[HEADER_SIZE..].to_vec(),
+        ];
+        let mut rng = crate::util::FuzzRng::new(0x5DEE_CE66_D1CE_4B9F);
+        for seed in &seeds {
+            for _ in 0..2000 {
+                let mut case = crate::util::fuzz_mutate(&mut rng, seed);
                 if case.is_empty() {
                     case.push(ENVELOPE_TAG);
                 }

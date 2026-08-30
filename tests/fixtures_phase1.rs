@@ -55,6 +55,7 @@ fn replay_fixture(dir: &Path, name: &str) -> ondadb::Result<Vec<Record>> {
             ReplayRecord::RangeDelete { start, end, seq } => {
                 panic!("legacy fixture yielded a range delete {start:?}..{end:?}@{seq}")
             }
+            other => panic!("legacy fixture yielded a control record {other:?}"),
         }
         Ok(())
     })?;

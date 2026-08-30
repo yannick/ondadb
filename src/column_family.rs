@@ -749,6 +749,18 @@ impl ColumnFamily {
                     crate::wal::ReplayRecord::RangeDelete { start, end, seq } => {
                         mem.add_range(&start, &end, seq);
                     }
+                    // 2PC is unified-only: a per-CF WAL cannot establish a
+                    // prepare across independent logs, so this binary never
+                    // writes a control frame here. Finding one means the
+                    // database was written in unified mode and reopened per-CF.
+                    crate::wal::ReplayRecord::Prepare { .. }
+                    | crate::wal::ReplayRecord::Decision { .. } => {
+                        return Err(OndaError::InvalidArgs(format!(
+                            "column family {name:?} has a prepared-transaction record in its \
+                             per-column-family WAL; two-phase commit requires \
+                             unified_memtable=true"
+                        )));
+                    }
                 }
                 Ok(())
             })?;

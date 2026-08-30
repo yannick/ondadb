@@ -553,7 +553,13 @@ pub(crate) fn decode_delta_header(raw: &[u8], off: usize) -> Result<(DecEntry, u
         return Err(corrupt());
     }
     let (kind, n) = uvarint(&raw[off..]).ok_or_else(corrupt)?;
-    crate::format::check_kind(kind)?;
+    // `check_point_kind`, not `check_kind`: a delta entry is a **point** entry
+    // in a data block, exactly as `decode_entry`'s is. Range deletes live in the
+    // aux section and transaction-control records (3.2) never reach an SSTable
+    // at all, so either one here is a placement no writer produces — and the
+    // looser check would fold a control kind into a flags byte with no
+    // tombstone bit set and hand back a plain put.
+    crate::format::check_point_kind(kind)?;
     let mut p = off + n;
     let (mods, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
     crate::format::check_modifiers(mods)?;

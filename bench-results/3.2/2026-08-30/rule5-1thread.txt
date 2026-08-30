@@ -1,0 +1,12 @@
+A run1 ops=20000 threads=1 elapsed_ms=10812.1 ops_per_sec=1850 p50_ns=7125 p99_ns=8543875 p999_ns=15013916
+B run1 ops=20000 threads=1 elapsed_ms=9706.5 ops_per_sec=2060 p50_ns=7250 p99_ns=8268083 p999_ns=13579917
+A run2 ops=20000 threads=1 elapsed_ms=11867.3 ops_per_sec=1685 p50_ns=7542 p99_ns=8841917 p999_ns=14741709
+B run2 ops=20000 threads=1 elapsed_ms=25341.5 ops_per_sec=789 p50_ns=8375 p99_ns=12684500 p999_ns=26879667
+A run3 ops=20000 threads=1 elapsed_ms=26277.1 ops_per_sec=761 p50_ns=10042 p99_ns=14119333 p999_ns=23280708
+B run3 ops=20000 threads=1 elapsed_ms=20037.3 ops_per_sec=998 p50_ns=8959 p99_ns=10619709 p999_ns=20744000
+A run4 ops=20000 threads=1 elapsed_ms=13224.5 ops_per_sec=1512 p50_ns=8167 p99_ns=9832417 p999_ns=18549125
+B run4 ops=20000 threads=1 elapsed_ms=17302.5 ops_per_sec=1156 p50_ns=8041 p99_ns=10232250 p999_ns=19797666
+A run5 ops=20000 threads=1 elapsed_ms=18283.4 ops_per_sec=1094 p50_ns=8333 p99_ns=10341875 p999_ns=20032084
+B run5 ops=20000 threads=1 elapsed_ms=28759.6 ops_per_sec=695 p50_ns=10750 p99_ns=15528875 p999_ns=39958041
+A run6 ops=20000 threads=1 elapsed_ms=20069.8 ops_per_sec=997 p50_ns=8292 p99_ns=10095625 p999_ns=19951041
+B run6 ops=20000 threads=1 elapsed_ms=14868.6 ops_per_sec=1345 p50_ns=7000 p99_ns=9938959 p999_ns=18810125

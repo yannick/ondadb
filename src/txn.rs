@@ -103,6 +103,20 @@ fn buffered_ranges<'a>(
         .map(move |w| (&w.cf, buf_slice(buf, w.key), buf_slice(buf, w.value)))
 }
 
+/// A durably prepared transaction (3.2), named by the id its coordinator
+/// supplied.
+///
+/// A receipt, not a handle: the transaction's state lives in the database and
+/// survives this value, the process, and the machine. Resolve it with
+/// [`DB::commit_prepared`] or [`DB::abort_prepared`], from any thread and after
+/// any number of restarts. Dropping this value resolves nothing — that is the
+/// point of a prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTxn {
+    /// The coordinator-supplied transaction id.
+    pub id: [u8; 16],
+}
+
 /// A multi-operation transaction.
 pub struct Txn {
     db: Arc<DbInner>,
@@ -124,7 +138,26 @@ pub struct Txn {
     read_cfs: HashMap<usize, Arc<ColumnFamily>>,
     /// Named savepoints: `(name, writes_len, buf_len, read_log_len)`.
     savepoints: Vec<(String, usize, usize, usize)>,
-    done: bool,
+    state: TxnState,
+}
+
+/// Where a transaction sits in the shared state machine
+/// (`active -> committed | rolled_back`, `active -> prepared -> committed |
+/// aborted`).
+///
+/// Three states, not a `done` flag, because 3.2 adds a terminal-for-this-handle
+/// state that is *not* finished: after [`Txn::prepare`] the transaction is
+/// durable and still resolvable, just no longer this handle's to mutate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxnState {
+    /// Buffering writes; every API is available.
+    Active,
+    /// Durably prepared. `prepare` consumes the `Txn`, so the mutating APIs are
+    /// unreachable by ownership; the state exists so `Drop` knows not to
+    /// release what the registry now owns.
+    Prepared,
+    /// Committed, rolled back, or dropped.
+    Finished,
 }
 
 impl std::fmt::Debug for Txn {
@@ -259,7 +292,7 @@ impl DB {
             read_log: Vec::new(),
             read_cfs: HashMap::new(),
             savepoints: Vec::new(),
-            done: false,
+            state: TxnState::Active,
         }
     }
 
@@ -421,7 +454,7 @@ impl Txn {
     /// transaction landing inside this span — needs the whole write set and is
     /// made at commit ([`Txn::check_own_range_overlap`]).
     pub fn delete_range(&mut self, cf: &Arc<ColumnFamily>, start: &[u8], end: &[u8]) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
                 "transaction already finished".into(),
             ));
@@ -499,7 +532,7 @@ impl Txn {
         value: &[u8],
         ttl: Duration,
     ) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
                 "transaction already finished".into(),
             ));
@@ -510,7 +543,7 @@ impl Txn {
 
     /// Buffer a delete (tombstone).
     pub fn delete(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
                 "transaction already finished".into(),
             ));
@@ -523,7 +556,7 @@ impl Txn {
     /// has conservative ordinary-tombstone semantics; compaction does not yet
     /// implement the single-delete collapse optimization.
     pub fn single_delete(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
                 "transaction already finished".into(),
             ));
@@ -545,7 +578,7 @@ impl Txn {
     /// Operands carry no TTL in v1: a per-operand expiry would resurrect the
     /// base it was folded into.
     pub fn merge(&mut self, cf: &Arc<ColumnFamily>, key: &[u8], operand: &[u8]) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
                 "transaction already finished".into(),
             ));
@@ -1140,6 +1173,49 @@ impl Txn {
         }
     }
 
+    /// Refuse this commit if a prepared transaction has reserved any key it
+    /// writes (3.2). Called under `commit_mu`, before any level validation.
+    ///
+    /// This is what makes a successful `prepare` unable to lose a conflict
+    /// later: from the moment it registers, every other writer at every
+    /// isolation level is refused on its keys, so `commit_prepared` can only
+    /// fail on durability.
+    fn check_reservations(&self, prepared: &PreparedCommit) -> Result<()> {
+        // One relaxed load in the steady state — no prepared transaction
+        // anywhere — so neither branch below is reached.
+        if !self.db.has_reservations() {
+            return Ok(());
+        }
+        let reg = self.db.prepared.lock();
+        if reg.is_empty() {
+            return Ok(());
+        }
+        for &i in &prepared.order {
+            let w = &self.writes[i];
+            let a = buf_slice(&self.buf, w.key);
+            // A range delete covering a reserved key is another writer changing
+            // it, so it is refused exactly as a point write to that key would
+            // be. A hash probe cannot answer a span, hence the two arms.
+            let hit = if w.is_range() {
+                reg.owner_in_range(
+                    w.cf.id(),
+                    w.cf.comparator(),
+                    a,
+                    buf_slice(&self.buf, w.value),
+                )
+            } else {
+                reg.owner_of(w.cf.id(), a).map(|id| (id, a.to_vec()))
+            };
+            if let Some((owner, key)) = hit {
+                return Err(OndaError::Conflict(format!(
+                    "key {key:?} is reserved by prepared transaction {owner:02x?}; the \
+                     reservation is released by commit_prepared or abort_prepared"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_commit(&self, prepared: &PreparedCommit, needs_write_check: bool) -> Result<()> {
         if needs_write_check {
             self.validate_write_conflicts(prepared)?;
@@ -1249,7 +1325,7 @@ impl Txn {
     /// Commit the transaction.  Returns [`OndaError::Conflict`] on a
     /// serialization conflict (Snapshot/Serializable).
     pub fn commit(&mut self) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
                 "transaction already finished".into(),
             ));
@@ -1257,7 +1333,7 @@ impl Txn {
         // Fail-stop: after a durability failure no new commit may be
         // acknowledged. The transaction stays usable for rollback.
         self.db.poison.check()?;
-        self.done = true;
+        self.state = TxnState::Finished;
         let needs_check = matches!(
             self.isolation,
             IsolationLevel::Snapshot | IsolationLevel::Serializable
@@ -1316,15 +1392,20 @@ impl Txn {
             }
         };
 
-        // A commit containing a range delete takes `commit_mu` even at
-        // ReadCommitted: its span check and its marker insert must be atomic
-        // against every other conflict-checking commit. Point-only commits keep
-        // today's behavior exactly.
-        let _guard = if needs_check || self.isolation == IsolationLevel::Serializable || has_range {
-            Some(db.commit_mu.lock())
-        } else {
-            None
-        };
+        // EVERY commit takes `commit_mu` as of 3.2 (phase rule 5), at every
+        // isolation level, including the single-op `DB::put`/`DB::delete` path
+        // that took no lock at all before. The reason is the reservation check
+        // below: putting it outside the lock is a TOCTOU — releasing the
+        // registry lock before taking `commit_mu` leaves a window in which a
+        // concurrent `prepare` registers between this commit's check and its
+        // apply, and first-preparer-wins stops meaning anything. See RV-M3 in
+        // `docs/plans/phase-3-transactions/plan.md` for the latency contract
+        // this makes worse, deliberately.
+        let _guard = db.commit_mu.lock();
+        if let Err(error) = self.check_reservations(&prepared) {
+            self.release();
+            return Err(error);
+        }
         if let Err(error) = self.validate_commit(&prepared, needs_check) {
             self.release();
             return Err(error);
@@ -1397,12 +1478,246 @@ impl Txn {
         Ok(())
     }
 
+    /// Durably **prepare** this transaction under the coordinator-supplied
+    /// `id`, the first phase of two-phase commit (3.2).
+    ///
+    /// Consumes the transaction. On `Ok` the writeset is on disk and every key
+    /// it writes is reserved: no other writer, at any isolation level, can
+    /// change them until the transaction is resolved with
+    /// [`DB::commit_prepared`] or [`DB::abort_prepared`]. That is the guarantee
+    /// a coordinator needs from a participant — **a prepare that returns `Ok`
+    /// cannot subsequently lose a conflict**, so `commit_prepared` can only
+    /// fail on durability.
+    ///
+    /// Nothing becomes visible. Prepared records are not applied to the
+    /// memtable, not published, and reserve **no sequence number**: sequences
+    /// are assigned at `commit_prepared`, so a prepare that never commits
+    /// leaves no gap.
+    ///
+    /// Validation and reservation happen under one `commit_mu` acquisition, in
+    /// that order, so a second overlapping `prepare` is refused rather than
+    /// racing. The frame is fsynced before this returns, on the WAL handle it
+    /// was appended to.
+    ///
+    /// Refused with:
+    ///
+    /// * [`InvalidArgs`](OndaError::InvalidArgs) in the per-column-family
+    ///   layout — per-CF WALs cannot atomically establish a record across
+    ///   independent logs — and for a transaction holding a range delete, which
+    ///   the prepare record has no shape for;
+    /// * [`ReadOnly`](OndaError::ReadOnly) on a read-only handle
+    ///   ([`DB::list_prepared`] still works);
+    /// * [`Poisoned`](OndaError::Poisoned) on a fail-stopped database;
+    /// * [`Exists`](OndaError::Exists) for an id that is still live, or whose
+    ///   previous instance's WAL generations are not yet unlinked;
+    /// * [`Conflict`](OndaError::Conflict) on level validation or on overlap
+    ///   with another prepare's reservation;
+    /// * [`TooLarge`](OndaError::TooLarge) past
+    ///   [`Options::max_prepared_bytes`](crate::Options::max_prepared_bytes).
+    ///
+    /// **Cross-thread.** `commit_prepared` is a [`DB`] method and normally runs
+    /// on another thread. `note_thread_commit` records the read-your-writes
+    /// floor on the *committing* thread only, so the preparing thread does not
+    /// read its own prepared write back through the read floor. That is
+    /// accepted, not a bug.
+    pub fn prepare(mut self, id: &[u8; 16]) -> Result<PreparedTxn> {
+        let result = self.prepare_inner(id);
+        // Whatever happened, this handle is done: on success the registry owns
+        // the arena, on failure the writes are discarded. `Drop` runs next and
+        // releases the snapshot.
+        self.state = TxnState::Finished;
+        if result.is_ok() {
+            self.state = TxnState::Prepared;
+        }
+        result.map(|()| PreparedTxn { id: *id })
+    }
+
+    fn prepare_inner(&mut self, id: &[u8; 16]) -> Result<()> {
+        if self.state != TxnState::Active {
+            return Err(OndaError::InvalidArgs(
+                "transaction already finished".into(),
+            ));
+        }
+        self.db.poison.check()?;
+        if self.db.opts.read_only {
+            return Err(OndaError::ReadOnly(
+                "cannot prepare a transaction on a read-only database".into(),
+            ));
+        }
+        // The capability is the *permission* to write kinds 16-18, taken once
+        // and durably before the first byte using them exists — the same
+        // contract `delete_range` has for kind 5. It is also what makes the
+        // rollback story true: with the bit unset no control frame is ever
+        // written, so the whole feature is inert on disk.
+        if self.db.caps() & crate::format::CAP_TXN_DECISIONS == 0 {
+            return Err(OndaError::InvalidArgs(
+                "prepared transactions require the CAP_TXN_DECISIONS format capability; \
+                 call DB::enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS) \
+                 once, before the first prepare"
+                    .into(),
+            ));
+        }
+        // Mirrors `commit`'s multi-CF refusal, and for the same reason — except
+        // that a prepare needs the shared log however many families it touches,
+        // because the prepare and its decision are separate frames that must
+        // land in one recoverable log.
+        let Some(unified) = self.db.unified.clone() else {
+            return Err(OndaError::InvalidArgs(
+                "prepared transactions require unified_memtable=true for atomic commit".into(),
+            ));
+        };
+        if self.writes.iter().any(|w| w.is_range()) {
+            return Err(OndaError::InvalidArgs(
+                "a transaction holding a range delete cannot be prepared: the prepare \
+                 record carries one-key writes only (kinds 1/2/3, and 1.1's operand)"
+                    .into(),
+            ));
+        }
+        let prepared = self.prepare_commit();
+        // Build the writeset once, outside the lock: the cf-id-prefixed keys the
+        // frame carries, and the registry entry that mirrors them.
+        let (scratch, spans) = self.prefixed_writeset(&prepared);
+        let mut cf_ids: Vec<u64> = prepared
+            .order
+            .iter()
+            .map(|&i| self.writes[i].cf.id())
+            .collect();
+        cf_ids.sort_unstable();
+        cf_ids.dedup();
+        let bytes = crate::db::prepared_bytes(self.buf.len(), prepared.order.len());
+
+        let _guard = self.db.commit_mu.lock();
+        // Level validation FIRST, so a prepare that would have lost a conflict
+        // at commit loses it here instead — the whole point of moving the
+        // decision forward.
+        let needs_check = matches!(
+            self.isolation,
+            IsolationLevel::Snapshot | IsolationLevel::Serializable
+        );
+        self.validate_commit(&prepared, needs_check)?;
+        if needs_check {
+            // The same span check `commit` makes: a point write covered by a
+            // range delete committed after this transaction's snapshot has lost
+            // its conflict, and a prepare must discover that here rather than
+            // promise a commit it would have to refuse.
+            self.validate_span_conflicts(&prepared)?;
+        }
+        {
+            let reg = self.db.prepared.lock();
+            if reg.knows(id) {
+                return Err(OndaError::Exists(format!(
+                    "prepared transaction {id:02x?} is already registered"
+                )));
+            }
+            for &i in &prepared.order {
+                let w = &self.writes[i];
+                let key = buf_slice(&self.buf, w.key);
+                if let Some(owner) = reg.owner_of(w.cf.id(), key) {
+                    return Err(OndaError::Conflict(format!(
+                        "key {key:?} is already reserved by prepared transaction {owner:02x?}"
+                    )));
+                }
+            }
+            reg.check_capacity(bytes)?;
+        }
+
+        // Capture the handle and the generation in ONE acquisition: rotation
+        // replaces the handle and bumps the generation together, and syncing
+        // through the store would re-clone the *current* WAL and miss a frame a
+        // concurrent rotation has just closed out.
+        let (wal, prepare_gen) = unified.wal_handle();
+        let wal = wal.ok_or_else(|| OndaError::InvalidDb("unified wal closed".into()))?;
+        let recs: Vec<RecordRef<'_>> = spans
+            .iter()
+            .map(|(key, w)| RecordRef {
+                key: &scratch[key.0..key.0 + key.1],
+                value: buf_slice(&self.buf, self.writes[*w].value),
+                seq: 0, // the sentinel; `append_prepare` enforces it too
+                ttl: self.writes[*w].ttl,
+                kind: self.writes[*w].kind,
+            })
+            .collect();
+        wal.append_prepare(
+            crate::wal::ENVELOPE_SCHEMA_UNIFIED,
+            id,
+            &cf_ids,
+            &recs,
+        )?;
+        // Durable before the registration: a reservation the WAL does not know
+        // about would vanish on restart while the coordinator believed it held.
+        wal.sync()?;
+
+        let writes: Vec<crate::prepared::PreparedWrite> = prepared
+            .order
+            .iter()
+            .map(|&i| {
+                let w = &self.writes[i];
+                crate::prepared::PreparedWrite {
+                    cf_id: w.cf.id(),
+                    key: w.key,
+                    value: w.value,
+                    ttl: w.ttl,
+                    kind: w.kind,
+                }
+            })
+            .collect();
+        let entry = crate::prepared::PreparedEntry {
+            id: *id,
+            cf_ids,
+            // The arena is MOVED, not copied and not recycled. The `Drop` that
+            // follows calls `put_buf` on an empty `Vec`, which returns
+            // immediately — and that bypass is required, not incidental:
+            // pinning an up-to-32-MiB buffer in a thread-local for an unbounded
+            // prepare lifetime is exactly what `BUF_POOL`'s caps prevent.
+            buf: std::mem::take(&mut self.buf),
+            writes,
+            prepared_at: now_nanos(),
+            bytes,
+            prepare_gen,
+        };
+        let mut reg = self.db.prepared.lock();
+        reg.register(entry);
+        self.db.note_prepared_count(&reg);
+        drop(reg);
+        self.db.wal_gens.lock().pin(prepare_gen);
+        drop(_guard);
+        self.writes.clear();
+        self.read_set.clear();
+        self.read_log.clear();
+        self.read_cfs.clear();
+        self.savepoints.clear();
+        Ok(())
+    }
+
+    /// The commit's keys with their 8-byte big-endian CF-id prefix, in one
+    /// scratch buffer, plus `(span, write index)` pairs into it.
+    ///
+    /// Same shape `UnifiedStore::apply` builds, because the prepare frame's
+    /// keys must be byte-identical to the ones the eventual apply writes.
+    fn prefixed_writeset(&self, prepared: &PreparedCommit) -> (Vec<u8>, Vec<(BufRange, usize)>) {
+        let total: usize = prepared
+            .order
+            .iter()
+            .map(|&i| 8 + self.writes[i].key.1)
+            .sum();
+        let mut scratch = Vec::with_capacity(total);
+        let mut spans = Vec::with_capacity(prepared.order.len());
+        for &i in &prepared.order {
+            let w = &self.writes[i];
+            let at = scratch.len();
+            scratch.extend_from_slice(&w.cf.id().to_be_bytes());
+            scratch.extend_from_slice(buf_slice(&self.buf, w.key));
+            spans.push(((at, scratch.len() - at), i));
+        }
+        (scratch, spans)
+    }
+
     /// Discard all buffered writes.
     pub fn rollback(&mut self) -> Result<()> {
-        if self.done {
+        if self.state != TxnState::Active {
             return Ok(());
         }
-        self.done = true;
+        self.state = TxnState::Finished;
         self.writes.clear();
         self.read_set.clear();
         self.read_log.clear();
@@ -1415,7 +1730,7 @@ impl Txn {
 
     /// Reset the transaction for reuse at a (possibly new) isolation level.
     pub fn reset(&mut self, level: IsolationLevel) -> Result<()> {
-        if !self.done {
+        if self.state == TxnState::Active {
             self.rollback()?;
         }
         let fixed = matches!(
@@ -1447,7 +1762,7 @@ impl Txn {
         self.read_log.clear();
         self.read_cfs.clear();
         self.savepoints.clear();
-        self.done = false;
+        self.state = TxnState::Active;
         Ok(())
     }
 
@@ -1462,6 +1777,9 @@ impl Txn {
 impl Drop for Txn {
     fn drop(&mut self) {
         self.writes.clear();
+        // After `prepare` the arena belongs to the registry and `self.buf` is
+        // the empty `Vec` `mem::take` left behind; `put_buf` returns
+        // immediately on a zero-capacity buffer, so nothing is recycled.
         put_buf(std::mem::take(&mut self.buf));
         self.release();
     }

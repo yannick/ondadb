@@ -1,0 +1,73 @@
+//! Rule-5 micro-benchmark: the cost of taking `commit_mu` and probing the
+//! prepared-transaction reservation registry on the ORDINARY commit path.
+//!
+//! Measures the single-op `DB::put` path — a `ReadCommitted` transaction, which
+//! took no commit lock at all before 3.2 — with `SyncMode::None`, so the number
+//! is the commit path itself and not an fsync. Reports throughput and per-op
+//! p50/p99/p999.
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ondadb::{ColumnFamilyConfig, Options, SyncMode, DB};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let ops: usize = args.get(1).map(|s| s.parse().unwrap()).unwrap_or(400_000);
+    let threads: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(8);
+    let dir = args.get(3).cloned().unwrap_or_else(|| "/tmp/rule5db".into());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let db = Arc::new(DB::open(Options::new(&dir)).unwrap());
+    let cf = db
+        .create_column_family(
+            "bench",
+            ColumnFamilyConfig {
+                sync_mode: SyncMode::None,
+                // Large enough that the run never rotates. A flush stall is
+                // background-IO latency, not commit-path latency, and at the
+                // default buffer it swamped the signal completely: p50 12.8us
+                // against a p99 of 24ms, with ~99% of wall time spent waiting
+                // on backpressure rather than committing.
+                write_buffer_size: 1 << 30,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    let per = ops / threads;
+    let value = vec![b'v'; 100];
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let (db, cf, value) = (db.clone(), cf.clone(), value.clone());
+        handles.push(std::thread::spawn(move || {
+            let mut lat: Vec<u64> = Vec::with_capacity(per);
+            for i in 0..per {
+                let key = format!("k{:016}", t * per + i);
+                let at = Instant::now();
+                db.put(&cf, key.as_bytes(), &value, Duration::ZERO).unwrap();
+                lat.push(at.elapsed().as_nanos() as u64);
+            }
+            lat
+        }));
+    }
+    let mut lat: Vec<u64> = Vec::with_capacity(ops);
+    for h in handles {
+        lat.extend(h.join().unwrap());
+    }
+    let elapsed = start.elapsed();
+    lat.sort_unstable();
+    let pick = |q: f64| lat[((lat.len() as f64 * q) as usize).min(lat.len() - 1)];
+    println!(
+        "ops={} threads={} elapsed_ms={:.1} ops_per_sec={:.0} p50_ns={} p99_ns={} p999_ns={}",
+        lat.len(),
+        threads,
+        elapsed.as_secs_f64() * 1000.0,
+        lat.len() as f64 / elapsed.as_secs_f64(),
+        pick(0.50),
+        pick(0.99),
+        pick(0.999),
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

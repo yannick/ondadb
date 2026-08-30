@@ -100,7 +100,9 @@ the two unexamined candidates.
 
 | Lock | Guards | Held across |
 |---|---|---|
-| `DbInner::commit_mu` | Snapshot/Serializable validation + apply, **and every commit containing a range delete** (1.2) | conflict check → apply → publish → span-marker insert |
+| `DbInner::commit_mu` | **every** commit, at every isolation level (3.2 phase rule 5); before that, only Snapshot/Serializable validation + apply and any commit containing a range delete (1.2) | reservation check → conflict check → apply → publish → span-marker insert. In `commit_prepared` it additionally spans the **decision fsync** |
+| `DbInner::prepared` (Mutex) | the prepared-transaction reservation registry (3.2) | one hash probe on the commit path; the whole of `Txn::prepare`'s validate-and-register; the whole of `commit_prepared`/`abort_prepared` including their decision fsync. Taken **inside** `commit_mu`, never outside it on a write path, and never while `wal_gens` is held |
+| `DbInner::wal_gens` (Mutex) | unified WAL generation pins and the retirement sweep (3.2) | one pin, one release, or one sweep. A **leaf**: flush workers take it holding nothing, and the unlinking itself happens after it is dropped |
 | `DbInner::span_index` (Mutex+Condvar) | committed-span markers (1.2) | one check, one insert, or one prune; **never held across IO**. Also taken alone, ahead of `commit_mu`, for the capacity reservation |
 | `DbInner::cf_lifecycle_mu` (2.2) | the catalog-shape changes that validate before they publish: CF create / create-many / drop / clear, partition-rule add/remove | validation → `catalog_txn` → publish. Taken **before** `manifest_mu`, never after |
 | `DbInner::manifest_mu` | manifest rebuild + save; under `CAP_MANIFEST_EDITS` also the edit append, the publish step and the snapshot-compaction trigger | whole `persist_manifest`, or a whole `catalog_txn` |
@@ -126,7 +128,134 @@ Order among the four that meet: `cf_lifecycle_mu` → `manifest_mu` → `cfs` �
 the registry lock they used before 2.2.
 
 Other safe patterns used: rotation drops `rot` while opening the next WAL file;
-commit runs hooks after dropping `commit_mu`.
+commit runs hooks after dropping `commit_mu`, and so does `commit_prepared`.
+
+### Prepared transactions: the registry and the pins (3.2)
+
+Two pieces of state, two locks, and they **never nest**. No path holds one while
+acquiring the other; `sweep_wal_gens` takes `wal_gens`, drops it, and only then
+takes `prepared` to release retired ids.
+
+**`DbInner::prepared` — the reservation registry.** `Txn::prepare` validates at
+the transaction's own isolation level, checks `by_key` for overlap, checks the
+id, checks the byte cap, appends and fsyncs the prepare frame, and registers —
+all under **one** `commit_mu` acquisition. From that moment the reserved keys are
+protected from every other writer, which is what makes the central guarantee
+true: *a `prepare` that returns `Ok` cannot subsequently lose a conflict*, so
+`commit_prepared` can only fail on durability.
+
+Phase rule 5 is the other half: **every** commit checks the registry, under
+`commit_mu`. That extends `commit_mu` to `ReadUncommitted`, `ReadCommitted` and
+`RepeatableRead`, which took no lock before 3.2 — including every single-op
+`DB::put`/`DB::delete`, which begins a `ReadCommitted` transaction. Putting the
+check outside the lock would be a TOCTOU: releasing the registry lock before
+taking `commit_mu` leaves a window in which a concurrent `prepare` registers
+between an ordinary commit's check and its apply, and first-preparer-wins stops
+meaning anything.
+
+The steady state — no prepared transaction anywhere — costs one relaxed load:
+`DbInner::prepared_live` is written only under `commit_mu`, so a commit reading
+it under the same lock cannot see a stale zero, and the registry mutex is never
+touched. The check is also **non-blocking**: it never waits on a prepared owner,
+so an abandoned prepare degrades one key range rather than the whole write path.
+
+**Measured cost** (`bench-results/3.2/2026-08-30/`), and it has two faces:
+
+- **Uncontended**: below the measurement floor — median per-op p50 moved 0.3%,
+  against a 41–54% run-to-run spread within each arm.
+- **8 concurrent writers**: a **~3× throughput regression** (2,206 → 730
+  ops/sec median) and 4.1× worse p99. Real, not noise: the base arm varies +92%
+  (machine-limited) while the 3.2 arm varies +27% (lock-limited), and the two
+  distributions do not overlap.
+
+The regression is *not* the registry probe — that is one relaxed load when no
+prepare is outstanding. It is that `commit_mu` is held across the whole apply,
+so eight `ReadCommitted` writers that previously ran their WAL append and
+memtable insert concurrently now serialize all of it. That is the price rule 5
+charges, and it cannot be lowered by moving the check: outside the lock it is a
+TOCTOU. Lowering it means shrinking the critical section — write intents or a
+second publication protocol — which is RV-M3's job, not 3.2's. This measurement
+is what turns RV-M3 from a deferred theoretical item into one with a price.
+
+**Latency (RV-M3, stated not hidden).** `commit_prepared` holds `commit_mu`
+across an fsync, inside a reserved-but-unpublished window, so `visible_seq`
+cannot advance past the reserved block until the fsync returns — and every
+concurrent fixed-isolation `begin`/`reset` meanwhile spins in
+`wait_visible_at_own_floor` (`yield_now` in a loop, bounded at one second). This
+makes RV-M3 worse, deliberately. The fix, if the numbers demand one, is RV-M3
+itself (write intents, or a second publication protocol), not a weakening of the
+ordering: the validation-to-apply exclusion `commit_mu` provides is exactly what
+the reservation depends on. `commit_prepared` also holds `prepared` across that
+fsync, so `list_prepared` blocks for its duration; a resolve-then-write order
+would instead let a same-process retry answer `Ok` for a transaction whose
+decision never reached disk.
+
+**`DbInner::wal_gens` — the generation pins.** The prepare frame lives in unified
+WAL generation `P` and the decision lands in whatever generation `D ≥ P` is
+current at resolve time. Pinning only `P` is a **data bug**: `D`'s immutable can
+flush and unlink first, and a crash then leaves a prepare with no decision, so
+recovery re-registers a reservation for a transaction that already committed and
+a coordinator retry applies the whole writeset again at fresh sequences.
+
+So the pin covers the pair. `flush_unified` hands its paths to
+`DbInner::retire_wal_paths` instead of unlinking them — **per path, not per
+immutable**, because the first immutable after an open carries every replayed
+generation plus the new one, and routinely bundles a pinned generation with
+unpinned ones. A withheld generation `G` retires when all of:
+
+- **(a)** no *unresolved* prepare has `prepare_gen == G`;
+- **(b)** every resolved pair with `prepare_gen == G` has its decision's
+  generation flushed or already deleted;
+- **(c)** every resolved pair with `decision_gen == G` **and**
+  `prepare_gen != G` has had its prepare unlinked already.
+
+Condition (c) is the ordering rule: **the prepare is unlinked before its
+decision, never the other way round.** A crash after unlinking `P` leaves a
+decision for an unknown id, which recovery treats as a no-op — safe, because `P`
+only went once `D` had flushed, i.e. once the applied records were durable in
+L0. The `prepare_gen != G` exclusion keeps the predicate from being circular
+when a pair shares one generation; those two retire atomically with the file.
+
+The sweep runs after every flush, every resolve and every abort, and returns its
+unlink list **in order**, which the caller then performs outside the lock.
+
+A resolved pair's id stays *retiring* — unusable for a new prepare — until both
+its generations are unlinked. Reusing it earlier would put two prepare frames
+with one id in the replayed set, which recovery cannot disambiguate (and rejects
+as `Corruption`).
+
+**Costs the pin imposes,** accepted and documented rather than worked around: a
+pinned generation is fully re-replayed on the next open (file absence *is* the
+flushed marker — replay has no sequence floor, no generation floor and no
+manifest cross-check), which re-inflates the memtable accounting and causes a
+redundant rotation and flush after a pinned reopen. Re-insertion is
+**observably** idempotent, not structurally so, and the two backends differ:
+`SkipMap::insert` replaces at `(key, seq)`, while `ArenaShard::put` always links
+a new node that shadows identically. Reads agree; memory and `approx_size` do
+not. Every idempotency test therefore runs in **both** feature configurations.
+
+An abandoned prepare pins its generation forever. That is the intended
+operator-visible failure mode: `DB::list_prepared` reports id, age and bytes, and
+nothing is ever auto-aborted.
+
+**The pin registry and `DeletionPause` stay separate** and do not unify.
+`DeletionPause` guards SSTable unlinking for checkpoint/backup (invariant 6,
+routed through `remove_sst_file`), while WAL files have always been deleted by a
+bare `wal::remove_wal_files` on both flush paths. Merging them would put an
+unbounded, coordinator-driven hold on SST deletion.
+
+**Recovery is a two-pass, order-free scan.** The unified WAL is four-striped in
+every mode but `SyncMode::Full`, stripe choice is per-thread, and `prepare` and
+`commit_prepared` are separate API calls that commonly run on different threads
+— so a prepare frame and its decision land in different stripe files with no
+recoverable relative order. "Replay frames in order" is not available, and
+requiring `SyncMode::Full` to buy it would be a silent, expensive configuration
+constraint. Pass 1 (inside `UnifiedStore::open`) collects every prepare and every
+decision and inserts **nothing** into the memtable; pass 2
+(`DbInner::resolve_recovered_prepares`, called from `build_db_inner` right after
+`observe_seq(unified_max_seq)`) matches them. A commit decision raises the
+watermark to `commit_seq + count - 1` **before** applying, so a decision whose
+records fail to apply has still reserved its sequences.
 
 ### Range deletes and the committed-span index (1.2)
 

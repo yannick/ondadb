@@ -112,6 +112,18 @@ pub fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// Report a recovery-time anomaly the caller cannot be handed as an error.
+///
+/// The engine has no logging framework and deliberately does not grow one: this
+/// is the single case where an open *succeeds* with state the operator must
+/// know about — prepared transactions recovered past
+/// [`Options::max_prepared_bytes`](crate::Options::max_prepared_bytes).
+/// Refusing the open instead would leave no way to inspect, let alone resolve,
+/// the durable state causing it. At most one line per open.
+pub(crate) fn log_warn(message: &str) {
+    eprintln!("ondadb: {message}");
+}
+
 /// A source of Unix-nanosecond readings, so a test can drive time instead of
 /// waiting for it.
 pub type ClockFn = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
