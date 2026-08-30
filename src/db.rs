@@ -969,6 +969,21 @@ impl DB {
         Ok(cf)
     }
 
+    /// Create a [`TailingIterator`](crate::tailing::TailingIterator) over `cf`:
+    /// a forward-only cursor that can be refreshed past its own end instead of
+    /// being rebuilt per poll.
+    ///
+    /// **Not a change feed.** A refreshed tail observes only keys strictly
+    /// greater than the last one it yielded; changes at or behind the cursor
+    /// are never surfaced. See the type's documentation for the full contract.
+    ///
+    /// DB-level by construction: each segment reads at the read-committed floor,
+    /// and refreshing a transaction's *fixed* snapshot would silently break that
+    /// snapshot — so there is no `Txn` equivalent.
+    pub fn new_tailing_iterator(&self, cf: &Arc<ColumnFamily>) -> crate::tailing::TailingIterator {
+        crate::tailing::TailingIterator::new(self.inner.clone(), cf.clone())
+    }
+
     /// Flush a column family's active memtable to an SSTable (blocks until the
     /// flush is enqueued and drained).
     pub fn flush_memtable(&self, cf: &Arc<ColumnFamily>) -> Result<()> {

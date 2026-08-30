@@ -346,3 +346,57 @@ fn explicit_migration_preserves_per_cf_data_and_one_cross_cf_txn_syncs_once() {
     assert_eq!(db.get(&b, b"hs").unwrap(), b"hardstate");
     db.close().unwrap();
 }
+
+/// The tail must work over the unified memtable layout too, where the shared
+/// store is consulted through a CF-scoped overlay iterator.
+///
+/// Known cost, accepted for v1: the unified overlay path is rebuilt per
+/// segment, so a tail that refreshes often pays for it more than the per-CF
+/// layout does.
+#[test]
+fn tailing_iterator_works_in_unified_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_unified(dir.path().to_str().unwrap());
+    let cf = db
+        .create_column_family("q", ColumnFamilyConfig::default())
+        .unwrap();
+    // A second CF sharing the memtable: its keys must never leak into the tail.
+    let other = db
+        .create_column_family("other", ColumnFamilyConfig::default())
+        .unwrap();
+
+    let key = |i: u32| format!("k{i:06}").into_bytes();
+    for i in 0..40 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+        db.put(&other, &key(i), b"noise", Duration::ZERO).unwrap();
+    }
+
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+    let mut observed: Vec<Vec<u8>> = Vec::new();
+    while tail.valid() {
+        assert_eq!(tail.value(), b"v");
+        observed.push(tail.key().to_vec());
+        tail.next();
+    }
+    assert_eq!(observed.len(), 40);
+
+    // Append, then tail on: strictly greater keys only, and complete.
+    for i in 40..80 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+        db.put(&other, &key(i), b"noise", Duration::ZERO).unwrap();
+    }
+    assert!(tail.refresh());
+    while tail.valid() {
+        observed.push(tail.key().to_vec());
+        tail.next();
+    }
+    assert!(tail.err().is_none());
+    assert_eq!(observed, (0..80).map(key).collect::<Vec<_>>());
+
+    // A key behind the cursor stays invisible here as well.
+    db.put(&cf, &key(7), b"rewritten", Duration::ZERO).unwrap();
+    tail.refresh();
+    assert!(!tail.valid());
+    db.close().unwrap();
+}

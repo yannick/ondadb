@@ -1,0 +1,10 @@
+run 1 queue-peek(tail) consumers=1 220000 entries in 1586.565 ms; 138664 ops/sec; constructions=752; constructions_per_entry=0.003418
+run 1 queue-peek(rebuild) consumers=1 220000 entries in 2994.389 ms; 73471 ops/sec; constructions=1350277; constructions_per_entry=6.137623
+run 2 queue-peek(tail) consumers=1 220000 entries in 3480.018 ms; 63218 ops/sec; constructions=749; constructions_per_entry=0.003405
+run 2 queue-peek(rebuild) consumers=1 220000 entries in 6048.468 ms; 36373 ops/sec; constructions=2969871; constructions_per_entry=13.499414
+run 3 queue-peek(tail) consumers=1 220000 entries in 4287.923 ms; 51307 ops/sec; constructions=860; constructions_per_entry=0.003909
+run 3 queue-peek(rebuild) consumers=1 220000 entries in 3353.164 ms; 65610 ops/sec; constructions=1442085; constructions_per_entry=6.554932
+run 4 queue-peek(tail) consumers=1 220000 entries in 1780.067 ms; 123591 ops/sec; constructions=850; constructions_per_entry=0.003864
+run 4 queue-peek(rebuild) consumers=1 220000 entries in 2096.566 ms; 104934 ops/sec; constructions=499456; constructions_per_entry=2.270255
+run 5 queue-peek(tail) consumers=1 220000 entries in 4237.819 ms; 51914 ops/sec; constructions=874; constructions_per_entry=0.003973
+run 5 queue-peek(rebuild) consumers=1 220000 entries in 3294.004 ms; 66788 ops/sec; constructions=1680667; constructions_per_entry=7.639395

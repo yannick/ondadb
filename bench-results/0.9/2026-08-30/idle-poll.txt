@@ -1,0 +1,10 @@
+run 1 idle-poll(tail) 200000 polls in 2.667 ms; 74992988 polls/sec; 13.3 ns/poll; constructions=1; constructions_per_poll=0.000005
+run 1 idle-poll(rebuild) 200000 polls in 76.448 ms; 2616145 polls/sec; 382.2 ns/poll; constructions=200000; constructions_per_poll=1.000000
+run 2 idle-poll(tail) 200000 polls in 2.241 ms; 89230941 polls/sec; 11.2 ns/poll; constructions=1; constructions_per_poll=0.000005
+run 2 idle-poll(rebuild) 200000 polls in 80.239 ms; 2492569 polls/sec; 401.2 ns/poll; constructions=200000; constructions_per_poll=1.000000
+run 3 idle-poll(tail) 200000 polls in 2.481 ms; 80604534 polls/sec; 12.4 ns/poll; constructions=1; constructions_per_poll=0.000005
+run 3 idle-poll(rebuild) 200000 polls in 106.310 ms; 1881288 polls/sec; 531.6 ns/poll; constructions=200000; constructions_per_poll=1.000000
+run 4 idle-poll(tail) 200000 polls in 2.715 ms; 73670469 polls/sec; 13.6 ns/poll; constructions=1; constructions_per_poll=0.000005
+run 4 idle-poll(rebuild) 200000 polls in 87.662 ms; 2281489 polls/sec; 438.3 ns/poll; constructions=200000; constructions_per_poll=1.000000
+run 5 idle-poll(tail) 200000 polls in 2.299 ms; 86984886 polls/sec; 11.5 ns/poll; constructions=1; constructions_per_poll=0.000005
+run 5 idle-poll(rebuild) 200000 polls in 77.077 ms; 2594801 polls/sec; 385.4 ns/poll; constructions=200000; constructions_per_poll=1.000000

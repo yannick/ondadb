@@ -64,6 +64,7 @@ pub mod storage;
 #[cfg(feature = "s3")]
 pub mod storage_s3;
 pub mod table_cache;
+pub mod tailing;
 pub mod txn;
 pub mod unified;
 pub mod util;
@@ -90,4 +91,5 @@ pub use perf::PerfContext;
 pub use storage::{LocalStorage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;
+pub use tailing::TailingIterator;
 pub use txn::Txn;

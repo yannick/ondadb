@@ -18,6 +18,7 @@ type/function names — grep for them; line numbers rot.
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
 | `table_cache.rs` | `TableCache`: sharded (CLOCK) LRU of open SSTable readers, bounding resident index+bloom memory by reader count (`max_open_readers`) and byte budget (`max_open_reader_bytes`); the `max_open_files` equivalent |
 | `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse and pinned-block borrowed keys/values |
+| `tailing.rs` | `TailingIterator`: forward-only keyspace tail that refreshes past its own end (not a change feed) |
 | `compaction.rs` | Leveled compaction: pick level, k-way merge, version collapse, tombstone/TTL GC, compaction filters; bottom-level output cut at partition boundaries; FIFO style (oldest-table eviction) |
 | `ingest.rs` | Bulk ingestion: pre-sorted stream → L0 SSTables directly (no WAL/memtable); atomic install at `finish()` |
 | `manifest.rs` | Durable catalog (`MANIFEST`): next file id, global seq, per-CF config blob + SST set (incl. per-table partition/tier/max-entry-time via the append-tolerant tail); crash-atomic save |
@@ -116,6 +117,40 @@ every SST, then heap-merges in internal order collapsing MVCC versions
 (`Iterator::advance_forward/backward`). Keys and values are returned as
 borrowed slices from per-child pinned blocks where possible; see
 `docs/concurrency-and-safety.md` § Pinned blocks.
+
+### Keyspace-tailing iterator (`tailing.rs`, 0.9)
+
+`DB::new_tailing_iterator(cf)` returns a `TailingIterator`: a forward-only
+cursor over an append-only ordered keyspace that can be advanced *past its own
+end* instead of being rebuilt per poll. It holds one ordinary `Iterator`
+("segment") at a time, plus the last key it yielded. `refresh()` is non-blocking
+and rebuilds only when the segment is exhausted **and** `read_floor_seq()` has
+advanced since the segment was built; the new segment is
+`cf.new_iterator(floor, None, (Bound::Excluded(last_yielded), Bound::Unbounded))`
+followed by `seek_to_first()`. Both no-op paths cost a `valid()` check and one
+atomic load. The target workload is the queue peek in `memtable.rs`'s header,
+where per-poll iterator construction is the dominant cost.
+
+**This is not a change feed.** A refreshed tail may observe only keys that
+compare strictly greater than its last yielded key; an insert, update or delete
+at or behind the cursor is never observed, and an already-yielded key is never
+re-yielded. There is deliberately no `prev` and no `seek_for_prev`.
+
+Each segment reads at `DbInner::read_floor_seq()` — the read-committed floor,
+captured afresh per segment, never a pinned snapshot. Refreshing a *fixed*
+snapshot would silently break that snapshot's guarantees, which is why the tail
+is a `DB`-level API with no `Txn` equivalent (a `Txn` passes its buffered writes
+as the `extra` overlay; the tail always passes `None`). `now` for TTL expiry
+comes from `new_iterator`'s own `coarse_now_nanos()` call, so a long-lived tail
+re-evaluates expiry per segment rather than against its construction time. A
+segment whose sources cannot all be opened is an `Iterator::failed(..)`, so
+`err()` must be checked after a walk goes invalid — otherwise a missing table
+reads as "no more entries". `segments()` reports iterator constructions, which
+is what the acceptance benchmark divides by yielded entries.
+
+Known cost, accepted for v1: in unified-memtable mode the CF-scoped overlay is
+rebuilt per segment, so a tail that refreshes often pays more there than under
+the per-CF layout.
 
 ### Lazy memtable iterator (`LazyMemIter`, default build)
 

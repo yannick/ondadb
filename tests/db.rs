@@ -1087,3 +1087,282 @@ fn iterator_counters_are_thread_affine() {
     t.rollback().unwrap();
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 0.9 — keyspace-tailing iterator
+// ---------------------------------------------------------------------------
+
+/// Format a tail test key so byte order matches numeric order.
+fn tk(i: u32) -> Vec<u8> {
+    format!("k{i:06}").into_bytes()
+}
+
+/// Drain the current segment, appending every yielded key.
+fn drain(tail: &mut ondadb::TailingIterator, out: &mut Vec<Vec<u8>>) {
+    while tail.valid() {
+        out.push(tail.key().to_vec());
+        tail.next();
+    }
+}
+
+#[test]
+fn tailing_iterator_walks_a_static_keyspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    // Half the keyspace in SSTables, half in the memtable, so the tail has to
+    // merge the same sources a normal snapshot iterator does.
+    for i in 0..200 {
+        db.put(&cf, &tk(i), format!("v{i}").as_bytes(), Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    for i in 200..300 {
+        db.put(&cf, &tk(i), format!("v{i}").as_bytes(), Duration::ZERO)
+            .unwrap();
+    }
+
+    let txn = db.begin();
+    let mut reference = Vec::new();
+    let mut it = txn.new_iterator(&cf);
+    it.seek_to_first();
+    while it.valid() {
+        reference.push((it.key().to_vec(), it.value().to_vec()));
+        it.next();
+    }
+    assert!(it.err().is_none());
+    assert_eq!(reference.len(), 300);
+
+    let mut tail = db.new_tailing_iterator(&cf);
+    let mut observed = Vec::new();
+    tail.seek_to_first();
+    while tail.valid() {
+        observed.push((tail.key().to_vec(), tail.value().to_vec()));
+        tail.next();
+    }
+    assert!(tail.err().is_none());
+    assert_eq!(observed, reference);
+    // Nothing was written since the tail was built, so an exhausted tail has
+    // nothing to refresh to.
+    assert!(!tail.refresh());
+    db.close().unwrap();
+}
+
+#[test]
+fn refresh_yields_only_strictly_greater_keys() {
+    const SEED: u32 = 50;
+    const APPENDED: u32 = 500;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    let db = Arc::new(db);
+    for i in 0..SEED {
+        db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+    }
+
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+
+    let writer = {
+        let db = db.clone();
+        let cf = cf.clone();
+        std::thread::spawn(move || {
+            for i in SEED..SEED + APPENDED {
+                db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+            }
+        })
+    };
+
+    let total = (SEED + APPENDED) as usize;
+    let mut observed: Vec<Vec<u8>> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        drain(&mut tail, &mut observed);
+        assert!(tail.err().is_none(), "{:?}", tail.err());
+        if observed.len() == total {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tail stalled at {} of {total}",
+            observed.len()
+        );
+        if !tail.refresh() {
+            std::thread::yield_now();
+        }
+    }
+    writer.join().unwrap();
+
+    for pair in observed.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "tail went backwards or repeated: {:?} then {:?}",
+            String::from_utf8_lossy(&pair[0]),
+            String::from_utf8_lossy(&pair[1])
+        );
+    }
+    let expected: Vec<Vec<u8>> = (0..SEED + APPENDED).map(tk).collect();
+    assert_eq!(observed, expected);
+    // The whole point: far fewer iterator constructions than yielded entries.
+    assert!(
+        tail.segments() < total as u64,
+        "{} segments for {total} entries",
+        tail.segments()
+    );
+    drop(tail);
+    Arc::try_unwrap(db).unwrap().close().unwrap();
+}
+
+#[test]
+fn refresh_is_noop_mid_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for i in 0..10 {
+        db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+    }
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+    tail.next();
+    assert!(tail.valid());
+
+    // Advance the visible floor while entries remain unread.
+    db.put(&cf, &tk(99), b"v", Duration::ZERO).unwrap();
+    let before = tail.segments();
+    assert!(!tail.refresh(), "mid-segment refresh must not rebuild");
+    assert_eq!(tail.segments(), before);
+
+    // The same segment continues from where it stood (k000001), at its own
+    // snapshot: k000099 is not in it.
+    let mut rest = Vec::new();
+    drain(&mut tail, &mut rest);
+    assert_eq!(rest, (1..10).map(tk).collect::<Vec<_>>());
+    db.close().unwrap();
+}
+
+#[test]
+fn refresh_is_noop_when_floor_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for i in 0..10 {
+        db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+    }
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+    let mut all = Vec::new();
+    drain(&mut tail, &mut all);
+    assert_eq!(all.len(), 10);
+
+    let before = tail.segments();
+    assert!(!tail.refresh());
+    assert!(!tail.refresh());
+    assert_eq!(
+        tail.segments(),
+        before,
+        "an unchanged floor must not rebuild"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn tail_never_observes_updates_behind_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for i in 0..5 {
+        db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+    }
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+    let mut observed = Vec::new();
+    drain(&mut tail, &mut observed);
+    assert_eq!(observed.len(), 5);
+
+    // Update a key the tail already passed: never re-yielded.
+    db.put(&cf, &tk(2), b"updated", Duration::ZERO).unwrap();
+    tail.refresh();
+    drain(&mut tail, &mut observed);
+    assert_eq!(observed.len(), 5, "an update behind the cursor re-surfaced");
+
+    // Delete it: also never yielded (this is not a change feed).
+    db.delete(&cf, &tk(2)).unwrap();
+    tail.refresh();
+    drain(&mut tail, &mut observed);
+    assert_eq!(observed.len(), 5, "a delete behind the cursor surfaced");
+    assert!(tail.err().is_none());
+
+    // The change itself is real — a fresh reader sees it.
+    assert!(db.get(&cf, &tk(2)).is_err());
+    db.close().unwrap();
+}
+
+#[test]
+fn tail_never_observes_inserts_behind_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for i in [1u32, 2, 4, 5] {
+        db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+    }
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+    let mut observed = Vec::new();
+    drain(&mut tail, &mut observed);
+    assert_eq!(observed, [1u32, 2, 4, 5].map(tk).to_vec());
+
+    db.put(&cf, &tk(3), b"late", Duration::ZERO).unwrap();
+    tail.refresh();
+    drain(&mut tail, &mut observed);
+    assert_eq!(
+        observed.len(),
+        4,
+        "a key inserted behind the cursor must stay invisible to this tail"
+    );
+
+    // Visible to anyone who starts fresh.
+    let txn = db.begin();
+    let mut it = txn.new_iterator(&cf);
+    it.seek_to_first();
+    let mut fresh = Vec::new();
+    while it.valid() {
+        fresh.push(it.key().to_vec());
+        it.next();
+    }
+    assert_eq!(fresh, [1u32, 2, 3, 4, 5].map(tk).to_vec());
+    db.close().unwrap();
+}
+
+#[test]
+fn tail_surfaces_iterator_construction_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open(dir.path());
+    for i in 0..20 {
+        db.put(&cf, &tk(i), b"v", Duration::ZERO).unwrap();
+    }
+
+    // Drain the first segment from the memtable alone, so no SSTable reader is
+    // open when the table below is destroyed.
+    let mut tail = db.new_tailing_iterator(&cf);
+    tail.seek_to_first();
+    let mut observed = Vec::new();
+    drain(&mut tail, &mut observed);
+    assert_eq!(observed.len(), 20);
+
+    // k000999 sits above the cursor, so the flushed table cannot be pruned out
+    // of the next segment by its lower bound.
+    db.put(&cf, &tk(999), b"v", Duration::ZERO).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    // Destroy the table behind the manifest's back. Readers are opened lazily,
+    // so the rebuild below is the first attempt to open this one.
+    let klog = std::fs::read_dir(dir.path().join("cf-default"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "klog"))
+        .expect("flush created a klog");
+    std::fs::write(&klog, b"not an sstable").unwrap();
+
+    assert!(!tail.refresh(), "a failed rebuild is not a valid segment");
+    assert!(!tail.valid());
+    assert!(
+        tail.err().is_some(),
+        "a tail that cannot open a table must report it, not return a short answer"
+    );
+    let _ = db.close();
+}
