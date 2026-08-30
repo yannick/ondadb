@@ -101,7 +101,8 @@ the two unexamined candidates.
 | Lock | Guards | Held across |
 |---|---|---|
 | `DbInner::commit_mu` | Snapshot/Serializable validation + apply | conflict check → apply → publish |
-| `DbInner::manifest_mu` | manifest rebuild + save | whole `persist_manifest` |
+| `DbInner::cf_lifecycle_mu` (2.2) | the catalog-shape changes that validate before they publish: CF create / create-many / drop / clear, partition-rule add/remove | validation → `catalog_txn` → publish. Taken **before** `manifest_mu`, never after |
+| `DbInner::manifest_mu` | manifest rebuild + save; under `CAP_MANIFEST_EDITS` also the edit append, the publish step and the snapshot-compaction trigger | whole `persist_manifest`, or a whole `catalog_txn` |
 | `DbInner::publish` (Mutex) | publish cursor | short |
 | `DbInner::file_deletion.paused` | pause counter + deferred-delete list | short; `pause_deletions` returns an RAII guard. Never held across the unlink or the channel send |
 | `DbInner::file_deletion.worker.{tx,handle}` | deletion-queue sender / join handle | one unbounded `send` (never blocks) or one `take`; the join in `drain_deletions` happens with neither held |
@@ -109,16 +110,22 @@ the two unexamined candidates.
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
 | `ColumnFamily::compact_mu` (Mutex) | whole-CF compaction operations | manual compaction sweep and FIFO eviction; acquired before the whole-keyspace range lock |
 | `ColumnFamily::range_locks` | key ranges being rewritten | bounded compaction jobs use non-blocking acquisition; attach takes the whole keyspace; detach and part moves block on the affected partition span, including copy + manifest flip |
-| `ColumnFamily::live_partition_rules` (RwLock) | the live partition-rule set | `append_partition_rule` validates + appends under one write acquisition (concurrent duplicate adds: exactly one wins); released **before** `persist_manifest`, which re-reads the rules via `effective_config` |
+| `ColumnFamily::live_partition_rules` (RwLock) | the live partition-rule set | one read acquisition to validate a candidate set, one write acquisition to append/remove it inside the transaction's publish step. Exclusion between concurrent duplicate adds comes from `cf_lifecycle_mu`, which spans both (exactly one wins) |
 | `Wal::qstate` / per-stripe file mutexes | group-commit queue / file appends | one frame write |
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
 | `commit_hook` (Mutex) | hook fn | hook invocation |
 | `DbInner::span_permits` (Mutex&lt;usize&gt;) | count of free compaction **span workers** (0.8) | one non-blocking take/release; never held across IO |
 | `<dir>/LOCK` (OS advisory file lock) | whole DB directory against other processes/handles | entire open→close lifetime; exclusive for read-write, shared for read-only opens; second open fails with `OndaError::Locked` |
 
-Safe patterns used: `create/drop_column_family` release the `cfs` write lock
-before `persist_manifest`; rotation drops `rot` while opening the next WAL
-file; commit runs hooks after dropping `commit_mu`.
+Order among the four that meet: `cf_lifecycle_mu` → `manifest_mu` → `cfs` →
+`ColumnFamily::state`. `catalog_txn` runs its publish closure while holding
+`manifest_mu`, and `write_snapshot` takes `cfs.read()` under the same lock, so
+**no caller may hold `cfs.write()` across a catalog transaction** — that is why
+`create_column_family` and friends serialize on `cf_lifecycle_mu` instead of on
+the registry lock they used before 2.2.
+
+Other safe patterns used: rotation drops `rot` while opening the next WAL file;
+commit runs hooks after dropping `commit_mu`.
 
 ### Background-wait rule and its one exception (0.6)
 

@@ -331,12 +331,23 @@ impl DB {
         }
         let ids: Vec<u64> = handles.iter().map(|h| h.meta.id).collect();
 
-        // 1. Drop the tables from the in-memory level set (new reads stop seeing
-        //    them immediately), then 2. persist the manifest — the atomic commit
-        //    point. A crash after this leaves the files in place but out of the
-        //    catalog: harmless orphans, and a clean reopen.
-        cf.remove_bottom_tables(&ids);
-        self.inner.persist_manifest()?;
+        // 1. Append and fsync ONE `RemoveTables` edit — that fsync is the
+        //    atomic commit point (2.2; before it, the commit point was the
+        //    manifest rewrite that followed the in-memory removal). Then
+        //    2. drop the tables from the level set, so new reads stop seeing
+        //    them. A crash after the fsync leaves the files in place but out of
+        //    the catalog: harmless orphans, and a clean reopen. A crash before
+        //    it leaves the part attached and every file where it was.
+        let edit = crate::manifest_edit::VersionEdit::new(vec![
+            crate::manifest_edit::Op::RemoveTables {
+                cf: cf.name().to_string(),
+                ids: ids.clone(),
+            },
+        ]);
+        self.inner
+            .catalog_txn(edit, |p| {
+                cf.remove_bottom_tables(&ids, p);
+            })?;
 
         // 3. Move the file pairs aside. Existing readers hold their own open
         //    descriptors/mmaps, so the moves don't disturb them.
@@ -491,14 +502,31 @@ impl DB {
             return Err(e);
         }
 
-        for (handle, at_bottom) in staged {
-            if at_bottom {
-                cf.insert_bottom_sorted(handle);
-            } else {
-                cf.install_handles_l0(vec![handle]);
-            }
+        // The copies are finished and fsynced; ONE edit adds every table. On an
+        // append/fsync failure nothing is published and the copies are unlinked,
+        // exactly as the staging failure above does — the model for the whole
+        // attach/ingest/clone family.
+        let mut edit = crate::manifest_edit::VersionEdit::default();
+        for (handle, _) in &staged {
+            edit.push(crate::manifest_edit::Op::AddTable {
+                cf: cf.name().to_string(),
+                meta: handle.meta.clone(),
+            });
         }
-        self.inner.persist_manifest()?;
+        if let Err(e) = self.inner.catalog_txn(edit, |p| {
+            for (handle, at_bottom) in staged {
+                if at_bottom {
+                    cf.insert_bottom_sorted(handle, p);
+                } else {
+                    cf.install_handles_l0(vec![handle], p);
+                }
+            }
+        }) {
+            for path in &copied {
+                let _ = default_storage.delete(path);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -633,14 +661,27 @@ impl DB {
         let max_seq = part.tables.iter().map(|t| t.max_seq).max().unwrap_or(0);
         self.inner.observe_seq(max_seq);
 
-        for (handle, at_bottom) in staged {
-            if at_bottom {
-                cf.insert_bottom_sorted(handle);
-            } else {
-                cf.install_handles_l0(vec![handle]);
-            }
+        // Zero-copy: there is nothing to unlink on failure, so the rollback is
+        // "discard the staged handles" — which is what not publishing them is.
+        // Every table carries `object: Some(..)` (checked above), so every
+        // `AddTable` here carries one too.
+        let mut edit = crate::manifest_edit::VersionEdit::default();
+        for (handle, _) in &staged {
+            debug_assert!(handle.meta.object.is_some());
+            edit.push(crate::manifest_edit::Op::AddTable {
+                cf: cf.name().to_string(),
+                meta: handle.meta.clone(),
+            });
         }
-        self.inner.persist_manifest()?;
+        self.inner.catalog_txn(edit, |p| {
+            for (handle, at_bottom) in staged {
+                if at_bottom {
+                    cf.insert_bottom_sorted(handle, p);
+                } else {
+                    cf.install_handles_l0(vec![handle], p);
+                }
+            }
+        })?;
         Ok(())
     }
 
@@ -1015,10 +1056,24 @@ impl crate::db::DbInner {
             MovePhase::DestinationSynced,
         )?;
 
-        // Flip: swap the handles in memory, then persist the manifest (the
-        // durable commit point that records tier=<tier> for these ids).
-        cf.swap_bottom_tables(new_handles);
-        self.persist_manifest()?;
+        // Flip: ONE edit carrying every `UpdateTable{Tier, Object}`, then the
+        // swap. The edit record's fsync is the durable commit point that
+        // records tier=<tier> for these ids (2.2; before it, the manifest
+        // rewrite that followed the swap was). A partially applied flip is not
+        // representable — the ops are one all-or-nothing record.
+        let mut edit = crate::manifest_edit::VersionEdit::default();
+        for handle in &new_handles {
+            edit.push(crate::manifest_edit::Op::UpdateTable {
+                cf: cf.name().to_string(),
+                id: handle.meta.id,
+                update: crate::manifest_edit::TableUpdate::relocation(
+                    handle.meta.tier.clone(),
+                    handle.meta.object.clone(),
+                ),
+            });
+        }
+        let swap_in = new_handles;
+        self.catalog_txn(edit, |p| cf.swap_bottom_tables(swap_in, p))?;
         observe_committed_move(
             observer,
             cf.name(),
@@ -1279,12 +1334,20 @@ impl DB {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.inner.poison.check()?;
-        // Validate + append to the live rules under the CF's rule lock, then
-        // persist the manifest (its own `manifest_mu` serializes the rewrite).
-        // The lock is released before persist because `persist_manifest` re-reads
-        // the live rules through `effective_config`.
-        cf.append_partition_rule(rule)?;
-        self.inner.persist_manifest()?;
+        // Validate against the live rules, then publish inside the transaction.
+        // `cf_lifecycle_mu` spans both halves, so a racing add validates against
+        // the set this one is about to install rather than the one before it —
+        // which is what the old single-lock validate-and-append gave.
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        let candidate = cf.plan_partition_rule_addition(&rule)?;
+        let edit = crate::manifest_edit::VersionEdit::new(vec![
+            crate::manifest_edit::Op::SetCfConfig {
+                name: cf.name().to_string(),
+                config: candidate.encode(),
+            },
+        ]);
+        self.inner
+            .catalog_txn(edit, |p| cf.append_partition_rule(rule, p))?;
         Ok(())
     }
 
@@ -1302,8 +1365,16 @@ impl DB {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.inner.poison.check()?;
-        cf.remove_partition_rule(prefix)?;
-        self.inner.persist_manifest()?;
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        let candidate = cf.plan_partition_rule_removal(prefix)?;
+        let edit = crate::manifest_edit::VersionEdit::new(vec![
+            crate::manifest_edit::Op::SetCfConfig {
+                name: cf.name().to_string(),
+                config: candidate.encode(),
+            },
+        ]);
+        self.inner
+            .catalog_txn(edit, |p| cf.remove_partition_rule(prefix, p))?;
         Ok(())
     }
 }

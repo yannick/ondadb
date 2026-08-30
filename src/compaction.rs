@@ -708,11 +708,21 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     cf.compacting
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let res = (|| {
-        let victims = cf.take_fifo_victims(cf.opts.fifo_max_bytes, cf.opts.fifo_ttl);
+        let victims = cf.select_fifo_victims(cf.opts.fifo_max_bytes, cf.opts.fifo_ttl);
         if victims.is_empty() {
             return Ok(());
         }
-        db.persist_manifest()?;
+        // Selection no longer mutates the level set: the eviction is published
+        // by the transaction, after its edit record's fsync, and only then may
+        // a file be unlinked (AGENTS.md invariant 1).
+        let ids: Vec<u64> = victims.iter().map(|t| t.meta.id).collect();
+        let edit = crate::manifest_edit::VersionEdit::new(vec![
+            crate::manifest_edit::Op::RemoveTables {
+                cf: cf.name().to_string(),
+                ids: ids.clone(),
+            },
+        ]);
+        db.catalog_txn(edit, |p| cf.remove_l0_tables(&ids, p))?;
         for t in &victims {
             db.remove_sst_file(&cf.klog_path(t.meta.id), t.meta.klog_size);
             db.remove_sst_file(
@@ -1603,12 +1613,9 @@ fn install_compaction_outputs(
     level: usize,
     target: usize,
     inputs: &[Arc<SstHandle>],
-    outputs: &[SstMeta],
-) -> Vec<Arc<SstHandle>> {
-    let new_handles: Vec<Arc<SstHandle>> = outputs
-        .iter()
-        .map(|meta| cf.handle_for(meta.clone()))
-        .collect();
+    new_handles: &[Arc<SstHandle>],
+    p: &crate::db::Publish,
+) {
     let input_ids: std::collections::HashSet<u64> =
         inputs.iter().map(|table| table.meta.id).collect();
     cf.update_levels(|levels| {
@@ -1646,14 +1653,15 @@ fn install_compaction_outputs(
              is committed data becoming unreachable (level={level} target={target})"
         );
         updated
-    });
-    new_handles
+    }, p);
 }
 
-/// Undo [`install_compaction_outputs`] after a failed `persist_manifest`.
+/// Undo [`install_compaction_outputs`] after a failed snapshot write.
 ///
-/// The manifest still names the inputs, so in-memory state must go back to
-/// naming them too before the output files are unlinked — otherwise a reader
+/// Reachable only as `catalog_txn`'s rollback closure, and therefore only on the
+/// pre-`CAP_MANIFEST_EDITS` path, where the publication necessarily precedes the
+/// write. The manifest still names the inputs, so in-memory state must go back
+/// to naming them too before the output files are unlinked — otherwise a reader
 /// between the two steps sees tables whose bytes are about to disappear. The
 /// inputs are re-inserted at their own recorded level rather than restored from
 /// a level-set snapshot taken before the install, because a snapshot would also
@@ -1663,6 +1671,7 @@ fn rollback_compaction_outputs(
     cmp: &ComparatorRef,
     inputs: &[Arc<SstHandle>],
     installed: &[Arc<SstHandle>],
+    p: &crate::db::Publish,
 ) {
     let output_ids: std::collections::HashSet<u64> =
         installed.iter().map(|table| table.meta.id).collect();
@@ -1696,7 +1705,7 @@ fn rollback_compaction_outputs(
             }
         }
         updated
-    });
+    }, p);
     for table in installed {
         table.close();
     }
@@ -1808,14 +1817,35 @@ fn compact_inputs_inner(
         "spans produced overlapping or unsorted output — the span bounds are \
          not a partition of the keyspace (level={level} target={target})"
     );
-    let installed = install_compaction_outputs(cf, &cmp, level, target, &inputs, &outputs);
-
-    // Writer::finish has synced every output and its parent directory. Publish
-    // that new level set durably before any obsolete input can be unlinked.
-    if let Err(error) = db.persist_manifest() {
-        // The manifest still names the inputs. Put them back before unlinking
-        // the outputs, so the file set and the level set agree again.
-        rollback_compaction_outputs(cf, &cmp, &inputs, &installed);
+    // Writer::finish has synced every output and its parent directory
+    // (catalog_txn step 2). ONE edit retires every input and adds every output;
+    // a partially applied compaction is not representable.
+    let new_handles: Vec<Arc<SstHandle>> = outputs
+        .iter()
+        .map(|meta| cf.handle_for(meta.clone()))
+        .collect();
+    let mut edit = crate::manifest_edit::VersionEdit::default();
+    edit.push(crate::manifest_edit::Op::RemoveTables {
+        cf: cf.name().to_string(),
+        ids: inputs.iter().map(|table| table.meta.id).collect(),
+    });
+    for meta in &outputs {
+        edit.push(crate::manifest_edit::Op::AddTable {
+            cf: cf.name().to_string(),
+            meta: meta.clone(),
+        });
+    }
+    let publish_handles = new_handles.clone();
+    let rollback_handles = new_handles;
+    if let Err(error) = db.catalog_txn_with_rollback(
+        edit,
+        |p| install_compaction_outputs(cf, &cmp, level, target, &inputs, &publish_handles, p),
+        |p| rollback_compaction_outputs(cf, &cmp, &inputs, &rollback_handles, p),
+    ) {
+        // Nothing durable references the outputs: either the append failed and
+        // they were never published, or the pre-capability snapshot failed and
+        // the rollback above put the inputs back. Either way the file set and
+        // the level set agree again once these are gone.
         for meta in &outputs {
             let klog = cf.klog_path(meta.id);
             db.remove_sst_file(&klog, meta.klog_size);
@@ -1823,6 +1853,7 @@ fn compact_inputs_inner(
         }
         return Err(error);
     }
+    // Step 5: obsolete inputs are retired only after the edit's fsync.
     remove_compaction_inputs(db, cf, &inputs);
     Ok(())
 }

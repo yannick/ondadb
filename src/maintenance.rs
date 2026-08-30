@@ -268,41 +268,96 @@ impl DB {
         // Keep src's SSTables from being compacted away while we hard-link them.
         let _pause = self.inner.pause_deletions();
 
-        let dst_cf = self.create_column_family(dst, src_cf.effective_config())?;
+        // The destination family is created *and* populated by ONE edit
+        // (`CreateCF` + `AddTable` x N), so it never exists on disk as an empty
+        // catalog entry a crash could strand. That rules out routing through
+        // `create_column_family`, which is a transaction of its own.
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        if self.inner.cfs.read().contains_key(dst) {
+            return Err(OndaError::Exists(dst.into()));
+        }
+        let config = src_cf.effective_config();
+        let comparator = crate::comparator::comparator_by_name(&config.comparator_name)
+            .ok_or_else(|| {
+                OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
+            })?;
+        let dst_cf = crate::column_family::ColumnFamily::create(
+            self.inner.ctx.clone(),
+            dst.to_string(),
+            self.inner.cf_dir(dst),
+            config,
+            comparator,
+        )?;
 
-        // Hard-link each src SSTable into dst under a fresh id and register it.
+        // Hard-link each src SSTable into dst under a fresh id.
         let src_metas: Vec<SstMeta> = src_cf.snapshot_ssts();
         let mut by_level: Vec<Vec<Arc<SstHandle>>> = Vec::new();
-        for meta in src_metas {
-            let new_id = self.inner.next_file_id();
-            let storage = src_cf.tiers().storage_for(meta.tier.as_deref());
-            let src_klog = src_cf.klog_path_for(&meta);
-            for (ext, source, size) in [
-                ("klog", src_klog.clone(), meta.klog_size),
-                ("vlog", crate::sst::vlog_path_for(&src_klog), meta.vlog_size),
-            ] {
-                if ext == "vlog" && size == 0 {
-                    continue;
+        let mut linked: Vec<std::path::PathBuf> = Vec::new();
+        let mut new_metas: Vec<SstMeta> = Vec::new();
+        let staging = (|| -> Result<()> {
+            for meta in src_metas {
+                let new_id = self.inner.next_file_id();
+                let storage = src_cf.tiers().storage_for(meta.tier.as_deref());
+                let src_klog = src_cf.klog_path_for(&meta);
+                for (ext, source, size) in [
+                    ("klog", src_klog.clone(), meta.klog_size),
+                    ("vlog", crate::sst::vlog_path_for(&src_klog), meta.vlog_size),
+                ] {
+                    if ext == "vlog" && size == 0 {
+                        continue;
+                    }
+                    let destination =
+                        std::path::PathBuf::from(format!("{}/{new_id}.{ext}", dst_cf.dir()));
+                    place_storage_file(storage.as_ref(), &source, &destination, true)?;
+                    linked.push(destination);
                 }
-                let destination =
-                    std::path::PathBuf::from(format!("{}/{new_id}.{ext}", dst_cf.dir()));
-                place_storage_file(storage.as_ref(), &source, &destination, true)?;
+                let level = meta.level as usize;
+                let mut new_meta = meta;
+                new_meta.id = new_id;
+                new_meta.tier = None;
+                new_meta.object = None;
+                while by_level.len() <= level {
+                    by_level.push(Vec::new());
+                }
+                by_level[level].push(dst_cf.open_sst(new_meta.clone())?);
+                new_metas.push(new_meta);
             }
-            let level = meta.level as usize;
-            let mut new_meta = meta;
-            new_meta.id = new_id;
-            new_meta.tier = None;
-            new_meta.object = None;
-            while by_level.len() <= level {
-                by_level.push(Vec::new());
+            Ok(())
+        })();
+        if let Err(e) = staging {
+            for path in &linked {
+                let _ = std::fs::remove_file(path);
             }
-            by_level[level].push(dst_cf.open_sst(new_meta)?);
+            return Err(e);
         }
         if by_level.is_empty() {
             by_level.push(Vec::new());
         }
-        dst_cf.install_levels(by_level);
-        self.inner.persist_manifest()?;
+        let mut ops = vec![crate::manifest_edit::Op::CreateCf {
+            name: dst.to_string(),
+            config: dst_cf.effective_config().encode(),
+        }];
+        for meta in new_metas {
+            ops.push(crate::manifest_edit::Op::AddTable {
+                cf: dst.to_string(),
+                meta,
+            });
+        }
+        let published = dst_cf.clone();
+        if let Err(e) = self
+            .inner
+            .catalog_txn(crate::manifest_edit::VersionEdit::new(ops), |p| {
+                self.inner.register_cf(&published, p);
+                published.install_levels(by_level, p);
+            })
+        {
+            // Nothing was published; the hard links this call made are the only
+            // trace, and they go.
+            for path in &linked {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
         Ok(dst_cf)
     }
 }

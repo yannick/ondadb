@@ -274,9 +274,14 @@ Flush worker (`db.rs::flush_worker`):
 - `ColumnFamily::flush_imm` → under fastpath `write_l0_streaming`: a 16-way
   `FlushMerge` over borrowing `ShardCursor`s feeds `Writer::add` directly —
   no `Vec<Entry>` materialization, no sort. Safe build: `snapshot()` + sort.
+  Nothing is published: `flush_imm` returns a `FlushOutput` holding the finished
+  handle (`None` for an empty memtable) and the WAL paths.
 - `Writer::finish` fsyncs klog+vlog and the CF directory.
-- `persist_manifest()`; **only on `Ok`** delete the imm's WAL files
-  (`wal::remove_wal_files` unlinks all stripes).
+- `catalog_txn(AddTable, publish_flush)`: the record is appended and **fsynced**,
+  and only then is the table installed in L0 and the sealed memtable retired,
+  under one state write-lock. **Only on `Ok`** are the imm's WAL files deleted
+  (`wal::remove_wal_files` unlinks all stripes) — invariant 1's gate is the edit
+  fsync, never a snapshot write.
 - If L0 count ≥ `l1_file_count_trigger`, enqueue compaction.
 
 ## Compaction (`compaction.rs`)
@@ -289,8 +294,9 @@ TTL entries only at the bottom level. Output SSTs are split at
 `target_file_size` and, at the bottom level, additionally **cut at partition
 boundaries** (see § Partitions). Every output carries
 `max_entry_time = max` over its inputs' stamps, so re-compacting cold data
-does not reset its age for the part mover. Ordering: new levels installed →
-`persist_manifest()?` → inputs deleted via `DbInner::remove_sst_file`
+does not reset its age for the part mover. Ordering: outputs written and fsynced → ONE edit
+(`RemoveTables` for every input plus `AddTable` for every output) appended and
+fsynced → new levels installed → inputs deleted via `DbInner::remove_sst_file`
 (defer-aware, and paced when `obsolete_delete_bytes_per_second` is set — see
 § Paced obsolete-file deletion). Input deletion resolves **default-tier paths only** — a
 compacted input that lived on a named tier is not unlinked there (a storage
@@ -483,10 +489,13 @@ part via the crash-safe protocol of `relocate_part`:
 
 ```
 copy every file pair to the target tier (StorageWriter::finish = durable)
+→ one edit of UpdateTable{Tier,Object} per id, appended + fsynced
+                              # the commit point: records tier=<t> for the ids
 → swap the in-memory handles (reads flip; in-flight reads finish on old handles)
-→ persist_manifest()          # the commit point: records tier=<t> for the ids
 → delete the source files (remove_sst_file, defer-aware and paceable)
 ```
+
+The flip is one record, so a partially applied move is not representable.
 
 A crash before the flip leaves target-side copies the manifest does not
 know about; after it, source-side leftovers. Both are cleaned by
@@ -563,21 +572,78 @@ publish the candidate → retire removed handles through
 snapshot-compaction trigger → on failure publish nothing, leave the old state
 visible, and fail-stop.
 
-This **inverts** today's order at every mutating site, which publishes before
-persisting. Appends and snapshot compaction both hold `manifest_mu`, and that is
-not optional: compaction renames a fresh log over the live one, so a record
-appended between the snapshot write and the rename would be silently lost.
+This **inverts** the pre-2.2 order at every mutating site, which published
+before persisting. Appends and snapshot compaction both hold `manifest_mu`, and
+that is not optional: compaction renames a fresh log over the live one, so a
+record appended between the snapshot write and the rename would be silently
+lost.
+
+`next_file_id` and `global_seq` ride no edit. Recovery reconciles both from what
+the catalog actually references (rule r7), which is smaller *and* safe under
+concurrency: transactions serialize on `manifest_mu` in an order the file-id
+allocator does not, so a per-site `SetNextFileID` could land out of order and
+fail its own monotonicity precondition on replay.
+
+An `AddTable` at level 0 replays to the **front** of the CF's table list, which
+is where `install_handles_l0` puts the handle: L0 is read newest-first and
+`ColumnFamily::load` preserves the manifest's within-level order, so appending
+would reopen a family with its newest L0 table treated as its oldest.
+
+### The publication token
+
+`publish` receives a `db::Publish`, a zero-sized token with a private field and
+no constructor outside `db.rs`. Every function that installs catalog state takes
+one by reference:
+
+| Primitive | Where | Publishes |
+| --- | --- | --- |
+| `install_handles_l0` | `column_family.rs` | new L0 tables (flush, ingest, attach) |
+| `publish_flush` | `column_family.rs` | an L0 table + retiring its sealed memtable |
+| `update_levels` | `column_family.rs` | a whole level set (compaction install/rollback) |
+| `install_levels` | `column_family.rs` | a pre-built level set (clone) |
+| `remove_bottom_tables` | `column_family.rs` | detach |
+| `insert_bottom_sorted` | `column_family.rs` | attach into the bottom level |
+| `swap_bottom_tables` | `column_family.rs` | the part-mover flip |
+| `remove_l0_tables` | `column_family.rs` | FIFO eviction |
+| `append_partition_rule` / `remove_partition_rule` | `column_family.rs` | live partition rules |
+| `register_cf` / `unregister_cf` | `db.rs` | the CF registries |
+| `publish_instance_nonce` / `publish_wal_layout` | `db.rs` | the two scalar catalog fields |
+
+`db.rs` mints a token in exactly two places: `catalog_txn`, after the fsync, and
+`prepare_capability`, which publishes through a full snapshot rewrite because it
+is the path that turns the edit log on. Publishing from `compaction.rs`,
+`parts.rs`, `ingest.rs` or `maintenance.rs` outside a transaction therefore does
+not compile.
+
+`catalog_txn` publishes nothing for an edit with no ops (an empty flush): there
+is no catalog change to make durable, so no id and no fsync are spent.
+
+Compaction is the one site with an in-memory undo, and uses
+`catalog_txn_with_rollback`. Its rollback runs in exactly one situation — the
+pre-capability path published (it must: the snapshot is rebuilt from live state)
+and then the snapshot write failed. With the log on, a failed append publishes
+nothing; and once the edit is durable nothing is rolled back, because rolling
+back committed state is how a catalog comes to name files a later step deletes.
+
+`cf_lifecycle_mu` serializes the catalog-shape changes that validate before they
+publish — CF create / create-many / drop / clear, and partition-rule add/remove.
+Those held `cfs.write()` across validation and insert before 2.2; they cannot
+now, because the insert happens inside `catalog_txn`, which takes `manifest_mu`
+and then `cfs.read()`. Lock order: `cf_lifecycle_mu` → `manifest_mu` → `cfs` →
+`cf.state`.
 
 The capability is taken through `DB::enable_format_capabilities`, which persists
 the bit *before* the first append (`enable_capability`'s persist-before-use
 ordering), and that persist is the compaction that creates the log. A database
 that never takes it never grows a log file.
 
-**Migration status:** the twenty `persist_manifest` call sites still use the
-pre-2.2 publish-then-persist order; moving them onto `catalog_txn` — and with
-them restating invariant 1's WAL-reclaim gate as "after the edit fsync" — is the
-next slice of 2.2. Until then the durable behaviour of a running database is
-unchanged, whether or not the capability is enabled.
+**Migration status:** every catalog-mutating site now goes through
+`catalog_txn`. Three `persist_manifest` callers remain, and all three are
+deliberately snapshot writers, not mutations: `enable_capability` (the path that
+creates the log), `snapshot_to` (checkpoint/backup force a snapshot on the
+source, then write a snapshot-only destination with no log), and `close` (a
+final snapshot compaction whose failure is the caller's — a silently dropped one
+would make the next open replay more than it should).
 
 ## Recovery (`DB::open`)
 

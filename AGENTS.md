@@ -53,10 +53,24 @@ ratios between engines, not absolute numbers across sessions. See
 ## Critical invariants (violating any of these is a data-loss bug)
 
 1. **Durability ordering on flush**: SSTable written → `sync_all` on klog+vlog →
-   parent-dir fsync (all inside `Writer::finish`) → manifest persisted
-   (`DbInner::persist_manifest`) → only if that returned `Ok` may WAL files be
-   deleted (`wal::remove_wal_files`). Same ordering for compaction: manifest
-   before input-file deletion.
+   parent-dir fsync (all inside `Writer::finish`) → **the catalog edit appended
+   and fsynced to `MANIFEST-EDITS`** (`DbInner::catalog_txn`) → only if that
+   returned `Ok` may WAL files be deleted (`wal::remove_wal_files`). Same
+   ordering for compaction: edit fsync before input-file deletion.
+   Snapshot compaction is a **space optimization and never a durability
+   precondition** — nothing keys off a snapshot write. Without
+   `CAP_MANIFEST_EDITS` there is no log and `catalog_txn` falls back to the
+   pre-2.2 full rewrite (`DbInner::persist_manifest`), which is then the gate;
+   the ordering is otherwise identical.
+   Every catalog mutation goes through `catalog_txn`, which publishes **after**
+   the durable edit and hands the publish closure a `db::Publish` token. The six
+   level-set primitives (`install_handles_l0`, `update_levels`, `install_levels`,
+   `remove_bottom_tables`, `insert_bottom_sorted`, `swap_bottom_tables`), the
+   `remove_l0_tables`/`publish_flush` halves, the CF-registry insert/remove and
+   the partition-rule append/remove all demand that token, so publishing outside
+   a transaction does not compile. The one documented exception is
+   `DbInner::prepare_capability`, which publishes through a full snapshot
+   rewrite because it is the path that turns the edit log on.
 2. **Manifest writes are serialized** by `DbInner::manifest_mu`; `Manifest::save`
    is temp-file + fsync + rename + dir-fsync (the dir fsync propagates its
    error). Never write the manifest outside `persist_manifest`. Under 2.2's

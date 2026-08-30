@@ -129,17 +129,30 @@ impl Ingestion {
         Ok(())
     }
 
-    /// Finish the ingestion: fsync the last table, install every table into
-    /// L0 atomically, and persist the manifest. Returns the entry count.
+    /// Finish the ingestion: fsync the last table, then publish every table
+    /// into L0 in ONE catalog transaction. Returns the entry count.
+    ///
+    /// `finished` is set only once that transaction commits, so a failed append
+    /// or fsync falls through to [`Drop`], which unlinks every table this
+    /// ingestion wrote. Nothing was published, so no reader ever saw them.
     pub fn finish(mut self) -> Result<u64> {
         let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Flush);
-        self.finished = true;
         if let Some((w, file_id)) = self.writer.take() {
             self.done.push(self.cf.finish_writer_to_handle(w, file_id)?);
         }
         if !self.done.is_empty() {
-            self.cf.install_handles_l0(std::mem::take(&mut self.done));
-            self.db.persist_manifest()?;
+            let handles = std::mem::take(&mut self.done);
+            let mut edit = crate::manifest_edit::VersionEdit::default();
+            for handle in &handles {
+                edit.push(crate::manifest_edit::Op::AddTable {
+                    cf: self.cf.name().to_string(),
+                    meta: handle.meta.clone(),
+                });
+            }
+            let cf = Arc::clone(&self.cf);
+            self.db
+                .catalog_txn(edit, move |p| cf.install_handles_l0(handles, p))?;
+            self.finished = true;
             // Bulk ingest must arm compaction, exactly as a memtable flush
             // does. It did not, and the consequence was not subtle: a
             // bulk-loaded store accumulated **14,051 L0 SSTables for a million
@@ -160,6 +173,7 @@ impl Ingestion {
                 let _ = self.db.ctx.compact_tx.send(Arc::clone(&self.cf));
             }
         }
+        self.finished = true;
         self.pending_files.clear(); // referenced by the manifest now
                                     // Read-your-own-ingest: record this thread's floor exactly as
                                     // `Txn::commit` does. Without it, a fixed-snapshot transaction begun

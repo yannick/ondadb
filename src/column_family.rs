@@ -106,6 +106,16 @@ pub struct ImmMemtable {
     pub wal_paths: Vec<String>,
 }
 
+/// What a flush produced, before anything is published (2.2).
+///
+/// `table` is `None` when the sealed memtable held no entries — a legal outcome
+/// that adds nothing to the catalog, so its transaction carries no ops.
+#[derive(Debug)]
+pub(crate) struct FlushOutput {
+    pub table: Option<Arc<SstHandle>>,
+    pub wal_paths: Vec<String>,
+}
+
 /// Shared database context handed to each column family.
 pub(crate) struct CfCtx {
     /// Storage-tier registry: resolves a table's tier to its root directory and
@@ -861,8 +871,12 @@ impl ColumnFamily {
     }
 
     /// Flush an immutable memtable to a new L0 SSTable with id `file_id`.
-    /// Returns the WAL paths that may now be deleted.
-    pub(crate) fn flush_imm(&self, imm: &Arc<ImmMemtable>, file_id: u64) -> Result<Vec<String>> {
+    ///
+    /// Writes and fsyncs the table and stops there: nothing is published. The
+    /// caller wraps [`publish_flush`](Self::publish_flush) in a `catalog_txn`,
+    /// so the table becomes visible — and its WAL becomes reclaimable — only
+    /// after the edit record's fsync (AGENTS.md invariant 1).
+    pub(crate) fn flush_imm(&self, imm: &Arc<ImmMemtable>, file_id: u64) -> Result<FlushOutput> {
         self.flushing.store(true, Ordering::Relaxed);
         let result = self.flush_imm_inner(imm, file_id);
         self.flushing.store(false, Ordering::Relaxed);
@@ -870,25 +884,39 @@ impl ColumnFamily {
         result
     }
 
-    fn flush_imm_inner(&self, imm: &Arc<ImmMemtable>, file_id: u64) -> Result<Vec<String>> {
+    fn flush_imm_inner(&self, imm: &Arc<ImmMemtable>, file_id: u64) -> Result<FlushOutput> {
         // Fast path: stream entries straight out of the sealed memtable's arena
         // nodes through a k-way merge — no per-entry allocation, no sort.
         #[cfg(feature = "arena-memtable")]
-        self.write_l0_streaming(&imm.mem, file_id)?;
+        let table = self.write_l0_streaming(&imm.mem, file_id)?;
         #[cfg(not(feature = "arena-memtable"))]
-        {
+        let table = {
             let entries = imm.mem.snapshot();
-            self.write_l0(&entries, file_id)?;
-        }
-        // Remove the flushed immutable.
-        {
-            let mut s = self.state.write();
-            if let Some(pos) = s.imm.iter().position(|i| Arc::ptr_eq(i, imm)) {
-                s.imm.remove(pos);
-            }
-        }
+            self.write_l0(&entries, file_id)?
+        };
         self.flush_count.fetch_add(1, Ordering::Relaxed);
-        Ok(imm.wal_paths.clone())
+        Ok(FlushOutput {
+            table,
+            wal_paths: imm.wal_paths.clone(),
+        })
+    }
+
+    /// Publish step of a flush transaction: install the new L0 table and retire
+    /// the sealed memtable it was written from, under one state write-lock so no
+    /// reader ever sees the same entries twice.
+    pub(crate) fn publish_flush(
+        &self,
+        imm: &Arc<ImmMemtable>,
+        table: Option<Arc<SstHandle>>,
+        _p: &crate::db::Publish,
+    ) {
+        let mut s = self.state.write();
+        if let Some(handle) = table {
+            s.levels[0].insert(0, handle); // newest first
+        }
+        if let Some(pos) = s.imm.iter().position(|i| Arc::ptr_eq(i, imm)) {
+            s.imm.remove(pos);
+        }
     }
 
     /// Finish `w` (fsync + footer) and open a reader, without installing it.
@@ -916,18 +944,16 @@ impl ColumnFamily {
     }
 
     /// Register already-finished SSTables as the newest L0 files, atomically.
-    pub(crate) fn install_handles_l0(&self, handles: Vec<Arc<SstHandle>>) {
+    ///
+    /// A publication primitive: reachable only from a `catalog_txn` publish
+    /// closure (see [`crate::db::Publish`]). The reversal is load-bearing —
+    /// `handles` arrives oldest-first and L0 is read newest-first — and the
+    /// edit log's `AddTable` replay reproduces exactly this order.
+    pub(crate) fn install_handles_l0(&self, handles: Vec<Arc<SstHandle>>, _p: &crate::db::Publish) {
         let mut s = self.state.write();
         for h in handles {
             s.levels[0].insert(0, h); // newest first
         }
-    }
-
-    /// Finish `w` and register the resulting SSTable as the newest L0 file.
-    fn install_l0(&self, w: Writer, file_id: u64) -> Result<()> {
-        let handle = self.finish_writer_to_handle(w, file_id)?;
-        self.install_handles_l0(vec![handle]);
-        Ok(())
     }
 
     /// Open a fresh SSTable writer for this CF (used by bulk ingestion).
@@ -938,10 +964,10 @@ impl ColumnFamily {
     /// Stream a sealed memtable to a new L0 SSTable without materializing
     /// entries (keys/values borrowed from the arena through the merge).
     #[cfg(feature = "arena-memtable")]
-    fn write_l0_streaming(&self, mem: &Memtable, file_id: u64) -> Result<()> {
+    fn write_l0_streaming(&self, mem: &Memtable, file_id: u64) -> Result<Option<Arc<SstHandle>>> {
         let mut m = mem.flush_merge();
         if !m.valid() {
-            return Ok(());
+            return Ok(None);
         }
         let klog = self.klog_path(file_id);
         let mut w = self.new_writer(&klog, mem.num_entries().max(0) as usize)?;
@@ -957,13 +983,17 @@ impl ColumnFamily {
             )?;
             m.advance();
         }
-        self.install_l0(w, file_id)
+        self.finish_writer_to_handle(w, file_id).map(Some)
     }
 
     /// Write `entries` (already in this CF's internal order) to a new L0 SSTable.
-    fn write_l0(&self, entries: &[crate::memtable::Entry], file_id: u64) -> Result<()> {
+    fn write_l0(
+        &self,
+        entries: &[crate::memtable::Entry],
+        file_id: u64,
+    ) -> Result<Option<Arc<SstHandle>>> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let klog = self.klog_path(file_id);
         let mut w = self.new_writer(&klog, entries.len())?;
@@ -977,16 +1007,18 @@ impl ColumnFamily {
                 e.single_delete,
             )?;
         }
-        self.install_l0(w, file_id)
+        self.finish_writer_to_handle(w, file_id).map(Some)
     }
 
     /// Ingest a CF's slice of a split unified memtable: sort by this CF's
     /// comparator, then write an L0 SSTable.
+    /// Returns the finished, fsynced table without publishing it: the caller
+    /// installs it inside a `catalog_txn`.
     pub(crate) fn ingest_l0(
         &self,
         mut entries: Vec<crate::memtable::Entry>,
         file_id: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<SstHandle>>> {
         entries.sort_by(|a, b| {
             self.cmp
                 .compare(&a.user_key, &b.user_key)
@@ -1694,6 +1726,7 @@ impl ColumnFamily {
     pub(crate) fn update_levels(
         &self,
         f: impl FnOnce(&[Vec<Arc<SstHandle>>]) -> Vec<Vec<Arc<SstHandle>>>,
+        _p: &crate::db::Publish,
     ) {
         let mut s = self.state.write();
         let next = f(&s.levels);
@@ -1753,16 +1786,20 @@ impl ColumnFamily {
         (entries, tombs)
     }
 
-    /// FIFO eviction: remove the oldest L0 tables until the CF is back under
-    /// `max_bytes`, plus any table whose klog file age exceeds `ttl`. Returns
-    /// the removed handles (caller persists the manifest, then deletes files).
-    pub(crate) fn take_fifo_victims(
+    /// FIFO eviction, selection half: the oldest L0 tables that put the CF back
+    /// under `max_bytes`, plus any table whose klog file age exceeds `ttl`.
+    ///
+    /// Selects only — the level set is untouched. The removal half is
+    /// [`remove_l0_tables`](Self::remove_l0_tables), which runs inside the
+    /// eviction's `catalog_txn`; before 2.2 this function mutated the level set
+    /// itself, which put the publication ahead of the durable edit.
+    pub(crate) fn select_fifo_victims(
         &self,
         max_bytes: u64,
         ttl: std::time::Duration,
     ) -> Vec<Arc<SstHandle>> {
         let now = std::time::SystemTime::now();
-        let mut s = self.state.write();
+        let s = self.state.read();
         // File ids are allocated monotonically: smallest id = oldest table.
         let mut by_age: Vec<Arc<SstHandle>> = s.levels[0].clone();
         by_age.sort_by_key(|t| t.meta.id);
@@ -1796,14 +1833,23 @@ impl ColumnFamily {
                 total -= t.meta.klog_size + t.meta.vlog_size;
             }
         }
-        if !victims.is_empty() {
-            s.levels[0].retain(|t| !victims.iter().any(|v| Arc::ptr_eq(v, t)));
-        }
         victims
     }
 
+    /// Removal half of FIFO eviction: drop these ids from L0.
+    ///
+    /// A publication primitive: reachable only from a `catalog_txn` publish
+    /// closure (see [`crate::db::Publish`]).
+    pub(crate) fn remove_l0_tables(&self, ids: &[u64], _p: &crate::db::Publish) {
+        let mut s = self.state.write();
+        s.levels[0].retain(|t| !ids.contains(&t.meta.id));
+    }
+
     /// Install pre-built level handles (used by clone).
-    pub(crate) fn install_levels(&self, levels: Vec<Vec<Arc<SstHandle>>>) {
+    ///
+    /// A publication primitive: reachable only from a `catalog_txn` publish
+    /// closure (see [`crate::db::Publish`]).
+    pub(crate) fn install_levels(&self, levels: Vec<Vec<Arc<SstHandle>>>, _p: &crate::db::Publish) {
         self.replace_levels(levels);
     }
 
@@ -1872,14 +1918,24 @@ impl ColumnFamily {
     /// happen under one write-lock acquisition, so two concurrent adds serialize
     /// and the second observes the first (rejecting a duplicate). In-memory only;
     /// the caller persists the manifest.
-    pub(crate) fn append_partition_rule(&self, rule: PartitionRule) -> Result<()> {
-        let mut rules = self.live_partition_rules.write();
+    pub(crate) fn plan_partition_rule_addition(
+        &self,
+        rule: &PartitionRule,
+    ) -> Result<ColumnFamilyConfig> {
+        let rules = self.live_partition_rules.read();
         let mut candidate = self.opts.clone();
         candidate.partition_rules = rules.clone();
         candidate.partition_rules.push(rule.clone());
         candidate.validate().map_err(OndaError::InvalidArgs)?;
-        rules.push(rule);
-        Ok(())
+        Ok(candidate)
+    }
+
+    /// Publication half of [`plan_partition_rule_addition`]. A publication
+    /// primitive: reachable only from a `catalog_txn` publish closure. Callers
+    /// hold `DbInner::cf_lifecycle_mu` across plan and publish, which is what
+    /// keeps two concurrent adds from both validating against the old set.
+    pub(crate) fn append_partition_rule(&self, rule: PartitionRule, _p: &crate::db::Publish) {
+        self.live_partition_rules.write().push(rule);
     }
 
     /// Remove the partition rule whose prefix exactly equals `prefix` from the
@@ -1888,14 +1944,23 @@ impl ColumnFamily {
     /// [`append_partition_rule`](Self::append_partition_rule): write-side-only,
     /// so already-materialized bottom parts keep their stamps until a later
     /// compaction rewrites them.
-    pub(crate) fn remove_partition_rule(&self, prefix: &[u8]) -> Result<()> {
-        let mut rules = self.live_partition_rules.write();
-        let before = rules.len();
-        rules.retain(|r| r.prefix != prefix);
-        if rules.len() == before {
+    pub(crate) fn plan_partition_rule_removal(&self, prefix: &[u8]) -> Result<ColumnFamilyConfig> {
+        let rules = self.live_partition_rules.read();
+        let mut candidate = self.opts.clone();
+        candidate.partition_rules = rules.clone();
+        candidate.partition_rules.retain(|r| r.prefix != prefix);
+        if candidate.partition_rules.len() == rules.len() {
             return Err(OndaError::NotFound);
         }
-        Ok(())
+        Ok(candidate)
+    }
+
+    /// Publication half of [`plan_partition_rule_removal`]. A publication
+    /// primitive: reachable only from a `catalog_txn` publish closure.
+    pub(crate) fn remove_partition_rule(&self, prefix: &[u8], _p: &crate::db::Publish) {
+        self.live_partition_rules
+            .write()
+            .retain(|r| r.prefix != prefix);
     }
 
     // ---- part lifecycle support (used by parts.rs) ----
@@ -1918,7 +1983,7 @@ impl ColumnFamily {
     /// Remove the tables with these ids from the bottom level, under the state
     /// write-lock (the in-memory half of an atomic detach/move). Returns the
     /// number actually removed.
-    pub(crate) fn remove_bottom_tables(&self, ids: &[u64]) -> usize {
+    pub(crate) fn remove_bottom_tables(&self, ids: &[u64], _p: &crate::db::Publish) -> usize {
         let mut s = self.state.write();
         let Some(bottom) = s.levels.last_mut() else {
             return 0;
@@ -1949,7 +2014,7 @@ impl ColumnFamily {
 
     /// Insert `handle` into the bottom level, keeping it sorted by `min_key`
     /// (the invariant leveled reads rely on for binary search).
-    pub(crate) fn insert_bottom_sorted(&self, handle: Arc<SstHandle>) {
+    pub(crate) fn insert_bottom_sorted(&self, handle: Arc<SstHandle>, _p: &crate::db::Publish) {
         let mut s = self.state.write();
         let cmp = self.cmp.clone();
         let bottom = s
@@ -1964,7 +2029,11 @@ impl ColumnFamily {
     /// ids, new handles/metas) under the state write-lock. Used by the tier
     /// mover to swap in relocated handles; in-flight reads finish on the old
     /// handles they already hold.
-    pub(crate) fn swap_bottom_tables(&self, replacements: Vec<Arc<SstHandle>>) {
+    pub(crate) fn swap_bottom_tables(
+        &self,
+        replacements: Vec<Arc<SstHandle>>,
+        _p: &crate::db::Publish,
+    ) {
         let mut s = self.state.write();
         let cmp = self.cmp.clone();
         let Some(bottom) = s.levels.last_mut() else {

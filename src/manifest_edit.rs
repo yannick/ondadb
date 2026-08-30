@@ -1039,7 +1039,20 @@ fn mutate(m: &mut Manifest, op: &Op) {
     match op {
         Op::AddTable { cf, meta } => {
             if let Some(i) = cf_index(m, cf) {
-                m.cfs[i].sstables.push(meta.clone());
+                if meta.level == 0 {
+                    // L0 is newest-first and `ColumnFamily::load` keeps the
+                    // manifest's relative order within a level, so a replayed
+                    // `AddTable` must land where `install_handles_l0` put the
+                    // handle — at the front. Appending would reopen the family
+                    // with its newest L0 table treated as its oldest, and
+                    // newest-first shadowing is a correctness invariant
+                    // (`src/compaction.rs`, the L0 input-selection comment).
+                    m.cfs[i].sstables.insert(0, meta.clone());
+                } else {
+                    // Every level below L0 is re-sorted by `min_key` at load,
+                    // so position in the vector carries no meaning there.
+                    m.cfs[i].sstables.push(meta.clone());
+                }
             }
         }
         Op::RemoveTable { cf, id, .. } => {

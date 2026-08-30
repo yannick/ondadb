@@ -1,0 +1,29 @@
+# 2.2 slice 9 — structural-operation latency at a 10k-table catalog
+# host: Darwin 25.5.0 arm64  date: 2026-08-30T17:40:03Z
+# probe: tests/manifest_edits.rs::structural_op_latency_probe (release)
+# full  = catalog persisted by a whole-manifest rewrite (no CAP_MANIFEST_EDITS)
+# edits = catalog persisted by one appended, fsynced MANIFEST-EDITS record
+# ballast CF 'bulk' holds the tables; every measured op runs on CF 'hot'.
+
+   Compiling ondadb v0.8.2 (/Volumes/HOME/code/storage-engines/ondadb/.claude/worktrees/agent-aa0ea9d1ca8bca8fa)
+    Finished `release` profile [optimized] target(s) in 9.67s
+     Running tests/manifest_edits.rs (/Volumes/cargo/cargo-build/37/17c54c9514407d/release/deps/manifest_edits-49a4a0b75734b8e5)
+
+running 1 test
+test structural_op_latency_probe has been running for over 60 seconds
+# fixture: 10000 tables, MANIFEST=270029 bytes (synthetic ballast)
+# 200 flushes and 25 compactions per arm, 5 runs
+run=1 mode=full  flush p50=  108.13ms p99=  150.56ms  compact p50=   63.49ms p99=  424.73ms  log=0B
+run=1 mode=edits flush p50=   81.81ms p99=  123.75ms  compact p50=   47.69ms p99=  497.75ms  log=21877B
+run=2 mode=full  flush p50=   86.32ms p99=  159.54ms  compact p50=   62.59ms p99=  512.21ms  log=0B
+run=2 mode=edits flush p50=   64.29ms p99=  115.06ms  compact p50=   47.51ms p99=  219.39ms  log=21877B
+run=3 mode=full  flush p50=   79.42ms p99=  132.34ms  compact p50=   65.16ms p99= 1201.91ms  log=0B
+run=3 mode=edits flush p50=   88.84ms p99=  159.06ms  compact p50=   52.61ms p99=  969.46ms  log=21877B
+run=4 mode=full  flush p50=  110.02ms p99=  268.11ms  compact p50=   70.21ms p99=  354.40ms  log=0B
+run=4 mode=edits flush p50=   55.76ms p99=  115.41ms  compact p50=   28.97ms p99=  334.83ms  log=21877B
+run=5 mode=full  flush p50=   89.14ms p99=  141.27ms  compact p50=   49.32ms p99=  318.96ms  log=0B
+run=5 mode=edits flush p50=   59.43ms p99=  106.24ms  compact p50=   29.99ms p99=  130.85ms  log=21877B
+test structural_op_latency_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 833.49s
+

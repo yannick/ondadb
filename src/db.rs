@@ -74,6 +74,38 @@ impl Default for EditLogState {
     }
 }
 
+/// Proof that the holder is inside a catalog transaction's publish step (2.2).
+///
+/// Every function that installs a new level set — the six publication
+/// primitives listed in `docs/architecture.md`, plus the CF-registry and
+/// partition-rule publications — takes one of these by reference. The type has
+/// a private field and no public constructor, so a token can only be minted in
+/// this module, and this module mints one in exactly two places:
+///
+/// * [`DbInner::catalog_txn`], after the edit record's fsync returned `Ok`;
+/// * [`DbInner::prepare_capability`], whose staging is published by a **full
+///   snapshot rewrite** rather than an edit — it is the path that turns the
+///   edit log on, so it cannot itself be an edit.
+///
+/// That is what makes "no catalog mutation happens outside `catalog_txn`" a
+/// compile-time property of `column_family.rs`, `compaction.rs`, `parts.rs`,
+/// `ingest.rs` and `maintenance.rs` rather than a convention.
+#[derive(Debug)]
+pub(crate) struct Publish(());
+
+impl Publish {
+    /// Minted by `catalog_txn` once the edit is durable.
+    fn after_durable_edit() -> Publish {
+        Publish(())
+    }
+
+    /// Minted by the capability-enable path, which publishes through a full
+    /// snapshot (see the type documentation).
+    fn for_snapshot_rewrite() -> Publish {
+        Publish(())
+    }
+}
+
 struct PublishState {
     cursor: u64,                  // next start sequence expected to publish
     completed: HashMap<u64, u64>, // start -> end of completed-but-unpublished ranges
@@ -294,6 +326,18 @@ pub struct DbInner {
     /// worker, and CF create/drop all call `persist_manifest` concurrently; without
     /// this they would race on the shared temp file and could publish a torn manifest.
     manifest_mu: Mutex<()>,
+    /// Serializes the catalog-shape changes that must *validate* before they
+    /// publish: CF create / create-many / drop / clear, and partition-rule
+    /// add/remove (2.2 slice 9).
+    ///
+    /// Before the migration these held `cfs.write()` (or the CF's rule lock)
+    /// across the validation and the insert, which is no longer possible: the
+    /// publication now happens inside `catalog_txn`, and `catalog_txn` takes
+    /// `manifest_mu` and then `cfs.read()` — taking `cfs.write()` first would
+    /// deadlock the moment the snapshot-compaction trigger fired. This lock
+    /// keeps the "a losing concurrent creator sees `Exists`" guarantee those
+    /// call sites had. Always taken **before** `manifest_mu`, never after.
+    pub(crate) cf_lifecycle_mu: Mutex<()>,
     /// Durable database-wide WAL layout written by `persist_manifest`.
     wal_layout: Mutex<WalLayout>,
     /// Edit-log cursor (2.2), guarded by `manifest_mu` in effect: it is only
@@ -644,26 +688,68 @@ impl DbInner {
     /// Until `CAP_MANIFEST_EDITS` is enabled there is no log, and this falls
     /// back to the pre-2.2 order — publish, then rewrite the whole manifest —
     /// so enabling the capability is the only thing that changes behaviour.
-    // Call-site migration is the next slice of 2.2: the twenty `persist_manifest`
-    // sites move onto this helper in the documented order (flush and unified
-    // flush, ingest, compaction, mover/parts, CF lifecycle, open paths). Until
-    // then its only callers are the crash-matrix tests below.
-    #[allow(dead_code)]
-    pub(crate) fn catalog_txn(&self, edit: VersionEdit, publish: impl FnOnce()) -> Result<()> {
+    ///
+    /// `publish` receives a [`Publish`] token: the six level-set primitives and
+    /// the CF-registry / partition-rule publications all demand one, so they are
+    /// unreachable from anywhere else.
+    ///
+    /// `next_file_id` and `global_seq` are deliberately **not** carried by every
+    /// edit. They are reconciled at recovery from what the catalog actually
+    /// references (`manifest_edit::recover_catalog`, rule r7), which is both
+    /// smaller and safe under concurrency: two transactions serialize on
+    /// `manifest_mu` in an order the file-id allocator does not, so a
+    /// per-site `SetNextFileID` could land out of order and fail its own
+    /// monotonicity precondition on replay.
+    pub(crate) fn catalog_txn(
+        &self,
+        edit: VersionEdit,
+        publish: impl FnOnce(&Publish),
+    ) -> Result<()> {
+        self.catalog_txn_with_rollback(edit, publish, |_| {})
+    }
+
+    /// [`catalog_txn`](Self::catalog_txn) for the one caller that has an
+    /// in-memory undo: compaction, whose install swaps a whole level set.
+    ///
+    /// `rollback` runs in exactly one situation — the **pre-capability** path
+    /// published (it has to: the snapshot is rebuilt from live state) and then
+    /// the snapshot write failed. With the edit log on, a failed append
+    /// publishes nothing and `rollback` is never called; and once the edit is
+    /// durable it is never called either, because rolling back committed state
+    /// is how a catalog comes to name files a later step deletes.
+    pub(crate) fn catalog_txn_with_rollback(
+        &self,
+        edit: VersionEdit,
+        publish: impl FnOnce(&Publish),
+        rollback: impl FnOnce(&Publish),
+    ) -> Result<()> {
         self.poison.check()?;
         if self.opts.read_only {
             // Exactly `persist_manifest`'s early return: nothing is made
             // durable. The in-memory publication still happens, so a read-only
             // handle's view stays consistent with what it just did.
-            publish();
+            publish(&Publish::after_durable_edit());
             return Ok(());
         }
         let _mu = self.manifest_mu.lock();
         let mut st = self.edit_log.lock();
         if st.log.is_none() {
             // Pre-capability: today's publish-then-persist order, unchanged.
-            publish();
-            return self.write_snapshot(&mut st);
+            publish(&Publish::after_durable_edit());
+            let res = self.write_snapshot(&mut st);
+            if res.is_err() {
+                rollback(&Publish::after_durable_edit());
+            }
+            return res;
+        }
+        if edit.is_empty() {
+            // An edit with no ops changes no catalog state, so there is nothing
+            // to make durable and nothing a later replay could need. Appending
+            // an empty record would only burn an id and an fsync. The in-memory
+            // publication (a flush that produced no table still has to retire
+            // its sealed memtable) still happens.
+            publish(&Publish::after_durable_edit());
+            return Ok(());
         }
         let edit_id = st.next_edit_id;
         let appended = st
@@ -680,7 +766,7 @@ impl DbInner {
         }
         st.next_edit_id = edit_id + 1;
         // Step 4: publication follows the durable edit, never precedes it.
-        publish();
+        publish(&Publish::after_durable_edit());
         self.manifest_persists.fetch_add(1, Ordering::Relaxed);
         // Step 6, in the same critical section: a record appended between a
         // snapshot write and its log rename would be silently lost.
@@ -690,7 +776,14 @@ impl DbInner {
             .map(|l| (l.bytes(), l.count()))
             .unwrap_or((0, 0));
         if crate::manifest_edit::snapshot_due(bytes, count, st.snapshot_bytes) {
-            self.write_snapshot(&mut st)?;
+            // Deliberately not propagated. The edit is already durable, so this
+            // transaction COMMITTED; returning `Err` here would tell the caller
+            // to unlink files the catalog now permanently references. A failed
+            // compaction has already fail-stopped the database (`write_snapshot`),
+            // and every state it can leave behind is one recovery accepts: the
+            // live log was never truncated in place, so the old log still
+            // carries every record the new snapshot does not.
+            let _ = self.write_snapshot(&mut st);
         }
         Ok(())
     }
@@ -910,6 +1003,40 @@ impl DbInner {
         self.manifest_persists.load(Ordering::Relaxed)
     }
 
+    /// Publish a newly built column family into the registries.
+    ///
+    /// A publication primitive: the `DbInner::cfs` / `cf_by_id` insert is a
+    /// catalog mutation exactly as a level-set swap is, so it demands the same
+    /// token (see [`Publish`]).
+    pub(crate) fn register_cf(&self, cf: &Arc<ColumnFamily>, _p: &Publish) {
+        self.cfs.write().insert(cf.name().to_string(), cf.clone());
+        // Same name => same stable id, so this also replaces a cleared family's
+        // routing entry.
+        self.cf_by_id.write().insert(cf.id(), cf.clone());
+        self.note_periodic_cf(cf);
+    }
+
+    /// Remove a column family from the registries, returning the old handle.
+    /// The other half of [`register_cf`](Self::register_cf).
+    pub(crate) fn unregister_cf(&self, name: &str, _p: &Publish) -> Option<Arc<ColumnFamily>> {
+        let cf = self.cfs.write().remove(name);
+        if let Some(cf) = &cf {
+            self.cf_by_id.write().remove(&cf.id());
+        }
+        cf
+    }
+
+    /// Publish the minted instance nonce (A2). Object names embed it, so it is
+    /// installed only once its `SetNonce` edit is durable.
+    pub(crate) fn publish_instance_nonce(&self, nonce: u64, _p: &Publish) {
+        *self.instance_nonce.lock() = Some(nonce);
+    }
+
+    /// Publish the database-wide WAL layout flip (per-CF -> unified, one way).
+    pub(crate) fn publish_wal_layout(&self, layout: WalLayout, _p: &Publish) {
+        *self.wal_layout.lock() = layout;
+    }
+
     pub(crate) fn cf_dir(&self, name: &str) -> String {
         format!("{}/cf-{}", self.dir, name)
     }
@@ -995,6 +1122,25 @@ impl DbInner {
     }
 }
 
+/// The ops that retire a column family: every table it holds, then the family.
+///
+/// `DropCF`'s precondition is that the same edit removed all of its tables, so
+/// the two always travel together.
+fn drop_cf_ops(name: &str, cf: &Arc<ColumnFamily>) -> Vec<crate::manifest_edit::Op> {
+    let ids: Vec<u64> = cf.snapshot_ssts().into_iter().map(|meta| meta.id).collect();
+    let mut ops = Vec::with_capacity(2);
+    if !ids.is_empty() {
+        ops.push(crate::manifest_edit::Op::RemoveTables {
+            cf: name.to_string(),
+            ids,
+        });
+    }
+    ops.push(crate::manifest_edit::Op::DropCf {
+        name: name.to_string(),
+    });
+    ops
+}
+
 /// Which tables [`DbInner::prepare_capability`] stamped, per column family, so
 /// a failed manifest write can put exactly those back.
 type CapabilityPrepareUndo = Vec<(Arc<ColumnFamily>, std::collections::HashSet<u64>)>;
@@ -1011,7 +1157,12 @@ fn restamp(
     pick: impl Fn(&SstHandle) -> Option<Option<i64>>,
 ) -> std::collections::HashSet<u64> {
     let mut changed = std::collections::HashSet::new();
-    cf.update_levels(|levels| {
+    // The capability-enable path publishes through a full snapshot rewrite, not
+    // an edit — it is the path that turns the edit log on, so it cannot itself
+    // be an edit. See `Publish`.
+    let token = Publish::for_snapshot_rewrite();
+    cf.update_levels(
+        |levels| {
         levels
             .iter()
             .map(|level| {
@@ -1027,9 +1178,11 @@ fn restamp(
                         None => table.clone(),
                     })
                     .collect()
-            })
-            .collect()
-    });
+                })
+                .collect()
+        },
+        &token,
+    );
     changed
 }
 
@@ -1245,6 +1398,7 @@ fn build_db_inner(
         periodic_running: AtomicBool::new(false),
         periodic_check: AtomicU64::new(PERIODIC_DISABLED),
         manifest_mu: Mutex::new(()),
+        cf_lifecycle_mu: Mutex::new(()),
         wal_layout: Mutex::new(requested_layout),
         edit_log: Mutex::new(EditLogState {
             generation: manifest.generation,
@@ -1376,10 +1530,12 @@ fn ensure_instance_nonce(inner: &Arc<DbInner>) -> Result<()> {
     if !has_shared || inner.instance_nonce.lock().is_some() {
         return Ok(());
     }
-    *inner.instance_nonce.lock() = Some(mint_instance_nonce(&inner.dir));
-    // Persist immediately: object names embed the nonce, so a crash before a
-    // later manifest write must not allow a different nonce to be minted.
-    inner.persist_manifest()
+    // One `SetNonce` edit, durable before the nonce is installed: object names
+    // embed it, so a crash must never leave objects named after a nonce a
+    // reopen would re-mint differently.
+    let nonce = mint_instance_nonce(&inner.dir);
+    let edit = VersionEdit::new(vec![crate::manifest_edit::Op::SetNonce(nonce)]);
+    inner.catalog_txn(edit, |p| inner.publish_instance_nonce(nonce, p))
 }
 
 impl DB {
@@ -1465,8 +1621,11 @@ impl DB {
         }
         db.inner.poison.check()?;
 
-        *db.inner.wal_layout.lock() = WalLayout::Unified;
-        db.inner.persist_manifest()?;
+        let edit = VersionEdit::new(vec![crate::manifest_edit::Op::SetWalLayout(
+            WalLayout::Unified,
+        )]);
+        db.inner
+            .catalog_txn(edit, |p| db.inner.publish_wal_layout(WalLayout::Unified, p))?;
         db.close()
     }
 
@@ -1486,8 +1645,12 @@ impl DB {
             OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
         })?;
         config.validate().map_err(OndaError::InvalidArgs)?;
-        let mut cfs = self.inner.cfs.write();
-        if cfs.contains_key(name) {
+        // `cf_lifecycle_mu`, not `cfs.write()`, is what makes a losing racer see
+        // `Exists` now: the registry insert happens inside the transaction, and
+        // holding the registry's write lock across `catalog_txn` would deadlock
+        // against the snapshot the trigger may take (see the field's docs).
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        if self.inner.cfs.read().contains_key(name) {
             return Err(OndaError::Exists(name.into()));
         }
         let cf = ColumnFamily::create(
@@ -1497,11 +1660,16 @@ impl DB {
             config,
             cmp,
         )?;
-        cfs.insert(name.to_string(), cf.clone());
-        drop(cfs);
-        self.inner.cf_by_id.write().insert(cf.id(), cf.clone());
-        self.inner.note_periodic_cf(&cf);
-        self.inner.persist_manifest()?;
+        let edit = VersionEdit::new(vec![crate::manifest_edit::Op::CreateCf {
+            name: name.to_string(),
+            config: cf.effective_config().encode(),
+        }]);
+        // A failed transaction leaves the directory and its empty WAL behind,
+        // referenced by no catalog — exactly what a crash between the old
+        // create and its manifest persist left, and what the open-time sweep
+        // already treats as an artifact.
+        self.inner
+            .catalog_txn(edit, |p| self.inner.register_cf(&cf, p))?;
         Ok(cf)
     }
 
@@ -1553,13 +1721,18 @@ impl DB {
             }
         }
 
-        // Hold the registry write lock across the whole batch: check every name
-        // is free, then create and insert them, so a concurrent creator can
-        // neither observe a half-built batch nor collide with one.
-        let mut cfs = self.inner.cfs.write();
-        for (name, _) in specs {
-            if cfs.contains_key(*name) {
-                return Err(OndaError::Exists((*name).into()));
+        // Hold `cf_lifecycle_mu` across the whole batch: check every name is
+        // free, then build and publish them together, so a concurrent creator
+        // can neither observe a half-built batch nor collide with one. (Before
+        // 2.2 this was the registry's own write lock; it cannot be, now that the
+        // insert happens inside `catalog_txn` — see the field's docs.)
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        {
+            let cfs = self.inner.cfs.read();
+            for (name, _) in specs {
+                if cfs.contains_key(*name) {
+                    return Err(OndaError::Exists((*name).into()));
+                }
             }
         }
         let mut created = Vec::with_capacity(specs.len());
@@ -1573,21 +1746,26 @@ impl DB {
                 config.clone(),
                 cmp,
             )?;
-            cfs.insert((*name).to_string(), cf.clone());
             created.push(cf);
         }
-        drop(cfs);
-        {
-            let mut by_id = self.inner.cf_by_id.write();
-            for cf in &created {
-                by_id.insert(cf.id(), cf.clone());
+        // ONE edit for the entire batch: N `CreateCF` ops in one record, one
+        // append, one fsync — the same collapse the batch always promised, now
+        // measured in edit bytes rather than whole-catalog rewrites.
+        let edit = VersionEdit::new(
+            created
+                .iter()
+                .map(|cf| crate::manifest_edit::Op::CreateCf {
+                    name: cf.name().to_string(),
+                    config: cf.effective_config().encode(),
+                })
+                .collect(),
+        );
+        let publish = created.clone();
+        self.inner.catalog_txn(edit, |p| {
+            for cf in &publish {
+                self.inner.register_cf(cf, p);
             }
-        }
-        for cf in &created {
-            self.inner.note_periodic_cf(cf);
-        }
-        // One manifest persist for the entire batch.
-        self.inner.persist_manifest()?;
+        })?;
         Ok(created)
     }
 
@@ -1655,13 +1833,25 @@ impl DB {
         if self.inner.opts.read_only {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
-        let cf = {
-            let mut cfs = self.inner.cfs.write();
-            cfs.remove(name).ok_or(OndaError::NotFound)?
-        };
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        let cf = self
+            .inner
+            .cfs
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(OndaError::NotFound)?;
+        // The `DropCF` edit is durable BEFORE any file is unlinked. Before 2.2
+        // the directory went first, so a crash in that window left a manifest
+        // naming a directory that no longer existed; this is the same shape as
+        // invariant 1, applied to a drop.
+        let edit = VersionEdit::new(drop_cf_ops(name, &cf));
+        self.inner
+            .catalog_txn(edit, |p| {
+                self.inner.unregister_cf(name, p);
+            })?;
         cf.close_resources();
         let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
-        self.inner.persist_manifest()?;
         Ok(())
     }
 
@@ -1684,27 +1874,52 @@ impl DB {
                 "clear_column_family is not supported in unified-memtable mode".into(),
             ));
         }
-        let mut cfs = self.inner.cfs.write();
-        let old = cfs.remove(name).ok_or(OndaError::NotFound)?;
+        let _lifecycle = self.inner.cf_lifecycle_mu.lock();
+        let old = self
+            .inner
+            .cfs
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(OndaError::NotFound)?;
         let cfg = old.effective_config();
         let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
         })?;
-        old.close_resources();
-        let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
-        let cf = ColumnFamily::create(
-            self.inner.ctx.clone(),
-            name.to_string(),
-            self.inner.cf_dir(name),
-            cfg,
-            cmp,
-        )?;
-        cfs.insert(name.to_string(), cf.clone());
-        drop(cfs);
-        // Same name => same stable id, so this replaces the old routing entry.
-        self.inner.cf_by_id.write().insert(cf.id(), cf.clone());
-        self.inner.note_periodic_cf(&cf);
-        self.inner.persist_manifest()?;
+        // ONE edit: every table removed, the family dropped, the same name
+        // re-created empty. Durable before a single byte is unlinked.
+        let mut ops = drop_cf_ops(name, &old);
+        ops.push(crate::manifest_edit::Op::CreateCf {
+            name: name.to_string(),
+            config: cfg.encode(),
+        });
+        // The wipe-and-recreate runs *inside* the publish step so the registry
+        // never shows a gap: a concurrent `get_column_family` sees either the
+        // full old family or the empty new one, which is this method's contract.
+        // `ColumnFamily::create` is the one fallible thing here; its error is
+        // carried out rather than swallowed, and the durable edit already says
+        // the family exists and is empty, so a reopen agrees with the catalog.
+        let rebuilt: Mutex<Option<Result<Arc<ColumnFamily>>>> = Mutex::new(None);
+        self.inner.catalog_txn(VersionEdit::new(ops), |p| {
+            self.inner.unregister_cf(name, p);
+            old.close_resources();
+            let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
+            let made = ColumnFamily::create(
+                self.inner.ctx.clone(),
+                name.to_string(),
+                self.inner.cf_dir(name),
+                cfg,
+                cmp,
+            );
+            if let Ok(cf) = &made {
+                self.inner.register_cf(cf, p);
+            }
+            *rebuilt.lock() = Some(made);
+        })?;
+        let cf = rebuilt
+            .lock()
+            .take()
+            .expect("the publish step always records its outcome")?;
         Ok(cf)
     }
 
@@ -2090,11 +2305,25 @@ fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
 
 fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>) {
     match cf.flush_imm(&imm, db.next_file_id()) {
-        Ok(wal_paths) => {
-            // The SST is already synced by `flush_imm`. Reclaim its WAL only
-            // after the manifest durably references that SST.
-            if db.persist_manifest().is_ok() {
-                for path in wal_paths {
+        Ok(out) => {
+            // The SST is already synced by `flush_imm` (catalog_txn step 2).
+            // Reclaim its WAL only after the edit record's fsync returned `Ok`
+            // — AGENTS.md invariant 1. Note what the gate is *not*: a snapshot
+            // write. Snapshot compaction is a space optimization and must never
+            // be a durability precondition.
+            let mut edit = VersionEdit::default();
+            if let Some(handle) = &out.table {
+                edit.push(crate::manifest_edit::Op::AddTable {
+                    cf: cf.name().to_string(),
+                    meta: handle.meta.clone(),
+                });
+            }
+            let table = out.table.clone();
+            if db
+                .catalog_txn(edit, |p| cf.publish_flush(&imm, table, p))
+                .is_ok()
+            {
+                for path in out.wal_paths {
                     crate::wal::remove_wal_files(path);
                 }
             }
@@ -2116,25 +2345,51 @@ fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>)
 }
 
 fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
-    // Each CF slice lands in L0 before the single manifest publication.
+    // Every CF slice is written and fsynced first; ONE edit then publishes them
+    // all, so a shared WAL is never released against a partially recorded flush.
     let mut all_slices_flushed = true;
+    let mut edit = VersionEdit::default();
+    let mut staged: Vec<(Arc<ColumnFamily>, Arc<SstHandle>)> = Vec::new();
     for (cf_id, entries) in crate::unified::split_by_cf(&imm) {
         let cf = db.cf_by_id.read().get(&cf_id).cloned();
         let Some(cf) = cf else {
             continue;
         };
-        if let Err(error) = cf.ingest_l0(entries, db.next_file_id()) {
-            db.fail_stop(format!("unified flush failed: {error}"));
-            all_slices_flushed = false;
+        match cf.ingest_l0(entries, db.next_file_id()) {
+            Ok(Some(handle)) => {
+                edit.push(crate::manifest_edit::Op::AddTable {
+                    cf: cf.name().to_string(),
+                    meta: handle.meta.clone(),
+                });
+                staged.push((cf.clone(), handle));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                db.fail_stop(format!("unified flush failed: {error}"));
+                all_slices_flushed = false;
+            }
         }
-        schedule_compaction_after_flush(db, &cf);
     }
     // A shared WAL covers every CF slice. One failed slice must retain it even
-    // if the manifest could persist the successful slices; recovery needs the
-    // original atomic batch. Only full flush + manifest durability delete it.
-    if all_slices_flushed && db.persist_manifest().is_ok() {
-        for path in &imm.wal_paths {
-            crate::wal::remove_wal_files(path);
+    // if the manifest could record the successful slices; recovery needs the
+    // original atomic batch. Only a full flush plus the edit's fsync delete it.
+    if all_slices_flushed {
+        let published: Vec<Arc<ColumnFamily>> = staged.iter().map(|(cf, _)| cf.clone()).collect();
+        let install = staged;
+        if db
+            .catalog_txn(edit, |p| {
+                for (cf, handle) in install {
+                    cf.install_handles_l0(vec![handle], p);
+                }
+            })
+            .is_ok()
+        {
+            for path in &imm.wal_paths {
+                crate::wal::remove_wal_files(path);
+            }
+        }
+        for cf in &published {
+            schedule_compaction_after_flush(db, cf);
         }
     }
     if let Some(unified) = &db.unified {
@@ -2308,7 +2563,7 @@ mod catalog_txn_tests {
         fault::fail_nth(fault::Call::Sync, 1);
         let err = db
             .inner
-            .catalog_txn(add_table(41), || sink.publish())
+            .catalog_txn(add_table(41), |_| sink.publish())
             .expect_err("a failed fsync must fail the transaction");
         fault::clear();
         assert_eq!(err.kind(), "io", "{err:?}");
@@ -2324,7 +2579,7 @@ mod catalog_txn_tests {
         let db = edits_db(dir.path());
         let sink = Sink::default();
         db.inner
-            .catalog_txn(add_table(41), || sink.publish())
+            .catalog_txn(add_table(41), |_| sink.publish())
             .unwrap();
         assert!(sink.published());
         assert_eq!(log_ids(dir.path()), vec![1]);
@@ -2339,12 +2594,12 @@ mod catalog_txn_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = edits_db(dir.path());
         fault::fail_nth(fault::Call::Sync, 1);
-        let _ = db.inner.catalog_txn(add_table(41), || {});
+        let _ = db.inner.catalog_txn(add_table(41), |_| {});
         fault::clear();
         assert!(db.poisoned().is_some(), "a durability failure fail-stops");
         let err = db
             .inner
-            .catalog_txn(add_table(42), || {})
+            .catalog_txn(add_table(42), |_| {})
             .expect_err("a poisoned database accepts no further transactions");
         assert!(matches!(err, OndaError::Poisoned(_)), "{err:?}");
     }
@@ -2359,7 +2614,7 @@ mod catalog_txn_tests {
         fault::fail_nth(fault::Call::Write, 1);
         let err = db
             .inner
-            .catalog_txn(add_table(41), || sink.publish())
+            .catalog_txn(add_table(41), |_| sink.publish())
             .expect_err("a failed write must fail the transaction");
         fault::clear();
         assert_eq!(err.kind(), "io");
@@ -2380,7 +2635,7 @@ mod catalog_txn_tests {
         let db = edits_db(dir.path());
         // The empty publish closure *is* the crash: the record is fsynced and
         // the candidate state was never installed.
-        db.inner.catalog_txn(add_table(41), || {}).unwrap();
+        db.inner.catalog_txn(add_table(41), |_| {}).unwrap();
         assert_eq!(log_ids(dir.path()), vec![1], "the record is durable");
         // What the next open would read, computed from the files as they stand.
         let back = recover_catalog(dir.path()).unwrap();
@@ -2401,7 +2656,7 @@ mod catalog_txn_tests {
         std::fs::write(&victim, b"x").unwrap();
         let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
         db.inner
-            .catalog_txn(add_table(41), || order.lock().push("publish"))
+            .catalog_txn(add_table(41), |_| order.lock().push("publish"))
             .unwrap();
         db.inner.remove_sst_file(victim.to_str().unwrap(), 4096);
         order.lock().push("retire");
@@ -2423,7 +2678,7 @@ mod catalog_txn_tests {
         let db = DB::open(o).unwrap();
         let sink = Sink::default();
         db.inner
-            .catalog_txn(add_table(41), || sink.publish())
+            .catalog_txn(add_table(41), |_| sink.publish())
             .expect("a read-only transaction is not an error");
         assert!(sink.published(), "the in-memory publication still happens");
         assert_eq!(
@@ -2442,7 +2697,7 @@ mod catalog_txn_tests {
         let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
         db.create_column_family("default", ColumnFamilyConfig::default())
             .unwrap();
-        db.inner.catalog_txn(add_table(41), || {}).unwrap();
+        db.inner.catalog_txn(add_table(41), |_| {}).unwrap();
         assert!(
             !crate::manifest_edit::edit_log_path(dir.path()).exists(),
             "no capability, no log"
@@ -2456,7 +2711,7 @@ mod catalog_txn_tests {
             "the capability is durable before the first append, and creates the log"
         );
         assert_eq!(manifest_version(dir.path()), 2);
-        db.inner.catalog_txn(add_table(42), || {}).unwrap();
+        db.inner.catalog_txn(add_table(42), |_| {}).unwrap();
         assert_eq!(log_ids(dir.path()), vec![1]);
         db.close().unwrap();
     }
@@ -2500,7 +2755,7 @@ mod catalog_txn_tests {
             assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
             db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
                 .unwrap();
-            db.inner.catalog_txn(add_table(4_242), || {}).unwrap();
+            db.inner.catalog_txn(add_table(4_242), |_| {}).unwrap();
             db.close().unwrap();
         }
         let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
@@ -2524,7 +2779,7 @@ mod catalog_txn_tests {
         if let Op::AddTable { meta, .. } = &mut fat.ops[0] {
             meta.min_key = vec![7u8; (crate::manifest_edit::SNAPSHOT_MIN_EDIT_BYTES + 1) as usize];
         }
-        db.inner.catalog_txn(fat, || {}).unwrap();
+        db.inner.catalog_txn(fat, |_| {}).unwrap();
         assert!(
             log_ids(dir.path()).is_empty(),
             "the trigger fired inside the same section and restarted the log empty"
@@ -2538,6 +2793,98 @@ mod catalog_txn_tests {
     fn manifest_version(dir: &std::path::Path) -> u32 {
         let bytes = std::fs::read(manifest_path(dir.to_str().unwrap())).unwrap();
         u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+    }
+
+    /// Slice 8's last row, which only becomes checkable once the call sites are
+    /// migrated: publication is unreachable outside a catalog transaction.
+    ///
+    /// The guarantee itself is Rust's — `Publish` has a private field, so no
+    /// other module can build one, and every primitive demands one by
+    /// reference, so a stray publication does not compile. This test guards the
+    /// two ways that could be quietly undone: dropping the parameter from a
+    /// primitive, or adding a constructor another module can call. It reads the
+    /// sources through `include_str!`, so it cannot go stale against a moved
+    /// file or a renamed directory.
+    #[test]
+    fn no_publication_primitive_is_reachable_outside_txn() {
+        const CF: &str = include_str!("column_family.rs");
+        const DB: &str = include_str!("db.rs");
+
+        /// The signature text of `fn <name>(`, up to the body brace.
+        fn signature<'a>(src: &'a str, file: &str, name: &str) -> &'a str {
+            let decl = format!("fn {name}(");
+            let at = src
+                .find(&decl)
+                .unwrap_or_else(|| panic!("{name} is no longer declared in {file}"));
+            let end = src[at..]
+                .find(" {")
+                .expect("a function signature ends at its body");
+            &src[at..at + end]
+        }
+
+        // Every level-set, registry and rule publication demands the token.
+        for name in [
+            "install_handles_l0",
+            "publish_flush",
+            "update_levels",
+            "install_levels",
+            "remove_bottom_tables",
+            "insert_bottom_sorted",
+            "swap_bottom_tables",
+            "remove_l0_tables",
+            "append_partition_rule",
+            "remove_partition_rule",
+        ] {
+            let sig = signature(CF, "column_family.rs", name);
+            assert!(
+                sig.contains("Publish"),
+                "{name} publishes catalog state without a Publish token: {sig}"
+            );
+        }
+        for name in [
+            "register_cf",
+            "unregister_cf",
+            "publish_instance_nonce",
+            "publish_wal_layout",
+        ] {
+            let sig = signature(DB, "db.rs", name);
+            assert!(
+                sig.contains("Publish"),
+                "{name} publishes catalog state without a Publish token: {sig}"
+            );
+        }
+
+        // The token's field stays private, so `Publish` is unconstructible
+        // outside this module...
+        assert!(
+            DB.contains("pub(crate) struct Publish(());"),
+            "Publish's field must stay private — a public field makes the token \
+             forgeable from any module"
+        );
+        // ...and no other module names a constructor, directly or by path.
+        for (file, src) in [
+            ("column_family.rs", CF),
+            ("compaction.rs", include_str!("compaction.rs")),
+            ("parts.rs", include_str!("parts.rs")),
+            ("ingest.rs", include_str!("ingest.rs")),
+            ("maintenance.rs", include_str!("maintenance.rs")),
+        ] {
+            assert!(
+                !src.contains("Publish(") && !src.contains("Publish::"),
+                "{file} mints a Publish token; only db.rs may, and only in \
+                 catalog_txn or the capability-enable snapshot rewrite"
+            );
+        }
+        // Inside db.rs the mint sites are exactly the two documented ones. The
+        // needle is assembled rather than written out, so this test's own
+        // source does not count as a third one.
+        let mint = format!("() -{} Publish {{", ">");
+        assert_eq!(
+            DB.matches(mint.as_str()).count(),
+            2,
+            "db.rs must mint the token in exactly two places: after a durable \
+             edit, and for the capability-enable snapshot rewrite"
+        );
     }
 }
 

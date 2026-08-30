@@ -70,11 +70,16 @@ single-edit semantics, and
 87× on replay, and the property the acceptance criterion actually asks for —
 *bounded* replay — only holds because of it.
 
-## Not measured here
+## Not measured here — since measured
 
-The `../bench` flush/compaction p99 evidence at the 10k-table fixture. It cannot
-be produced yet: the twenty `persist_manifest` call sites have **not** been
-migrated onto `catalog_txn` (that is the next slice), so a running database still
-pays a full rewrite per flush whether or not the capability is enabled. Running
-`../bench` today would measure the unchanged path and report a null result that
-says nothing about the feature. It belongs with the migration commit.
+The flush/compaction p99 evidence at the 10k-table fixture could not be produced
+at the time of this record: the twenty `persist_manifest` call sites had **not**
+been migrated onto `catalog_txn`, so a running database still paid a full rewrite
+per flush whether or not the capability was enabled, and any benchmark would have
+measured the unchanged path.
+
+It landed with the migration commit (2.2 slice 9):
+`bench-results/2.2-slice9/2026-08-30/`. Summary of that record — flush p50 89.1 →
+64.3 ms and p99 150.6 → 115.4 ms at a 270 KB catalog (4/5 paired runs each),
+compaction p50 63.5 → 47.5 ms (5/5); compaction p99 **inconclusive** at 25
+samples per run and reported as such.
