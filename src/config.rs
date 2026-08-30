@@ -293,6 +293,46 @@ pub struct Options {
     /// [`DB::checkpoint`](crate::DB::checkpoint)) still defers every unlink
     /// regardless of this setting. Not persisted.
     pub obsolete_delete_bytes_per_second: u64,
+    /// Maximum number of parallel **spans** one compaction job may split its
+    /// user-key range into (0.8). `0` and `1` both mean today's behavior: one
+    /// span, one merge, no extra thread. Default `1`.
+    ///
+    /// A job that qualifies partitions its key range at comparator-aware
+    /// boundaries — partition cuts where it writes bottom output, target-table
+    /// `min_key`s otherwise — and merges the pieces concurrently into one
+    /// atomic install. Every version of a user key stays in one span, so the
+    /// result is logically identical to the single-span merge; the *files* are
+    /// not, since their boundaries and ids differ.
+    ///
+    /// It applies to capacity-triggered level >= 1 jobs and L0 -> L1
+    /// oldest-window jobs. [`DB::compact`](crate::DB::compact)'s whole-level
+    /// sweep, the in-place bottom rewrite, FIFO eviction and any column family
+    /// with a compaction filter installed stay single-span — the filter because
+    /// it is written against a single-threaded, key-ordered traversal.
+    ///
+    /// The actual span count is
+    /// `min(max_subcompactions, useful boundaries + 1, free span permits + 1)`,
+    /// reported per job as [`CfStats::span_count`](crate::CfStats::span_count).
+    ///
+    /// **Not persisted.** It describes this host, not the stored data — the
+    /// same rule [`background_io_bytes_per_second`](Self::background_io_bytes_per_second)
+    /// follows.
+    pub max_subcompactions: usize,
+    /// Size of the DB-wide pool of span-worker threads
+    /// ([`max_subcompactions`](Self::max_subcompactions)). `0` (the default)
+    /// derives [`num_compaction_threads`](Self::num_compaction_threads).
+    ///
+    /// The pool is deliberately sized *independently* of the compaction worker
+    /// count, and a job's coordinator consumes nothing from it: the coordinator
+    /// runs span 0 on the compaction thread it already occupies, which
+    /// `num_compaction_threads` already accounts for. Permits gate only the
+    /// extra threads. Sizing one shared pool for both instead makes the feature
+    /// a no-op at the defaults — two concurrent jobs would take both permits as
+    /// coordinators and no span worker could ever run.
+    ///
+    /// Acquisition never blocks: a job takes what is free and runs fewer spans
+    /// if it cannot have them all. Not persisted.
+    pub max_subcompaction_workers: usize,
     /// Replace the built-in token bucket with a caller-supplied limiter.
     ///
     /// Set, this overrides
@@ -490,6 +530,8 @@ impl Default for Options {
             background_io_bytes_per_second: 0, // unlimited: no limiter object
             background_io_burst_bytes: 0,
             obsolete_delete_bytes_per_second: 0, // unlink inline: no worker thread
+            max_subcompactions: 1,               // one span: today's behavior, no extra thread
+            max_subcompaction_workers: 0,        // derive num_compaction_threads
             io_limiter: None,
         }
     }

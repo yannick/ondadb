@@ -78,6 +78,18 @@ pub struct CfStats {
     /// `hard_pending_compaction_bytes`, so a value pinned near the hard limit
     /// means ingest is outrunning compaction.
     pub compaction_debt: u64,
+    /// Spans the most recent **bounded** compaction job on this family ran
+    /// (0.8). `1` means it ran as one merge — the default, and what a family
+    /// excluded from spanning always reports. The single-span job classes
+    /// ([`DB::compact`](crate::DB::compact)'s whole-level sweep, FIFO eviction)
+    /// leave it alone rather than overwriting what the bounded jobs did.
+    /// See [`Options::max_subcompactions`](crate::Options::max_subcompactions).
+    pub span_count: u64,
+    /// `max_span_bytes - min_span_bytes` for that job: how unevenly the
+    /// boundary planner divided the work. Near zero is the goal; a large value
+    /// on a multi-span job means the span boundaries did not track the input
+    /// bytes, and the job took as long as its widest span.
+    pub span_imbalance_bytes: u64,
 }
 
 /// Database-wide statistics.
@@ -124,6 +136,10 @@ impl ColumnFamily {
             sst_probes: self.sst_probes.load(std::sync::atomic::Ordering::Relaxed),
             compaction_debt: self
                 .compaction_debt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            span_count: self.span_count.load(std::sync::atomic::Ordering::Relaxed),
+            span_imbalance_bytes: self
+                .span_imbalance_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             levels,
         }

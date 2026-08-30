@@ -158,11 +158,83 @@ Two consequences worth knowing operationally:
 `DB::compact` (the manual sweep) still takes the column family whole — it
 rewrites every level by design.
 
+## Splitting one job across threads
+
+`Options::num_compaction_threads` limits how many *jobs* run at once, and jobs
+only run at once when their key ranges are disjoint. One large job — an L0
+push-down that rewrites all of L1 — is a single merge on a single thread however
+many workers are configured, and it is usually the longest job the engine
+produces.
+
+Since 0.8, `Options::max_subcompactions` lets that one job split its key range
+into **spans** and merge them concurrently into a single atomic install:
+
+| Field | Default | What it controls |
+|---|---|---|
+| `max_subcompactions` | 1 | Maximum spans one job splits into. `0` and `1` both mean today's behavior |
+| `max_subcompaction_workers` | 0 | Size of the database-wide pool of span threads; `0` derives `num_compaction_threads` |
+
+Neither is persisted: like the IO limiter's knobs they describe the host, not the
+stored data, and are re-read at every open.
+
+The split is **logically invisible**. Boundaries are user keys and spans are
+half-open, so every version of a key stays in one span; a scan returns the same
+thing at every snapshot whether the job ran in one span or four. What does
+change is the *files*: their boundaries and ids differ from a single-span run,
+which is why the tests compare scans and not bytes.
+
+Where the cuts land, in order of preference:
+
+1. **Partition boundaries**, when the job writes bottom output. A part is never
+   split across spans, and a bottom SSTable never spans two partitions anyway,
+   so these cuts are free. A partition boundary is a key *prefix*, and "a prefix
+   is the first key of its partition" is a bytewise fact — so a **partitioned**
+   family with a custom comparator stays single-span rather than risk cutting a
+   part in half. A custom comparator on its own does not: cuts then come from
+   real table keys, compared with that comparator.
+2. **Target-table `min_key`s** otherwise — already sorted, and points where the
+   output would have started a new file regardless.
+3. The **input tables' `min_key`s**, when the target level is empty.
+
+More candidates than spans are sampled by cumulative target bytes, so the spans
+carry comparable amounts of work rather than comparable amounts of keyspace.
+Read the result back per job:
+
+```rust
+let s = cf.stats();
+s.span_count;             // spans the last bounded job ran (1 = single merge)
+s.span_imbalance_bytes;   // widest span minus narrowest, in output bytes
+```
+
+A `span_imbalance_bytes` close to the job's whole output means the boundaries
+did not track the data, and the job took as long as its widest span.
+
+**What stays single-span**, whatever the setting: `DB::compact`'s whole-level
+sweep and its in-place bottom rewrite, FIFO (which never merges), and any column
+family with a compaction filter installed. The filter is excluded for a
+semantic reason rather than a thread-safety one — `CompactionFilterFn` is
+already `Send + Sync`, but it is written against a single-threaded, key-ordered
+traversal, and spans would make the order depend on the span count.
+
+**Sizing.** The span pool is separate from `num_compaction_threads` on purpose,
+and a job's coordinator takes nothing from it — it runs the first span on the
+compaction thread it already occupies. `max_subcompactions = 4` with the default
+two compaction threads therefore peaks at 2 coordinators + 2 span workers, not
+8. Nothing ever waits for a permit: a job that cannot have all its spans runs
+fewer.
+
+The default is `1`, and stays there: the gain is real only when one job is large
+relative to the device's spare bandwidth, and a machine whose compaction is
+already IO-bound gets nothing from splitting it (the 0.6 limiter still caps the
+total either way). Raise it when `compaction_debt` is driven by a few big jobs
+rather than by many small ones, and measure.
+
 ## Tuning by symptom
 
 | Symptom | Look at |
 |---|---|
 | Write throughput collapses over a long ingest | `compaction_debt` — if pinned near the hard ceiling, compaction cannot keep up; raise `num_compaction_threads`, or accept the paced rate as the real one |
+| Debt is driven by a few very large jobs rather than many small ones | `max_subcompactions` — see § Splitting one job across threads; check `span_imbalance_bytes` afterwards |
 | `close()` takes seconds | Expected with `finish_compactions_on_close = true`; otherwise check debt at close |
 | Point reads slow right after opening | L0 depth. `cf.stats().levels[0]` — see § Closing |
 | Point reads slow in steady state | Level count and bloom settings, not this document — see `docs/performance.md` |

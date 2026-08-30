@@ -222,6 +222,10 @@ pub struct DbInner {
     /// it at a time.
     pub(crate) mover_running: AtomicBool,
 
+    /// Admission for the **extra** threads a compaction job spawns to run its
+    /// spans in parallel (0.8). See [`SpanPermits`].
+    pub(crate) span_permits: SpanPermits,
+
     /// Serializes manifest rebuild+write. Multiple flush workers, the compaction
     /// worker, and CF create/drop all call `persist_manifest` concurrently; without
     /// this they would race on the shared temp file and could publish a torn manifest.
@@ -275,6 +279,79 @@ pub struct DbInner {
     /// DB has opened (per-CF, unified, and post-rotation). Observability/test
     /// hook (see [`DB::wal_sync_count`]); relaxed increments on an fsync-bound path.
     pub(crate) wal_syncs: Arc<AtomicU64>,
+}
+
+/// DB-wide budget for parallel compaction **span workers** (0.8).
+///
+/// Sized independently of `num_compaction_threads`, and a coordinator consumes
+/// nothing: it is an `onda-compact-{n}` thread that runs span 0 itself, and
+/// `num_compaction_threads` already accounts for it. The naive alternative —
+/// one pool of `num_compaction_threads` permits with the coordinator taking one
+/// — silently no-ops at the defaults, because two concurrent jobs would consume
+/// both permits as coordinators and no span worker could ever run.
+///
+/// Acquisition never blocks. A job takes what is free and degrades to fewer
+/// spans (ultimately to one, which is exactly today's behavior), so no
+/// background thread ever waits here while holding its range lock.
+#[derive(Debug)]
+pub(crate) struct SpanPermits {
+    available: Mutex<usize>,
+}
+
+/// Permits held for the life of one compaction job; released when it joins its
+/// workers, on the error path as much as the happy one.
+#[derive(Debug)]
+pub(crate) struct SpanPermitGuard<'a> {
+    pool: &'a SpanPermits,
+    held: usize,
+}
+
+impl SpanPermits {
+    pub(crate) fn new(permits: usize) -> SpanPermits {
+        SpanPermits {
+            available: Mutex::new(permits),
+        }
+    }
+
+    /// Take up to `want` permits, without waiting for any.
+    pub(crate) fn take(&self, want: usize) -> SpanPermitGuard<'_> {
+        let mut available = self.available.lock();
+        let held = want.min(*available);
+        *available -= held;
+        SpanPermitGuard { pool: self, held }
+    }
+
+    /// Permits free right now — test observability only.
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        *self.available.lock()
+    }
+}
+
+impl SpanPermitGuard<'_> {
+    pub(crate) fn granted(&self) -> usize {
+        self.held
+    }
+
+    /// Give back everything past `keep`: the boundary planner may find fewer
+    /// useful cuts than the permits allow, and holding the surplus for the
+    /// length of the merge would starve a concurrent job for nothing.
+    pub(crate) fn reduce_to(&mut self, keep: usize) {
+        if keep >= self.held {
+            return;
+        }
+        let released = self.held - keep;
+        self.held = keep;
+        *self.pool.available.lock() += released;
+    }
+}
+
+impl Drop for SpanPermitGuard<'_> {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            *self.pool.available.lock() += self.held;
+        }
+    }
 }
 
 /// RAII guard that pauses obsolete-SSTable deletion while held (see
@@ -803,6 +880,10 @@ fn build_db_inner(
         stop,
         pending_flush,
         mover_running: AtomicBool::new(false),
+        span_permits: SpanPermits::new(match opts.max_subcompaction_workers {
+            0 => opts.num_compaction_threads.max(1),
+            n => n,
+        }),
         manifest_mu: Mutex::new(()),
         wal_layout: Mutex::new(requested_layout),
         instance_nonce: Mutex::new(manifest.instance_nonce),

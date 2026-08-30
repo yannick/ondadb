@@ -113,6 +113,7 @@ the two unexamined candidates.
 | `Wal::qstate` / per-stripe file mutexes | group-commit queue / file appends | one frame write |
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
 | `commit_hook` (Mutex) | hook fn | hook invocation |
+| `DbInner::span_permits` (Mutex&lt;usize&gt;) | count of free compaction **span workers** (0.8) | one non-blocking take/release; never held across IO |
 | `<dir>/LOCK` (OS advisory file lock) | whole DB directory against other processes/handles | entire open→close lifetime; exclusive for read-write, shared for read-only opens; second open fails with `OndaError::Locked` |
 
 Safe patterns used: `create/drop_column_family` release the `cfs` write lock
@@ -210,6 +211,65 @@ Ordering obligations:
 
 FIFO is the queue's discipline but not a correctness requirement: file ids are
 never reused, so no retirement can depend on an earlier one having run.
+### Compaction span workers and their permit pool (0.8)
+
+`Options::max_subcompactions` (default `1`) lets **one** compaction job split
+its user-key range into half-open spans and merge them concurrently. The shape
+is deliberately narrow:
+
+- **Boundaries are user keys and the spans are half-open**, so every version of
+  one user key lands in exactly one span. That is what makes each span's own
+  `VersionRetention` correct: it never sees a partial version chain.
+  `plan_spans` is pure over table metadata — partition cuts where the job writes
+  bottom output, target-table `min_key`s otherwise — and is comparator-aware
+  throughout. A partitioned job under a non-bytewise comparator stays
+  single-span, because "a partition boundary prefix is the first key of its
+  partition" is a bytewise argument.
+- **Job-wide decisions are frozen once**, before any span starts, in `FrozenJob`
+  (`bottom`, `oldest_snapshot`, `now`, `carry_entry_time`, the partition
+  resolver, the compaction filter). Two spans re-deriving `bottom` or the
+  resolver independently could straddle a concurrent change and cut differently
+  out of one input set.
+- **Span 0 runs inline on the coordinator's own thread**; the rest run on
+  `std::thread::scope` threads named `onda-span-{n}`, so every one of them is
+  joined before the job returns — on the error path as much as the happy one.
+  Each sets `IoClass::Compaction` with an `ioctrl::scoped` guard at entry: a
+  fresh thread defaults to `Foreground`, and without the guard every byte a span
+  moved would escape the 0.6 limiter.
+- **One shared cancel flag** in `FrozenJob`, polled once per entry. The first
+  failure sets it; siblings stop rather than finish megabytes of doomed output.
+- **One install.** Spans hold no lock of their own — the job's single
+  `RangeGuard` already excludes everyone else from the whole span — and nothing
+  reaches the level set until every span has succeeded: outputs are concatenated
+  in span order, debug-asserted sorted and disjoint, installed with **one**
+  `install_compaction_outputs`, then persisted with one `persist_manifest`.
+  A reader therefore sees either all of the inputs or all of the outputs.
+  Failure anywhere removes every output file directly (none reached the
+  manifest): a partial span through `CompactionOutputBuilder`'s abort-on-drop, a
+  *finished* sibling's tables explicitly, since `finish()` has already taken
+  them out of the builder's reach.
+- **Persist failure rolls the install back** (`rollback_compaction_outputs`)
+  before the outputs are unlinked, so the level set goes back to naming the
+  inputs the manifest still names. Inputs are re-inserted at their own recorded
+  level rather than from a pre-install snapshot, which would also undo whatever
+  a concurrent flush added meanwhile.
+
+**The permit pool is sized independently of the compaction worker count, and a
+coordinator consumes nothing from it.** `DbInner::span_permits` holds
+`max_subcompaction_workers` permits (default: `num_compaction_threads`), and a
+job takes `spans - 1` of them. The coordinator is an `onda-compact-{n}` thread
+that is going to do a share of the merge itself, and `num_compaction_threads`
+already accounts for it. Sizing one pool for both silently no-ops at the
+defaults: with two compaction threads, two concurrent jobs would consume both
+permits as coordinators and no span worker could ever run
+(`coordinators_do_not_consume_span_permits` pins this).
+
+Acquisition **never blocks**. A job takes what is free and degrades to fewer
+spans, ultimately to one, so the background-wait rule above is not stretched any
+further: no thread ever parks on this pool while holding its range lock.
+Permits are released when the job joins its workers, including on the error
+path, and the surplus is released early when the boundary planner finds fewer
+useful cuts than the permits allow.
 
 ## Rotation protocol (`ColumnFamily::rotate_memtable`)
 
@@ -393,6 +453,9 @@ Contract:
 `spawn_workers`: `num_flush_threads.max(1)` flush workers plus
 `num_compaction_threads.max(1)` compaction workers, fed
 by unbounded crossbeam channels, polling with 50 ms tick to observe `stop`.
+A compaction worker may additionally spawn scoped `onda-span-{n}` threads for
+the length of one job (0.8, off by default) — they are joined inside the job,
+so they never outlive it and `close` has nothing extra to wait for.
 `DB::close`: set `closing` → **cancel the background IO limiter** (0.6: so the
 drain below cannot wait on a rate) → rotate every CF (+unified) with `force` →
 spin until `pending_flush == 0` → set `stop`, join workers → final

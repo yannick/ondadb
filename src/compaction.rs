@@ -45,7 +45,30 @@
 //! that wraps, because the cheapest candidate may be vetoed or already locked
 //! — and it applies to levels >= 1 only: L0's oldest-first window is a
 //! correctness invariant, not a cost choice.
+//!
+//! # Parallel spans within one job (0.8)
+//!
+//! Bounded jobs cap the *size* of a job but not its *duration*: an L0 push-down
+//! that rewrites all of L1 is one merge on one thread, however many compaction
+//! workers are configured, because the concurrency above is between jobs on
+//! disjoint ranges and this is one job. [`Options::max_subcompactions`]
+//! (default 1, off) lets such a job partition its user-key range into half-open
+//! **spans** ([`plan_spans`]), merge them concurrently ([`run_span`] per span,
+//! span 0 inline on the coordinator's thread), and install every output with
+//! ONE `install_compaction_outputs` and one `persist_manifest`.
+//!
+//! The split is invisible to a reader. Boundaries are user keys and spans are
+//! half-open, so every version of one user key lands in exactly one span, which
+//! is what makes each span's own [`VersionRetention`] correct. Job-wide
+//! decisions are frozen once in [`FrozenJob`] and shared by reference, so no two
+//! spans can disagree about `bottom`, the snapshot horizon or the partitioner.
+//! The output *files* differ from a single-span run — different boundaries,
+//! different ids — so the oracle is logical scan equality at every snapshot,
+//! not byte equality.
+//!
+//! [`Options::max_subcompactions`]: crate::config::Options::max_subcompactions
 
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::column_family::{ColumnFamily, SstHandle};
@@ -120,7 +143,7 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     while let Some((job, guard)) = pick_compaction(db, cf) {
         cf.compacting
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let res = compact_inputs(db, cf, job.level, job.target, job.inputs);
+        let res = compact_inputs_spanned(db, cf, job.level, job.target, job.inputs);
         cf.compacting
             .store(false, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
@@ -723,7 +746,7 @@ impl<'a> CompactionOutputBuilder<'a> {
         cmp: &'a ComparatorRef,
         target: usize,
         bottom: bool,
-        inputs: &[Arc<SstHandle>],
+        carry_entry_time: Option<i64>,
         partitioner: Option<crate::config::PartitionResolver>,
     ) -> Self {
         Self {
@@ -733,10 +756,7 @@ impl<'a> CompactionOutputBuilder<'a> {
             target,
             bottom,
             target_bytes: (cf.opts.target_file_size as u64).max(1),
-            carry_entry_time: inputs
-                .iter()
-                .filter_map(|handle| handle.meta.max_entry_time)
-                .max(),
+            carry_entry_time,
             partitioner,
             current: None,
             outputs: Vec::new(),
@@ -910,77 +930,495 @@ fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Option<usize> {
     best
 }
 
-struct CompactionMerge<'a> {
-    db: &'a Arc<DbInner>,
-    cf: &'a Arc<ColumnFamily>,
-    cmp: &'a ComparatorRef,
-    target: usize,
-    inputs: &'a [Arc<SstHandle>],
+/// Every decision a compaction job makes **once**, before any merge work
+/// starts, and then hands to each span by shared reference.
+///
+/// Freezing them is what makes several spans of one job agree with each other:
+/// two workers deriving `bottom` or the partition resolver independently could
+/// see a concurrent compaction or a rule addition in between and cut different
+/// boundaries out of the same input set. It is also why a single-span job is
+/// unchanged by this refactor — the same values were already captured once in
+/// `compact_inputs`, just closer to the merge.
+struct FrozenJob {
+    /// The job's one snapshot of `is_bottom_target`.
     bottom: bool,
     oldest_snapshot: u64,
     now: i64,
-    filter: Option<crate::column_family::CompactionFilterFn>,
+    /// `max_entry_time` carried onto every output, from the inputs.
+    carry_entry_time: Option<i64>,
     partitioner: Option<crate::config::PartitionResolver>,
+    filter: Option<crate::column_family::CompactionFilterFn>,
+    /// Set by the first span that fails; every span polls it once per entry so
+    /// siblings stop instead of finishing megabytes of doomed output. Lives
+    /// here because it is the one piece of per-job state every span shares,
+    /// and `run_span` already takes the job by reference.
+    cancel: std::sync::atomic::AtomicBool,
 }
 
-impl CompactionMerge<'_> {
-    fn run(self) -> Result<Vec<SstMeta>> {
-        let mut iterators: Vec<SstIterator> = self
-            .inputs
-            .iter()
-            .map(|table| table.reader().map(|reader| reader.iter()))
-            .collect::<Result<_>>()?;
-        for iterator in &mut iterators {
-            iterator.seek_to_first();
-        }
-        let mut retention = VersionRetention::new(
-            self.bottom,
-            self.oldest_snapshot,
-            self.now,
-            self.cmp.clone(),
-        );
-        let mut outputs = CompactionOutputBuilder::new(
-            self.db,
-            self.cf,
-            self.cmp,
-            self.target,
-            self.bottom,
-            self.inputs,
-            self.partitioner,
-        );
-        while let Some(index) = smallest_input(&iterators, self.cmp) {
-            let (key, seq, tombstone, ttl, single_delete) = {
-                let iterator = &iterators[index];
-                (
-                    iterator.user_key().to_vec(),
-                    iterator.seq(),
-                    iterator.is_tombstone(),
-                    iterator.ttl(),
-                    iterator.is_single_delete(),
-                )
-            };
-            if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl)
-            {
-                let value = iterators[index].value()?;
-                let filter_removes = filter_eligible
-                    && self.filter.as_ref().is_some_and(|filter| {
-                        filter(&key, &value) == crate::column_family::FilterDecision::Remove
-                    });
-                if !(filter_removes && self.bottom) {
-                    outputs.write(
-                        &key,
-                        &value,
-                        seq,
-                        ttl,
-                        tombstone || filter_removes,
-                        single_delete,
-                    )?;
+impl FrozenJob {
+    fn new(
+        db: &Arc<DbInner>,
+        cf: &Arc<ColumnFamily>,
+        target: usize,
+        inputs: &[Arc<SstHandle>],
+    ) -> Result<FrozenJob> {
+        // One snapshot of the predicate for the whole job: retention, partition
+        // cutting and the output filter policy must all agree on whether this
+        // output is bottom, even if a concurrent compaction changes the shape.
+        let bottom = is_bottom_target(cf, target);
+        Ok(FrozenJob {
+            bottom,
+            oldest_snapshot: db.oldest_snapshot(),
+            now: now_nanos(),
+            carry_entry_time: inputs
+                .iter()
+                .filter_map(|handle| handle.meta.max_entry_time)
+                .max(),
+            // Only bottom output is partition-cut. Snapshot the resolver once
+            // so a concurrent rule addition cannot change boundaries during
+            // this run.
+            partitioner: if bottom {
+                Some(cf.partition_resolver_snapshot()?)
+            } else {
+                None
+            },
+            filter: cf.compaction_filter(),
+            cancel: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Merge the half-open user-key span `[lower, upper)` of `inputs` into tables
+/// for `target`, and return their metadata. The tables are on disk and synced
+/// when this returns; nothing is installed and nothing is persisted.
+///
+/// A whole job is `run_span(.., Unbounded, Unbounded, ..)`; several spans of
+/// one job partition the keyspace between them. Because the bounds are **user**
+/// keys and the spans are half-open, every version of one user key lands in
+/// exactly one span, which is what makes the per-span [`VersionRetention`]
+/// correct: it never sees a partial version chain.
+#[allow(clippy::too_many_arguments)]
+fn run_span(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    cmp: &ComparatorRef,
+    target: usize,
+    inputs: &[Arc<SstHandle>],
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+    frozen: &FrozenJob,
+) -> Result<Vec<SstMeta>> {
+    let mut iterators: Vec<SstIterator> = inputs
+        .iter()
+        .map(|table| table.reader().map(|reader| reader.iter()))
+        .collect::<Result<_>>()?;
+    for iterator in &mut iterators {
+        match lower {
+            Bound::Unbounded => iterator.seek_to_first(),
+            // Entries are ordered user key ascending, sequence DESCENDING, so
+            // `(key, u64::MAX)` is the first version of `key`.
+            Bound::Included(key) => iterator.seek(key, u64::MAX),
+            Bound::Excluded(key) => {
+                // `(key, 0)` is the LAST version of `key`; one step past it
+                // leaves the whole excluded key behind.
+                iterator.seek(key, 0);
+                if iterator.valid() && cmp.compare(iterator.user_key(), key).is_eq() {
+                    iterator.next();
                 }
             }
-            iterators[index].next();
         }
-        outputs.finish()
     }
+    let past_upper = |key: &[u8]| match upper {
+        Bound::Unbounded => false,
+        Bound::Excluded(end) => cmp.compare(key, end).is_ge(),
+        Bound::Included(end) => cmp.compare(key, end).is_gt(),
+    };
+
+    let mut retention = VersionRetention::new(
+        frozen.bottom,
+        frozen.oldest_snapshot,
+        frozen.now,
+        cmp.clone(),
+    );
+    let mut outputs = CompactionOutputBuilder::new(
+        db,
+        cf,
+        cmp,
+        target,
+        frozen.bottom,
+        frozen.carry_entry_time,
+        frozen.partitioner.clone(),
+    );
+    while let Some(index) = smallest_input(&iterators, cmp) {
+        let (key, seq, tombstone, ttl, single_delete) = {
+            let iterator = &iterators[index];
+            (
+                iterator.user_key().to_vec(),
+                iterator.seq(),
+                iterator.is_tombstone(),
+                iterator.ttl(),
+                iterator.is_single_delete(),
+            )
+        };
+        if past_upper(&key) {
+            break;
+        }
+        if frozen.cancelled() {
+            // A sibling already failed; this span's outputs are removed by
+            // `CompactionOutputBuilder`'s abort-on-drop.
+            return Err(crate::error::OndaError::Unknown(
+                "compaction span cancelled by a failing sibling span".to_string(),
+            ));
+        }
+        if let Retention::Keep { filter_eligible } = retention.decide(&key, seq, tombstone, ttl) {
+            let value = iterators[index].value()?;
+            let filter_removes = filter_eligible
+                && frozen.filter.as_ref().is_some_and(|filter| {
+                    filter(&key, &value) == crate::column_family::FilterDecision::Remove
+                });
+            if !(filter_removes && frozen.bottom) {
+                outputs.write(
+                    &key,
+                    &value,
+                    seq,
+                    ttl,
+                    tombstone || filter_removes,
+                    single_delete,
+                )?;
+            }
+        }
+        iterators[index].next();
+    }
+    outputs.finish()
+}
+
+/// Extra span workers this job may ask the DB-wide pool for: one fewer than
+/// the span count, because the coordinator runs span 0 inline on the
+/// `onda-compact-{n}` thread it already occupies.
+///
+/// Returns 0 — a single span, today's behavior — for every excluded job class.
+fn span_budget(db: &Arc<DbInner>, frozen: &FrozenJob, spans_allowed: bool) -> usize {
+    if !spans_allowed {
+        return 0;
+    }
+    // A user compaction filter is written against a single-threaded, key-ordered
+    // traversal, and its documented "not snapshot-consistent" caveat would
+    // become dependent on the span count on top of that. Thread safety is not
+    // the reason — the type is already `Send + Sync`.
+    if frozen.filter.is_some() {
+        return 0;
+    }
+    db.opts.max_subcompactions.max(1).saturating_sub(1)
+}
+
+/// Split the job's user-key range into at most `max_spans` half-open spans,
+/// returned as their lower bounds: element 0 is always `Unbounded` and span `i`
+/// runs from `plan[i]` up to (excluding) `plan[i + 1]`, the last one to
+/// `Unbounded`. Pure over table metadata — it opens nothing.
+///
+/// Candidates, in the order the design prefers them:
+///
+/// 1. **Partition cuts, when the job writes bottom output.** These are the
+///    ideal split points, because [`CompactionOutputBuilder`] already refuses
+///    to let one output table span two partitions, so a span boundary that is
+///    also a partition boundary costs nothing in extra files. A partition's
+///    boundary is a key *prefix* ([`crate::config::PartitionResolver::boundary`]),
+///    and a prefix is exactly the first key of its partition under a bytewise
+///    comparator — every key starting with `b` sorts at or after `b`, and no
+///    key sorting before `b` can start with it. That argument is bytewise-only,
+///    so a partitioned job under a custom comparator stays single-span rather
+///    than risk cutting a partition in half.
+/// 2. Otherwise the **target tables' `min_key`s**: free, already sorted, and
+///    each one is a point where the output would have started a new file
+///    anyway.
+/// 3. Failing that (an empty target level — an L0 -> L1 job into a fresh
+///    level), the **input tables' `min_key`s**.
+///
+/// Candidates are then deduplicated *under the comparator*, filtered down to
+/// the ones that actually have input data on both sides, and — if more remain
+/// than `max_spans - 1` — sampled by cumulative target bytes so the spans carry
+/// comparable amounts of work rather than comparable amounts of keyspace (see
+/// the weighting note below for why the target level and not the whole input
+/// set).
+fn plan_spans(
+    cmp: &ComparatorRef,
+    inputs: &[Arc<SstHandle>],
+    target_tables: &[Arc<SstHandle>],
+    partitioner: Option<&crate::config::PartitionResolver>,
+    max_spans: usize,
+) -> Vec<Bound<Vec<u8>>> {
+    let single = vec![Bound::Unbounded];
+    if max_spans <= 1 || inputs.is_empty() {
+        return single;
+    }
+
+    // A resolver that names no boundary anywhere in this job's key range does
+    // not partition it — an empty rule set, or rules that match nothing here —
+    // so it constrains nothing. Without this the common case (a bottom job on a
+    // family that never declared a partition rule) would refuse to split.
+    let partitioner = partitioner.filter(|resolver| {
+        inputs.iter().any(|table| {
+            resolver.boundary(&table.meta.min_key).is_some()
+                || resolver.boundary(&table.meta.max_key).is_some()
+        })
+    });
+
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    if let Some(partitioner) = partitioner {
+        if !cmp.is_bytewise() {
+            return single;
+        }
+        // Mandatory candidates first: a partition's own start key.
+        for table in inputs {
+            for key in [&table.meta.min_key, &table.meta.max_key] {
+                if let Some(boundary) = partitioner.boundary(key) {
+                    candidates.push(boundary.to_vec());
+                }
+            }
+        }
+    }
+    candidates.extend(target_tables.iter().map(|t| t.meta.min_key.clone()));
+    if candidates.is_empty() {
+        candidates.extend(inputs.iter().map(|t| t.meta.min_key.clone()));
+    }
+    if let Some(partitioner) = partitioner {
+        // A candidate that is not the first key of its partition would cut one
+        // in half. `boundary(c) == Some(c)` says `c` starts a partition;
+        // `None` says it is in no named partition at all, where a cut costs
+        // nothing — the partitions on either side still force their own cuts.
+        // (Every mandatory candidate above passes this by construction; it is
+        // the target `min_key`s mixed in with them that need screening.)
+        candidates.retain(|c| {
+            partitioner
+                .boundary(c)
+                .is_none_or(|boundary| boundary == c.as_slice())
+        });
+    }
+
+    candidates.sort_by(|a, b| cmp.compare(a, b));
+    candidates.dedup_by(|a, b| cmp.compare(a, b).is_eq());
+
+    // A boundary at or below the job's first key opens with an empty span, and
+    // one past its last key closes with one.
+    let (job_min, job_max) = key_span(inputs, cmp);
+    candidates.retain(|c| cmp.compare(c, &job_min).is_gt() && cmp.compare(c, &job_max).is_le());
+    if candidates.is_empty() {
+        return single;
+    }
+
+    // Bytes lying below each candidate — the work the spans before it would do.
+    //
+    // Measured over the TARGET tables when there are any, not over the whole
+    // input set. Target tables are disjoint and tile the job's key range, so
+    // "bytes in tables entirely below `c`" tracks how much of the *keyspace*
+    // sits below `c`. Source tables do not: an L0 table spans nearly everything
+    // under random keys, so every candidate would count its bytes in full and
+    // the weights would come out nearly flat — which is how a 4-span job of a
+    // perfectly even fixture ended up two thirds skewed. Splitting the target
+    // evenly splits the sources that overlay it evenly too.
+    let table_bytes =
+        |t: &Arc<SstHandle>| -> u64 { t.meta.klog_size.saturating_add(t.meta.vlog_size) };
+    let weighed: &[Arc<SstHandle>] = if target_tables.is_empty() {
+        inputs
+    } else {
+        target_tables
+    };
+    let below = |candidate: &[u8]| -> u64 {
+        weighed
+            .iter()
+            .filter(|t| cmp.compare(&t.meta.max_key, candidate).is_lt())
+            .fold(0u64, |sum, t| sum.saturating_add(table_bytes(t)))
+    };
+    let total: u64 = weighed
+        .iter()
+        .fold(0u64, |sum, t| sum.saturating_add(table_bytes(t)));
+
+    let wanted = max_spans - 1;
+    if candidates.len() > wanted {
+        // Keep the candidate nearest each even byte fraction, in order. Byte
+        // weight rather than keyspace: a job's inputs are rarely uniform, and
+        // the imbalance stat is what this is trying to keep small.
+        let weights: Vec<u64> = candidates.iter().map(|c| below(c)).collect();
+        let mut chosen: Vec<usize> = Vec::with_capacity(wanted);
+        for k in 1..=wanted {
+            let goal = (total / (wanted as u64 + 1)).saturating_mul(k as u64);
+            let pick = (0..candidates.len())
+                .filter(|i| !chosen.contains(i))
+                .min_by_key(|&i| weights[i].abs_diff(goal));
+            if let Some(pick) = pick {
+                chosen.push(pick);
+            }
+        }
+        chosen.sort_unstable();
+        candidates = chosen.into_iter().map(|i| candidates[i].clone()).collect();
+    }
+
+    // Drop boundaries that would open an empty span: no input table holds keys
+    // in `[previous, candidate)`.
+    let mut bounds: Vec<Bound<Vec<u8>>> = vec![Bound::Unbounded];
+    let mut previous: Option<Vec<u8>> = None;
+    for candidate in candidates {
+        let occupied = inputs.iter().any(|t| {
+            cmp.compare(&t.meta.min_key, &candidate).is_lt()
+                && previous
+                    .as_deref()
+                    .is_none_or(|lo| cmp.compare(&t.meta.max_key, lo).is_ge())
+        });
+        if !occupied {
+            continue;
+        }
+        previous = Some(candidate.clone());
+        bounds.push(Bound::Included(candidate));
+    }
+    bounds
+}
+
+/// Run `plan`'s spans and return each one's outputs, in span order.
+///
+/// Span 0 runs inline on the coordinator's own thread — it is an
+/// `onda-compact-{n}` worker that is going to do a share of the merge itself,
+/// and it is already accounted for by `num_compaction_threads`. The rest run on
+/// scoped threads, so every one of them is joined before this returns, on the
+/// error path as much as the happy one.
+fn run_spans(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    cmp: &ComparatorRef,
+    target: usize,
+    inputs: &[Arc<SstHandle>],
+    plan: &[Bound<Vec<u8>>],
+    frozen: &FrozenJob,
+) -> Result<Vec<Vec<SstMeta>>> {
+    if plan.len() <= 1 {
+        return Ok(vec![run_span(
+            db,
+            cf,
+            cmp,
+            target,
+            inputs,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            frozen,
+        )?]);
+    }
+
+    fn bound_ref(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+        match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(key) => Bound::Included(key.as_slice()),
+            Bound::Excluded(key) => Bound::Excluded(key.as_slice()),
+        }
+    }
+    /// The next span's INCLUSIVE lower bound is this one's exclusive upper
+    /// bound: the spans are half-open and share no key.
+    fn upper_of(plan: &[Bound<Vec<u8>>], index: usize) -> Bound<&[u8]> {
+        match plan.get(index + 1) {
+            None => Bound::Unbounded,
+            Some(Bound::Included(key)) => Bound::Excluded(key.as_slice()),
+            Some(other) => bound_ref(other),
+        }
+    }
+
+    let mut results: Vec<Result<Vec<SstMeta>>> = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(plan.len() - 1);
+        let mut spawn_failure: Option<crate::error::OndaError> = None;
+        for index in 1..plan.len() {
+            let (lower, upper) = (bound_ref(&plan[index]), upper_of(plan, index));
+            let worker = std::thread::Builder::new()
+                .name(format!("onda-span-{index}"))
+                .spawn_scoped(scope, move || {
+                    // A fresh thread defaults to `Foreground`; without this the
+                    // bytes a span moves would escape background pacing (0.6).
+                    let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Compaction);
+                    let outcome = run_span(db, cf, cmp, target, inputs, lower, upper, frozen);
+                    if outcome.is_err() {
+                        frozen.cancel();
+                    }
+                    outcome
+                });
+            match worker {
+                Ok(handle) => workers.push(handle),
+                Err(error) => {
+                    // Could not spawn: cancel the siblings already running and
+                    // let this job fail rather than silently drop a span's
+                    // share of the keyspace.
+                    frozen.cancel();
+                    spawn_failure = Some(error.into());
+                }
+            }
+        }
+        let mut results = vec![{
+            let outcome = run_span(
+                db,
+                cf,
+                cmp,
+                target,
+                inputs,
+                bound_ref(&plan[0]),
+                upper_of(plan, 0),
+                frozen,
+            );
+            if outcome.is_err() {
+                frozen.cancel();
+            }
+            outcome
+        }];
+        for worker in workers {
+            results.push(worker.join().unwrap_or_else(|_| {
+                Err(crate::error::OndaError::Unknown(
+                    "compaction span worker panicked".to_string(),
+                ))
+            }));
+        }
+        if let Some(error) = spawn_failure {
+            results.push(Err(error));
+        }
+        results
+    });
+
+    // Report the FIRST real failure rather than a cancellation caused by it.
+    if let Some(position) = results.iter().position(|r| r.is_err()) {
+        let mut first = position;
+        for (index, result) in results.iter().enumerate() {
+            if let Err(error) = result {
+                if !is_span_cancellation(error) {
+                    first = index;
+                    break;
+                }
+            }
+        }
+        // A span that FINISHED before its sibling failed has already handed its
+        // tables back, so `CompactionOutputBuilder`'s abort-on-drop no longer
+        // covers them. Nothing here ever reached the manifest, so they are
+        // removed outright — leaving them would leak a file per surviving span,
+        // per failed job.
+        for outputs in results.iter().flatten() {
+            for meta in outputs {
+                let klog = cf.klog_path(meta.id);
+                db.remove_sst_file(&crate::sst::vlog_path_for(&klog), meta.vlog_size);
+                db.remove_sst_file(&klog, meta.klog_size);
+            }
+        }
+        return Err(results.swap_remove(first).unwrap_err());
+    }
+    Ok(results
+        .into_iter()
+        .map(|r| r.expect("checked above"))
+        .collect())
+}
+
+fn is_span_cancellation(error: &crate::error::OndaError) -> bool {
+    matches!(error, crate::error::OndaError::Unknown(message)
+        if message.starts_with("compaction span cancelled"))
 }
 
 fn install_compaction_outputs(
@@ -990,7 +1428,7 @@ fn install_compaction_outputs(
     target: usize,
     inputs: &[Arc<SstHandle>],
     outputs: &[SstMeta],
-) {
+) -> Vec<Arc<SstHandle>> {
     let new_handles: Vec<Arc<SstHandle>> = outputs
         .iter()
         .map(|meta| cf.handle_for(meta.clone()))
@@ -1033,6 +1471,59 @@ fn install_compaction_outputs(
         );
         updated
     });
+    new_handles
+}
+
+/// Undo [`install_compaction_outputs`] after a failed `persist_manifest`.
+///
+/// The manifest still names the inputs, so in-memory state must go back to
+/// naming them too before the output files are unlinked — otherwise a reader
+/// between the two steps sees tables whose bytes are about to disappear. The
+/// inputs are re-inserted at their own recorded level rather than restored from
+/// a level-set snapshot taken before the install, because a snapshot would also
+/// undo whatever a concurrent flush added meanwhile.
+fn rollback_compaction_outputs(
+    cf: &Arc<ColumnFamily>,
+    cmp: &ComparatorRef,
+    inputs: &[Arc<SstHandle>],
+    installed: &[Arc<SstHandle>],
+) {
+    let output_ids: std::collections::HashSet<u64> =
+        installed.iter().map(|table| table.meta.id).collect();
+    cf.update_levels(|levels| {
+        let mut updated: Vec<Vec<Arc<SstHandle>>> = levels
+            .iter()
+            .map(|tables| {
+                tables
+                    .iter()
+                    .filter(|table| !output_ids.contains(&table.meta.id))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        for input in inputs {
+            let level = input.meta.level as usize;
+            if level >= updated.len() {
+                updated.resize(level + 1, Vec::new());
+            }
+            if updated[level]
+                .iter()
+                .any(|table| table.meta.id == input.meta.id)
+            {
+                continue;
+            }
+            updated[level].push(input.clone());
+            // L0 is newest-first and the inputs were its OLDEST files, so
+            // appending restores the order; every deeper level is sorted.
+            if level > 0 {
+                updated[level].sort_by(|a, b| cmp.compare(&a.meta.min_key, &b.meta.min_key));
+            }
+        }
+        updated
+    });
+    for table in installed {
+        table.close();
+    }
 }
 
 fn remove_compaction_inputs(db: &DbInner, cf: &ColumnFamily, inputs: &[Arc<SstHandle>]) {
@@ -1057,40 +1548,72 @@ pub(crate) fn compact_inputs(
     target: usize,
     inputs: Vec<Arc<SstHandle>>,
 ) -> Result<()> {
+    compact_inputs_inner(db, cf, level, target, inputs, false)
+}
+
+/// [`compact_inputs`] for the job classes 0.8 allows to run in parallel spans:
+/// capacity-triggered level >= 1 jobs and L0 -> L1 oldest-window jobs, both of
+/// which [`pick_compaction`] produces. Everything else — the manual sweep, the
+/// in-place bottom rewrite, FIFO — goes through [`compact_inputs`] and stays
+/// single-span.
+pub(crate) fn compact_inputs_spanned(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    target: usize,
+    inputs: Vec<Arc<SstHandle>>,
+) -> Result<()> {
+    compact_inputs_inner(db, cf, level, target, inputs, true)
+}
+
+fn compact_inputs_inner(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    target: usize,
+    inputs: Vec<Arc<SstHandle>>,
+    spans_allowed: bool,
+) -> Result<()> {
     let cmp = cf.cmp();
     debug_assert!(target == level || target == level + 1);
     if inputs.is_empty() {
         return Ok(());
     }
 
-    // One snapshot of the predicate for the whole job: retention, partition
-    // cutting and the output filter policy must all agree on whether this
-    // output is bottom, even if a concurrent compaction changes the shape.
-    let bottom = is_bottom_target(cf, target);
-    let oldest_snapshot = db.oldest_snapshot();
-    let now = now_nanos();
-    let filter = cf.compaction_filter();
-    // Only bottom output is partition-cut. Snapshot the resolver once so a
-    // concurrent rule addition cannot change boundaries during this run.
-    let partitioner = if bottom {
-        Some(cf.partition_resolver_snapshot()?)
-    } else {
-        None
-    };
-
-    let outputs = CompactionMerge {
-        db,
-        cf,
-        cmp: &cmp,
-        target,
-        inputs: &inputs,
-        bottom,
-        oldest_snapshot,
-        now,
-        filter,
-        partitioner,
+    let frozen = FrozenJob::new(db, cf, target, &inputs)?;
+    // Spans, permits and boundaries are all settled before any merge starts;
+    // nothing below re-reads configuration or level shape.
+    let mut permits = db
+        .span_permits
+        .take(span_budget(db, &frozen, spans_allowed));
+    let target_tables: Vec<Arc<SstHandle>> = inputs
+        .iter()
+        .filter(|table| table.meta.level as usize == target)
+        .cloned()
+        .collect();
+    let plan = plan_spans(
+        &cmp,
+        &inputs,
+        &target_tables,
+        frozen.partitioner.as_ref(),
+        permits.granted() + 1,
+    );
+    permits.reduce_to(plan.len().saturating_sub(1));
+    let outputs = run_spans(db, cf, &cmp, target, &inputs, &plan, &frozen);
+    // Every span worker has been joined by now, on the error path as much as
+    // the happy one, so the permits go back before the manifest fsync below
+    // rather than after it.
+    drop(permits);
+    let outputs = outputs?;
+    if spans_allowed {
+        // Only the bounded job classes report span statistics: the excluded
+        // ones are single-span by construction, and letting the whole-level
+        // sweep that follows `DB::compact`'s bounded rounds overwrite the
+        // numbers would hide what the rounds actually did.
+        record_span_stats(cf, &outputs);
     }
-    .run()?;
+    let outputs: Vec<SstMeta> = outputs.into_iter().flatten().collect();
+
     // Benchmark accounting only (`overlap_ratio_write_amp_benchmark`): the
     // numerator of compaction write amplification. Compiled out of every
     // non-test build — write-amp statistics are a documented non-goal of the
@@ -1104,13 +1627,58 @@ pub(crate) fn compact_inputs(
             .sum::<u64>(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    install_compaction_outputs(cf, &cmp, level, target, &inputs, &outputs);
+    debug_assert!(
+        outputs_are_sorted_and_disjoint(&cmp, &outputs),
+        "spans produced overlapping or unsorted output — the span bounds are \
+         not a partition of the keyspace (level={level} target={target})"
+    );
+    let installed = install_compaction_outputs(cf, &cmp, level, target, &inputs, &outputs);
 
     // Writer::finish has synced every output and its parent directory. Publish
     // that new level set durably before any obsolete input can be unlinked.
-    db.persist_manifest()?;
+    if let Err(error) = db.persist_manifest() {
+        // The manifest still names the inputs. Put them back before unlinking
+        // the outputs, so the file set and the level set agree again.
+        rollback_compaction_outputs(cf, &cmp, &inputs, &installed);
+        for meta in &outputs {
+            let klog = cf.klog_path(meta.id);
+            db.remove_sst_file(&klog, meta.klog_size);
+            db.remove_sst_file(&crate::sst::vlog_path_for(&klog), meta.vlog_size);
+        }
+        return Err(error);
+    }
     remove_compaction_inputs(db, cf, &inputs);
     Ok(())
+}
+
+/// Outputs across every span, concatenated in span order, must be sorted and
+/// non-overlapping — the observable half of "the spans partitioned the
+/// keyspace". Debug-only: it is O(n) over a handful of tables, but it asserts a
+/// property the merge already guarantees rather than checking user input.
+fn outputs_are_sorted_and_disjoint(cmp: &ComparatorRef, outputs: &[SstMeta]) -> bool {
+    outputs
+        .windows(2)
+        .all(|pair| cmp.compare(&pair[0].max_key, &pair[1].min_key).is_lt())
+}
+
+/// Publish the per-job span statistics (`CfStats::span_count`,
+/// `CfStats::span_imbalance_bytes`).
+fn record_span_stats(cf: &Arc<ColumnFamily>, per_span: &[Vec<SstMeta>]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes: Vec<u64> = per_span
+        .iter()
+        .map(|span| {
+            span.iter()
+                .map(|meta| meta.klog_size.saturating_add(meta.vlog_size))
+                .sum()
+        })
+        .collect();
+    let imbalance = match (bytes.iter().max(), bytes.iter().min()) {
+        (Some(max), Some(min)) => max - min,
+        _ => 0,
+    };
+    cf.span_count.store(per_span.len() as u64, Relaxed);
+    cf.span_imbalance_bytes.store(imbalance, Relaxed);
 }
 
 /// Does compaction output written into `target` land in the bottom level?
@@ -1204,9 +1772,12 @@ mod fixture;
 mod tests {
     use std::sync::Arc;
 
+    use std::ops::Bound;
+
     use super::{
-        build_job, gather_target, key_span, overlap_bytes, rank_candidates, target_is_bottom,
-        Retention, VersionRetention, COMPACTION_OUTPUT_BYTES, FIRST_FIT_ORDER,
+        build_job, gather_target, key_span, overlap_bytes, plan_spans, rank_candidates,
+        target_is_bottom, FrozenJob, Retention, VersionRetention, COMPACTION_OUTPUT_BYTES,
+        FIRST_FIT_ORDER,
     };
     use crate::comparator::{default_comparator, CaseInsensitive, ComparatorRef};
 
@@ -1592,6 +2163,1191 @@ mod tests {
             cf.compact_cursor.lock().get(&1).cloned(),
             Some(b"b099".to_vec())
         );
+    }
+
+    // ---- 0.8: frozen job decisions and span boundary planning --------------
+
+    /// Lower bounds as plain byte vectors, for readable assertions.
+    fn lowers(plan: &[Bound<Vec<u8>>]) -> Vec<Option<Vec<u8>>> {
+        plan.iter()
+            .map(|bound| match bound {
+                Bound::Unbounded => None,
+                Bound::Included(key) | Bound::Excluded(key) => Some(key.clone()),
+            })
+            .collect()
+    }
+
+    fn rules(prefixes: &[&str]) -> crate::config::PartitionResolver {
+        crate::config::PartitionResolver::Rules(
+            prefixes
+                .iter()
+                .map(|p| crate::config::PartitionRule {
+                    prefix: p.as_bytes().to_vec(),
+                    name: p.trim_end_matches('/').to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    /// A job freezes `bottom`, the snapshot horizon, `now`, the carried entry
+    /// time, the partition resolver and the compaction filter ONCE, before any
+    /// span opens a reader. Adding a partition rule afterwards must not move
+    /// the boundaries this job cuts on — the guarantee
+    /// `partition_resolver_snapshot` has always given, pinned at the new seam
+    /// where several spans share the snapshot by reference.
+    #[test]
+    fn frozen_job_is_captured_before_the_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            crate::DB::open(crate::config::Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family(
+                "default",
+                crate::config::ColumnFamilyConfig {
+                    partition_rules: vec![crate::config::PartitionRule {
+                        prefix: b"a/".to_vec(),
+                        name: "a".to_string(),
+                    }],
+                    ..crate::config::ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        // Level 0 is this family's bottom, so the job is partition-cutting.
+        let inputs = vec![handle(&cf, 1, 0, b"a/1", b"b/9", 100, 0)];
+        let frozen = FrozenJob::new(&db.inner, &cf, 0, &inputs).unwrap();
+        let partitioner = frozen
+            .partitioner
+            .clone()
+            .expect("a bottom job snapshots the resolver");
+        assert_eq!(partitioner.boundary(b"a/1"), Some(&b"a/"[..]));
+        assert_eq!(partitioner.boundary(b"b/9"), None);
+
+        db.add_partition_rule(
+            &cf,
+            crate::config::PartitionRule {
+                prefix: b"b/".to_vec(),
+                name: "b".to_string(),
+            },
+        )
+        .unwrap();
+        // The live resolver sees the new rule; the frozen one must not, or two
+        // spans of one job could cut on different boundaries.
+        assert_eq!(
+            cf.partition_resolver_snapshot().unwrap().boundary(b"b/9"),
+            Some(&b"b/"[..])
+        );
+        assert_eq!(frozen.partitioner.as_ref().unwrap().boundary(b"b/9"), None);
+        let cmp = cf.cmp();
+        assert_eq!(
+            lowers(&plan_spans(
+                &cmp,
+                &inputs,
+                &inputs,
+                frozen.partitioner.as_ref(),
+                4
+            )),
+            vec![None],
+            "the frozen resolver knows only the `a/` rule, whose boundary is \
+             below the job's first key"
+        );
+    }
+
+    #[test]
+    fn plan_spans_uses_partition_boundaries_when_bottom() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        let partitioner = rules(&["a/", "b/", "c/"]);
+        // One source table straddling all three partitions, over three
+        // partition-clean target tables.
+        let inputs = vec![
+            handle(&cf, 1, 1, b"a/0", b"c/9", 300, 0),
+            handle(&cf, 2, 2, b"a/0", b"a/9", 100, 0),
+            handle(&cf, 3, 2, b"b/0", b"b/9", 100, 0),
+            handle(&cf, 4, 2, b"c/0", b"c/9", 100, 0),
+        ];
+        let target: Vec<_> = inputs[1..].to_vec();
+
+        let plan = plan_spans(&cmp, &inputs, &target, Some(&partitioner), 8);
+        assert_eq!(
+            lowers(&plan),
+            vec![None, Some(b"b/".to_vec()), Some(b"c/".to_vec())],
+            "cuts must be the partition boundaries themselves"
+        );
+        // `a/` is the job's first key's boundary and would open an empty span,
+        // and no cut ever lands INSIDE a partition.
+        for bound in &plan[1..] {
+            let Bound::Included(key) = bound else {
+                panic!("span lower bounds are inclusive user keys")
+            };
+            assert_eq!(
+                partitioner.boundary(key).map(<[u8]>::to_vec),
+                Some(key.clone()),
+                "cut {key:?} is not the first key of its partition"
+            );
+        }
+    }
+
+    /// A partitioned job under a non-bytewise comparator stays single-span: the
+    /// "a boundary prefix is the first key of its partition" argument is a
+    /// bytewise one, and cutting on it under another order could split a part.
+    #[test]
+    fn plan_spans_will_not_cut_partitions_under_a_custom_comparator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let folded: ComparatorRef = Arc::new(CaseInsensitive);
+        let inputs = vec![
+            handle(&cf, 1, 1, b"a/0", b"c/9", 300, 0),
+            handle(&cf, 2, 2, b"a/0", b"a/9", 100, 0),
+            handle(&cf, 3, 2, b"b/0", b"c/9", 100, 0),
+        ];
+        assert_eq!(
+            lowers(&plan_spans(
+                &folded,
+                &inputs,
+                &inputs[1..],
+                Some(&rules(&["a/", "b/", "c/"])),
+                8
+            )),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn plan_spans_falls_back_to_target_min_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        let inputs = vec![
+            handle(&cf, 1, 1, b"a", b"z", 400, 0),
+            handle(&cf, 2, 2, b"a", b"f", 100, 0),
+            handle(&cf, 3, 2, b"g", b"m", 100, 0),
+            handle(&cf, 4, 2, b"n", b"z", 100, 0),
+        ];
+        let target: Vec<_> = inputs[1..].to_vec();
+        assert_eq!(
+            lowers(&plan_spans(&cmp, &inputs, &target, None, 8)),
+            vec![None, Some(b"g".to_vec()), Some(b"n".to_vec())],
+            "the target tables' min_keys are free, sorted split points"
+        );
+
+        // With no target tables at all (an L0 -> L1 job into a fresh level) the
+        // inputs' own min_keys are the only metadata left to cut on.
+        let l0 = vec![
+            handle(&cf, 10, 0, b"a", b"m", 100, 0),
+            handle(&cf, 11, 0, b"h", b"z", 100, 0),
+        ];
+        assert_eq!(
+            lowers(&plan_spans(&cmp, &l0, &[], None, 8)),
+            vec![None, Some(b"h".to_vec())]
+        );
+    }
+
+    #[test]
+    fn plan_spans_dedupes_comparator_equal_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let folded: ComparatorRef = Arc::new(CaseInsensitive);
+        // `M` and `m` are distinct byte strings that the CF's comparator calls
+        // equal. Two spans divided at both would make the middle one empty and
+        // — worse — would put versions of one user key on either side of a
+        // boundary the merge does not believe in.
+        let inputs = vec![
+            handle(&cf, 1, 1, b"a", b"z", 400, 0),
+            handle(&cf, 2, 2, b"a", b"f", 100, 0),
+            handle(&cf, 3, 2, b"M", b"q", 100, 0),
+            handle(&cf, 4, 2, b"m", b"z", 100, 0),
+        ];
+        let plan = plan_spans(&folded, &inputs, &inputs[1..], None, 8);
+        assert_eq!(plan.len(), 2, "M and m must collapse to one boundary");
+        let Bound::Included(cut) = &plan[1] else {
+            panic!("expected an inclusive cut")
+        };
+        assert!(folded.compare(cut, b"m").is_eq());
+    }
+
+    #[test]
+    fn plan_spans_drops_empty_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        // The source table covers `a..f` only; the target tables at `s` and `w`
+        // are below the job's span because a wide target table pulled them in.
+        // Cutting there would produce spans no input can fill.
+        let inputs = vec![
+            handle(&cf, 1, 1, b"a", b"f", 400, 0),
+            handle(&cf, 2, 2, b"a", b"f", 100, 0),
+        ];
+        let target = vec![
+            inputs[1].clone(),
+            handle(&cf, 3, 2, b"s", b"t", 100, 0),
+            handle(&cf, 4, 2, b"w", b"z", 100, 0),
+        ];
+        assert_eq!(
+            lowers(&plan_spans(&cmp, &inputs, &target, None, 8)),
+            vec![None],
+            "no cut has input data on both sides"
+        );
+
+        // A boundary equal to the job's first key would open with an empty
+        // span too, and one past its last key would close with one.
+        let two = vec![
+            handle(&cf, 5, 1, b"a", b"z", 400, 0),
+            handle(&cf, 6, 2, b"a", b"c", 100, 0),
+            handle(&cf, 7, 2, b"d", b"z", 100, 0),
+        ];
+        assert_eq!(
+            lowers(&plan_spans(&cmp, &two, &two[1..], None, 8)),
+            vec![None, Some(b"d".to_vec())]
+        );
+    }
+
+    #[test]
+    fn plan_spans_never_exceeds_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
+        let cmp = cf.cmp();
+        let mut inputs = vec![handle(&cf, 1, 1, b"k00", b"k63", 6400, 0)];
+        for i in 0..64u64 {
+            inputs.push(handle(
+                &cf,
+                100 + i,
+                2,
+                format!("k{i:02}").as_bytes(),
+                format!("k{i:02}z").as_bytes(),
+                100,
+                0,
+            ));
+        }
+        let target: Vec<_> = inputs[1..].to_vec();
+        for max in [1usize, 2, 3, 4, 8, 16] {
+            let plan = plan_spans(&cmp, &inputs, &target, None, max);
+            assert!(plan.len() <= max, "max {max} produced {} spans", plan.len());
+            assert!(matches!(plan[0], Bound::Unbounded));
+            // Strictly ascending, so the spans are a partition of the keyspace.
+            for pair in plan.windows(2) {
+                let (Bound::Included(a) | Bound::Excluded(a)) = &pair[1] else {
+                    panic!("only the first bound is unbounded")
+                };
+                if let Bound::Included(b) | Bound::Excluded(b) = &pair[0] {
+                    assert!(cmp.compare(b, a).is_lt());
+                }
+            }
+        }
+        // Zero and one both mean "today's behavior".
+        assert_eq!(plan_spans(&cmp, &inputs, &target, None, 0).len(), 1);
+    }
+
+    // ---- 0.8: running a job in parallel spans -----------------------------
+    //
+    // These build their tree by hand and call `compact_inputs_spanned`
+    // directly. The alternative — letting the size triggers schedule the job —
+    // would make every assertion below a race with whatever the flush-armed
+    // background worker picked up first, and "which job was the last one" is
+    // not a property any of this should depend on. The configuration therefore
+    // triggers nothing at all (`l1_file_count_trigger` and `l1_base_bytes` gate
+    // both `should_schedule_compaction` and `pick_compaction`), so the only
+    // compaction that ever runs is the one the test asks for.
+
+    fn quiet_span_config() -> crate::config::ColumnFamilyConfig {
+        crate::config::ColumnFamilyConfig {
+            write_buffer_size: 4 << 20,
+            // Small enough that L1 ends up holding many tables, which is what
+            // gives the boundary planner real target `min_key`s to cut on.
+            target_file_size: 8 << 10,
+            l1_file_count_trigger: 1 << 20,
+            l1_base_bytes: 1 << 60,
+            // Most values land in the vlog, so a span reads two files per input
+            // and the oracle covers separated values.
+            klog_value_threshold: 48,
+            ..crate::config::ColumnFamilyConfig::default()
+        }
+    }
+
+    fn span_options(dir: &tempfile::TempDir, spans: usize) -> crate::config::Options {
+        let mut options = crate::config::Options::new(dir.path().to_str().unwrap());
+        options.max_subcompactions = spans;
+        // Past what any test asks for, so a test that wants N spans measures
+        // the planner rather than the pool.
+        options.max_subcompaction_workers = 8;
+        options
+    }
+
+    fn span_value(round: u32, i: u32) -> Vec<u8> {
+        let mut value = format!("v{round:02}-{i:06}-").into_bytes();
+        value.resize(64 + (i as usize % 23), b'x');
+        value
+    }
+
+    /// One flushed L0 table per round, each spanning the whole key range.
+    ///
+    /// Batched into transactions of `WRITE_BATCH` keys rather than one
+    /// auto-committed `put` each: a `put` is a commit, and a commit is a WAL
+    /// append, which is where a profile of the span benchmark spent 98% of its
+    /// time building the fixture rather than merging it. Each key still gets its
+    /// own sequence, so the version chains the merge sees are unchanged.
+    const WRITE_BATCH: u32 = 2048;
+
+    fn write_rounds(
+        db: &crate::DB,
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        rounds: std::ops::Range<u32>,
+        keys: u32,
+    ) {
+        for round in rounds {
+            let mut written = 0u32;
+            while written < keys {
+                let end = (written + WRITE_BATCH).min(keys);
+                let mut txn = db.begin_with_isolation(crate::config::IsolationLevel::ReadCommitted);
+                for i in written..end {
+                    txn.put(
+                        cf,
+                        format!("k{i:06}").as_bytes(),
+                        &span_value(round, i),
+                        std::time::Duration::ZERO,
+                    )
+                    .unwrap();
+                }
+                txn.commit().unwrap();
+                written = end;
+            }
+            db.flush_memtable(cf).unwrap();
+        }
+    }
+
+    const SPAN_KEYS: u32 = 1200;
+
+    /// A two-level tree with a big L0 -> L1 job pending: three flushed L0
+    /// tables merged into a many-table L1 by one ordinary single-span job,
+    /// then three more L0 tables left on top of it.
+    fn span_fixture(
+        dir: &tempfile::TempDir,
+        spans: usize,
+    ) -> (crate::DB, Arc<crate::column_family::ColumnFamily>) {
+        let db = crate::DB::open(span_options(dir, spans)).unwrap();
+        let cf = span_fixture_cf(&db, "default");
+        (db, cf)
+    }
+
+    /// [`span_fixture`]'s column family on its own, for the tests that need two
+    /// of them in one database — the span permit pool is DB-wide.
+    fn span_fixture_cf(db: &crate::DB, name: &str) -> Arc<crate::column_family::ColumnFamily> {
+        let cf = db.create_column_family(name, quiet_span_config()).unwrap();
+        write_rounds(db, &cf, 0..3, SPAN_KEYS);
+        let l0 = cf.with_levels(|levels| levels[0].clone());
+        super::compact_inputs(&db.inner, &cf, 0, 1, l0).unwrap();
+        assert!(
+            cf.with_levels(|levels| levels[1].len()) >= 4,
+            "the fixture's L1 must hold several tables or there is nothing to cut on"
+        );
+        write_rounds(db, &cf, 3..6, SPAN_KEYS);
+        cf
+    }
+
+    /// Every table the pending job merges: all of L0 plus all of L1.
+    fn pending_inputs(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+    ) -> Vec<Arc<crate::column_family::SstHandle>> {
+        cf.with_levels(|levels| {
+            let mut inputs = levels[0].clone();
+            inputs.extend(levels.get(1).into_iter().flatten().cloned());
+            inputs
+        })
+    }
+
+    fn scan(
+        txn: &crate::Txn,
+        cf: &Arc<crate::column_family::ColumnFamily>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut iterator = txn.new_iterator(cf);
+        iterator.seek_to_first();
+        let mut out = Vec::new();
+        while iterator.valid() {
+            out.push((iterator.key().to_vec(), iterator.value().to_vec()));
+            iterator.next();
+        }
+        assert!(
+            iterator.err().is_none(),
+            "scan failed: {:?}",
+            iterator.err()
+        );
+        out
+    }
+
+    /// Klog and vlog file names under `dir`'s column family, sorted.
+    fn sst_files(dir: &tempfile::TempDir) -> Vec<String> {
+        let mut files: Vec<String> = std::fs::read_dir(dir.path().join("cf-default"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".klog") || name.ends_with(".vlog"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn level_ids(cf: &Arc<crate::column_family::ColumnFamily>) -> Vec<Vec<u64>> {
+        cf.with_levels(|levels| {
+            levels
+                .iter()
+                .map(|tables| tables.iter().map(|t| t.meta.id).collect())
+                .collect()
+        })
+    }
+
+    /// What one arm of a 1-vs-N comparison produced.
+    struct SpanArm {
+        at_snapshot: Vec<(Vec<u8>, Vec<u8>)>,
+        at_visible: Vec<(Vec<u8>, Vec<u8>)>,
+        span_count: u64,
+        span_imbalance_bytes: u64,
+        total_output_bytes: u64,
+        target: Vec<(Vec<u8>, Vec<u8>)>,
+    }
+
+    /// Build the fixture, run its pending job at `spans` spans, and report the
+    /// scans taken through a snapshot held across the whole compaction and
+    /// afterwards at the visible sequence.
+    fn run_arm(spans: usize) -> SpanArm {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = span_fixture(&dir, spans);
+        // Held across the compaction: this is the job's `oldest_snapshot`, and
+        // every version at or above it must survive the merge whatever the span
+        // count.
+        let pinned = db.begin();
+        let before = scan(&pinned, &cf);
+
+        let inputs = pending_inputs(&cf);
+        super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+
+        let at_snapshot = scan(&pinned, &cf);
+        assert_eq!(
+            before, at_snapshot,
+            "a pinned snapshot's scan changed across a {spans}-span compaction"
+        );
+        let visible = db.begin();
+        let at_visible = scan(&visible, &cf);
+        let stats = cf.stats();
+        let target = cf.with_levels(|levels| {
+            levels[1]
+                .iter()
+                .map(|t| (t.meta.min_key.clone(), t.meta.max_key.clone()))
+                .collect()
+        });
+        let total_output_bytes = cf.with_levels(|levels| {
+            levels[1]
+                .iter()
+                .fold(0u64, |sum, t| sum + t.meta.klog_size + t.meta.vlog_size)
+        });
+        drop(pinned);
+        drop(visible);
+        db.close().unwrap();
+        SpanArm {
+            at_snapshot,
+            at_visible,
+            span_count: stats.span_count,
+            span_imbalance_bytes: stats.span_imbalance_bytes,
+            total_output_bytes,
+            target,
+        }
+    }
+
+    /// Output tables must be sorted and disjoint, and cover the job's whole
+    /// range — the observable half of "the spans partitioned the keyspace".
+    fn assert_sorted_and_disjoint(tables: &[(Vec<u8>, Vec<u8>)]) {
+        for pair in tables.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "output tables overlap or are unsorted: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn two_span_compaction_matches_one_span() {
+        let one = run_arm(1);
+        let two = run_arm(2);
+
+        assert_eq!(one.span_count, 1, "one span was asked for");
+        assert_eq!(two.span_count, 2, "the job did not split");
+        // The output FILES cannot match — boundaries and ids differ — but what
+        // the engine returns must, at the pinned snapshot and at the visible
+        // sequence alike.
+        assert_eq!(one.at_snapshot, two.at_snapshot);
+        assert_eq!(one.at_visible, two.at_visible);
+        assert_sorted_and_disjoint(&one.target);
+        assert_sorted_and_disjoint(&two.target);
+        assert_eq!(
+            (
+                one.target.first().map(|t| t.0.clone()),
+                one.target.last().map(|t| t.1.clone())
+            ),
+            (
+                two.target.first().map(|t| t.0.clone()),
+                two.target.last().map(|t| t.1.clone())
+            ),
+            "the spans together covered a different key range"
+        );
+    }
+
+    /// Span bounds are user keys and the spans are half-open, so every version
+    /// of one key lands in exactly one span and therefore in one output table.
+    /// The observable form is the target level staying disjoint — a boundary
+    /// falling between two versions of a key would leave two tables claiming it
+    /// — plus a snapshot pinned across the merge still reading the version it
+    /// was pinned to.
+    #[test]
+    fn all_versions_of_a_key_land_in_one_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = span_fixture(&dir, 4);
+        // Six versions of every key are live across the inputs; pin the third
+        // generation so the merge cannot collapse them to the newest.
+        let mut pinned = db.begin();
+        let before: Vec<Vec<u8>> = (0..SPAN_KEYS)
+            .map(|i| pinned.get(&cf, format!("k{i:06}").as_bytes()).unwrap())
+            .collect();
+
+        let inputs = pending_inputs(&cf);
+        super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+        assert!(cf.stats().span_count > 1, "the job ran in one span");
+
+        for (i, expected) in before.iter().enumerate() {
+            let key = format!("k{i:06}");
+            assert_eq!(
+                &pinned.get(&cf, key.as_bytes()).unwrap(),
+                expected,
+                "the version the snapshot pinned was lost for {key}"
+            );
+            // Exactly one table in the target level can claim the key.
+            let claimants = cf.with_levels(|levels| {
+                levels[1]
+                    .iter()
+                    .filter(|t| {
+                        t.meta.min_key.as_slice() <= key.as_bytes()
+                            && key.as_bytes() <= t.meta.max_key.as_slice()
+                    })
+                    .count()
+            });
+            assert_eq!(claimants, 1, "{key} is claimed by {claimants} tables");
+        }
+        drop(pinned);
+        db.close().unwrap();
+    }
+
+    /// The centerpiece. 1, 2 and 4 spans over the same inputs must be
+    /// logically indistinguishable at the oldest snapshot and at the visible
+    /// sequence, over every entry kind the engine has, under a custom
+    /// comparator, and in both memtable layouts.
+    #[test]
+    fn span_oracle_1_vs_n() {
+        /// Puts, deletes, single-deletes, TTL entries and vlog-separated
+        /// values, keyed so that a case-insensitive comparator sees ONE user
+        /// key where the bytes differ — which is exactly the version chain a
+        /// boundary must not cut.
+        fn build(
+            dir: &tempfile::TempDir,
+            spans: usize,
+            unified: bool,
+        ) -> (crate::DB, Arc<crate::column_family::ColumnFamily>) {
+            let mut options = span_options(dir, spans);
+            options.unified_memtable = unified;
+            // The unified store has no per-CF `flush_memtable`: it rotates on
+            // size. Make that size small enough that each generation below
+            // overflows it, so both layouts reach the same shape — several
+            // flushed L0 tables over a many-table L1.
+            options.unified_memtable_write_buffer_size = 32 << 10;
+            let db = crate::DB::open(options).unwrap();
+            let cf = db
+                .create_column_family(
+                    "default",
+                    crate::config::ColumnFamilyConfig {
+                        comparator_name: "case_insensitive".to_string(),
+                        ..quiet_span_config()
+                    },
+                )
+                .unwrap();
+            let mut round = 0u32;
+            let mut generation = |db: &crate::DB, cf: &Arc<crate::column_family::ColumnFamily>| {
+                let mut txn = db.begin();
+                for i in 0..800u32 {
+                    let key = if round.is_multiple_of(2) {
+                        format!("K{i:06}")
+                    } else {
+                        format!("k{i:06}")
+                    };
+                    match (round + i) % 5 {
+                        0 => txn.delete(cf, key.as_bytes()).unwrap(),
+                        1 if round > 0 => txn.single_delete(cf, key.as_bytes()).unwrap(),
+                        2 => txn
+                            .put(
+                                cf,
+                                key.as_bytes(),
+                                &span_value(round, i),
+                                std::time::Duration::from_secs(3600),
+                            )
+                            .unwrap(),
+                        _ => txn
+                            .put(
+                                cf,
+                                key.as_bytes(),
+                                &span_value(round, i),
+                                std::time::Duration::ZERO,
+                            )
+                            .unwrap(),
+                    }
+                }
+                txn.commit().unwrap();
+                db.flush_memtable(cf).unwrap();
+                round += 1;
+            };
+            for _ in 0..3 {
+                generation(&db, &cf);
+            }
+            let l0 = cf.with_levels(|levels| levels[0].clone());
+            assert!(
+                !l0.is_empty(),
+                "the fixture flushed nothing (unified={unified})"
+            );
+            super::compact_inputs(&db.inner, &cf, 0, 1, l0).unwrap();
+            assert!(
+                cf.with_levels(|levels| levels[1].len()) >= 3,
+                "L1 must hold several tables or there is nothing to cut on"
+            );
+            for _ in 0..3 {
+                generation(&db, &cf);
+            }
+            (db, cf)
+        }
+
+        for unified in [false, true] {
+            let mut arms = Vec::new();
+            for spans in [1usize, 2, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let (db, cf) = build(&dir, spans, unified);
+                let pinned = db.begin();
+                let before = scan(&pinned, &cf);
+                let inputs = pending_inputs(&cf);
+                super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+                let at_snapshot = scan(&pinned, &cf);
+                assert_eq!(before, at_snapshot, "unified={unified} spans={spans}");
+                let visible = db.begin();
+                let at_visible = scan(&visible, &cf);
+                let count = cf.stats().span_count;
+                drop(pinned);
+                drop(visible);
+                db.close().unwrap();
+                arms.push((spans, count, at_snapshot, at_visible));
+            }
+            assert_eq!(arms[0].1, 1);
+            assert!(arms[1].1 > 1, "the 2-span arm ran {} span(s)", arms[1].1);
+            assert!(arms[2].1 > 1, "the 4-span arm ran {} span(s)", arms[2].1);
+            assert!(arms[2].1 <= 4);
+            for arm in &arms[1..] {
+                assert_eq!(
+                    arms[0].2, arm.2,
+                    "snapshot scan differs at {} spans (unified={unified})",
+                    arm.0
+                );
+                assert_eq!(
+                    arms[0].3, arm.3,
+                    "visible scan differs at {} spans (unified={unified})",
+                    arm.0
+                );
+            }
+        }
+    }
+
+    /// A span that fails takes the whole job with it: nothing installed,
+    /// nothing persisted, and no output file left behind. Injected at reader
+    /// open (a truncated klog) and at value read (a corrupted vlog frame) —
+    /// two points a span fails before it ever reaches `Writer::finish` — and
+    /// the siblings merging the other spans must be cancelled and cleaned up
+    /// with it.
+    #[test]
+    fn span_failure_leaves_no_partial_install() {
+        for truncate in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, cf) = span_fixture(&dir, 4);
+            let before_levels = level_ids(&cf);
+            let before_files = sst_files(&dir);
+            let manifest_before =
+                std::fs::read(crate::manifest::manifest_path(dir.path())).unwrap();
+
+            // Break one L1 input. Whichever span owns its key range fails; the
+            // rest must stop and remove what they had already written.
+            // The NEWEST L0 table: its versions are the ones the merge
+            // retains, so its vlog frames are actually read.
+            let klog = cf.with_levels(|levels| cf.klog_path(levels[0][0].meta.id));
+            if truncate {
+                std::fs::write(&klog, b"").unwrap();
+            } else {
+                // Values are vlog-separated here, so this is the frame a span
+                // reads when it asks the merge for a retained value.
+                let vlog = crate::sst::vlog_path_for(&klog);
+                let mut bytes = std::fs::read(&vlog).unwrap();
+                let middle = bytes.len() / 2;
+                for byte in &mut bytes[middle..middle + 64] {
+                    *byte ^= 0xff;
+                }
+                std::fs::write(&vlog, bytes).unwrap();
+            }
+            // The reader may already be open with its index resident; evict
+            // every reader so the damage is read from disk rather than served
+            // from memory.
+            db.set_max_open_readers(0);
+            db.set_max_open_readers(64);
+
+            let inputs = pending_inputs(&cf);
+            let error = super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs)
+                .expect_err("a broken input must fail the job");
+            assert!(
+                !format!("{error}").is_empty(),
+                "truncate={truncate}: no error text"
+            );
+
+            assert_eq!(
+                level_ids(&cf),
+                before_levels,
+                "truncate={truncate}: the level set changed after a failed job"
+            );
+            assert_eq!(
+                std::fs::read(crate::manifest::manifest_path(dir.path())).unwrap(),
+                manifest_before,
+                "truncate={truncate}: the manifest changed after a failed job"
+            );
+            assert_eq!(
+                sst_files(&dir),
+                before_files,
+                "truncate={truncate}: a failed job left output files behind"
+            );
+            drop(db);
+        }
+    }
+
+    /// A `persist_manifest` failure after a successful multi-span merge rolls
+    /// the in-memory install back — the manifest still names the inputs, so the
+    /// level set has to name them too — and removes the outputs it wrote.
+    #[test]
+    fn span_manifest_persist_failure_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = span_fixture(&dir, 4);
+        let before_levels = level_ids(&cf);
+        let before_files = sst_files(&dir);
+        let manifest_before = std::fs::read(crate::manifest::manifest_path(dir.path())).unwrap();
+
+        // `Manifest::save` writes `MANIFEST.tmp` and renames it. A directory of
+        // that name makes the create fail, and nothing else.
+        std::fs::create_dir(dir.path().join("MANIFEST.tmp")).unwrap();
+        let inputs = pending_inputs(&cf);
+        super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs)
+            .expect_err("the manifest write must fail");
+        std::fs::remove_dir(dir.path().join("MANIFEST.tmp")).unwrap();
+
+        assert_eq!(
+            level_ids(&cf),
+            before_levels,
+            "the in-memory install was not rolled back"
+        );
+        assert_eq!(
+            std::fs::read(crate::manifest::manifest_path(dir.path())).unwrap(),
+            manifest_before
+        );
+        assert_eq!(
+            sst_files(&dir),
+            before_files,
+            "the outputs of the rolled-back install were left on disk"
+        );
+        // Every input is still readable through the rolled-back level set.
+        let txn = db.begin();
+        assert_eq!(scan(&txn, &cf).len(), SPAN_KEYS as usize);
+        drop(txn);
+        drop(db); // the database is poisoned; `close` would surface the same error
+    }
+
+    /// Span workers are fresh threads, and a fresh thread defaults to
+    /// `Foreground`. Without a scope guard at span entry every byte a span
+    /// moves would escape 0.6's background pacing.
+    #[test]
+    fn span_workers_charge_as_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(crate::ioctrl::RecordingLimiter::default());
+        let mut options = span_options(&dir, 4);
+        options.io_limiter = Some(recorder.clone());
+        let db = crate::DB::open(options).unwrap();
+        let cf = db
+            .create_column_family("default", quiet_span_config())
+            .unwrap();
+        write_rounds(&db, &cf, 0..3, SPAN_KEYS);
+        let l0 = cf.with_levels(|levels| levels[0].clone());
+        super::compact_inputs(&db.inner, &cf, 0, 1, l0).unwrap();
+        write_rounds(&db, &cf, 3..6, SPAN_KEYS);
+
+        recorder.clear();
+        let inputs = pending_inputs(&cf);
+        // The caller thread is a test thread, i.e. `Foreground`; a real
+        // coordinator is an `onda-compact-{n}` worker that already carries the
+        // class. Scope it here so only the SPAWNED spans are under test.
+        {
+            let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Compaction);
+            super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+        }
+        let spans = cf.stats().span_count;
+        let compaction = recorder.bytes_for(crate::ioctrl::IoClass::Compaction);
+        let foreground = recorder.count_for(crate::ioctrl::IoClass::Foreground);
+        db.close().unwrap();
+
+        assert!(spans > 1, "the job ran in one span");
+        assert!(compaction > 0, "a multi-span job charged nothing");
+        assert_eq!(
+            foreground, 0,
+            "a span worker escaped its IoClass::Compaction scope"
+        );
+    }
+
+    /// The imbalance stat is what makes span skew visible: a single span
+    /// reports none, and the fixture's even geometry — every round writes every
+    /// key — must divide into spans of comparable size.
+    #[test]
+    fn span_imbalance_is_reported() {
+        let one = run_arm(1);
+        assert_eq!(one.span_count, 1);
+        assert_eq!(
+            one.span_imbalance_bytes, 0,
+            "a single span cannot be imbalanced"
+        );
+
+        // The fixture writes every key in every round, so its spans carry
+        // comparable work and the spread stays a fraction of the job.
+        let four = run_arm(4);
+        assert!(four.span_count > 1);
+        assert!(
+            four.span_imbalance_bytes < four.total_output_bytes / 2,
+            "an even geometry reported {} of {} bytes of skew",
+            four.span_imbalance_bytes,
+            four.total_output_bytes
+        );
+
+        // A skewed geometry: one span's worth of keyspace holds most of the
+        // bytes, because only the low keys were ever written more than once.
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::DB::open(span_options(&dir, 2)).unwrap();
+        let cf = db
+            .create_column_family("default", quiet_span_config())
+            .unwrap();
+        write_rounds(&db, &cf, 0..3, SPAN_KEYS);
+        let l0 = cf.with_levels(|levels| levels[0].clone());
+        super::compact_inputs(&db.inner, &cf, 0, 1, l0).unwrap();
+        // Rewrite only the bottom eighth of the keyspace, with fat values.
+        for i in 0..SPAN_KEYS / 8 {
+            db.put(
+                &cf,
+                format!("k{i:06}").as_bytes(),
+                &vec![b'w'; 2048],
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        let inputs = pending_inputs(&cf);
+        super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+        let skewed = cf.stats();
+        db.close().unwrap();
+        assert_eq!(skewed.span_count, 2);
+        assert!(
+            skewed.span_imbalance_bytes > 0,
+            "a deliberately skewed job reported a perfectly even split"
+        );
+    }
+
+    /// The excluded job classes stay single-span even when the option asks for
+    /// eight: a compaction filter (per-key ordering semantics), the whole-level
+    /// sweep and in-place bottom rewrite `DB::compact` runs, and FIFO, which
+    /// never merges at all.
+    #[test]
+    fn excluded_jobs_run_single_span() {
+        // A compaction filter: eligible job class, excluded family.
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = span_fixture(&dir, 8);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        cf.set_compaction_filter(Some(Arc::new(move |_k: &[u8], _v: &[u8]| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::column_family::FilterDecision::Keep
+        })));
+        let inputs = pending_inputs(&cf);
+        super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+        assert_eq!(
+            cf.stats().span_count,
+            1,
+            "a filtered column family must stay single-span"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the filter never ran, so the exclusion was not exercised"
+        );
+        db.close().unwrap();
+
+        // `DB::compact`: its bounded rounds may span, but the whole-level sweep
+        // and the in-place bottom rewrite that follow are a single-span class
+        // and never report otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::DB::open(span_options(&dir, 8)).unwrap();
+        let cf = db
+            .create_column_family("default", quiet_span_config())
+            .unwrap();
+        write_rounds(&db, &cf, 0..3, 400);
+        db.compact(&cf).unwrap();
+        assert_eq!(
+            cf.stats().span_count,
+            1,
+            "the manual sweep must stay single-span"
+        );
+        db.close().unwrap();
+
+        // FIFO evicts and never merges.
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::DB::open(span_options(&dir, 8)).unwrap();
+        let cf = db
+            .create_column_family(
+                "default",
+                crate::config::ColumnFamilyConfig {
+                    compaction_style: crate::config::CompactionStyle::Fifo,
+                    fifo_max_bytes: 8 << 10,
+                    write_buffer_size: 8 << 10,
+                    ..crate::config::ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        write_rounds(&db, &cf, 0..4, 200);
+        db.compact(&cf).unwrap();
+        assert_eq!(cf.stats().span_count, 1, "FIFO must stay single-span");
+        db.close().unwrap();
+    }
+
+    /// Point reads run throughout a 4-span job with the reader cache squeezed,
+    /// so readers are evicted and reopened underneath them. Every read must be
+    /// correct: the install is one `update_levels` swap, so a reader sees
+    /// either all the inputs or all the outputs and never a partial set.
+    #[test]
+    fn point_reads_during_multi_span_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = span_fixture(&dir, 4);
+        db.set_max_open_readers(2);
+        let expected: Vec<Vec<u8>> = (0..SPAN_KEYS)
+            .map(|i| db.get(&cf, format!("k{i:06}").as_bytes()).unwrap())
+            .collect();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let reads = std::sync::atomic::AtomicU64::new(0);
+        let inputs = pending_inputs(&cf);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let (db, cf, stop, reads, expected) = (&db, &cf, &stop, &reads, &expected);
+                scope.spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        for (i, want) in expected.iter().enumerate() {
+                            let key = format!("k{i:06}");
+                            assert_eq!(
+                                &db.get(cf, key.as_bytes()).unwrap(),
+                                want,
+                                "a read during compaction observed a partial install at {key}"
+                            );
+                            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let spans = cf.stats().span_count;
+        let served = reads.load(std::sync::atomic::Ordering::Relaxed);
+        db.close().unwrap();
+        assert!(spans > 1, "the job ran in one span");
+        assert!(served > 0, "no read ran during the compaction");
+    }
+
+    /// The F8.3 regression pin. The span pool is sized independently of the
+    /// compaction worker count and a coordinator takes nothing from it: it runs
+    /// span 0 on the `onda-compact-{n}` thread it already occupies, which
+    /// `num_compaction_threads` already accounts for.
+    ///
+    /// One shared pool with the coordinator taking a permit silently no-ops at
+    /// the defaults — two concurrent jobs would consume both permits as
+    /// coordinators and no span worker could ever run. Two concurrent jobs here
+    /// each ask for exactly one span worker out of a pool of two, so under that
+    /// design one of them would run single-span.
+    #[test]
+    fn coordinators_do_not_consume_span_permits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = span_options(&dir, 2);
+        options.num_compaction_threads = 2;
+        options.max_subcompaction_workers = 0; // derive num_compaction_threads
+        let db = crate::DB::open(options).unwrap();
+        assert_eq!(
+            db.inner.span_permits.available(),
+            2,
+            "the pool must default to num_compaction_threads"
+        );
+        let left = span_fixture_cf(&db, "left");
+        let right = span_fixture_cf(&db, "right");
+        let left_inputs = pending_inputs(&left);
+        let right_inputs = pending_inputs(&right);
+
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let db = &db;
+            let gate = &gate;
+            let job = |cf: &Arc<crate::column_family::ColumnFamily>,
+                       inputs: Vec<Arc<crate::column_family::SstHandle>>| {
+                gate.wait();
+                super::compact_inputs_spanned(&db.inner, cf, 0, 1, inputs).unwrap();
+            };
+            let right = right.clone();
+            let other = scope.spawn(move || job(&right, right_inputs));
+            job(&left, left_inputs);
+            other.join().unwrap();
+        });
+
+        let (left_spans, right_spans) = (left.stats().span_count, right.stats().span_count);
+        assert_eq!(
+            db.inner.span_permits.available(),
+            2,
+            "permits were not released when the jobs joined"
+        );
+        db.close().unwrap();
+        assert_eq!(
+            (left_spans, right_spans),
+            (2, 2),
+            "a coordinator consumed a permit: two concurrent jobs each wanted \
+             ONE span worker from a pool of two"
+        );
+    }
+
+    /// A job that cannot have every span it asked for runs fewer, and completes
+    /// correctly — permits are never waited on, because that wait would happen
+    /// under the job's own range lock.
+    #[test]
+    fn span_count_degrades_under_permit_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = span_options(&dir, 4);
+        options.max_subcompaction_workers = 1; // one extra thread, DB-wide
+        let db = crate::DB::open(options).unwrap();
+        let cf = span_fixture_cf(&db, "default");
+        let pinned = db.begin();
+        let before = scan(&pinned, &cf);
+
+        let inputs = pending_inputs(&cf);
+        super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+
+        let stats = cf.stats();
+        assert_eq!(
+            stats.span_count, 2,
+            "a job asking for 4 spans with one permit must run 2"
+        );
+        assert_eq!(
+            before,
+            scan(&pinned, &cf),
+            "the degraded job did not produce the same data"
+        );
+        assert_eq!(db.inner.span_permits.available(), 1);
+        drop(pinned);
+        db.close().unwrap();
+    }
+
+    /// Wall time of one deliberately large bounded job at 1, 2 and 4 spans, at
+    /// a fixed thread and IO budget.
+    ///
+    /// `#[ignore]`d: it writes and rewrites hundreds of megabytes. Arms
+    /// alternate so thermal drift lands on all three, and the median of each is
+    /// what is compared — this machine's run-to-run spread is 15-20%.
+    ///
+    /// ```sh
+    /// cargo test --release --lib -- --ignored --nocapture span_scaling
+    /// ```
+    ///
+    /// One CSV line per run: `spans,run,seconds,span_count,imbalance_bytes`.
+    #[test]
+    #[ignore]
+    fn subcompaction_span_scaling_benchmark() {
+        let runs: usize = std::env::var("ONDADB_BENCH_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let keys: u32 = std::env::var("ONDADB_BENCH_KEYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+
+        /// One job, timed. The tree is built the same way every time, so the
+        /// only difference between arms is how the merge is executed.
+        fn one_run(spans: usize, keys: u32) -> (f64, u64, u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = span_options(&dir, spans);
+            // Fixed budget for every arm: the point is spans, not threads.
+            options.num_compaction_threads = 2;
+            options.max_subcompaction_workers = 4;
+            let db = crate::DB::open(options).unwrap();
+            let cf = db
+                .create_column_family(
+                    "default",
+                    crate::config::ColumnFamilyConfig {
+                        // ~12 tables per level at this size, so the planner
+                        // has boundaries to give four spans.
+                        target_file_size: 1 << 20,
+                        ..quiet_span_config()
+                    },
+                )
+                .unwrap();
+            write_rounds(&db, &cf, 0..3, keys);
+            let l0 = cf.with_levels(|levels| levels[0].clone());
+            super::compact_inputs(&db.inner, &cf, 0, 1, l0).unwrap();
+            write_rounds(&db, &cf, 3..6, keys);
+
+            let inputs = pending_inputs(&cf);
+            let started = std::time::Instant::now();
+            super::compact_inputs_spanned(&db.inner, &cf, 0, 1, inputs).unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            let stats = cf.stats();
+            db.close().unwrap();
+            (elapsed, stats.span_count, stats.span_imbalance_bytes)
+        }
+
+        let mut by_arm: std::collections::BTreeMap<usize, Vec<f64>> =
+            std::collections::BTreeMap::new();
+        println!("spans,run,seconds,span_count,imbalance_bytes");
+        for run in 0..runs {
+            for spans in [1usize, 2, 4] {
+                let (seconds, count, imbalance) = one_run(spans, keys);
+                println!("{spans},{run},{seconds:.3},{count},{imbalance}");
+                by_arm.entry(spans).or_default().push(seconds);
+            }
+        }
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 2], v[0], v[v.len() - 1])
+        };
+        let (base, base_min, base_max) = median(by_arm[&1].clone());
+        println!("1 span: median {base:.3}s  min {base_min:.3}  max {base_max:.3}");
+        for spans in [2usize, 4] {
+            let (m, lo, hi) = median(by_arm[&spans].clone());
+            println!(
+                "{spans} spans: median {m:.3}s  min {lo:.3}  max {hi:.3}  speedup {:.2}x => {}",
+                base / m,
+                // The gate: the speedup must exceed the single-span arm's own
+                // min-max spread, or it is indistinguishable from noise.
+                if base - m > base_max - base_min {
+                    "MET"
+                } else {
+                    "NOT MET"
+                }
+            );
+        }
     }
 
     /// Deterministic 64-bit generator: the property test must reproduce

@@ -287,6 +287,13 @@ pub struct ColumnFamily {
     /// landing in L0, a compaction completing) via
     /// [`crate::compaction::refresh_compaction_debt`].
     pub(crate) compaction_debt: AtomicU64,
+    /// Spans the most recent **bounded** compaction job on this family ran, and
+    /// the byte spread between its widest and narrowest span (0.8). `1` and `0`
+    /// mean it ran as a single merge — the default, and what a family excluded
+    /// from spanning always reports. Written only by the job classes that may
+    /// span, so the single-span sweep does not overwrite what they did.
+    pub(crate) span_count: AtomicU64,
+    pub(crate) span_imbalance_bytes: AtomicU64,
     commit_hook: Mutex<Option<CommitHookFn>>,
     compaction_filter: Mutex<Option<CompactionFilterFn>>,
     /// Mirrors `commit_hook.is_some()`; lets the commit path skip building hook
@@ -450,6 +457,8 @@ impl ColumnFamily {
             range_locks: crate::range_lock::RangeLocks::new(cmp.clone()),
             compact_cursor: Mutex::new(std::collections::HashMap::new()),
             compaction_debt: AtomicU64::new(0),
+            span_count: AtomicU64::new(1),
+            span_imbalance_bytes: AtomicU64::new(0),
             commit_hook: Mutex::new(None),
             compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
@@ -584,6 +593,8 @@ impl ColumnFamily {
             range_locks: crate::range_lock::RangeLocks::new(cmp.clone()),
             compact_cursor: Mutex::new(std::collections::HashMap::new()),
             compaction_debt: AtomicU64::new(0),
+            span_count: AtomicU64::new(1),
+            span_imbalance_bytes: AtomicU64::new(0),
             commit_hook: Mutex::new(None),
             compaction_filter: Mutex::new(None),
             hook_set: AtomicBool::new(false),
