@@ -11,6 +11,10 @@
 //! `flags(1) | key_len uvarint | val_len uvarint | seq uvarint |
 //!  ttl varint (if HAS_TTL) | key | value`
 //!
+//! The flags byte is strictly masked (`format::check_entry_flags`): unknown
+//! bits and writer-impossible combinations are `Corruption`. A torn tail still
+//! ends a stripe cleanly — see [`Wal::replay`] for the split.
+//!
 //! Under [`SyncMode::Full`], concurrent committers are collapsed via **group
 //! commit**: the first thread in becomes the leader and writes every queued
 //! frame plus a single `fsync`, then wakes the followers.  The other sync modes
@@ -75,18 +79,23 @@ impl Record {
     }
 }
 
+/// One entry handed to a [`Wal::replay`] callback.
+///
+/// An enum rather than a bare [`Record`] because not every record kind is a
+/// point write: 1.2's range deletes carry two keys and no value, so replay
+/// callers must match on the kind instead of assuming one.
+#[derive(Debug, Clone)]
+pub enum ReplayRecord {
+    /// A put, delete or single-delete.
+    Point(Record),
+}
+
 /// Append one record's body (no framing) to `dst`.
 fn encode_record_body(dst: &mut Vec<u8>, r: RecordRef<'_>) {
-    let mut fl = 0u8;
-    if r.tombstone {
-        fl |= flags::TOMBSTONE;
-    }
-    if r.single_delete {
-        fl |= flags::SINGLE_DELETE;
-    }
-    if r.ttl != 0 {
-        fl |= flags::HAS_TTL;
-    }
+    // Normalize here, not only at decode: `RecordRef` is public, so a caller
+    // outside the crate can hand us `single_delete` without `tombstone`.
+    crate::format::debug_check_entry_flags(r.tombstone, r.single_delete, false);
+    let fl = crate::format::normalized_entry_flags(r.tombstone, r.single_delete, r.ttl != 0, false);
     dst.push(fl);
     append_uvarint(dst, r.key.len() as u64);
     append_uvarint(dst, r.value.len() as u64);
@@ -99,38 +108,45 @@ fn encode_record_body(dst: &mut Vec<u8>, r: RecordRef<'_>) {
 }
 
 /// Decode one record from the front of `p`, returning it and the bytes
-/// consumed. `None` on malformed input.
-fn decode_record(p: &[u8]) -> Option<(Record, usize)> {
+/// consumed.
+///
+/// Every failure is [`OndaError::Corruption`]: the caller only reaches this
+/// function for a frame whose CRC already verified, so a body that does not
+/// decode was written intact and still contradicts the format. Torn tails are
+/// detected one level up, before the CRC, and end a stripe cleanly instead.
+fn decode_record(p: &[u8]) -> Result<(Record, usize)> {
+    let corrupt = || OndaError::Corruption("wal: malformed record".into());
     if p.is_empty() {
-        return None;
+        return Err(corrupt());
     }
     let fl = p[0];
+    crate::format::check_entry_flags(fl)?;
     let mut off = 1usize;
     let mut r = Record {
         tombstone: fl & flags::TOMBSTONE != 0,
         single_delete: fl & flags::SINGLE_DELETE != 0,
         ..Default::default()
     };
-    let (klen, n) = uvarint(&p[off..])?;
+    let (klen, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
     off += n;
-    let (vlen, n) = uvarint(&p[off..])?;
+    let (vlen, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
     off += n;
-    let (seq, n) = uvarint(&p[off..])?;
+    let (seq, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
     off += n;
     r.seq = seq;
     if fl & flags::HAS_TTL != 0 {
-        let (ttl, n) = varint(&p[off..])?;
+        let (ttl, n) = varint(&p[off..]).ok_or_else(corrupt)?;
         off += n;
         r.ttl = ttl;
     }
     let (klen, vlen) = (klen as usize, vlen as usize);
-    let need = klen.checked_add(vlen)?;
+    let need = klen.checked_add(vlen).ok_or_else(corrupt)?;
     if p.len() - off < need {
-        return None;
+        return Err(corrupt());
     }
     r.key = p[off..off + klen].to_vec();
     r.value = p[off + klen..off + need].to_vec();
-    Some((r, off + need))
+    Ok((r, off + need))
 }
 
 struct QueueState {
@@ -466,11 +482,12 @@ impl Wal {
     /// meaningful — sequence numbers define visibility.  A torn or
     /// checksum-failed frame at a stripe's tail ends that stripe cleanly (the
     /// expected result of a crash mid-write); each frame — one committed batch —
-    /// replays atomically.  Returns the highest sequence number seen.  Missing
-    /// files replay as empty.
+    /// replays atomically.  A record that fails to decode *inside* a CRC-valid
+    /// frame is not crash residue and fails with [`OndaError::Corruption`].
+    /// Returns the highest sequence number seen.  Missing files replay as empty.
     pub fn replay<F>(path: impl AsRef<Path>, mut f: F) -> Result<u64>
     where
-        F: FnMut(Record) -> Result<()>,
+        F: FnMut(ReplayRecord) -> Result<()>,
     {
         let mut last_seq = 0u64;
         for k in 0..WAL_STRIPES {
@@ -482,7 +499,7 @@ impl Wal {
 
     fn replay_file<F>(path: std::path::PathBuf, f: &mut F) -> Result<u64>
     where
-        F: FnMut(Record) -> Result<()>,
+        F: FnMut(ReplayRecord) -> Result<()>,
     {
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -506,17 +523,16 @@ impl Wal {
                 return Ok(last_seq); // corrupted tail
             }
             // Decode every record in the (verified) frame.
+            // Past this point the bytes are known-intact: any decode failure
+            // is corruption, not a torn tail, and must not be swallowed.
             let mut p = &payload[..];
             while !p.is_empty() {
-                let (rec, used) = match decode_record(p) {
-                    Some(x) => x,
-                    None => return Ok(last_seq), // malformed despite CRC: stop
-                };
+                let (rec, used) = decode_record(p)?;
                 p = &p[used..];
                 if rec.seq > last_seq {
                     last_seq = rec.seq;
                 }
-                f(rec)?;
+                f(ReplayRecord::Point(rec))?;
             }
         }
     }
@@ -601,6 +617,169 @@ fn interval_sync(shared: Arc<Shared>, stop: Receiver<()>, interval: Duration) {
 mod tests {
     use super::*;
 
+    /// Every decoder in this feature must be total over arbitrary bytes: a
+    /// `Result`, never a panic. Seeded from the frozen corpus so the shapes are
+    /// real WAL bytes rather than uniform noise.
+    #[test]
+    fn fuzz_decode_record_never_panics() {
+        let mut seeds: Vec<Vec<u8>> = Vec::new();
+        for name in [
+            "wal_legacy_all_flags.bin",
+            "wal_legacy_empty_frame.bin",
+            "wal_legacy_torn_tail.bin",
+            "wal_legacy_crc_valid_undecodable.bin",
+        ] {
+            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            // Frame headers included and excluded: the record decoder must
+            // survive both a payload and the raw file it came from.
+            seeds.push(bytes[HEADER_SIZE.min(bytes.len())..].to_vec());
+            seeds.push(bytes);
+        }
+        let mut buf = Vec::new();
+        for r in wal_fuzz_records() {
+            encode_record_body(&mut buf, r.as_ref());
+        }
+        seeds.push(buf);
+
+        let mut rng = crate::util::FuzzRng::new(0x9E37_79B9_7F4A_7C15);
+        for seed in &seeds {
+            for _ in 0..2000 {
+                let case = crate::util::fuzz_mutate(&mut rng, seed);
+                // Both entry points, at every offset a caller could pass.
+                let _ = decode_record(&case);
+                if !case.is_empty() {
+                    let at = rng.below(case.len());
+                    let _ = decode_record(&case[at..]);
+                }
+            }
+        }
+    }
+
+    /// Fuzz seeds: one record per writer-produced flag combination.
+    fn wal_fuzz_records() -> Vec<Record> {
+        vec![
+            rec("a", "1", 1),
+            Record {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                seq: 300000,
+                ttl: 1_700_000_000_000_000_000,
+                ..Default::default()
+            },
+            Record {
+                key: b"d".to_vec(),
+                seq: 3,
+                tombstone: true,
+                single_delete: true,
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// `0x08` once named a `DELTA_SEQ` encoding that no writer ever produced;
+    /// it is reserved-unknown and must fail closed.
+    #[test]
+    fn decode_record_rejects_unknown_flag_bit() {
+        let body = [0x08u8, 1, 1, 5, b'k', b'v'];
+        let err = decode_record(&body).expect_err("unknown flag bit must be rejected");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn decode_record_rejects_single_delete_without_tombstone() {
+        let body = [flags::SINGLE_DELETE, 1, 0, 5, b'k'];
+        let err = decode_record(&body).expect_err("SINGLE_DELETE implies TOMBSTONE");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    /// Replay a frozen corpus fixture from a private directory.
+    fn replay_fixture(name: &str) -> (tempfile::TempDir, Result<(Vec<Record>, u64)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        std::fs::copy(crate::util::phase1_fixture(name), &path).unwrap();
+        let mut got = Vec::new();
+        let res = Wal::replay(&path, |r| {
+            let ReplayRecord::Point(r) = r;
+            got.push(r);
+            Ok(())
+        })
+        .map(|last| (got, last));
+        (dir, res)
+    }
+
+    /// A torn payload is the expected crash residue, not corruption: the stripe
+    /// ends cleanly and every record before the tear is delivered.
+    #[test]
+    fn torn_payload_stops_replay_cleanly() {
+        let (_dir, res) = replay_fixture("wal_legacy_torn_tail.bin");
+        let (got, last) = res.expect("a torn tail must not fail replay");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, b"good");
+        assert_eq!(last, 1);
+    }
+
+    /// A frame whose CRC checks out but whose record body does not decode is a
+    /// real corruption: the bytes were written intact and still lie.
+    #[test]
+    fn crc_valid_undecodable_record_is_corruption() {
+        let (_dir, res) = replay_fixture("wal_legacy_crc_valid_undecodable.bin");
+        let err = res.expect_err("a CRC-valid undecodable record must fail replay");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    /// `Wal::append_batch(&[])` is public API and writes a zero-length frame;
+    /// replay skips it and keeps reading.
+    #[test]
+    fn empty_frame_is_skipped_and_replay_continues() {
+        let (_dir, res) = replay_fixture("wal_legacy_empty_frame.bin");
+        let (got, last) = res.expect("an empty frame must not fail replay");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, b"after");
+        assert_eq!(last, 9);
+    }
+
+    /// `encode_record_body` builds its flags byte through
+    /// `format::normalized_entry_flags`; the byte assertion goes there because
+    /// the encode site debug-asserts the invariant (twin below).
+    #[test]
+    fn wal_encode_normalizes_single_delete() {
+        use crate::format::normalized_entry_flags;
+        assert_eq!(
+            normalized_entry_flags(false, true, false, false),
+            flags::TOMBSTONE | flags::SINGLE_DELETE
+        );
+        let mut buf = Vec::new();
+        encode_record_body(
+            &mut buf,
+            RecordRef {
+                key: b"k",
+                value: b"",
+                seq: 1,
+                ttl: 0,
+                tombstone: true,
+                single_delete: true,
+            },
+        );
+        assert_eq!(buf[0], flags::TOMBSTONE | flags::SINGLE_DELETE);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "SINGLE_DELETE")]
+    fn wal_encode_debug_asserts_single_delete_implies_tombstone() {
+        encode_record_body(
+            &mut Vec::new(),
+            RecordRef {
+                key: b"k",
+                value: b"",
+                seq: 1,
+                ttl: 0,
+                tombstone: false,
+                single_delete: true,
+            },
+        );
+    }
+
     #[test]
     fn new_wal_creation_propagates_parent_sync_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -675,7 +854,8 @@ mod tests {
         let total = threads * batches * per_batch;
         let mut seen = vec![false; total + 1];
         let mut count = 0usize;
-        let last = Wal::replay(&path, |r| {
+        let last = Wal::replay(&path, |rec| {
+            let ReplayRecord::Point(r) = rec;
             assert!(!seen[r.seq as usize], "duplicate seq {}", r.seq);
             seen[r.seq as usize] = true;
             count += 1;
@@ -706,7 +886,8 @@ mod tests {
             wal.append_batch(&[b.as_ref(), c.as_ref()]).unwrap();
         }
         let mut got = Vec::new();
-        let last = Wal::replay(&path, |r| {
+        let last = Wal::replay(&path, |rec| {
+            let ReplayRecord::Point(r) = rec;
             got.push((String::from_utf8(r.key).unwrap(), r.seq));
             Ok(())
         })
@@ -740,7 +921,8 @@ mod tests {
             .unwrap();
         }
         let mut recs = Vec::new();
-        Wal::replay(&path, |r| {
+        Wal::replay(&path, |rec| {
+            let ReplayRecord::Point(r) = rec;
             recs.push(r);
             Ok(())
         })
@@ -796,7 +978,8 @@ mod tests {
             f.write_all(&[0xFF]).unwrap();
         }
         let mut keys = Vec::new();
-        Wal::replay(&path, |r| {
+        Wal::replay(&path, |rec| {
+            let ReplayRecord::Point(r) = rec;
             keys.push(r.key);
             Ok(())
         })

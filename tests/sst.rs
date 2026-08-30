@@ -559,3 +559,72 @@ fn per_prefix_compression_rules() {
     }
     assert_eq!(seen, keys);
 }
+
+/// A footer flag bit this binary does not implement is `UnsupportedFormat`, not
+/// `Corruption`: the bytes are well-formed, they just name a feature we lack.
+#[test]
+fn footer_unknown_flag_bit_is_unsupported_format() {
+    const FOOTER_SIZE: usize = 64;
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
+    let mut bytes = std::fs::read(&src).unwrap();
+    let flags_at = bytes.len() - FOOTER_SIZE + 48;
+    // 0x20 is above every assigned footer bit (0x10 is reserved for 1.0B's
+    // extended-block flag), and the footer carries no checksum of its own.
+    bytes[flags_at] |= 0x20;
+
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("1.klog");
+    std::fs::write(&klog, &bytes).unwrap();
+    std::fs::write(
+        klog.with_extension("vlog"),
+        std::fs::read(src.with_extension("vlog")).unwrap(),
+    )
+    .unwrap();
+
+    let err = Reader::open(
+        klog.to_str().unwrap(),
+        LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        1,
+        default_comparator(),
+    )
+    .expect_err("an unknown footer flag must be refused");
+    assert_eq!(err.kind(), "unsupported_format");
+}
+
+/// The footer decoder must be total over its flags byte: every value either
+/// opens the table or returns an error, and none panics.
+#[test]
+fn fuzz_footer_flags_never_panic() {
+    const FOOTER_SIZE: usize = 64;
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
+    let original = std::fs::read(&src).unwrap();
+    let vlog = std::fs::read(src.with_extension("vlog")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("1.klog");
+    std::fs::write(klog.with_extension("vlog"), &vlog).unwrap();
+
+    for value in 0u8..=255 {
+        let mut bytes = original.clone();
+        let flags_at = bytes.len() - FOOTER_SIZE + 48;
+        bytes[flags_at] = value;
+        std::fs::write(&klog, &bytes).unwrap();
+        let res = Reader::open(
+            klog.to_str().unwrap(),
+            LocalStorage::new(Arc::new(FileCache::new(4)), cfg!(feature = "mmap-reads")),
+            Arc::new(BlockCache::new(1 << 20)),
+            1,
+            default_comparator(),
+        );
+        if let Err(e) = res {
+            // Only the two fail-closed taxonomies are acceptable here.
+            assert!(
+                matches!(e.kind(), "corruption" | "unsupported_format"),
+                "flags {value:#04x}: unexpected {}",
+                e.kind()
+            );
+        }
+    }
+}

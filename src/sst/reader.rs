@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use super::{
     cmp_internal, decode_entry, vlog_path_for, Block, BlockHandle, IndexEntry, SstIterator,
     FOOTER_BTREE, FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
-    VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
+    KNOWN_FOOTER_FLAGS, VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
 };
 use crate::bloom::Bloom;
 use crate::cache::BlockCache;
@@ -227,6 +227,11 @@ impl Reader {
         r.num_entries = read_u64(&footer[32..40]);
         r.max_seq = read_u64(&footer[40..48]);
         let flags = footer[48];
+        if flags & !KNOWN_FOOTER_FLAGS != 0 {
+            return Err(OndaError::UnsupportedFormat(format!(
+                "sst footer flags {flags:#04x} outside known mask {KNOWN_FOOTER_FLAGS:#04x}"
+            )));
+        }
         r.has_restarts = flags & FOOTER_RESTARTS != 0;
         r.vlog_v2 = flags & FOOTER_VLOG_V2 != 0;
 

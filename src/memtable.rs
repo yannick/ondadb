@@ -51,6 +51,9 @@ use std::ops::Bound;
 use self_cell::self_cell;
 
 use crate::comparator::ComparatorRef;
+// The arena memtable keeps its own flag bytes on its nodes, so the SkipMap
+// paths that read these bits are compiled out under `arena-memtable`.
+#[cfg_attr(feature = "arena-memtable", allow(unused_imports))]
 use crate::format::flags;
 #[cfg(not(feature = "arena-memtable"))]
 use crate::format::{self, make_internal_key};
@@ -253,17 +256,8 @@ fn shard_of(h: u64) -> usize {
 }
 
 pub(crate) fn flag_bits(tombstone: bool, single_delete: bool, ttl: i64) -> u8 {
-    let mut f = 0;
-    if tombstone {
-        f |= flags::TOMBSTONE;
-    }
-    if single_delete {
-        f |= flags::SINGLE_DELETE;
-    }
-    if ttl != 0 {
-        f |= flags::HAS_TTL;
-    }
-    f
+    crate::format::debug_check_entry_flags(tombstone, single_delete, false);
+    crate::format::normalized_entry_flags(tombstone, single_delete, ttl != 0, false)
 }
 
 impl Memtable {
@@ -1452,6 +1446,33 @@ impl std::fmt::Debug for LazyArenaIter {
 mod tests {
     use super::*;
     use crate::comparator::default_comparator;
+
+    /// `flag_bits` produces its byte through `format::normalized_entry_flags`,
+    /// so the byte assertion goes there: calling `flag_bits` with the broken
+    /// combination directly would trip its debug assert (see the twin below).
+    #[test]
+    fn flag_bits_normalizes_single_delete_to_tombstone() {
+        use crate::format::{flags, normalized_entry_flags};
+        assert_eq!(
+            normalized_entry_flags(false, true, false, false),
+            flags::TOMBSTONE | flags::SINGLE_DELETE
+        );
+        // Well-formed inputs keep the exact legacy bytes.
+        assert_eq!(flag_bits(false, false, 0), 0);
+        assert_eq!(flag_bits(false, false, 5), flags::HAS_TTL);
+        assert_eq!(flag_bits(true, false, 0), flags::TOMBSTONE);
+        assert_eq!(
+            flag_bits(true, true, 0),
+            flags::TOMBSTONE | flags::SINGLE_DELETE
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "SINGLE_DELETE")]
+    fn flag_bits_debug_asserts_single_delete_implies_tombstone() {
+        let _ = flag_bits(false, true, 0);
+    }
 
     fn mt() -> Arc<Memtable> {
         Memtable::new(default_comparator())

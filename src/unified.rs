@@ -225,7 +225,8 @@ impl UnifiedStore {
         for g in &gens {
             let p = wal_path(dir, *g);
             replay_paths.push(p.clone());
-            let last = Wal::replay(&p, |r| {
+            let last = Wal::replay(&p, |rec| {
+                let crate::wal::ReplayRecord::Point(r) = rec;
                 mem.put(&r.key, r.value, r.seq, r.ttl, r.tombstone, r.single_delete);
                 Ok(())
             })?;

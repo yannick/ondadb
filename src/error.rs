@@ -42,6 +42,11 @@ pub enum OndaError {
     /// background flush) and fail-stopped: writes are rejected until the
     /// database is reopened. Reads keep working.
     Poisoned(String),
+    /// Bytes are well-formed but name a format feature this binary does not
+    /// implement (an unknown capability bit, footer flag, record kind or aux
+    /// section). Distinct from [`OndaError::Corruption`], which means the bytes
+    /// contradict a format this binary *does* implement.
+    UnsupportedFormat(String),
     /// Unclassified error.
     Unknown(String),
 }
@@ -65,6 +70,7 @@ impl OndaError {
             OndaError::ReadOnly(_) => -13,
             OndaError::Busy(_) => -14,
             OndaError::Poisoned(_) => -15,
+            OndaError::UnsupportedFormat(_) => -16,
         }
     }
 
@@ -87,6 +93,7 @@ impl OndaError {
             -13 => OndaError::ReadOnly(String::new()),
             -14 => OndaError::Busy(String::new()),
             -15 => OndaError::Poisoned(String::new()),
+            -16 => OndaError::UnsupportedFormat(String::new()),
             _ => OndaError::Unknown(format!("code {code}")),
         }
     }
@@ -108,6 +115,7 @@ impl OndaError {
             OndaError::ReadOnly(_) => "readonly",
             OndaError::Busy(_) => "busy",
             OndaError::Poisoned(_) => "poisoned",
+            OndaError::UnsupportedFormat(_) => "unsupported_format",
             OndaError::Unknown(_) => "unknown",
         }
     }
@@ -132,6 +140,7 @@ impl fmt::Display for OndaError {
             OndaError::Poisoned(m) => {
                 write!(f, "poisoned (fail-stop after durability failure): {m}")
             }
+            OndaError::UnsupportedFormat(m) => write!(f, "unsupported format: {m}"),
             OndaError::Unknown(m) => write!(f, "unknown error: {m}"),
         }
     }
@@ -164,6 +173,10 @@ mod tests {
         assert_eq!(OndaError::Corruption(String::new()).code(), -5);
         assert_eq!(OndaError::Conflict(String::new()).code(), -7);
         assert_eq!(OndaError::Busy(String::new()).code(), -14);
+        assert_eq!(OndaError::UnsupportedFormat("m".into()).code(), -16);
+        assert_eq!(OndaError::from_code(-16).kind(), "unsupported_format");
+        assert!(format!("{}", OndaError::UnsupportedFormat("m".into()))
+            .starts_with("unsupported format"));
     }
 
     #[test]

@@ -106,3 +106,62 @@ impl Poison {
         }
     }
 }
+
+/// Path of one frozen phase-1 fixture (`tests/fixtures/phase1/`, committed to
+/// git). Unit tests in the decoder modules read the corpus through this.
+#[cfg(test)]
+pub(crate) fn phase1_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/phase1")
+        .join(name)
+}
+
+/// Deterministic xorshift64 PRNG driving the fuzz-corpus tests. A real PRNG
+/// dependency would be a new crate for four lines of arithmetic, and a fixed
+/// seed keeps a failure reproducible.
+#[cfg(test)]
+pub(crate) struct FuzzRng(u64);
+
+#[cfg(test)]
+impl FuzzRng {
+    pub(crate) fn new(seed: u64) -> FuzzRng {
+        FuzzRng(seed | 1)
+    }
+
+    pub(crate) fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    pub(crate) fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+}
+
+/// Derive one fuzz case from `seed`: a handful of random byte pokes, plus an
+/// occasional truncation (the shape that finds missing length checks).
+#[cfg(test)]
+pub(crate) fn fuzz_mutate(rng: &mut FuzzRng, seed: &[u8]) -> Vec<u8> {
+    let mut out = seed.to_vec();
+    if out.is_empty() {
+        return out;
+    }
+    let pokes = 1 + rng.below(4);
+    for _ in 0..pokes {
+        let at = rng.below(out.len());
+        out[at] = rng.next_u64() as u8;
+    }
+    if rng.below(4) == 0 {
+        let keep = rng.below(out.len());
+        out.truncate(keep);
+    }
+    out
+}

@@ -19,6 +19,8 @@ use crate::error::{OndaError, Result};
 
 const MAGIC: u32 = 0x5756_4D46; // "WVMF"
 const VERSION: u32 = 1;
+/// Every manifest tail tag is this wide.
+const TAG_LEN: usize = 8;
 const WAL_LAYOUT_TAG: &[u8; 8] = b"ONDAWAL1";
 const OBJECT_TAG: &[u8; 8] = b"ONDAOBJ1";
 const INSTANCE_TAG: &[u8; 8] = b"ONDAINS1";
@@ -170,14 +172,13 @@ impl Manifest {
         let (next_file_id, global_seq, column_family_count) = decode_manifest_header(&mut cursor)?;
         let mut cfs = decode_manifest_column_families(&mut cursor, column_family_count)?;
         let p = decode_positional_tails(cursor.into_remaining(), &mut cfs)?;
-        let (p, instance_nonce) = decode_tagged_tails(p, &mut cfs)?;
-        let wal_layout = decode_wal_layout(p)?;
+        let tags = decode_tagged_tails(p, &mut cfs)?;
         Ok(Manifest {
             next_file_id,
             global_seq,
             cfs,
-            wal_layout,
-            instance_nonce,
+            wal_layout: tags.wal_layout,
+            instance_nonce: tags.instance_nonce,
         })
     }
 }
@@ -335,16 +336,23 @@ fn decode_manifest_header(cursor: &mut ManifestCursor<'_>) -> Result<(u64, u64, 
     Ok((next_file_id, global_seq, column_family_count))
 }
 
+/// Cap what a count field may pre-allocate. The vector still grows to whatever
+/// the bytes actually contain; this only stops a CRC-valid manifest whose count
+/// lies from asking for gigabytes before the first element is read.
+fn capacity_hint(count: usize) -> usize {
+    count.min(4096)
+}
+
 fn decode_manifest_column_families(
     cursor: &mut ManifestCursor<'_>,
     count: usize,
 ) -> Result<Vec<CfManifest>> {
-    let mut cfs = Vec::with_capacity(count);
+    let mut cfs = Vec::with_capacity(capacity_hint(count));
     for _ in 0..count {
         let name = String::from_utf8(cursor.byte_vec()?).map_err(|_| corrupt_manifest())?;
         let config = cursor.byte_vec()?;
         let table_count = cursor.uvar()? as usize;
-        let mut sstables = Vec::with_capacity(table_count);
+        let mut sstables = Vec::with_capacity(capacity_hint(table_count));
         for _ in 0..table_count {
             sstables.push(decode_sstable(cursor)?);
         }
@@ -388,32 +396,65 @@ fn decode_positional_tails<'a>(mut p: &'a [u8], cfs: &mut [CfManifest]) -> Resul
     Ok(p)
 }
 
-fn decode_tagged_tails<'a>(
-    mut p: &'a [u8],
-    cfs: &mut [CfManifest],
-) -> Result<(&'a [u8], Option<u64>)> {
-    if let Some(rest) = p.strip_prefix(OBJECT_TAG) {
-        p = decode_name_section(rest, cfs, |sst, name| sst.object = Some(name))?;
-    }
-    let mut instance_nonce = None;
-    if p.len() >= INSTANCE_TAG.len() + 8 && p.starts_with(INSTANCE_TAG) {
-        instance_nonce = Some(read_u64(&p[INSTANCE_TAG.len()..]));
-        p = &p[INSTANCE_TAG.len() + 8..];
-    }
-    Ok((p, instance_nonce))
+/// Everything the tagged-tail section carries.
+#[derive(Default)]
+struct TaggedTails {
+    wal_layout: WalLayout,
+    instance_nonce: Option<u64>,
 }
 
-fn decode_wal_layout(p: &[u8]) -> Result<WalLayout> {
-    if p.is_empty() {
-        return Ok(WalLayout::PerColumnFamily);
+/// Decode the tagged tail sections by dispatching on each 8-byte tag.
+///
+/// This rejects exactly what the previous fixed sequence rejected — an unknown
+/// or short residual was already `Corruption`, because `decode_wal_layout`
+/// demanded an exact 9-byte remainder. The loop shape is what makes the tag set
+/// extensible: a new section is one more arm, not another positional hazard.
+/// The default arm must stay `Corruption` so a tag this binary does not know is
+/// never mistaken for data.
+fn decode_tagged_tails(mut p: &[u8], cfs: &mut [CfManifest]) -> Result<TaggedTails> {
+    let mut out = TaggedTails::default();
+    let mut seen_object = false;
+    let mut seen_layout = false;
+    while !p.is_empty() {
+        if p.len() < TAG_LEN {
+            return Err(corrupt_manifest());
+        }
+        let (tag, rest) = p.split_at(TAG_LEN);
+        p = if tag == OBJECT_TAG {
+            // Duplicates are corruption: the encoder emits each tag at most
+            // once, and a second copy would silently overwrite the first.
+            if std::mem::replace(&mut seen_object, true) {
+                return Err(corrupt_manifest());
+            }
+            decode_name_section(rest, cfs, |sst, name| sst.object = Some(name))?
+        } else if tag == INSTANCE_TAG {
+            if out.instance_nonce.is_some() {
+                return Err(corrupt_manifest());
+            }
+            if rest.len() < 8 {
+                return Err(corrupt_manifest());
+            }
+            out.instance_nonce = Some(read_u64(rest));
+            &rest[8..]
+        } else if tag == WAL_LAYOUT_TAG {
+            if std::mem::replace(&mut seen_layout, true) {
+                return Err(corrupt_manifest());
+            }
+            out.wal_layout = decode_layout_byte(rest)?;
+            &rest[1..]
+        } else {
+            return Err(corrupt_manifest());
+        };
     }
-    if p.len() == WAL_LAYOUT_TAG.len() + 1
-        && p.starts_with(WAL_LAYOUT_TAG)
-        && p[WAL_LAYOUT_TAG.len()] == 1
-    {
-        return Ok(WalLayout::Unified);
+    Ok(out)
+}
+
+/// Decode the single payload byte of [`WAL_LAYOUT_TAG`]; only `1` is assigned.
+fn decode_layout_byte(p: &[u8]) -> Result<WalLayout> {
+    match p.first() {
+        Some(1) => Ok(WalLayout::Unified),
+        _ => Err(corrupt_manifest()),
     }
-    Err(corrupt_manifest())
 }
 
 /// Encode one tail section: for each CF in order, a uvarint count of tables
@@ -522,6 +563,86 @@ fn take_bytes(p: &[u8]) -> Option<(Vec<u8>, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names of every frozen VERSION-1 manifest fixture, in emission order of
+    /// the tail sections they exercise.
+    const V1_FIXTURES: &[&str] = &[
+        "manifest_v1_notail.bin",
+        "manifest_v1_partition.bin",
+        "manifest_v1_tier.bin",
+        "manifest_v1_time.bin",
+        "manifest_v1_unified.bin",
+        "manifest_v1_object.bin",
+        "manifest_v1_nonce.bin",
+    ];
+
+    /// Read a frozen fixture and re-checksum it with `extra` spliced in before
+    /// the trailing CRC, so the tail decoder — not the CRC — is what rejects.
+    fn fixture_with_extra_tail(name: &str, extra: &[u8]) -> Vec<u8> {
+        let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+        let mut body = bytes[..bytes.len() - 4].to_vec();
+        body.extend_from_slice(extra);
+        let crc = checksum(&body);
+        append_u32(&mut body, crc);
+        body
+    }
+
+    /// The manifest decoder must be total over arbitrary bytes: a `Result`,
+    /// never a panic. The mutated body is re-checksummed on purpose — a
+    /// CRC-valid manifest whose interior lies is exactly the class of input the
+    /// whole-file CRC cannot catch.
+    #[test]
+    fn fuzz_manifest_decode_never_panics() {
+        let seeds: Vec<Vec<u8>> = V1_FIXTURES
+            .iter()
+            .map(|n| std::fs::read(crate::util::phase1_fixture(n)).unwrap())
+            .collect();
+        let mut rng = crate::util::FuzzRng::new(0x2545_F491_4F6C_DD1D);
+        for seed in &seeds {
+            for _ in 0..2000 {
+                let case = crate::util::fuzz_mutate(&mut rng, seed);
+                let _ = Manifest::decode(&case);
+                if case.len() > 4 {
+                    let mut body = case[..case.len() - 4].to_vec();
+                    let crc = checksum(&body);
+                    append_u32(&mut body, crc);
+                    let _ = Manifest::decode(&body);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_v1_tail_fixtures_decode_identically() {
+        for name in V1_FIXTURES {
+            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(m.encode(), bytes, "{name}: re-encode must be byte-identical");
+        }
+    }
+
+    #[test]
+    fn unknown_tag_is_corruption() {
+        let bytes = fixture_with_extra_tail("manifest_v1_object.bin", b"ONDAXXX1\0\0\0\0\0\0\0\0");
+        let err = Manifest::decode(&bytes).expect_err("an unknown tail tag must fail closed");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn duplicate_tag_is_corruption() {
+        let mut extra = INSTANCE_TAG.to_vec();
+        extra.extend_from_slice(&[0u8; 8]);
+        let bytes = fixture_with_extra_tail("manifest_v1_nonce.bin", &extra);
+        let err = Manifest::decode(&bytes).expect_err("a repeated tail tag must fail closed");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    #[test]
+    fn short_residual_is_corruption() {
+        let bytes = fixture_with_extra_tail("manifest_v1_object.bin", b"ONDAWAL");
+        let err = Manifest::decode(&bytes).expect_err("a short tail residual must fail closed");
+        assert_eq!(err.kind(), "corruption");
+    }
 
     fn sample() -> Manifest {
         Manifest {

@@ -19,8 +19,47 @@ everywhere is `(user_key asc via the CF comparator, seq desc)` —
 `sst::cmp_internal` is the reference implementation.
 
 Entry flag bits (`format::flags`, shared by WAL + SSTable):
-`TOMBSTONE=0x01, HAS_TTL=0x02, HAS_VLOG=0x04, DELTA_SEQ=0x08 (reserved),
-SINGLE_DELETE=0x10`.
+`TOMBSTONE=0x01, HAS_TTL=0x02, HAS_VLOG=0x04, SINGLE_DELETE=0x10`.
+`KNOWN_ENTRY_FLAGS = 0x17` is the whole mask; `0x08` is **reserved-unknown**
+(it named a `DELTA_SEQ` encoding no writer ever produced). Flags are modifiers,
+never an extensibility mechanism — new record semantics get a record *kind*,
+not a spare bit.
+
+**Strict decoding** (`format::check_entry_flags`, called by both
+`wal::decode_record` and `sst::decode_entry`). An entry is rejected as
+`Corruption` when it sets a bit outside `KNOWN_ENTRY_FLAGS`, or carries a
+combination no writer can produce:
+
+| Rejected | Why unproducible |
+|---|---|
+| `flags & !0x17` | no writer ever sets those bits |
+| `SINGLE_DELETE` without `TOMBSTONE` | a single-delete *is* a tombstone |
+| `TOMBSTONE` with `HAS_VLOG` | `Writer::add` separates a value only when `!tombstone` |
+
+The three encode sites — `memtable::flag_bits`, `wal::encode_record_body`,
+`sst::encode_entry` — all build their byte through
+`format::normalized_entry_flags`, which repairs both invariants (and
+debug-asserts them first). That normalization is what makes the decode-side
+strictness safe: `wal::RecordRef` is public, so a caller outside the crate can
+construct `{ tombstone: false, single_delete: true }`, and writing bytes we then
+refuse to read would turn a caller's mistake into an unopenable database.
+
+### Error taxonomy
+
+| Error | Meaning | Examples |
+|---|---|---|
+| `Corruption` (code `-5`) | the bytes contradict a format this binary *does* implement | unknown entry-flag bit, `SINGLE_DELETE` without `TOMBSTONE`, unknown or duplicated manifest tail tag, a record that fails to decode inside a CRC-valid WAL frame |
+| `UnsupportedFormat` (code `-16`) | the bytes are well-formed but name a feature this binary does not implement | a footer flag bit outside `KNOWN_FOOTER_FLAGS` |
+
+A **torn tail** is neither: a short header, a short payload or a frame CRC
+mismatch is the expected residue of a crash mid-write and ends that WAL stripe
+cleanly (`Ok`).
+
+Every legacy byte pattern these rules must keep accepting is pinned by the
+frozen corpus in `tests/fixtures/phase1/` (see
+`tests/fixtures_phase1.rs::legacy_corpus_decodes_unchanged`). Those files were
+produced by the 0.8.2 encoders and are regenerated only by an explicit,
+reviewed format change — the `#[ignore]`d `regenerate_phase1_fixtures` test.
 
 ## WAL (`wal.rs`)
 
@@ -49,9 +88,22 @@ flags u8 | key_len uvarint | val_len uvarint | seq uvarint
 | ttl varint (only if HAS_TTL) | key bytes | value bytes
 ```
 
-Replay (`Wal::replay`): short/torn header or payload, CRC mismatch, or a
-record that fails to decode ⇒ clean end of that stripe (expected crash
-residue). A frame is applied all-or-nothing. WAL bytes are never compressed.
+Replay (`Wal::replay`) splits the two tail cases:
+
+- short/torn header, short payload, or CRC mismatch ⇒ **clean end of that
+  stripe** (`Ok(last_seq)`) — the expected crash residue;
+- a record that fails to decode *inside* a CRC-verified frame ⇒
+  **`Err(Corruption)`** propagated out of `Wal::replay`. Those bytes reached
+  disk intact and still contradict the format, so swallowing them would hide
+  real corruption behind the crash-recovery path.
+
+A frame with `payload_len == 0` is legitimate (`Wal::append_batch(&[])` is
+public API) and is skipped; replay continues with the frames behind it. A frame
+is applied all-or-nothing. WAL bytes are never compressed.
+
+Replay callbacks receive a `wal::ReplayRecord`, not a bare `Record`: later
+record kinds are not all point writes, so callers match on the kind rather than
+assume one.
 
 ## SSTable (`sst/`)
 
@@ -142,9 +194,16 @@ offset  field
 24..32  bloom handle length
 32..40  num_entries
 40..48  max_seq
-48      flags: FOOTER_HAS_BLOOM=0x01, FOOTER_BTREE=0x02
+48      flags: FOOTER_HAS_BLOOM=0x01, FOOTER_BTREE=0x02,
+               FOOTER_RESTARTS=0x04, FOOTER_VLOG_V2=0x08
+49..56  unused
 56..64  FOOTER_MAGIC = 0x5741_5645_5353_5431
 ```
+
+`KNOWN_FOOTER_FLAGS = 0x0F`. A bit outside that mask was written by a newer
+binary and names a feature this one does not implement, so `Reader::open`
+refuses the file with `OndaError::UnsupportedFormat` (code `-16`) rather than
+`Corruption` — the file is intact, this binary is simply too old.
 
 ### Bloom filter (`bloom.rs`)
 
@@ -211,13 +270,27 @@ precede it, even if those are all-empty counts:
 | any `max_entry_time`                | sections 1 + 2 + 3 |
 | unified WAL layout                  | sections 1 + 2 + 3 + tagged section 4 |
 
-**Decoding** is positional: after the CF loop, if bytes remain before the
-CRC the first section is the partition section, the next (if bytes remain)
-the tier section, the next the time section, and the tagged layout section
-last. A manifest that stops before the layout tag decodes as
-`PerColumnFamily`; every legacy layout therefore decodes cleanly. Unified
-manifests emit the preceding three sections even when empty so the tag is
-unambiguous.
+**Decoding** is positional for sections 1–3: after the CF loop, if bytes remain
+before the CRC the first section is the partition section, the next (if bytes
+remain) the tier section, the next the time section. Everything after that is
+**tagged**, and is decoded by a dispatch loop (`decode_tagged_tails`) that reads
+an 8-byte tag, hands the remainder to that tag's decoder, and repeats:
+
+- a tag this binary does not know ⇒ `Corruption` (the loop's default arm);
+- a residual shorter than 8 bytes, or a tag payload shorter than the tag
+  requires ⇒ `Corruption`;
+- a repeated tag ⇒ `Corruption` (the encoder emits each at most once, and a
+  second copy would silently overwrite the first);
+- `ONDAWAL1` accepts only layout byte `1`.
+
+This rejects exactly what the previous fixed sequence rejected — an unknown
+trailing tag was already `Corruption`, because the old `decode_wal_layout`
+demanded an exact 9-byte residual. The loop shape is what lets a future tail
+section be one more arm instead of another positional hazard.
+
+A manifest that stops before the layout tag decodes as `PerColumnFamily`; every
+legacy layout therefore decodes cleanly. Unified manifests emit the preceding
+three sections even when empty so the tag is unambiguous.
 
 **Compatibility rules:**
 

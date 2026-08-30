@@ -15,10 +15,85 @@ pub mod flags {
     pub const HAS_TTL: u8 = 0x02;
     /// Value lives in the vlog; klog holds an 8-byte offset.
     pub const HAS_VLOG: u8 = 0x04;
-    /// Sequence is delta-encoded from the previous entry.
-    pub const DELTA_SEQ: u8 = 0x08;
     /// Single-delete tombstone (set together with [`TOMBSTONE`]).
     pub const SINGLE_DELETE: u8 = 0x10;
+}
+
+/// Mask of every entry-flag bit this binary implements (`0x17`).
+///
+/// `0x08` is deliberately absent: it named a `DELTA_SEQ` encoding no writer
+/// ever produced, so it is reserved-unknown and the decoders reject it. Record
+/// extensibility comes from kinds, not from the remaining flag bits.
+pub const KNOWN_ENTRY_FLAGS: u8 =
+    flags::TOMBSTONE | flags::HAS_TTL | flags::HAS_VLOG | flags::SINGLE_DELETE;
+
+/// Build the flags byte of one entry, normalizing the two invariants the
+/// decoders enforce: a single-delete *is* a tombstone, and a tombstone never
+/// carries a vlog pointer (it has no value to separate).
+///
+/// Normalizing rather than trusting the caller is what makes strict decoding
+/// safe: [`RecordRef`](crate::wal::RecordRef) is public and `wal::append_batch`
+/// is exported, so `{ tombstone: false, single_delete: true }` is constructible
+/// outside the crate. Writing those bytes and then refusing to read them back
+/// would turn a caller's mistake into an unopenable database. Debug builds
+/// still trip [`debug_check_entry_flags`] at each encode site, so an internal
+/// bug is loud where being loud is free.
+pub fn normalized_entry_flags(
+    tombstone: bool,
+    single_delete: bool,
+    has_ttl: bool,
+    has_vlog: bool,
+) -> u8 {
+    let tombstone = tombstone || single_delete;
+    let mut fl = 0u8;
+    if tombstone {
+        fl |= flags::TOMBSTONE;
+    }
+    if single_delete {
+        fl |= flags::SINGLE_DELETE;
+    }
+    if has_ttl {
+        fl |= flags::HAS_TTL;
+    }
+    if has_vlog && !tombstone {
+        fl |= flags::HAS_VLOG;
+    }
+    fl
+}
+
+/// Debug-only guard for the invariants [`normalized_entry_flags`] repairs.
+#[inline]
+pub(crate) fn debug_check_entry_flags(tombstone: bool, single_delete: bool, has_vlog: bool) {
+    debug_assert!(
+        !single_delete || tombstone,
+        "SINGLE_DELETE without TOMBSTONE"
+    );
+    debug_assert!(!(tombstone && has_vlog), "TOMBSTONE with HAS_VLOG");
+}
+
+/// Reject an entry-flag byte this binary cannot honor.
+///
+/// Two classes, both `Corruption` (the bytes contradict a format this binary
+/// *does* implement, rather than naming one it does not):
+/// unknown bits outside [`KNOWN_ENTRY_FLAGS`], and combinations no writer can
+/// produce — `SINGLE_DELETE` without `TOMBSTONE`, `TOMBSTONE` with `HAS_VLOG`.
+pub fn check_entry_flags(fl: u8) -> crate::error::Result<()> {
+    if fl & !KNOWN_ENTRY_FLAGS != 0 {
+        return Err(crate::error::OndaError::Corruption(format!(
+            "entry flags {fl:#04x} outside known mask {KNOWN_ENTRY_FLAGS:#04x}"
+        )));
+    }
+    if fl & flags::SINGLE_DELETE != 0 && fl & flags::TOMBSTONE == 0 {
+        return Err(crate::error::OndaError::Corruption(
+            "entry flags: SINGLE_DELETE without TOMBSTONE".into(),
+        ));
+    }
+    if fl & flags::TOMBSTONE != 0 && fl & flags::HAS_VLOG != 0 {
+        return Err(crate::error::OndaError::Corruption(
+            "entry flags: TOMBSTONE with HAS_VLOG".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Width of the internal-key sequence trailer.

@@ -51,6 +51,13 @@ pub(crate) const FOOTER_RESTARTS: u8 = 0x04;
 /// compressed; `alg = None` stores it raw). Absent on legacy files, whose
 /// frames are `[crc32c u32 LE][raw value]`.
 pub(crate) const FOOTER_VLOG_V2: u8 = 0x08;
+/// Mask of every footer flag bit this binary implements (`0x0F`).
+///
+/// A file setting a bit outside this mask was written by a newer binary and
+/// names a feature we do not implement — [`OndaError::UnsupportedFormat`], not
+/// `Corruption`.
+pub(crate) const KNOWN_FOOTER_FLAGS: u8 =
+    FOOTER_HAS_BLOOM | FOOTER_BTREE | FOOTER_RESTARTS | FOOTER_VLOG_V2;
 /// Entries per restart interval written by default.
 pub(crate) const RESTART_INTERVAL: usize = 8;
 /// Default target data-block size used by low-level writers when their option
@@ -218,19 +225,11 @@ pub(crate) fn encode_entry(
     has_vlog: bool,
     vlog_off: u64,
 ) {
-    let mut fl = 0u8;
-    if tombstone {
-        fl |= flags::TOMBSTONE;
-    }
-    if single_delete {
-        fl |= flags::SINGLE_DELETE;
-    }
-    if ttl != 0 {
-        fl |= flags::HAS_TTL;
-    }
-    if has_vlog {
-        fl |= flags::HAS_VLOG;
-    }
+    crate::format::debug_check_entry_flags(tombstone, single_delete, has_vlog);
+    let fl = crate::format::normalized_entry_flags(tombstone, single_delete, ttl != 0, has_vlog);
+    // Normalization may have cleared HAS_VLOG (a tombstone has no separated
+    // value); the layout below must follow the byte that was actually written.
+    let has_vlog = fl & flags::HAS_VLOG != 0;
     dst.push(fl);
     append_uvarint(dst, user_key.len() as u64);
     append_uvarint(dst, value.len() as u64);
@@ -253,6 +252,7 @@ pub(crate) fn decode_entry(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> 
         return Err(corrupt());
     }
     let fl = raw[off];
+    crate::format::check_entry_flags(fl)?;
     let mut p = off + 1;
     let (klen, n) = uvarint(&raw[p..]).ok_or_else(corrupt)?;
     p += n;
@@ -267,7 +267,7 @@ pub(crate) fn decode_entry(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> 
         ttl = t;
     }
     let klen = klen as usize;
-    if p + klen > raw.len() {
+    if klen.checked_add(p).ok_or_else(corrupt)? > raw.len() {
         return Err(corrupt());
     }
     let key_start = p;
@@ -281,7 +281,7 @@ pub(crate) fn decode_entry(raw: &[u8], off: usize) -> Result<(DecEntry, usize)> 
         (p, vlen as usize, off, p + 8)
     } else {
         let vl = vlen as usize;
-        if p + vl > raw.len() {
+        if vl.checked_add(p).ok_or_else(corrupt)? > raw.len() {
             return Err(corrupt());
         }
         (p, vl, 0u64, p + vl)
@@ -315,4 +315,98 @@ pub(crate) fn cmp_internal(
 /// Encode a compression algorithm for the writer's data blocks.
 pub(crate) fn data_block_alg(opts_alg: Compression) -> Compression {
     opts_alg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::normalized_entry_flags;
+
+    /// `decode_entry` must be total over arbitrary bytes at arbitrary offsets:
+    /// a `Result`, never a panic. Seeded from the frozen klog corpus.
+    #[test]
+    fn fuzz_decode_entry_never_panics() {
+        let mut seeds: Vec<Vec<u8>> = Vec::new();
+        for name in [
+            "klog_legacy_flat_restarts_bloom.klog",
+            "klog_legacy_btree_norestarts_nobloom.klog",
+        ] {
+            seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
+        }
+        // A well-formed entry stream, so mutations start from valid framing.
+        let mut buf = Vec::new();
+        encode_entry(&mut buf, b"k1", b"v", 1, 0, false, false, false, 0);
+        encode_entry(&mut buf, b"k2", b"", 2, 0, true, true, false, 0);
+        encode_entry(&mut buf, b"k3", b"vvvv", 3, 1_700_000_000, false, false, true, 64);
+        seeds.push(buf);
+
+        let mut rng = crate::util::FuzzRng::new(0xD1B5_4A32_D192_ED03);
+        for seed in &seeds {
+            for _ in 0..2000 {
+                let case = crate::util::fuzz_mutate(&mut rng, seed);
+                let at = rng.below(case.len().max(1));
+                let _ = decode_entry(&case, at);
+                let _ = decode_entry(&case, 0);
+            }
+        }
+    }
+
+    /// Hand-build one data-block entry with an arbitrary flags byte.
+    fn raw_entry(fl: u8, key: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut b = vec![fl];
+        append_uvarint(&mut b, key.len() as u64);
+        append_uvarint(&mut b, tail.len() as u64);
+        append_uvarint(&mut b, 5);
+        b.extend_from_slice(key);
+        b.extend_from_slice(tail);
+        b
+    }
+
+    /// `0x08` once named a `DELTA_SEQ` encoding that no writer ever produced;
+    /// it is reserved-unknown and must fail closed.
+    #[test]
+    fn decode_entry_rejects_unknown_flag_bit() {
+        let raw = raw_entry(0x08, b"k", b"v");
+        let err = decode_entry(&raw, 0).expect_err("unknown flag bit must be rejected");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    /// `Writer::add` never separates a tombstone value, so this combination
+    /// cannot come from any writer.
+    #[test]
+    fn decode_entry_rejects_tombstone_with_vlog() {
+        let mut raw = raw_entry(flags::TOMBSTONE | flags::HAS_VLOG, b"k", b"");
+        append_u64(&mut raw, 0x1234);
+        let err = decode_entry(&raw, 0).expect_err("TOMBSTONE with HAS_VLOG must be rejected");
+        assert_eq!(err.kind(), "corruption");
+    }
+
+    /// `encode_entry` builds its flags byte through
+    /// `format::normalized_entry_flags`; the byte assertion goes there because
+    /// the encode site debug-asserts the invariant (twin below).
+    #[test]
+    fn sst_encode_never_sets_vlog_on_tombstone() {
+        assert_eq!(
+            normalized_entry_flags(true, false, false, true),
+            flags::TOMBSTONE
+        );
+        let mut buf = Vec::new();
+        encode_entry(&mut buf, b"k", b"v", 1, 0, false, false, true, 0x1234);
+        assert_eq!(buf[0], flags::HAS_VLOG);
+        // A tombstone written with a vlog pointer would be rejected by the
+        // strict decoder; the normalized entry stores its (empty) value inline.
+        let mut buf = Vec::new();
+        encode_entry(&mut buf, b"k", b"", 1, 0, true, true, false, 0);
+        assert_eq!(buf[0], flags::TOMBSTONE | flags::SINGLE_DELETE);
+        let (dec, next) = decode_entry(&buf, 0).unwrap();
+        assert!(dec.tombstone() && dec.single_delete() && !dec.has_vlog());
+        assert_eq!(next, buf.len());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "TOMBSTONE")]
+    fn sst_encode_debug_asserts_tombstone_has_no_vlog() {
+        encode_entry(&mut Vec::new(), b"k", b"v", 1, 0, true, false, true, 7);
+    }
 }
