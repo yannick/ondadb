@@ -1,0 +1,104 @@
+# ondaDB 1.2 slices 10-12 — delete-only excise: time to space reclaim
+
+host:    Apple M2 Max
+os:      Darwin 25.5.0
+rustc:   rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)
+commit:  41b4d84 + working tree (feature 1.2 slices 10-12)
+build:   cargo test --release --features unsafe-fastpath --test range_delete_bench \
+           -- --ignored --nocapture range_delete_excise_vs_compaction_reclaim
+date:    2026-08-30T20:14:23Z
+
+Workload (phase 5 of the `range-delete` harness, `tests/range_delete_bench.rs`):
+60,000 keys x 100-byte values, `target_file_size` 2 MiB, 2 compaction threads.
+One `delete_range` covering the whole key space, then the same fully-covering
+bulk delete reclaimed two ways:
+
+  A (excise)      delete_range -> flush -> DB::excise_covered until no covered
+                  table remains. No block is read and no byte is rewritten: one
+                  `RemoveTables` catalog edit plus N unlinks.
+  B (compaction)  delete_range -> flush -> DB::compact. The pre-1.2 path:
+                  merge-read every input, write the survivors. `run_manual`
+                  carries no excise pre-pass, and while it holds the whole-
+                  keyspace range lock a background pre-pass is vetoed.
+
+A leaves the fragment owner behind by design (dropping it would destroy the
+evidence that justified the drop), so the arms are compared on covered bytes
+reclaimed and on wall clock, not on reaching zero resident bytes.
+
+
+================================================================================
+RAW OUTPUT — 3 repetitions, each the median of RUNS=5 (15 samples per arm)
+================================================================================
+
+repetition 1
+== 5. time to space reclaim: excise vs compaction ==
+  excise          132.0 ms   reclaimed      7106748 B        53846 B/ms
+  compaction      200.3 ms   reclaimed      7106900 B        35476 B/ms
+  speedup (wall clock, same coverage): 1.5x
+test range_delete_excise_vs_compaction_reclaim ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 259.06s
+
+repetition 2
+== 5. time to space reclaim: excise vs compaction ==
+  excise          138.0 ms   reclaimed      7106748 B        51502 B/ms
+  compaction      229.1 ms   reclaimed      7106900 B        31019 B/ms
+  speedup (wall clock, same coverage): 1.7x
+test range_delete_excise_vs_compaction_reclaim ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 183.69s
+
+repetition 3
+== 5. time to space reclaim: excise vs compaction ==
+  excise           97.2 ms   reclaimed      7106748 B        73098 B/ms
+  compaction      192.6 ms   reclaimed      7106900 B        36892 B/ms
+  speedup (wall clock, same coverage): 2.0x
+test range_delete_excise_vs_compaction_reclaim ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 128.39s
+
+BENCH_EXIT=0
+
+summary (median of the three repetitions)
+  excise       132.0 ms    7,106,748 B reclaimed    53,846 B/ms
+  compaction   200.3 ms    7,106,900 B reclaimed    35,476 B/ms
+  speedup      1.5x wall clock (observed range 1.5x - 2.0x)
+
+
+================================================================================
+GATE DECISION
+================================================================================
+
+PASS — but on a narrower margin than the phase-1 range-delete numbers, and the
+reason is worth stating rather than glossing.
+
+1. Same coverage. Both arms reclaim the same 7.1 MB (152 bytes apart — the
+   fragment owner's own framing). This is not "excise reclaims less, faster";
+   it is the same space, freed two ways.
+
+2. Wall clock: 1.5x median, 1.5-2.0x across three repetitions. This machine is
+   thermally noisy (+/-15-20% run to run, `docs/performance.md`), and 1.5x sits
+   only modestly outside that band — which is why three repetitions are recorded
+   rather than one, and why the ratio is read same-run only. The direction is
+   consistent in all three: excise is faster in every repetition, never slower.
+
+3. Why the margin is modest at this size, honestly. Both timers start at
+   `delete_range` and therefore both include the tombstone commit and the
+   `flush_memtable` that publishes the fragment — work excise does not avoid and
+   cannot make cheaper. At 60k keys / 7 MB that shared prefix is a large share of
+   both numbers, so the ratio understates what excise actually removes. The part
+   that differs is B's merge: read every input block, decompress, merge, write
+   survivors, fsync. That term scales with the data volume; excise's term is one
+   catalog record plus N unlinks and scales with the *table count*. The measured
+   ratio is therefore a floor that grows with dataset size, and 7 MB is a small
+   dataset by design (the harness has to run in minutes).
+
+4. What is categorical rather than measured. Excise reads **zero** SSTable data
+   blocks and writes **zero** SSTable bytes for the reclaimed tables. That is a
+   structural property of the transaction (`RemoveTables` edit -> publish ->
+   `remove_sst_file`), not a benchmark result, and it is what makes the feature
+   worth having on a cold or IO-bound tier where B's merge would be paid in
+   real IO rather than in page cache. This bench runs entirely warm, which is
+   the least favourable configuration for the claim.
+
+DECISION: ship. The measured wall-clock win is real and consistently signed, the
+byte-level claim is categorical, and no arm regressed. Not claimed: any specific
+multiple. If a future change needs a headline number, re-run at a dataset large
+enough that the shared flush prefix stops dominating.

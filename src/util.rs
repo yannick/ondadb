@@ -40,13 +40,20 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 pub mod fault {
     use std::cell::Cell;
 
-    /// The four calls whose failure the crash matrix distinguishes.
+    /// The calls whose failure the crash matrix distinguishes.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Call {
         Write,
         Flush,
         Sync,
         Rename,
+        /// Retirement of an obsolete SSTable file
+        /// (`DbInner::remove_sst_file`). Unlike the four above this does not
+        /// surface an error anywhere — the unlink is best-effort by design —
+        /// so the injection simply **skips** it, which is precisely the state a
+        /// crash between the durable catalog edit and the unlink leaves behind
+        /// (`excise_crash_before_unlink`).
+        Unlink,
     }
 
     thread_local! {

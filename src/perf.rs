@@ -57,6 +57,19 @@ pub struct PerfContext {
     /// Zero for a batch whose keys all land in different blocks, and zero for
     /// every non-batched read.
     pub multiget_blocks_deduped: u64,
+    /// Range-delete sources this operation consulted (1.2): one per memtable,
+    /// sealed memtable, unified store and SSTable whose fragments could cover a
+    /// key the operation touched.
+    ///
+    /// Zero for every column family that never issued a `delete_range` — the
+    /// gate is one comparison against `range_count == 0` per source, and a
+    /// source that is skipped is not counted. A number far above
+    /// `sstable_probes` is the signal that fragments have accumulated and want
+    /// a compaction to merge them.
+    pub range_sources: u64,
+    /// Keys this operation found deleted by a covering range tombstone rather
+    /// than by a point tombstone or by absence.
+    pub range_masked: u64,
 }
 
 impl PerfContext {
@@ -80,6 +93,8 @@ impl PerfContext {
             iterator_seeks: 0,
             iterator_steps: 0,
             multiget_blocks_deduped: 0,
+            range_sources: 0,
+            range_masked: 0,
         }
     }
 }

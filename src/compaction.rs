@@ -55,7 +55,9 @@
 //! (default 1, off) lets such a job partition its user-key range into half-open
 //! **spans** ([`plan_spans`]), merge them concurrently ([`run_span`] per span,
 //! span 0 inline on the coordinator's thread), and install every output with
-//! ONE `install_compaction_outputs` and one `persist_manifest`.
+//! ONE `install_compaction_outputs` inside one `DbInner::catalog_txn` —
+//! the catalog commit point since 2.2, whose edit-record fsync is what
+//! obsolete-input deletion keys off (AGENTS.md invariant 1).
 //!
 //! The split is invisible to a reader. Boundaries are user keys and spans are
 //! half-open, so every version of one user key lands in exactly one span, which
@@ -140,6 +142,12 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
         return run_fifo(db, cf);
     }
+    // The excise pre-pass (1.2), ahead of any capacity work: a table every one
+    // of whose keys a durable range tombstone already deletes is free to drop,
+    // and rewriting it first would be paying to move bytes that are about to be
+    // unlinked. One relaxed capability load for a family that never issued a
+    // range delete.
+    crate::excise::pre_pass(db, cf)?;
     while let Some((job, guard)) = pick_compaction(db, cf) {
         cf.compacting
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1964,7 +1972,16 @@ fn rollback_compaction_outputs(
     }
 }
 
-fn remove_compaction_inputs(db: &DbInner, cf: &ColumnFamily, inputs: &[Arc<SstHandle>]) {
+/// Retire tables the catalog no longer references: drop their cached
+/// descriptors, then hand both file halves to [`DbInner::remove_sst_file`]
+/// (invariant 6 — defer-aware, so a checkpoint in progress keeps the bytes, and
+/// paced when 0.6-B pacing is configured).
+///
+/// Called after publication, by compaction with its inputs and by delete-only
+/// excise (1.2) with the tables it dropped. Default-tier paths only, exactly as
+/// compaction's input removal has always been (AGENTS.md); excise refuses a
+/// non-default-tier candidate for that reason.
+pub(crate) fn retire_tables(db: &DbInner, cf: &ColumnFamily, inputs: &[Arc<SstHandle>]) {
     for table in inputs {
         table.close();
         db.remove_sst_file(&cf.klog_path(table.meta.id), table.meta.klog_size);
@@ -2107,7 +2124,7 @@ fn compact_inputs_inner(
         return Err(error);
     }
     // Step 5: obsolete inputs are retired only after the edit's fsync.
-    remove_compaction_inputs(db, cf, &inputs);
+    retire_tables(db, cf, &inputs);
     Ok(())
 }
 
@@ -3734,7 +3751,7 @@ mod tests {
         }
     }
 
-    /// A `persist_manifest` failure after a successful multi-span merge rolls
+    /// A catalog-transaction failure after a successful multi-span merge rolls
     /// the in-memory install back — the manifest still names the inputs, so the
     /// level set has to name them too — and removes the outputs it wrote.
     #[test]

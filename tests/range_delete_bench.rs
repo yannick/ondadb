@@ -23,6 +23,8 @@
 //!    it.
 //! 4. **Time to space reclaim** — how long a bulk delete takes to actually free
 //!    the bytes.
+//! 5. **Excise vs compaction** (slices 10-12) — the same fully-covering bulk
+//!    delete reclaimed by catalog edit and by rewrite, wall clock and bytes.
 //!
 //! This machine is thermally noisy (±15–20% run to run; see
 //! `docs/performance.md`), so every figure below is the median of `RUNS`
@@ -343,4 +345,93 @@ fn range_delete_time_to_space_reclaim() {
         median(point),
         median(range),
     );
+}
+
+// ---- 5. time to space reclaim: excise vs compaction (1.2 slices 10-12) ------
+
+/// The same fully-covering bulk delete reclaimed two ways.
+///
+/// **A (excise)** publishes the tombstone and then retires every fully shadowed
+/// table by catalog edit — no block is read, no byte is rewritten, and the work
+/// is one `RemoveTables` record plus N unlinks.
+///
+/// **B (compaction)** is the pre-1.2 path: the same tombstone, reclaimed by
+/// `DB::compact`, which merge-reads every input and writes the survivors.
+/// `run_manual` carries no excise pre-pass, and while it holds the whole-keyspace
+/// range lock a background pre-pass is vetoed — so B measures compaction. If the
+/// background worker nonetheless wins the race between the flush and the
+/// `compact` call, it makes B *faster*, which understates A's margin rather than
+/// inflating it.
+///
+/// A leaves the fragment owner behind by design (dropping it would destroy the
+/// evidence), so the arms are compared on **covered bytes reclaimed per
+/// millisecond**, not on reaching zero.
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+fn range_delete_excise_vs_compaction_reclaim() {
+    println!("\n== 5. time to space reclaim: excise vs compaction ==");
+    let mut excise_ms = Vec::new();
+    let mut compact_ms = Vec::new();
+    let mut excise_bytes = Vec::new();
+    let mut compact_bytes = Vec::new();
+
+    for _ in 0..RUNS {
+        // A: excise.
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = open(dir.path(), true);
+        fill(&db, &cf, KEYS);
+        let before = resident_bytes(&cf);
+        let t = Instant::now();
+        db.delete_range(&cf, &key(0), b"l").unwrap();
+        db.flush_memtable(&cf).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let n = db.excise_covered(&cf).unwrap();
+            let left = cf
+                .table_metadata()
+                .into_iter()
+                .flatten()
+                .filter(|m| m.range_count == 0)
+                .count();
+            if left == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "excise never converged");
+            if n == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        excise_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        excise_bytes.push((before - resident_bytes(&cf)) as f64);
+        db.close().unwrap();
+
+        // B: compaction.
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = open(dir.path(), true);
+        fill(&db, &cf, KEYS);
+        let before = resident_bytes(&cf);
+        let t = Instant::now();
+        db.delete_range(&cf, &key(0), b"l").unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        compact_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        compact_bytes.push((before - resident_bytes(&cf)) as f64);
+        db.close().unwrap();
+    }
+
+    let (a_ms, b_ms) = (median(excise_ms), median(compact_ms));
+    let (a_by, b_by) = (median(excise_bytes), median(compact_bytes));
+    println!(
+        "  excise      {:>9.1} ms   reclaimed {:>12.0} B   {:>10.0} B/ms",
+        a_ms,
+        a_by,
+        a_by / a_ms.max(f64::MIN_POSITIVE)
+    );
+    println!(
+        "  compaction  {:>9.1} ms   reclaimed {:>12.0} B   {:>10.0} B/ms",
+        b_ms,
+        b_by,
+        b_by / b_ms.max(f64::MIN_POSITIVE)
+    );
+    println!("  speedup (wall clock, same coverage): {:.1}x", b_ms / a_ms);
 }

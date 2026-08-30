@@ -48,6 +48,7 @@ pub mod config;
 pub mod db;
 pub mod encoding;
 pub mod error;
+pub(crate) mod excise;
 pub mod format;
 pub mod ingest;
 pub mod ioctrl;

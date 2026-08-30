@@ -405,6 +405,31 @@ pub struct DbInner {
     /// DB has opened (per-CF, unified, and post-rotation). Observability/test
     /// hook (see [`DB::wal_sync_count`]); relaxed increments on an fsync-bound path.
     pub(crate) wal_syncs: Arc<AtomicU64>,
+
+    /// Part operations (detach / attach / freeze / export / tier move) currently
+    /// running anywhere in this database (1.2).
+    ///
+    /// Those operations move, hard-link and re-catalogue files in phases that
+    /// their own range lock does not span end-to-end — `attach_part` copies
+    /// bytes before it knows which range it will claim, and a tier move flips a
+    /// manifest entry after its files have already been relocated. Delete-only
+    /// excise is opportunistic, so it simply declines to run while any of that
+    /// is in flight rather than reason about the interleavings.
+    parts_in_flight: AtomicU64,
+}
+
+/// Marks a part operation in flight for the lifetime of the guard, so
+/// [`crate::excise`] declines to run beside it. See
+/// [`DbInner::parts_in_flight`].
+#[derive(Debug)]
+pub(crate) struct PartsOpGuard<'a> {
+    inner: &'a DbInner,
+}
+
+impl Drop for PartsOpGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.parts_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Test-only rendezvous **inside** the `commit_mu` critical section (1.2).
@@ -1189,6 +1214,18 @@ impl DbInner {
         self.cancel_background_io();
     }
 
+    /// Mark a part operation in flight until the returned guard drops. See
+    /// [`parts_in_flight`](Self::parts_in_flight).
+    pub(crate) fn begin_parts_op(&self) -> PartsOpGuard<'_> {
+        self.parts_in_flight.fetch_add(1, Ordering::SeqCst);
+        PartsOpGuard { inner: self }
+    }
+
+    /// Whether any part operation is currently running.
+    pub(crate) fn parts_in_flight(&self) -> bool {
+        self.parts_in_flight.load(Ordering::SeqCst) > 0
+    }
+
     /// Retire an obsolete SSTable file, or defer it if deletions are paused (a
     /// checkpoint/backup is copying a consistent file set). Compaction, FIFO
     /// eviction and the part mover route all input-file removals through here.
@@ -1198,6 +1235,13 @@ impl DbInner {
     /// is charged when pacing is on. Unpaced (the default) it is ignored and
     /// the file is unlinked right here, on the caller's thread.
     pub(crate) fn remove_sst_file(&self, path: &str, bytes: u64) {
+        // Crash simulation only (`util::fault::Call::Unlink`): leave the file
+        // where it is, which is exactly the orphan a crash between the durable
+        // catalog edit and this unlink produces. Free — and gone entirely from
+        // release builds' behaviour — when no plan is installed.
+        if crate::util::fault::check(crate::util::fault::Call::Unlink).is_err() {
+            return;
+        }
         let task = DeleteTask {
             path: path.to_string(),
             bytes: bytes.max(DELETE_METADATA_BYTES),
@@ -1549,6 +1593,7 @@ fn build_db_inner(
         poison,
         clock,
         wal_syncs,
+        parts_in_flight: AtomicU64::new(0),
     });
     inner.observe_seq(unified_max_seq);
     Ok((
@@ -2421,8 +2466,19 @@ fn spawn_workers(
     *inner.workers.lock() = handles;
 }
 
-fn should_schedule_compaction(closing: bool, fifo: bool, l0_len: usize, trigger: usize) -> bool {
-    !closing && (fifo || l0_len >= trigger)
+/// `excised` is the 1.2 arm: a flush that published range-delete fragments has
+/// just made whole tables droppable by catalog edit alone, and that work is
+/// worth waking the worker for even with L0 nowhere near its trigger — a bulk
+/// delete followed by an idle database is exactly the case excise exists for,
+/// and it produces no capacity pressure of its own.
+fn should_schedule_compaction(
+    closing: bool,
+    fifo: bool,
+    l0_len: usize,
+    trigger: usize,
+    ranges: bool,
+) -> bool {
+    !closing && (fifo || ranges || l0_len >= trigger)
 }
 
 fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
@@ -2433,6 +2489,7 @@ fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
         fifo,
         cf.l0_len(),
         cf.opts.l1_file_count_trigger as usize,
+        cf.has_range_fragments(),
     ) {
         let _ = db.ctx.compact_tx.send(cf.clone());
     }
@@ -3495,10 +3552,13 @@ mod tests {
 
     #[test]
     fn flush_compaction_schedule_respects_style_trigger_and_close() {
-        assert!(should_schedule_compaction(false, true, 0, 4));
-        assert!(!should_schedule_compaction(false, false, 3, 4));
-        assert!(should_schedule_compaction(false, false, 4, 4));
-        assert!(!should_schedule_compaction(true, true, 8, 4));
+        assert!(should_schedule_compaction(false, true, 0, 4, false));
+        assert!(!should_schedule_compaction(false, false, 3, 4, false));
+        // A flush that published fragments wakes the worker for the excise
+        // pre-pass even with L0 below its trigger (1.2).
+        assert!(should_schedule_compaction(false, false, 3, 4, true));
+        assert!(should_schedule_compaction(false, false, 4, 4, false));
+        assert!(!should_schedule_compaction(true, true, 8, 4, true));
     }
 
     #[test]

@@ -496,12 +496,16 @@ impl Iterator {
         let mut mask = std::mem::take(&mut self.mask);
         let covering = mask.covering_seq(&self.m.cmp, self.key(), self.read_seq);
         self.mask = mask;
-        match covering {
+        let hidden = match covering {
             // Strictly greater: a point version written after the tombstone is
             // visible again, exactly as it would be after a point tombstone.
             Some(seq) => seq > visible.seq,
             None => false,
+        };
+        if hidden {
+            crate::perf::bump(|p| p.range_masked += 1);
         }
+        hidden
     }
 
     /// Is the current group key past the declared upper bound (forward

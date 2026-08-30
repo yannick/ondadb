@@ -22,11 +22,14 @@
 //! scan in flight is unaffected — this is the same property compaction already
 //! relies on when it unlinks input files out from under open iterators.
 //!
-//! All manifest-touching steps go through [`DbInner::persist_manifest`], which
-//! rewrites the whole manifest atomically (temp file + fsync + rename), so the
-//! removal/insertion of a part's table ids is a single crash-atomic record. The
-//! manifest is the source of truth: a crash mid-operation can only leave orphan
-//! files, never route a reader to a file that is not durably in place.
+//! All manifest-touching steps go through [`DbInner::catalog_txn`], whose
+//! append-and-fsync of one `VersionEdit` to `MANIFEST-EDITS` is the commit
+//! point (2.2; before it, the commit point was the whole-manifest rewrite
+//! `DbInner::persist_manifest` still performs when `CAP_MANIFEST_EDITS` is
+//! off). Either way the removal/insertion of a part's table ids is a single
+//! crash-atomic record. The catalog is the source of truth: a crash
+//! mid-operation can only leave orphan files, never route a reader to a file
+//! that is not durably in place.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -37,26 +40,41 @@ use crate::db::DB;
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, SstMeta, WalLayout};
 
-/// Refuse a table that carries range-tombstone fragments (1.2).
+/// Adopt an incoming table's range-tombstone summary (1.2, slice 11).
 ///
-/// Both attach paths rebuild `SstMeta` from the reader, so an incoming table's
-/// range summary would decode as "no fragments" while its aux section still
-/// held them — and the read path gates on `range_count`, so the tombstones
-/// would be silently invisible and the data they hide would resurrect.
-/// Validating and adopting a foreign range section is its own change (feature
-/// 1.2, slice 11); until then the only safe answer is to say no.
-fn reject_range_fragments(reader: &crate::sst::Reader, name: &str) -> Result<()> {
-    if reader.range_fragments().is_empty() {
-        return Ok(());
-    }
-    Err(OndaError::InvalidArgs(format!(
-        "attach rejected: table {name} carries {} range-delete fragment(s);          attaching a table with range tombstones is not supported in this          release (its summary cannot be re-derived, and an unrecorded fragment          would silently stop masking)",
-        reader.range_fragments().len()
-    )))
+/// Both attach paths rebuild `SstMeta` from the reader rather than trusting a
+/// foreign catalog, so the five `range_*` fields have to be re-derived from the
+/// aux section the reader already decoded and CRC-verified. Getting this wrong
+/// is silent: the read path gates on `range_count == 0`, so a summary that said
+/// "no fragments" over a table that has them would stop the tombstones masking
+/// and resurrect the data they hide. `summarize` is the same function
+/// `Writer::finish` uses, so the derived summary is the one the exporter wrote.
+///
+/// Sequence lineage is checked by the caller exactly as it is for points: a
+/// fragment sequence above this database's visible watermark is foreign
+/// lineage, and `Reader::max_seq` covers fragments as well as entries.
+fn adopt_range_summary(reader: &crate::sst::Reader, meta: &mut SstMeta) {
+    let range = crate::range_tombstone::summarize(reader.range_fragments());
+    meta.range_count = range.count;
+    meta.range_min_seq = range.min_seq;
+    meta.range_max_seq = range.max_seq;
+    meta.range_min_key = range.min_key;
+    meta.range_max_key = range.max_key;
 }
+
 use crate::range_lock::{KeyRange, RangeGuard};
 use crate::sst::vlog_path_for;
 
+/// Does an incoming table's **span** overlap one already staged for the bottom
+/// level?
+///
+/// Span, not point bounds: since 1.2 a table's fragments may reach past its
+/// last point key (they are clipped to the *output interval*, which extends
+/// into the gap before the next table's first key). Two bottom-level tables
+/// whose spans overlap would break the level->=1 disjointness the read path's
+/// binary search and gap-owner rule depend on, so such a pair goes to L0, where
+/// overlap is legal. The 0.8.2 check compared `min_key`/`max_key` only, which
+/// was exact while every table was point-only.
 fn staged_range_overlaps(
     cf: &ColumnFamily,
     staged_bottom: &[(Vec<u8>, Vec<u8>)],
@@ -67,6 +85,20 @@ fn staged_range_overlaps(
     staged_bottom.iter().any(|(staged_min, staged_max)| {
         cmp.compare(min_key, staged_max).is_le() && cmp.compare(staged_min, max_key).is_le()
     })
+}
+
+/// [`lock_partition_span`] generalized to an explicit key span, and made
+/// non-blocking (1.2).
+///
+/// The partition variant below re-derives its span under the lock because a
+/// compaction can widen a partition's extent; a caller that already knows the
+/// exact keys it means — delete-only excise, which names table bounds — has
+/// nothing to re-derive and only needs the same exclusion against compaction
+/// and the part operations. `None` means an overlapping holder has it: excise
+/// treats that as a veto rather than queueing behind a rewrite that may well
+/// delete the same bytes itself.
+pub(crate) fn try_lock_key_span(cf: &Arc<ColumnFamily>, range: KeyRange) -> Option<RangeGuard> {
+    cf.range_locks.try_acquire(range)
 }
 
 /// Lock the key span covering `partition`'s bottom-level tables, so compaction
@@ -319,6 +351,7 @@ impl DB {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.inner.poison.check()?;
+        let _parts_op = self.inner.begin_parts_op();
         // Serialize against compaction so the bottom level cannot be rewritten
         // out from under us between snapshot and removal. Scoped to this
         // partition's span, so compaction elsewhere in the CF continues.
@@ -411,6 +444,7 @@ impl DB {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.inner.poison.check()?;
+        let _parts_op = self.inner.begin_parts_op();
         // Whole keyspace: the incoming tables' extent is not known until the
         // directory has been read and validated, and the `bottom_overlaps`
         // placement decision below has to be stable against compaction. An
@@ -459,7 +493,6 @@ impl DB {
                     ..Default::default()
                 };
                 let reader = cf.open_reader_for(&meta)?;
-                reject_range_fragments(&reader, &src_klog)?;
                 if reader.max_seq() > visible {
                     return Err(OndaError::InvalidArgs(format!(
                         "attach rejected: table max_seq {} exceeds visible sequence {} \
@@ -469,12 +502,20 @@ impl DB {
                     )));
                 }
 
-                let min_key = reader.min_key().to_vec();
-                let max_key = reader.max_key().to_vec();
-                let at_bottom = !cf.bottom_overlaps(&min_key, &max_key)
-                    && !staged_range_overlaps(cf, &staged_bottom, &min_key, &max_key);
+                // Re-derive the range summary and the point bounds before the
+                // placement decision: `span_min`/`span_max` read exactly those
+                // fields, and a bottom slot is only legal when the incoming SPAN
+                // is disjoint from every live and staged one.
+                adopt_range_summary(&reader, &mut meta);
+                meta.min_key = reader.min_key().to_vec();
+                meta.max_key = reader.max_key().to_vec();
+                let cmp = cf.cmp();
+                let (span_min, span_max) =
+                    (meta.span_min(&cmp).to_vec(), meta.span_max(&cmp).to_vec());
+                let at_bottom = !cf.bottom_overlaps(&span_min, &span_max)
+                    && !staged_range_overlaps(cf, &staged_bottom, &span_min, &span_max);
                 if at_bottom {
-                    staged_bottom.push((min_key.clone(), max_key.clone()));
+                    staged_bottom.push((span_min, span_max));
                 }
                 meta.level = if at_bottom {
                     cf.bottom_level_index() as u32
@@ -485,8 +526,6 @@ impl DB {
                 meta.max_seq = reader.max_seq();
                 meta.klog_size = file_len(&dst_klog);
                 meta.vlog_size = if has_vlog { file_len(&dst_vlog) } else { 0 };
-                meta.min_key = min_key;
-                meta.max_key = max_key;
                 // A bottom part is partition-clean, so its tag is recoverable
                 // from any key it holds — resolved through the CF's scheme so a
                 // derived partitioner tags attached parts the same way
@@ -587,6 +626,7 @@ impl DB {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.inner.poison.check()?;
+        let _parts_op = self.inner.begin_parts_op();
         let is_shared = self
             .inner
             .opts
@@ -626,7 +666,7 @@ impl DB {
             // Opens through the tier's backend and CRC-verifies footer,
             // index and bloom — the same validation every reader open does.
             let reader = cf.open_reader_for(&meta)?;
-            reject_range_fragments(&reader, t.object.as_deref().unwrap_or("<unnamed>"))?;
+            adopt_range_summary(&reader, &mut meta);
             if reader.num_entries() != t.num_entries
                 || reader.max_seq() != t.max_seq
                 || reader.min_key() != t.min_key.as_slice()
@@ -643,10 +683,14 @@ impl DB {
                     t.max_seq,
                 )));
             }
-            let at_bottom = !cf.bottom_overlaps(&t.min_key, &t.max_key)
-                && !staged_range_overlaps(cf, &staged_bottom, &t.min_key, &t.max_key);
+            meta.min_key = t.min_key.clone();
+            meta.max_key = t.max_key.clone();
+            let cmp = cf.cmp();
+            let (span_min, span_max) = (meta.span_min(&cmp).to_vec(), meta.span_max(&cmp).to_vec());
+            let at_bottom = !cf.bottom_overlaps(&span_min, &span_max)
+                && !staged_range_overlaps(cf, &staged_bottom, &span_min, &span_max);
             if at_bottom {
-                staged_bottom.push((t.min_key.clone(), t.max_key.clone()));
+                staged_bottom.push((span_min, span_max));
             }
             meta.level = if at_bottom {
                 cf.bottom_level_index() as u32
@@ -657,8 +701,6 @@ impl DB {
             meta.max_seq = t.max_seq;
             meta.klog_size = t.klog_size;
             meta.vlog_size = t.vlog_size;
-            meta.min_key = t.min_key.clone();
-            meta.max_key = t.max_key.clone();
             meta.partition = if at_bottom {
                 cf.partition_resolver_snapshot()?.name_of(&meta.min_key)
             } else {
@@ -724,6 +766,7 @@ impl DB {
     /// point rather than an oversight.
     pub fn export_part(&self, cf: &Arc<ColumnFamily>, partition: &str) -> Result<PartManifest> {
         self.inner.poison.check()?;
+        let _parts_op = self.inner.begin_parts_op();
         let _pause = self.inner.pause_deletions();
 
         let mut handles = cf.bottom_partition_handles(partition);
@@ -786,6 +829,7 @@ impl DB {
         dir: impl AsRef<Path>,
     ) -> Result<()> {
         self.inner.poison.check()?;
+        let _parts_op = self.inner.begin_parts_op();
         // Keep the part's files from being unlinked by a concurrent compaction
         // while we hard-link them (deferred deletion, same as checkpoint()).
         let _pause = self.inner.pause_deletions();
@@ -945,6 +989,7 @@ impl crate::db::DbInner {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
         self.poison.check()?;
+        let _parts_op = self.begin_parts_op();
         if !cf.tiers().is_known(Some(tier)) {
             return Err(OndaError::InvalidArgs(format!("unknown tier {tier:?}")));
         }

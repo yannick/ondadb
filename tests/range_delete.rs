@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ondadb::format::{CAP_EXTENDED_RECORDS, CAP_RANGE_DELETES};
+use ondadb::format::{CAP_EXTENDED_RECORDS, CAP_MANIFEST_EDITS, CAP_RANGE_DELETES};
 use ondadb::manifest::SstMeta;
 use ondadb::{
     ColumnFamily, ColumnFamilyConfig, IsolationLevel, OndaError, Options, PartitionRule, DB,
@@ -47,6 +47,19 @@ fn open_plain(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>) {
 /// handle is fetched rather than created.
 fn reopen(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>) {
     let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
+    let cf = db
+        .get_column_family("default")
+        .expect("default is catalogued");
+    (db, cf)
+}
+
+/// Reopen `dir` read-only. Excise returns early on a read-only handle, so this
+/// is how a test inspects a catalog without a background pre-pass changing it
+/// underneath the assertion.
+fn reopen_read_only(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>) {
+    let mut opts = Options::new(dir.to_str().unwrap());
+    opts.read_only = true;
+    let db = DB::open(opts).unwrap();
     let cf = db
         .get_column_family("default")
         .expect("default is catalogued");
@@ -1287,19 +1300,21 @@ fn flush_fragments_cut_at_partition_boundaries() {
     db.close().unwrap();
 }
 
-// ---- surfaces that must refuse rather than get it wrong ---------------------
+// ---- slice 11: surfaces ------------------------------------------------------
 
-/// Attaching a table that carries range fragments is refused.
+/// Detach and re-attach a part carrying range fragments: the summary is
+/// re-derived from the table's own aux section, so the tombstones keep masking.
 ///
-/// Both attach paths rebuild `SstMeta` from the reader, so an incoming table's
-/// range summary cannot be re-derived: its `range_count` would decode as zero
-/// while the file still held the fragments, and the read path — which gates on
-/// exactly that field — would stop masking. Validating and adopting a foreign
-/// range section is a later change; refusing is the half that is safe now.
+/// Both attach paths rebuild `SstMeta` from the reader rather than trusting a
+/// foreign catalog. Before slice 11 that meant a table's `range_count` came back
+/// as zero while the file still held its fragments, and the read path — which
+/// gates on exactly that field — stopped masking, resurrecting the deleted data;
+/// attaching such a table was refused outright. `adopt_range_summary` closes it
+/// by running the same `summarize` the writer used.
 #[test]
-fn attach_refuses_a_table_carrying_range_fragments() {
-    let src = tempfile::tempdir().unwrap();
-    let mut opts = Options::new(src.path().to_str().unwrap());
+fn attach_adopts_range_fragments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
     opts.num_compaction_threads = 1;
     let cfg = ColumnFamilyConfig {
         partition_rules: vec![part(b"p/", "p")],
@@ -1308,44 +1323,365 @@ fn attach_refuses_a_table_carrying_range_fragments() {
     let (db, cf) = open_with(opts, cfg);
     db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
 
+    let k = |i: u32| format!("p/{i:04}").into_bytes();
     for i in 0..200u32 {
-        let mut k = b"p/".to_vec();
-        k.extend_from_slice(format!("{i:04}").as_bytes());
-        db.put(&cf, &k, b"v", Duration::ZERO).unwrap();
+        db.put(&cf, &k(i), b"v", Duration::ZERO).unwrap();
     }
     db.flush_memtable(&cf).unwrap();
     // A snapshot taken before the delete keeps the fragment alive through the
-    // compaction that pushes everything to the bottom.
+    // compaction that pushes everything to the bottom — and keeps the excise
+    // pre-pass from reclaiming the covered table before the part is detached.
     let held = db.begin_with_isolation(IsolationLevel::Snapshot);
     db.delete_range(&cf, b"p/0050", b"p/0150").unwrap();
     db.flush_memtable(&cf).unwrap();
     db.compact(&cf).unwrap();
-    assert!(
-        total_fragments(&cf) > 0,
-        "the part must carry fragments for this test to mean anything"
-    );
+    let before = total_fragments(&cf);
+    assert!(before > 0, "the part must carry fragments to mean anything");
 
     let detached = db.detach_part(&cf, "p").unwrap();
     assert!(!detached.table_ids.is_empty(), "the part held tables");
-    let part_dir = detached.dir.clone();
+    assert_eq!(total_fragments(&cf), 0, "the detach took the fragments out");
+    assert!(
+        db.get(&cf, &k(10)).is_err(),
+        "a detached part's live keys are gone for new reads too"
+    );
+
+    db.attach_part(&cf, &detached.dir).unwrap();
+    assert_eq!(
+        total_fragments(&cf),
+        before,
+        "every fragment came back through the re-derived summary"
+    );
+    for i in 0..200u32 {
+        assert_eq!(
+            db.get(&cf, &k(i)).is_ok(),
+            !(50..150).contains(&i),
+            "p/{i:04} after re-attach"
+        );
+    }
+    drop(held);
+    db.close().unwrap();
+}
+
+/// A checkpoint links the klog whole — aux block included — and copies the
+/// catalog's `range_*` fields, so the copy masks exactly what the source did.
+#[test]
+fn checkpoint_preserves_range_masking() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_ranged(dir.path());
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let held = db.begin_with_isolation(IsolationLevel::Snapshot);
+    db.delete_range(&cf, &key(10), &key(30)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    assert!(total_fragments(&cf) > 0);
+
+    let copy = tempfile::tempdir().unwrap();
+    db.checkpoint(copy.path()).unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    db.backup(backup.path()).unwrap();
     drop(held);
     db.close().unwrap();
 
-    // Attach into a fresh database: refused, by name and by reason.
-    let dst = tempfile::tempdir().unwrap();
-    let (db2, cf2) = open_ranged(dst.path());
-    let e = db2
-        .attach_part(&cf2, &part_dir)
-        .expect_err("a part carrying range fragments must be refused");
-    assert_eq!(e.kind(), "invalid_args", "{e}");
-    assert!(
-        e.to_string().contains("range-delete fragment"),
-        "the error must say why: {e}"
+    for (what, at) in [("checkpoint", copy.path()), ("backup", backup.path())] {
+        let (db2, cf2) = reopen(at);
+        assert!(total_fragments(&cf2) > 0, "{what} kept the fragments");
+        for i in 0..40u32 {
+            assert_eq!(
+                db2.get(&cf2, &key(i)).is_ok(),
+                !(10..30).contains(&i),
+                "{what} k{i:04}"
+            );
+        }
+        db2.close().unwrap();
+    }
+}
+
+/// `clone_column_family` hard-links the same klogs under fresh ids and copies
+/// each `SstMeta` verbatim, so the clone masks what the source masked.
+#[test]
+fn clone_column_family_preserves_range_masking() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_ranged(dir.path());
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let held = db.begin_with_isolation(IsolationLevel::Snapshot);
+    db.delete_range(&cf, &key(10), &key(30)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let clone = db.clone_column_family("default", "copy").unwrap();
+    assert_eq!(
+        total_fragments(&clone),
+        total_fragments(&cf),
+        "the clone carries the same fragments"
     );
-    db2.close().unwrap();
+    for i in 0..40u32 {
+        assert_eq!(
+            db.get(&clone, &key(i)).is_ok(),
+            !(10..30).contains(&i),
+            "clone k{i:04}"
+        );
+    }
+    drop(held);
+    db.close().unwrap();
+}
+
+// ---- slice 10: delete-only excise -------------------------------------------
+
+/// Tables of `cf` carrying no fragments of their own — the excise candidates.
+fn covered_tables(cf: &Arc<ColumnFamily>) -> Vec<SstMeta> {
+    tables(cf)
+        .into_iter()
+        .filter(|m| m.range_count == 0)
+        .collect()
+}
+
+/// Build a database whose first table is fully shadowed by a durable fragment
+/// owned by a second table, then **close and reopen** it.
+///
+/// The reopen is what makes the fixture deterministic. Publishing the fragment
+/// wakes the compaction worker — that is the point of the 1.2 arm of
+/// `should_schedule_compaction` — so a test that wants to observe *which* actor
+/// reclaimed the table cannot leave that wakeup outstanding. A snapshot held
+/// across the build makes the pre-pass that wakeup triggers a no-op, and the
+/// reopened database's worker has never been signalled at all: two L0 files are
+/// nowhere near `l1_file_count_trigger`. Returns the covered table's bytes.
+fn covered_table_fixture(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>, u64) {
+    let mut opts = Options::new(dir.to_str().unwrap());
+    opts.num_compaction_threads = 1;
+    let (db, cf) = open_with(opts, ColumnFamilyConfig::default());
+    // The edit log too, so `catalog_txn` runs its 2.2 shape: the append's fsync
+    // is the commit point and nothing is published before it. Without the log
+    // the pre-capability path publishes first and a later snapshot write makes
+    // the removal durable anyway (`detach_part`'s precedent) — a consistent
+    // catalog either way, but not one whose commit point a test can pin.
+    db.enable_format_capabilities(CAP_RANGE_DELETES | CAP_MANIFEST_EDITS)
+        .unwrap();
+    // Taken before anything is written, so the floor sits below every sequence
+    // the build produces and no fragment can justify a drop while it lives.
+    let held = db.begin_with_isolation(IsolationLevel::Snapshot);
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    // Half-open and strictly past the table's inclusive max_key.
+    db.delete_range(&cf, &key(0), &key(40)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    db.close().unwrap();
+    drop(held);
+    drop(cf);
+    drop(db);
+
+    let (db, cf) = reopen(dir);
+    let covered = covered_tables(&cf);
+    assert_eq!(covered.len(), 1, "one fully covered point-only table");
+    let bytes = covered[0].klog_size + covered[0].vlog_size;
+    assert!(bytes > 0, "the covered table holds bytes to reclaim");
+    (db, cf, bytes)
+}
+
+#[test]
+fn excise_drops_fully_covered_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf, _) = covered_table_fixture(dir.path());
+    assert_eq!(db.excise_covered(&cf).unwrap(), 1);
+    assert!(covered_tables(&cf).is_empty(), "the catalog lost it");
+    // The answer is unchanged: the fragment that justified the drop is still
+    // there, and every key still reads as deleted.
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04}");
+    }
+    assert!(total_fragments(&cf) > 0, "the owner survived");
+    db.close().unwrap();
+
+    let (db, cf) = reopen(dir.path());
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04} after reopen");
+    }
+    db.close().unwrap();
+}
+
+/// The stats an operator watches: a table reclaimed with no read and no
+/// rewrite is counted apart from compaction.
+#[test]
+fn excise_counts_reclaimed_tables_and_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf, bytes) = covered_table_fixture(dir.path());
+    assert_eq!(db.excise_covered(&cf).unwrap(), 1);
+    let stats = cf.stats();
+    assert_eq!(stats.excised_tables, 1, "one table retired by catalog edit");
+    assert_eq!(stats.excised_bytes, bytes, "and the bytes it held");
+    db.close().unwrap();
+}
+
+/// A live snapshot below the tombstone's sequence is a veto: the reader can
+/// still see the data the fragment deletes.
+#[test]
+fn excise_refuses_under_a_live_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.num_compaction_threads = 1;
+    let (db, cf) = open_with(opts, ColumnFamilyConfig::default());
+    db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let held = db.begin_with_isolation(IsolationLevel::Snapshot);
+    db.delete_range(&cf, &key(0), &key(40)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    assert_eq!(db.excise_covered(&cf).unwrap(), 0, "the snapshot vetoes it");
+    assert_eq!(covered_tables(&cf).len(), 1, "the covered table stays");
+    drop(held);
+    assert_eq!(db.excise_covered(&cf).unwrap(), 1, "and goes once it lifts");
+    db.close().unwrap();
+}
+
+/// Never drop the only durable owner of the tombstone that justifies the drop.
+#[test]
+fn excise_refuses_when_table_owns_its_own_covering_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.num_compaction_threads = 1;
+    let (db, cf) = open_with(opts, ColumnFamilyConfig::default());
+    db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
+    // Points and the covering span in ONE memtable, so one table carries both.
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.delete_range(&cf, &key(0), &key(40)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    assert_eq!(tables(&cf).len(), 1, "one table holding both kinds");
+
+    assert_eq!(db.excise_covered(&cf).unwrap(), 0);
+    assert_eq!(
+        tables(&cf).len(),
+        1,
+        "dropping it would destroy the evidence"
+    );
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04} still deleted");
+    }
+    db.close().unwrap();
+}
+
+/// The contiguous-set rule: two tables each owning part of the union that
+/// covers the other. Dropping the set would destroy exactly the fragments that
+/// justified dropping it, so the set is refused.
+#[test]
+fn excise_refuses_contiguous_set_owning_its_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.num_compaction_threads = 1;
+    let (db, cf) = open_with(opts, ColumnFamilyConfig::default());
+    db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
+    // Table 1 holds k0000..k0019 and the span covering k0020..k0039;
+    // table 2 holds k0020..k0039 and the span covering k0000..k0019.
+    for i in 0..20u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.delete_range(&cf, &key(20), &key(40)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    for i in 20..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.delete_range(&cf, &key(0), &key(20)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    assert_eq!(tables(&cf).len(), 2);
+
+    assert_eq!(db.excise_covered(&cf).unwrap(), 0);
+    assert_eq!(tables(&cf).len(), 2, "neither member may go");
+    db.close().unwrap();
+}
+
+/// A shared tier is a delete-free publication other databases may reference,
+/// and obsolete-file deletion resolves default-tier paths only — so a table
+/// that has left the default tier is never excised, however dead its keys are.
+#[test]
+fn excise_refuses_shared_tier_table() {
+    for shared in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = tempfile::tempdir().unwrap();
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        let def = ondadb::TierDef::new("cold", tier.path().to_str().unwrap());
+        opts.tiers = vec![if shared { def.shared() } else { def }];
+        opts.num_compaction_threads = 1;
+        let cfg = ColumnFamilyConfig {
+            partition_rules: vec![part(b"k", "all")],
+            ..Default::default()
+        };
+        let (db, cf) = open_with(opts, cfg);
+        db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
+        for i in 0..40u32 {
+            db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        db.move_part_to_tier(&cf, "all", "cold").unwrap();
+        assert!(
+            tables(&cf)
+                .iter()
+                .all(|m| m.tier.as_deref() == Some("cold")),
+            "shared={shared}: the part moved"
+        );
+        db.delete_range(&cf, &key(0), &key(40)).unwrap();
+        db.flush_memtable(&cf).unwrap();
+
+        assert_eq!(
+            db.excise_covered(&cf).unwrap(),
+            0,
+            "shared={shared}: an off-default-tier table is never excised"
+        );
+        assert_eq!(
+            tables(&cf)
+                .iter()
+                .filter(|m| m.tier.as_deref() == Some("cold"))
+                .count(),
+            1,
+            "shared={shared}: the tiered table stays catalogued"
+        );
+        db.close().unwrap();
+    }
+}
+
+/// The picker's pre-pass reclaims a covered table without an operator call.
+#[test]
+fn excise_runs_as_a_picker_pre_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.num_compaction_threads = 1;
+    let (db, cf) = open_with(opts, ColumnFamilyConfig::default());
+    db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.delete_range(&cf, &key(0), &key(40)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+    // Built without a snapshot hold, unlike `covered_table_fixture`: the flush
+    // that published the fragment signalled the compaction worker, and the
+    // pre-pass runs ahead of its capacity scoring.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !covered_tables(&cf).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pre-pass never reclaimed the covered table"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04}");
+    }
+    db.close().unwrap();
 }
 
 // ---- failure matrix ---------------------------------------------------------
+
 //
 // The `LOCK` file makes in-process crash simulation impossible by design: a
 // handle that is `forget`ten keeps the directory locked, so a reopen in the
@@ -1458,5 +1794,217 @@ fn range_compact_crash() {
 
     let (db, cf) = reopen(dir.path());
     assert_eq!(scan_forward(&db, &cf), before, "after reopen");
+    db.close().unwrap();
+}
+
+// ---- excise failure matrix --------------------------------------------------
+
+const EXCISE_CRASH_DIR_ENV: &str = "ONDA_EXCISE_CRASH_DIR";
+const EXCISE_CRASH_WHERE_ENV: &str = "ONDA_EXCISE_CRASH_WHERE";
+
+/// Not a real test: the child half of the excise crash simulations. A no-op
+/// unless the environment variables are set, so a normal suite run pays
+/// nothing. `WHERE` selects which side of the catalog edit the crash lands on.
+#[test]
+fn excise_crash_helper() {
+    let Ok(dir) = std::env::var(EXCISE_CRASH_DIR_ENV) else {
+        return;
+    };
+    let where_ = std::env::var(EXCISE_CRASH_WHERE_ENV).unwrap_or_default();
+    let (db, cf, _) = covered_table_fixture(std::path::Path::new(&dir));
+    match where_.as_str() {
+        // The catalog edit is durable, the file is not yet unlinked: an
+        // uncatalogued table left on disk, which the default-tier orphan sweep
+        // collects on the next open.
+        "unlink" => {
+            ondadb::util::fault::fail_nth(ondadb::util::fault::Call::Unlink, 1);
+            let dropped = db.excise_covered(&cf).unwrap();
+            ondadb::util::fault::clear();
+            assert_eq!(dropped, 1, "the catalog edit committed");
+        }
+        // The edit record's write fails: nothing is published, the database
+        // fail-stops, and a reopen sees the pre-excise catalog.
+        //
+        // `Write`, not `Sync`: a failed fsync says the bytes are not *durable*,
+        // not that they are absent — the record may already sit in the file,
+        // and recovery that finds a CRC-valid record is right to replay it. The
+        // write is the injection point at which "the catalog edit never
+        // happened" is a claim the filesystem actually supports.
+        "persist" => {
+            ondadb::util::fault::fail_nth(ondadb::util::fault::Call::Write, 1);
+            let failed = db.excise_covered(&cf);
+            ondadb::util::fault::clear();
+            assert!(failed.is_err(), "the injected write must fail the excise");
+        }
+        other => panic!("unknown crash point {other:?}"),
+    }
+    // Simulated crash: no close(), no Drop.
+    std::process::exit(0);
+}
+
+fn run_excise_crash(dir: &std::path::Path, where_: &str) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["excise_crash_helper", "--exact", "--nocapture"])
+        .env(EXCISE_CRASH_DIR_ENV, dir.to_str().unwrap())
+        .env(EXCISE_CRASH_WHERE_ENV, where_)
+        .status()
+        .expect("spawn the excise crash helper");
+    assert!(status.success(), "excise crash helper child failed");
+}
+
+/// Crash after the catalog edit, before the unlink: the table is on disk but
+/// out of the catalog. Reads are unaffected — the catalog is the source of
+/// truth — and the file is an orphan, never a route to stale data.
+#[test]
+fn excise_crash_before_unlink() {
+    let dir = tempfile::tempdir().unwrap();
+    run_excise_crash(dir.path(), "unlink");
+
+    let (db, cf) = reopen(dir.path());
+    assert_eq!(
+        covered_tables(&cf).len(),
+        0,
+        "the excised table stays out of the catalog across the crash"
+    );
+    assert!(total_fragments(&cf) > 0, "its covering fragment survived");
+    for i in 0..40u32 {
+        assert!(
+            db.get(&cf, &key(i)).is_err(),
+            "k{i:04} must not resurrect from the orphan"
+        );
+    }
+    db.close().unwrap();
+}
+
+/// Crash before the catalog edit is durable: the old catalog is what a reopen
+/// finds, the table is still there, and the tombstone still masks it.
+#[test]
+fn excise_crash_before_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    run_excise_crash(dir.path(), "persist");
+
+    let (db, cf) = reopen_read_only(dir.path());
+    assert_eq!(
+        covered_tables(&cf).len(),
+        1,
+        "the pre-excise catalog is what survived"
+    );
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04} still masked");
+    }
+    db.close().unwrap();
+
+    // And a writable reopen completes the excise the crash never committed —
+    // by the pre-pass or by the operator call, whichever gets there first.
+    let (db, cf) = reopen(dir.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !covered_tables(&cf).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reopened database never completed the excise"
+        );
+        let _ = db.excise_covered(&cf).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04} after the retry");
+    }
+    db.close().unwrap();
+}
+
+/// A failed catalog transaction **poisons** the database. The in-memory view
+/// was already the post-excise one when the edit's fsync failed, so there is
+/// nothing to leave untouched; restoring the handles would be a new capability
+/// with its own races. This is `detach_part`'s precedent, unchanged.
+#[test]
+fn excise_persist_fails_poisons() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf, _) = covered_table_fixture(dir.path());
+
+    ondadb::util::fault::fail_nth(ondadb::util::fault::Call::Write, 1);
+    let failed = db.excise_covered(&cf);
+    ondadb::util::fault::clear();
+    assert!(failed.is_err(), "the injected write must fail the excise");
+
+    // Fail-stopped: every subsequent write is refused, on this handle and for
+    // every column family.
+    let after = db.put(&cf, b"anything", b"v", Duration::ZERO);
+    assert!(after.is_err(), "a poisoned database accepts no writes");
+    assert!(
+        db.excise_covered(&cf).is_err(),
+        "and no further catalog transactions"
+    );
+
+    drop(cf);
+    drop(db);
+    // A reopen sees the pre-excise catalog. Read-only, because a writable
+    // reopen is entitled to run the pre-pass again and excise the table for
+    // real — which is correct, and would hide what is being asserted here.
+    let (db, cf) = reopen_read_only(dir.path());
+    assert_eq!(
+        covered_tables(&cf).len(),
+        1,
+        "the failed transaction published nothing durable"
+    );
+    for i in 0..40u32 {
+        assert!(db.get(&cf, &key(i)).is_err(), "k{i:04} still masked");
+    }
+    db.close().unwrap();
+}
+
+// ---- slice 12: PerfContext ---------------------------------------------------
+
+/// `range_sources` / `range_masked` answer "why was *this* read slow" for the
+/// 1.2 feature the way `bloom_probes` does for filters, and stay at zero for a
+/// family that never issued a range delete.
+#[test]
+fn perf_context_counts_range_sources_and_masked_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_ranged(dir.path());
+    for i in 0..40u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.delete_range(&cf, &key(10), &key(30)).unwrap();
+    db.flush_memtable(&cf).unwrap();
+
+    let scope = ondadb::perf::enter();
+    assert!(db.get(&cf, &key(20)).is_err(), "inside the span");
+    let masked = scope.finish();
+    assert!(
+        masked.range_sources > 0,
+        "the covering fragment's table was consulted"
+    );
+    assert_eq!(masked.range_masked, 1, "one key hidden by a range delete");
+
+    let scope = ondadb::perf::enter();
+    assert!(db.get(&cf, &key(5)).is_ok(), "outside the span");
+    let live = scope.finish();
+    assert!(live.range_sources > 0, "the sources were still consulted");
+    assert_eq!(live.range_masked, 0, "nothing was hidden");
+
+    // A scan counts one source per fragment list it materialized, and one
+    // `range_masked` per key it skipped.
+    let scope = ondadb::perf::enter();
+    let seen = scan_forward(&db, &cf).len();
+    let scan = scope.finish();
+    assert_eq!(seen, 20, "twenty keys survive the delete");
+    assert!(scan.range_sources > 0);
+    assert_eq!(scan.range_masked, 20, "twenty keys skipped");
+    db.close().unwrap();
+
+    // A family that never enabled range deletes pays nothing and reports zero.
+    let plain_dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_plain(plain_dir.path());
+    for i in 0..10u32 {
+        db.put(&cf, &key(i), b"v", Duration::ZERO).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    let scope = ondadb::perf::enter();
+    assert!(db.get(&cf, &key(5)).is_ok());
+    let _ = scan_forward(&db, &cf);
+    let none = scope.finish();
+    assert_eq!(none.range_sources, 0, "no source to consult");
+    assert_eq!(none.range_masked, 0);
     db.close().unwrap();
 }

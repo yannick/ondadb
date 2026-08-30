@@ -707,27 +707,13 @@ impl Writer {
         crate::util::sync_parent_dir(Path::new(&self.klog_path))?;
 
         self.finished = true;
-        let (range_min_key, range_max_key) =
-            match (self.range_fragments.first(), self.range_fragments.last()) {
-                (Some(first), Some(last)) => (Some(first.start.clone()), Some(last.end.clone())),
-                _ => (None, None),
-            };
+        let range = crate::range_tombstone::summarize(&self.range_fragments);
         Ok(FileMeta {
-            range_count: self.range_fragments.len() as u64,
-            range_min_seq: self
-                .range_fragments
-                .iter()
-                .map(|f| f.min_seq())
-                .min()
-                .unwrap_or(0),
-            range_max_seq: self
-                .range_fragments
-                .iter()
-                .map(|f| f.max_seq())
-                .max()
-                .unwrap_or(0),
-            range_min_key,
-            range_max_key,
+            range_count: range.count,
+            range_min_seq: range.min_seq,
+            range_max_seq: range.max_seq,
+            range_min_key: range.min_key,
+            range_max_key: range.max_key,
             id: 0,
             min_key: self.min_key.take().unwrap_or_default(),
             max_key: std::mem::take(&mut self.last_user_key),

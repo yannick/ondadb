@@ -110,7 +110,7 @@ the two unexamined candidates.
 | `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating` | gate checks, rotation drain |
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
 | `ColumnFamily::compact_mu` (Mutex) | whole-CF compaction operations | manual compaction sweep and FIFO eviction; acquired before the whole-keyspace range lock |
-| `ColumnFamily::range_locks` | key ranges being rewritten | bounded compaction jobs use non-blocking acquisition; attach takes the whole keyspace; detach and part moves block on the affected partition span, including copy + manifest flip |
+| `ColumnFamily::range_locks` | key ranges being rewritten | bounded compaction jobs use non-blocking acquisition; attach takes the whole keyspace; detach and part moves block on the affected partition span, including copy + manifest flip; delete-only excise (1.2) uses `parts::try_lock_key_span` — non-blocking over the union of its candidates' **span** bounds, held across revalidation, the catalog transaction and file retirement |
 | `ColumnFamily::live_partition_rules` (RwLock) | the live partition-rule set | one read acquisition to validate a candidate set, one write acquisition to append/remove it inside the transaction's publish step. Exclusion between concurrent duplicate adds comes from `cf_lifecycle_mu`, which spans both (exactly one wins) |
 | `Wal::qstate` / per-stripe file mutexes | group-commit queue / file appends | one frame write |
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
@@ -444,10 +444,52 @@ per-CF, then flips the manifest to unified before the first unified open accepts
 writes. A crash before the flip repeats legacy recovery; a crash after it opens
 the unified layout over already-durable SSTables.
 
+## Delete-only excise (`excise.rs`, 1.2)
+
+Excise removes catalogued tables without reading them, so its whole safety
+argument is about what it is allowed to observe and when. Ordering: plan over a
+level snapshot with no lock held → `parts::try_lock_key_span` over the union of
+the candidates' **span** bounds (`meta.span_min`/`span_max`, so a fragment
+reaching past a point bound is inside the lock) → **replan under that lock and
+drop to the intersection** → one `RemoveTables` edit through `catalog_txn` →
+`compaction::retire_tables`, which is `DbInner::remove_sst_file` per file half
+(invariant 6: defer-aware, so a checkpoint in progress keeps the bytes).
+
+The lock is taken non-blocking on purpose. An overlapping holder is a
+compaction or a part operation that may well rewrite or delete the same bytes
+itself, and excise is opportunistic: `Ok(0)` is a normal answer. The same is
+true of the `parts_in_flight` gate, of a foreign mount overlapping the
+candidate's span, and of a live snapshot below the tombstone's sequence.
+
+In-flight reads are unaffected for the reason compaction already relies on:
+they finish on the `Arc<SstHandle>`s and pinned blocks they already hold. Excise
+is therefore **not snapshot-consistent** in the same sense `detach_part` is not
+— but unlike `detach_part` it never changes an answer, because it only removes
+tables every one of whose keys a visible tombstone already deletes.
+
+A failed catalog transaction **fail-stops the database**. With the edit log on,
+nothing was published and a reopen reads the pre-excise catalog; without it, the
+pre-capability path published before the snapshot write (it has to — the
+snapshot is rebuilt from live state), so the in-memory view is already the
+post-excise one and a later snapshot may make it durable. Both states are
+consistent catalogs whose files were never unlinked, and both are exactly what
+`detach_part` has always produced.
+
 ## Part lifecycle & the part mover (`parts.rs`)
 
-Ordering all part operations follow: in-memory swap under `state.write()` →
-`persist_manifest` (the crash-atomic commit point) → only then touch files.
+Ordering all part operations follow: ONE `VersionEdit` appended and fsynced by
+`DbInner::catalog_txn` (the crash-atomic commit point since 2.2; before it, the
+whole-manifest rewrite `persist_manifest` still performs when
+`CAP_MANIFEST_EDITS` is off) → the in-memory swap under `state.write()`, inside
+that transaction's publish closure → only then touch files.
+
+Every part operation also holds a `DbInner::begin_parts_op` guard for its whole
+duration, bumping an `AtomicU64`. It is not a lock and excludes nothing among
+the part operations themselves — their range locks do that. It exists so
+delete-only excise (1.2) can decline to run beside phases those range locks do
+not span end to end: `attach_part` copies bytes before it knows which range it
+will claim, and a tier move flips a manifest entry after its files have already
+been relocated.
 In-flight reads are never interrupted — they finish on the `Arc<SstHandle>`s
 (and pinned blocks / mmaps) they already hold, the same lifetime argument
 compaction uses when unlinking inputs. `detach_part` is therefore **not

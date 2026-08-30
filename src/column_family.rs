@@ -383,6 +383,10 @@ pub struct ColumnFamily {
     /// Range-delete records committed to this family since it was opened
     /// (1.2). Zero for every family that never uses the feature.
     range_deletes: AtomicU64,
+    /// Tables retired by delete-only excise (1.2) since this family was opened,
+    /// and the klog+vlog bytes they held.
+    excised_tables: AtomicU64,
+    excised_bytes: AtomicU64,
     pub(crate) bloom_skips: AtomicU64,
     pub(crate) sst_probes: AtomicU64,
     /// `state` acquisitions made by the point-read planners
@@ -545,6 +549,8 @@ impl ColumnFamily {
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
             range_deletes: AtomicU64::new(0),
+            excised_tables: AtomicU64::new(0),
+            excised_bytes: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             #[cfg(test)]
             point_state_reads: AtomicU64::new(0),
@@ -690,6 +696,8 @@ impl ColumnFamily {
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
             range_deletes: AtomicU64::new(0),
+            excised_tables: AtomicU64::new(0),
+            excised_bytes: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             #[cfg(test)]
             point_state_reads: AtomicU64::new(0),
@@ -1362,7 +1370,9 @@ impl ColumnFamily {
             return Ok(None);
         }
         let mut best: Option<u64> = None;
+        let mut consulted: u64 = 0;
         let mut take = |seq: Option<u64>| {
+            consulted += 1;
             if let Some(s) = seq {
                 best = Some(best.map_or(s, |b: u64| b.max(s)));
             }
@@ -1380,6 +1390,13 @@ impl ColumnFamily {
             }
             take(th.reader()?.covering_seq(user_key, read_seq));
         }
+        // Cheap enough to be unconditional: the early return above already took
+        // every family that never issued a range delete out of this function.
+        let masked = u64::from(best.is_some());
+        crate::perf::bump(|p| {
+            p.range_sources += consulted;
+            p.range_masked += masked;
+        });
         Ok(best)
     }
 
@@ -2064,6 +2081,17 @@ impl ColumnFamily {
             .collect()
     }
 
+    /// Whether any catalogued table of this family carries range-delete
+    /// fragments (1.2) — the gate on the excise pre-pass being worth a wakeup.
+    pub(crate) fn has_range_fragments(&self) -> bool {
+        self.state
+            .read()
+            .levels
+            .iter()
+            .flatten()
+            .any(|th| th.meta.has_ranges())
+    }
+
     /// Markers the database-wide committed-span index currently holds.
     pub(crate) fn span_marker_count(&self) -> usize {
         self.ctx.span_index.len()
@@ -2078,6 +2106,20 @@ impl ColumnFamily {
     #[inline]
     pub(crate) fn note_range_delete(&self, n: u64) {
         self.range_deletes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Tables retired by delete-only excise, and the bytes they held.
+    pub(crate) fn excised(&self) -> (u64, u64) {
+        (
+            self.excised_tables.load(Ordering::Relaxed),
+            self.excised_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Count one excise transaction's worth of retired tables.
+    pub(crate) fn note_excised(&self, tables: u64, bytes: u64) {
+        self.excised_tables.fetch_add(tables, Ordering::Relaxed);
+        self.excised_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Snapshot the SSTable metadata for the manifest.
@@ -2333,8 +2375,10 @@ impl ColumnFamily {
 
     /// The effective durable config: `opts` with its partition rules replaced by
     /// the live set. Every path that (re)encodes the config for persistence —
-    /// `DbInner::persist_manifest`, `freeze_part`, CF copy/clear — goes through
-    /// this so a live-added rule round-trips across reopen.
+    /// the `CreateCf`/`SetCfConfig` ops `DbInner::catalog_txn` makes durable,
+    /// the snapshot `DbInner::persist_manifest` rebuilds from them, `freeze_part`,
+    /// CF copy/clear — goes through this so a live-added rule round-trips across
+    /// reopen.
     pub(crate) fn effective_config(&self) -> ColumnFamilyConfig {
         let mut cfg = self.opts.clone();
         cfg.partition_rules = self.live_partition_rules.read().clone();
@@ -2429,17 +2473,56 @@ impl ColumnFamily {
         before - bottom.len()
     }
 
-    /// Whether `[min_key, max_key]` overlaps any live bottom-level table. An
-    /// attached part with no overlap can slot straight into the bottom level;
-    /// otherwise it must go to L0 (which permits overlapping tables).
-    pub(crate) fn bottom_overlaps(&self, min_key: &[u8], max_key: &[u8]) -> bool {
+    /// Remove the tables with these ids from **every** level, under the state
+    /// write-lock. Returns the number actually removed.
+    ///
+    /// The level-agnostic sibling of
+    /// [`remove_bottom_tables`](Self::remove_bottom_tables), which edits only
+    /// `levels.last_mut()` because a part is by definition bottom-level. Delete-only
+    /// excise (1.2) has no such restriction — a bulk range delete's most valuable
+    /// targets are fully shadowed L0 and mid-level tables — so it needs a removal
+    /// that walks the whole level set.
+    ///
+    /// `retain` is **stable**, so the per-level `min_key` ordering established at
+    /// load survives; `find_overlapping`'s binary search, `bottom_overlaps` and
+    /// `insert_bottom_sorted` all depend on it (pinned by
+    /// `remove_tables_preserves_min_key_order`).
+    ///
+    /// A publication primitive: reachable only from a `catalog_txn` publish
+    /// closure.
+    pub(crate) fn remove_tables(&self, ids: &[u64], _p: &crate::db::Publish) -> usize {
+        let mut s = self.state.write();
+        let mut removed = 0;
+        for lvl in s.levels.iter_mut() {
+            let before = lvl.len();
+            lvl.retain(|h| !ids.contains(&h.meta.id));
+            removed += before - lvl.len();
+        }
+        removed
+    }
+
+    /// Whether `[span_min, span_max]` overlaps any live bottom-level table's
+    /// **span**. An attached part with no overlap can slot straight into the
+    /// bottom level; otherwise it must go to L0 (which permits overlapping
+    /// tables).
+    ///
+    /// Spans, not point bounds, on both sides since 1.2: a table's range
+    /// fragments may reach past its last point key, and two bottom tables whose
+    /// spans overlap would break the level->=1 disjointness `find_overlapping`
+    /// and the gap-owner rule depend on.
+    pub(crate) fn bottom_overlaps(&self, span_min: &[u8], span_max: &[u8]) -> bool {
         let s = self.state.read();
         let Some(bottom) = s.levels.last() else {
             return false;
         };
         bottom.iter().any(|h| {
-            self.cmp.compare(min_key, &h.meta.max_key).is_le()
-                && self.cmp.compare(&h.meta.min_key, max_key).is_le()
+            self.cmp
+                .compare(span_min, h.meta.span_max(&self.cmp))
+                .is_le()
+                && self
+                    .cmp
+                    .compare(h.meta.span_min(&self.cmp), span_max)
+                    .is_le()
         })
     }
 
@@ -2702,6 +2785,122 @@ mod tests {
             "fixture needs overlapping L0 files"
         );
         (db, cf)
+    }
+
+    /// Drive `remove_tables` the only way it is reachable: through a catalog
+    /// transaction, which is what mints the `Publish` token it demands.
+    fn remove_via_txn(db: &crate::DB, cf: &Arc<super::ColumnFamily>, ids: &[u64]) -> usize {
+        let edit =
+            crate::manifest_edit::VersionEdit::new(vec![crate::manifest_edit::Op::RemoveTables {
+                cf: cf.name().to_string(),
+                ids: ids.to_vec(),
+            }]);
+        let mut removed = 0;
+        db.inner
+            .catalog_txn(edit, |p| removed = cf.remove_tables(ids, p))
+            .unwrap();
+        removed
+    }
+
+    #[test]
+    fn remove_tables_removes_from_every_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = layered_cf(dir.path());
+        // One victim from L0 and one from the deepest populated level, so a
+        // bottom-only removal (`remove_bottom_tables`) could not do this.
+        let (l0, deep) = cf.with_levels(|levels| {
+            (
+                levels[0][0].meta.id,
+                levels
+                    .iter()
+                    .skip(1)
+                    .rev()
+                    .find_map(|l| l.first())
+                    .expect("a level below L0 is populated")
+                    .meta
+                    .id,
+            )
+        });
+        assert_ne!(l0, deep);
+
+        assert_eq!(remove_via_txn(&db, &cf, &[l0, deep]), 2);
+        let live: Vec<u64> =
+            cf.with_levels(|levels| levels.iter().flatten().map(|th| th.meta.id).collect());
+        assert!(!live.contains(&l0), "the L0 table is gone");
+        assert!(!live.contains(&deep), "the deep table is gone");
+        db.close().unwrap();
+    }
+
+    /// A column family whose deepest level holds several tables sorted by
+    /// `min_key` — the ordering `find_overlapping`'s binary search,
+    /// `bottom_overlaps` and `insert_bottom_sorted` all assume.
+    fn sorted_deep_level(dir: &std::path::Path) -> (crate::DB, Arc<super::ColumnFamily>) {
+        let db = crate::DB::open(crate::config::Options::new(dir.to_str().unwrap())).unwrap();
+        let cfg = crate::config::ColumnFamilyConfig {
+            // Small enough that one merge produces several output files.
+            target_file_size: 4 << 10,
+            ..Default::default()
+        };
+        let cf = db.create_column_family("sorted", cfg).unwrap();
+        for run in 0..6u32 {
+            for i in 0..40u32 {
+                let k = format!("k{:04}", run * 40 + i);
+                db.put(&cf, k.as_bytes(), &[b'v'; 64], std::time::Duration::ZERO)
+                    .unwrap();
+            }
+            db.flush_memtable(&cf).unwrap();
+        }
+        wait_for_deep_level(&cf);
+        db.compact(&cf).unwrap();
+        (db, cf)
+    }
+
+    #[test]
+    fn remove_tables_preserves_min_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = sorted_deep_level(dir.path());
+        let cmp = cf.cmp();
+        // A middle table of a sorted level: removing an end would leave the
+        // level sorted whatever `retain` did.
+        let (level, victim, probe) = cf
+            .with_levels(|levels| {
+                levels.iter().enumerate().skip(1).find_map(|(i, l)| {
+                    (l.len() >= 3).then(|| (i, l[1].meta.id, l[2].meta.min_key.clone()))
+                })
+            })
+            .expect("a sorted level with three tables");
+
+        assert_eq!(remove_via_txn(&db, &cf, &[victim]), 1);
+        cf.with_levels(|levels| {
+            let l = &levels[level];
+            assert!(
+                l.windows(2)
+                    .all(|w| cmp.compare(&w[0].meta.min_key, &w[1].meta.min_key).is_le()),
+                "the level is still sorted by min_key"
+            );
+            // ...and the binary search that depends on it still lands right.
+            let (hit, _) = super::ColumnFamily::find_overlapping_at(l, &cmp, &probe);
+            assert_eq!(
+                l[hit.expect("the probe key is inside a surviving table")]
+                    .meta
+                    .min_key,
+                probe
+            );
+        });
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn remove_tables_returns_removed_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = layered_cf(dir.path());
+        let id = cf.with_levels(|levels| levels[0][0].meta.id);
+        // An id the catalog does not hold contributes nothing to the count —
+        // and the edit names only the ids that exist, since a `RemoveTables`
+        // op naming an absent table is refused by the edit's own precondition.
+        assert_eq!(remove_via_txn(&db, &cf, &[id]), 1);
+        assert!(!cf.with_levels(|levels| levels.iter().flatten().any(|th| th.meta.id == id)));
+        db.close().unwrap();
     }
 
     #[test]

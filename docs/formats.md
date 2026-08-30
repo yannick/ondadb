@@ -832,8 +832,15 @@ Capability coupling, both directions, exactly as `ONDAAGE1`:
 
 Why the summary is in the catalog at all: the read path's **gap-owner rule**
 needs `range_count` and `range_max_key` to decide whether to consult a table,
-and `gather_target` needs the span bounds to size a compaction job — both before
-any reader is opened. Keeping them in the manifest is what makes "one extra
+`gather_target` needs the span bounds to size a compaction job, and delete-only
+excise (1.2) reads `range_count` to tell a covered candidate from a fragment
+owner — all before any reader is opened. (Excise then opens the owners' readers,
+and only theirs: the fragment *intervals* it needs live in the aux section, not
+in this summary, which carries only the enclosing min/max.) `attach_part` and
+`attach_part_by_ref` re-derive all five fields from the incoming table's decoded
+aux section rather than trusting a foreign catalog — a summary that disagreed
+with the section would leave fragments installed but invisible, and the read
+path's `range_count == 0` gate would silently stop masking. Keeping them in the manifest is what makes "one extra
 `range_count == 0` branch per point-only table" the whole cost of the feature
 for a database that does not use it.
 

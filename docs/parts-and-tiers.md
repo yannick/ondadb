@@ -490,6 +490,51 @@ Downgrade caveat: a manifest carrying object names (or the instance nonce) is
 refused by pre-A2 binaries (checksummed unknown tail → corruption error, fail
 stop). A database that never declares a shared tier never writes either tag.
 
+## Delete-only excise vs. detaching a part (1.2)
+
+`detach_part` is a metadata-only range drop at **partition** granularity: an
+operator names the partition, and its bottom-level tables leave the catalog in
+one crash-atomic record. Delete-only excise fills the **sub-part** granularity.
+Nobody names anything: a `delete_range` writes one range tombstone, compaction
+carries it down as durable fragments, and any table every one of whose keys
+those fragments already delete is retired by catalog edit — at any level, with
+no read and no rewrite.
+
+```rust
+// after a bulk delete, reclaim the space now rather than waiting for the
+// background pre-pass
+let reclaimed = db.excise_covered(&cf)?;   // tables retired
+let stats = cf.stats();
+println!("{} tables, {} bytes", stats.excised_tables, stats.excised_bytes);
+```
+
+Background compaction runs the same pass ahead of its capacity work, so a call
+is never required. `Ok(0)` is an ordinary answer and never an error: excise is
+opportunistic and declines rather than waits.
+
+**What excise will not touch, and why it matters here.**
+
+| Situation | Behavior |
+| --- | --- |
+| Table on a **named or shared tier** | Refused. Obsolete-file deletion resolves default-tier paths only (see the S3 leak gap below), so excising a tiered table would drop it from the catalog and leak the bytes — worse than leaving it. A shared tier is additionally a delete-free publication others may reference. |
+| Table mounted by `attach_part_by_ref` | Refused — a foreign mount is another database's publication. A foreign mount merely *overlapping* the candidate's span is also a veto. |
+| Any part operation in flight | Refused for its duration (detach / attach / freeze / export / tier move). |
+| A compaction or part operation holding an overlapping range | Refused; the lock is taken non-blocking. |
+| A live snapshot older than the tombstone | Refused until it closes — that reader can still see the data. |
+
+Practical consequence for a tiered database: move parts to cold storage *after*
+the deletes they will never need again have been reclaimed, not before. A part
+that reaches a named tier stops being excisable, and its space then comes back
+only through compaction.
+
+**Attaching a part that carries range tombstones** is supported: both attach
+paths re-derive the table's range summary from its own aux section (the same
+`summarize` the writer used) rather than trusting a foreign catalog, and the
+bottom-level placement check compares **span** bounds — a table's fragments may
+reach past its last point key, and two bottom tables with overlapping spans
+would break the level-≥1 disjointness reads depend on. An incoming table whose
+span overlaps a live or already-staged one goes to L0, where overlap is legal.
+
 ## Operational notes
 
 **Durability model.** The commit point for every part/tier operation is the
@@ -516,7 +561,9 @@ directories with `std::fs`, so they do **not** cover S3; likewise,
 compaction's obsolete-input deletion resolves default-tier paths, so
 compacting or re-cutting an S3-resident part strands its old objects.
 Both gaps leak *storage only* — the manifest is the source of truth, reads
-are never affected. Mitigation until in-engine GC lands: periodically audit
+are never affected. Delete-only excise (1.2) is the one caller that opts out of
+the gap instead of widening it: it refuses any candidate that is not on the
+default tier, so it never turns a tiered table into an unreferenced object. Mitigation until in-engine GC lands: periodically audit
 the bucket, listing `<root>/cf-<name>/` and deleting any `<id>.klog`/`.vlog`
 whose id the current manifest does not place on that tier (the startup
 sweep's rule, applied externally). Do not run the audit against a manifest

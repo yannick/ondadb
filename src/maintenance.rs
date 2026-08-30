@@ -88,6 +88,18 @@ pub struct CfStats {
     /// family — the durable cost of the deletes above, after flush and
     /// compaction have merged and clipped them.
     pub range_fragments: u64,
+    /// Tables delete-only excise (1.2) has retired since this family was
+    /// opened, and the klog+vlog bytes they held.
+    ///
+    /// Space reclaimed **without reading or rewriting** the data — a table every
+    /// one of whose keys a durable range tombstone already deleted is removed by
+    /// catalog edit alone. Compare against `compaction_count`: a bulk
+    /// `delete_range` whose reclamation shows up here cost no read or write
+    /// amplification at all, where the same delete expressed as point tombstones
+    /// would have been paid for in full by compaction.
+    pub excised_tables: u64,
+    /// Bytes those tables held (`klog_size + vlog_size`).
+    pub excised_bytes: u64,
     /// Markers the database-wide committed-span index currently holds.
     ///
     /// A database-wide number reported per family because that is where an
@@ -139,6 +151,7 @@ impl ColumnFamily {
     pub fn stats(&self) -> CfStats {
         let levels = self.level_summary();
         let (entries, tombs) = self.entry_counts();
+        let (excised_tables, excised_bytes) = self.excised();
         CfStats {
             name: self.name().to_string(),
             num_levels: levels.len(),
@@ -167,6 +180,8 @@ impl ColumnFamily {
                 .flatten()
                 .map(|m| m.range_count)
                 .sum(),
+            excised_tables,
+            excised_bytes,
             span_markers: self.span_marker_count(),
             compaction_debt: self
                 .compaction_debt

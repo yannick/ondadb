@@ -357,6 +357,40 @@ pub(crate) fn fragment_spans(
 
 /// Explode fragments back into one span per `(interval, seq)` pair, the input
 /// [`fragment_spans`] takes.
+/// The `SstMeta`/`FileMeta` range summary of a fragment list: the five fields a
+/// catalog carries so the read path can gate on `range_count == 0` and the
+/// gap-owner rule can consult `range_max_key` without opening the table.
+///
+/// One function so the two producers agree by construction: `Writer::finish`,
+/// which knows the fragments it just wrote, and `attach_part`, which must
+/// re-derive the summary from an incoming table's decoded aux section (a
+/// disagreement there would leave a fragment installed but invisible, and the
+/// data it hides would resurrect).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RangeSummary {
+    pub count: u64,
+    pub min_seq: u64,
+    pub max_seq: u64,
+    pub min_key: Option<Vec<u8>>,
+    pub max_key: Option<Vec<u8>>,
+}
+
+/// Summarize `frags` (sorted by `start`, as every producer and the reader's own
+/// validation guarantee).
+pub(crate) fn summarize(frags: &[Fragment]) -> RangeSummary {
+    let (min_key, max_key) = match (frags.first(), frags.last()) {
+        (Some(first), Some(last)) => (Some(first.start.clone()), Some(last.end.clone())),
+        _ => (None, None),
+    };
+    RangeSummary {
+        count: frags.len() as u64,
+        min_seq: frags.iter().map(|f| f.min_seq()).min().unwrap_or(0),
+        max_seq: frags.iter().map(|f| f.max_seq()).max().unwrap_or(0),
+        min_key,
+        max_key,
+    }
+}
+
 pub(crate) fn spans_of_fragments(frags: &[Fragment]) -> Vec<Span> {
     let mut out = Vec::new();
     for f in frags {
@@ -525,6 +559,7 @@ impl RangeMask {
     pub(crate) fn push(&mut self, frags: Vec<Fragment>) {
         if !frags.is_empty() {
             note_mask_source();
+            crate::perf::bump(|p| p.range_sources += 1);
             self.sources.push(FragCursor { frags, idx: 0 });
         }
     }

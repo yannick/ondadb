@@ -15,6 +15,7 @@ type/function names — grep for them; line numbers rot.
 | `memtable.rs` | Sharded (16) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath); the per-memtable `RangeTombstoneSet` |
 | `range_tombstone.rs` | Range deletes (1.2): the live `RangeTombstoneSet` beside the point shards, the durable `Fragment` form, the aux-section codec, and the `RangeMask` cursors the read paths apply |
 | `span_index.rs` | Committed-span index (1.2): the conflict domain a range delete needs, bounded by `Options::span_index_capacity` and pruned at the oldest live snapshot |
+| `excise.rs` | Delete-only excise (1.2): the picker pre-pass and `DB::excise_covered` that retire whole tables by catalog edit when durable fragments prove every key they hold is deleted |
 | `memtable_arena.rs` | *(unsafe-fastpath only)* arena skip-list shard: single-allocation nodes with inline key prefix + seq; `ShardCursor` for zero-copy flush |
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
@@ -360,6 +361,58 @@ fsynced → new levels installed → inputs deleted via `DbInner::remove_sst_fil
 compacted input that lived on a named tier is not unlinked there (a storage
 leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
 
+### Delete-only excise (1.2)
+
+`excise.rs` retires a whole SSTable **by catalog edit, without reading it**,
+when durable range-tombstone fragments prove every key it holds is already
+deleted. It is the sub-part-granularity counterpart to `detach_part`: that one
+drops a partition's bottom tables because an operator named the partition; this
+one drops any table at any level because the data says so.
+
+A candidate `T` qualifies when qualifying fragments — installed in some table's
+aux section, never a memtable's live set — satisfy
+
+```text
+fragment.start <= T.min_key   AND   T.max_key < fragment.end
+T.max_seq < fragment.seq <= oldest_snapshot
+the union of them is gap-free over [T.min_key, T.max_key]
+every OWNER of that union lies outside the dropped set
+```
+
+The first line generalizes to the union; no single fragment has to span `T`.
+The last is the contiguous-set rule — for one table it reads "never drop the
+only durable owner of the tombstone that justifies the drop", and offending
+members are removed from the candidate set until the intersection is empty.
+v1 additionally refuses a candidate carrying fragments of **its own**: the
+preconditions establish that `T`'s points are dead, but say nothing about the
+tables `T`'s fragments mask, and a fragment at level `L` shadows every level
+below it. That restriction is also what makes the owner rule hold by
+construction, since an owner carries fragments and is therefore never a
+candidate.
+
+Vetoes: foreign mounts (this database neither unlinks nor reasons about another
+database's publication), any table off the **default tier** (obsolete-file
+deletion resolves default-tier paths only, so an S3-resident excise would leak
+the object rather than reclaim it — this subsumes the shared-tier rule), an
+overlapping range-lock holder, and any in-flight part operation
+(`DbInner::parts_in_flight`).
+
+The transaction: plan lock-free over a level snapshot → `parts::try_lock_key_span`
+(the key-span generalization of `lock_partition_span`, non-blocking, so a
+compaction holding the range is a veto rather than a queue) → **revalidate**
+under that lock → ONE `RemoveTables` edit through `catalog_txn`, publishing via
+`ColumnFamily::remove_tables` → retire files through `DbInner::remove_sst_file`
+(invariant 6). A failed transaction fail-stops the database, exactly as
+`detach_part`'s identical shape does.
+
+It runs as a **pre-pass in the picker** (`compaction::run`, ahead of capacity
+scoring — a covered table is free to drop and rewriting it first pays to move
+bytes about to be unlinked) and as `DB::excise_covered(cf)` for operators. A
+flush that published fragments therefore wakes the compaction worker even with
+L0 far below its trigger: a bulk delete followed by an idle database is the
+case excise exists for, and it produces no capacity pressure of its own.
+`CfStats::excised_tables` / `excised_bytes` report what it reclaimed.
+
 ### Bounded jobs and backpressure (0.8.0)
 
 > User-facing guide with the tuning knobs and worked symptoms:
@@ -660,6 +713,7 @@ one by reference:
 | `update_levels` | `column_family.rs` | a whole level set (compaction install/rollback) |
 | `install_levels` | `column_family.rs` | a pre-built level set (clone) |
 | `remove_bottom_tables` | `column_family.rs` | detach |
+| `remove_tables` | `column_family.rs` | delete-only excise (level-agnostic) |
 | `insert_bottom_sorted` | `column_family.rs` | attach into the bottom level |
 | `swap_bottom_tables` | `column_family.rs` | the part-mover flip |
 | `remove_l0_tables` | `column_family.rs` | FIFO eviction |
