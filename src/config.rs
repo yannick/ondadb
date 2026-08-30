@@ -252,6 +252,33 @@ pub struct Options {
     /// This is the same name-and-registry indirection used for comparators,
     /// made extensible because partitioners are consumer-defined.
     pub partition_fns: Vec<Arc<dyn PartitionFn>>,
+    /// Bandwidth ceiling for *background* IO — flush, compaction and the part
+    /// mover — in bytes per second. `0` (the default) is unlimited, and costs
+    /// exactly one nil check per read/write: no limiter object is built.
+    ///
+    /// Foreground reads and write commits are never delayed by this, and the
+    /// WAL is never charged at all: it is foreground durability. Only the
+    /// bytes background work moves through SSTable blocks and vlog frames are
+    /// paced. See [`crate::ioctrl`].
+    ///
+    /// **Not persisted.** It describes this host and device, not the stored
+    /// data, so it is re-read from `Options` at every open — the same rule
+    /// `part_mover_interval` follows.
+    pub background_io_bytes_per_second: u64,
+    /// Credit a background worker may accrue while idle and then spend at
+    /// once, in bytes. `0` derives one second of
+    /// [`background_io_bytes_per_second`](Self::background_io_bytes_per_second),
+    /// the smallest burst that lets a steady producer actually reach the
+    /// configured rate. Ignored when the rate is `0`. Not persisted.
+    pub background_io_burst_bytes: u64,
+    /// Replace the built-in token bucket with a caller-supplied limiter.
+    ///
+    /// Set, this overrides
+    /// [`background_io_bytes_per_second`](Self::background_io_bytes_per_second)
+    /// entirely. It exists so tests can observe what the engine charges, and so
+    /// an embedder can enforce a policy the engine has no view of (a
+    /// device-wide budget shared with another process, say). Not persisted.
+    pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -438,6 +465,9 @@ impl Default for Options {
             tiers: Vec::new(),
             part_mover_interval: Duration::from_secs(30),
             partition_fns: Vec::new(),
+            background_io_bytes_per_second: 0, // unlimited: no limiter object
+            background_io_burst_bytes: 0,
+            io_limiter: None,
         }
     }
 }

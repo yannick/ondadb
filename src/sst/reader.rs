@@ -39,6 +39,11 @@ pub struct Reader {
     /// ([`FOOTER_VLOG_V2`]).
     vlog_v2: bool,
 
+    /// Background-IO admission, or `None` when unlimited. Charged on the paths
+    /// that actually issue device IO — a cache hit and an already-faulted mmap
+    /// block cost nothing and are charged nothing.
+    limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+
     /// Vlog frames whose CRC this reader has already verified, as a bounded
     /// direct-mapped set of frame offsets ([`VLOG_SLOT_EMPTY`] = free slot).
     /// Same reasoning as the klog `verified` bitmap below — the file is
@@ -199,6 +204,21 @@ impl Reader {
         cmp: ComparatorRef,
         vlog_cache_limit: usize,
     ) -> Result<Arc<Reader>> {
+        Reader::open_with_limiter(klog_path, storage, bc, file_id, cmp, vlog_cache_limit, None)
+    }
+
+    /// Like [`open`](Self::open), but the reader charges the bytes it fetches
+    /// against `limiter` under the reading thread's
+    /// [`IoClass`](crate::ioctrl::IoClass).
+    pub fn open_with_limiter(
+        klog_path: &str,
+        storage: Arc<dyn Storage>,
+        bc: Arc<BlockCache>,
+        file_id: u64,
+        cmp: ComparatorRef,
+        vlog_cache_limit: usize,
+        limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+    ) -> Result<Arc<Reader>> {
         let mut r = Reader {
             klog_path: klog_path.to_string(),
             vlog_path: vlog_path_for(klog_path),
@@ -206,6 +226,7 @@ impl Reader {
             bc,
             file_id,
             cmp,
+            limiter,
             index: Vec::new(),
             min_key: Vec::new(),
             max_key: Vec::new(),
@@ -447,6 +468,11 @@ impl Reader {
             let parsed = if seen {
                 crate::block::block_payload_preverified(&mmap[start..end])?
             } else {
+                // First touch of this block in this reader: the same point at
+                // which the CRC is paid is the point at which the pages are
+                // actually faulted in, so it is the mmap analogue of a cache
+                // miss and the only place worth charging.
+                crate::ioctrl::charge(&self.limiter, h.length);
                 let p = crate::block::block_payload(&mmap[start..end])?;
                 self.verified[word].fetch_or(bit, AtOrd::AcqRel);
                 p
@@ -472,6 +498,10 @@ impl Reader {
                 p.block_misses += 1;
                 p.block_read_bytes += h.length;
             });
+            // No IO charge here: under an mmap these bytes were already faulted
+            // in (and charged) at the first-touch branch above, and a later
+            // cache miss costs a decompression, not a device read. Charging
+            // again would double-count every compressed block's first read.
             let raw = crate::compress::decompress(alg, payload, raw_len)?;
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
             let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
@@ -488,6 +518,9 @@ impl Reader {
             p.block_misses += 1;
             p.block_read_bytes += h.length;
         });
+        // Charged before the read is issued, so a job cancelled while waiting
+        // never consumes the bandwidth it queued for.
+        crate::ioctrl::charge(&self.limiter, h.length);
         let f = self.storage.open_read(&self.klog_path)?;
         let (raw, alg) = read_block_at(&*f, h.offset, h.length)?;
         if alg != Compression::None {
@@ -514,6 +547,7 @@ impl Reader {
             let parsed = if seen {
                 crate::block::block_payload_preverified(&mmap[start..end])?
             } else {
+                crate::ioctrl::charge(&self.limiter, h.length);
                 let p = crate::block::block_payload(&mmap[start..end])?;
                 self.verified[word].fetch_or(bit, AtOrd::AcqRel);
                 p
@@ -838,6 +872,12 @@ impl Reader {
         // Where this value's bytes start, so admission sees exactly the decode
         // and nothing the caller had already buffered.
         let start = out.len();
+        // Charged before the read is issued, and at the funnel both paths pass
+        // through: charging inside `read_vlog_from_file` alone would leave every
+        // vlog read unpaced under `mmap-reads`, the configuration that reads the
+        // most. The header is included because the frame is what leaves the
+        // device, not the value.
+        crate::ioctrl::charge(&self.limiter, length + VLOG_V2_HDR_LEN as u64);
         #[cfg(feature = "mmap-reads")]
         let served = self.read_vlog_from_mmap(off, len, out)?;
         #[cfg(not(feature = "mmap-reads"))]

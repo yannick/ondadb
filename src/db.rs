@@ -52,6 +52,12 @@ pub struct DbInner {
     pub(crate) cf_by_id: RwLock<HashMap<u64, Arc<ColumnFamily>>>,
     pub(crate) ctx: Arc<CfCtx>,
     pub(crate) unified: Option<Arc<crate::unified::UnifiedStore>>,
+    /// Bandwidth admission for background IO, or `None` when unlimited (the
+    /// default). The same object the column families carry into their readers
+    /// and writers; held here so the caller-thread background paths
+    /// (`run_manual`, `flush_memtable`, ingest) can install it, and so close
+    /// and fail-stop can cancel it.
+    pub(crate) io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
 
     next_seq: AtomicU64,
     visible: AtomicU64,
@@ -321,7 +327,7 @@ impl DbInner {
                 // A failed manifest write is a durability failure: fsync may have
                 // dropped pages, and every caller's WAL-reclaim / file-delete step
                 // depends on this succeeding. Fail-stop rather than limp on.
-                self.poison.set(format!("manifest persist failed: {e}"));
+                self.fail_stop(format!("manifest persist failed: {e}"));
             }
         }
         res
@@ -336,6 +342,28 @@ impl DbInner {
 
     pub(crate) fn cf_dir(&self, name: &str) -> String {
         format!("{}/cf-{}", self.dir, name)
+    }
+
+    /// Release every thread parked on the background IO limiter and stop
+    /// delaying, permanently.
+    ///
+    /// A limiter wait is bounded by a refill that only keeps happening while
+    /// the database is alive, so both terminal transitions — close and
+    /// fail-stop — must cancel it. A no-op when background IO is unlimited.
+    pub(crate) fn cancel_background_io(&self) {
+        if let Some(limiter) = &self.io_limiter {
+            limiter.cancel();
+        }
+    }
+
+    /// Trip the fail-stop flag and release anything waiting on this database.
+    ///
+    /// Every production `poison.set` goes through here: after a durability
+    /// failure the workers are on their way out, and a compaction thread parked
+    /// on the IO limiter would otherwise sit out its full refill first.
+    pub(crate) fn fail_stop(&self, why: String) {
+        self.poison.set(why);
+        self.cancel_background_io();
     }
 
     /// Unlink an obsolete SSTable file, or defer it if deletions are paused (a
@@ -498,9 +526,17 @@ fn build_db_inner(
         opts.max_open_readers,
         opts.max_open_reader_bytes,
     ));
+    // Built once and shared: `None` unless background IO is limited, so the
+    // default configuration costs one nil check at each charge point.
+    let io_limiter = crate::ioctrl::limiter_for(
+        opts.background_io_bytes_per_second,
+        opts.background_io_burst_bytes,
+        opts.io_limiter.clone(),
+    );
     let ctx = Arc::new(CfCtx {
         tiers,
         bc: block_cache,
+        io_limiter: io_limiter.clone(),
         tables,
         flush_tx,
         compact_tx,
@@ -513,6 +549,7 @@ fn build_db_inner(
     });
     let inner = Arc::new(DbInner {
         opts: opts.clone(),
+        io_limiter,
         dir,
         instance_id: NEXT_DB_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         cfs: RwLock::new(HashMap::new()),
@@ -987,6 +1024,9 @@ impl DB {
     /// Flush a column family's active memtable to an SSTable (blocks until the
     /// flush is enqueued and drained).
     pub fn flush_memtable(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
+        // Rotation and any work this thread does on the way to it are flush
+        // work, not the caller's foreground work.
+        let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Flush);
         cf.rotate_memtable(true);
         let pending = || {
             if self.inner.unified.is_some() {
@@ -1047,6 +1087,14 @@ impl DB {
         if self.inner.closing.swap(true, Ordering::SeqCst) {
             return Ok(()); // already closing
         }
+        // Stop pacing background IO *before* anything waits on it. The final
+        // flushes below are drained by a spin-wait, and a flush worker parked on
+        // the limiter would make that wait as long as the configured rate says
+        // its bytes take — unbounded, from close's point of view. The limiter
+        // exists to protect foreground latency, and after close is called there
+        // is no more foreground work to protect: the right thing is to let
+        // shutdown durability run at full speed.
+        self.inner.cancel_background_io();
         // Enqueue final flushes for every column family (and the unified store).
         let cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
         if !self.inner.opts.read_only {
@@ -1306,7 +1354,7 @@ fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>)
                 .get(cf.name())
                 .is_some_and(|current| Arc::ptr_eq(current, &cf));
             if live {
-                db.poison.set(format!("background flush failed: {error}"));
+                db.fail_stop(format!("background flush failed: {error}"));
             }
         }
     }
@@ -1321,7 +1369,7 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
             continue;
         };
         if let Err(error) = cf.ingest_l0(entries, db.next_file_id()) {
-            db.poison.set(format!("unified flush failed: {error}"));
+            db.fail_stop(format!("unified flush failed: {error}"));
             all_slices_flushed = false;
         }
         schedule_compaction_after_flush(db, &cf);
@@ -1351,6 +1399,8 @@ fn process_flush_job(db: &Arc<DbInner>, job: FlushJob) {
 }
 
 fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>) {
+    // Dedicated thread: set the class once, never restore it.
+    crate::ioctrl::set_class(crate::ioctrl::IoClass::Flush);
     loop {
         match rx.recv_timeout(WORKER_TICK) {
             Ok(job) => process_flush_job(&db, job),
@@ -1365,6 +1415,9 @@ fn flush_worker(db: Arc<DbInner>, rx: Receiver<FlushJob>, stop: Arc<AtomicBool>)
 }
 
 fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<AtomicBool>) {
+    // Dedicated thread. The part mover shares it and inherits `Compaction`,
+    // which is right: moving a part between tiers is background IO.
+    crate::ioctrl::set_class(crate::ioctrl::IoClass::Compaction);
     // The part mover shares this worker: between compaction jobs, once per
     // `part_mover_interval`, run a mover pass (a cheap no-op unless some CF has
     // tier rules and an aged, mis-placed part). ZERO disables the scheduled pass.
@@ -1413,6 +1466,25 @@ fn compact_worker(db: Arc<DbInner>, rx: Receiver<Arc<ColumnFamily>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_limiter_object_when_disabled() {
+        // The default configuration must not allocate a limiter at all: the
+        // rollback position for this feature is "one nil check per charge
+        // point", not "a bucket that happens to be infinite".
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        assert!(db.inner.io_limiter.is_none());
+        assert!(db.inner.ctx.io_limiter.is_none());
+        db.close().unwrap();
+
+        let mut opts = Options::new(dir.path().to_str().unwrap());
+        opts.background_io_bytes_per_second = 1 << 20;
+        let db = DB::open(opts).unwrap();
+        assert!(db.inner.io_limiter.is_some());
+        assert!(db.inner.ctx.io_limiter.is_some());
+        db.close().unwrap();
+    }
 
     #[test]
     fn database_instance_ids_are_monotonic_and_unique() {

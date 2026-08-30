@@ -118,6 +118,64 @@ Safe patterns used: `create/drop_column_family` release the `cfs` write lock
 before `persist_manifest`; rotation drops `rot` while opening the next WAL
 file; commit runs hooks after dropping `commit_mu`.
 
+### Background-wait rule and its one exception (0.6)
+
+`ioctrl::charge` can **block** a background thread waiting for IO credit (see
+"Background IO limiter" below). No background wait may hold `commit_mu`,
+`rot`/`state`, or a WAL file mutex — those are on the foreground write path, and
+parking a compaction under one would convert a bandwidth limit into a write
+stall.
+
+**Explicit exception: a compaction job's own range lock.** `lock_job` returns a
+`RangeGuard` held for the whole job (`compact_inputs`: "the caller owns input
+selection *and* the range lock covering every input"), so every `charge()` in a
+compaction read or write blocks with that lock held. This is deliberate and
+safe: the range lock *is* that job's unit of exclusion — it exists to keep other
+compaction jobs off the same span, and **no foreground read or write path
+acquires it**. Waiting under it delays only work that was already excluded.
+`run_manual` and `run_fifo` additionally hold `cf.compact_mu` and a
+whole-keyspace range lock for the same reason and with the same justification.
+Every other lock in the inventory above stays off-limits to a background wait.
+
+### Background IO limiter (`ioctrl.rs`, 0.6)
+
+`IoClass` lives in a `const`-initialized thread-local `Cell`, so the foreground
+fast path is one TLS load. Workers set their class once at spawn
+(`onda-flush` → `Flush`, `onda-compact-{n}` → `Compaction`; the part mover
+shares the compaction worker and correctly inherits `Compaction`). The three
+paths that run background-sized IO on the *caller's* thread — `run_manual`,
+`DB::flush_memtable`, and `Ingestion::{add, finish}` — install the class with an
+`ioctrl::scoped` guard, which restores in LIFO order and restores while
+unwinding.
+
+The limiter object is **not** thread-local: it is DB-scoped, carried by
+`DbInner`, `CfCtx`, every `Reader` and every `Writer`, so two databases in one
+process pace independently and the default (`None`) is one nil check.
+
+Blocking points, all of them `TokenBucket::charge`:
+
+| Site | Charged |
+|---|---|
+| `Reader::read_data_block` / `read_data_block_local` | framed block length, on a block-cache miss or the first mmap touch of a block (the `verified` bit); a cache hit and a re-read cost nothing |
+| `Reader::read_vlog_into` | frame length (value + v2 header), at the funnel both the mmap and buffered paths pass through |
+| `Writer::flush_block`, `write_meta_block` | framed block length, before the write is issued |
+| `Writer::write_vlog` | frame length, before the write is issued |
+
+`IoClass::Foreground` never waits — `charge` returns immediately for it — and
+the WAL is never charged at all: it is foreground durability, not background
+bandwidth. Charges are split into `MAX_CHARGE_CHUNK` (1 MiB) pieces so a value
+larger than the bucket capacity still completes and cancellation stays
+observable.
+
+**Both terminal transitions wake every waiter.** `DbInner::fail_stop` (which all
+production `poison.set` calls now route through) and `DB::close` call
+`cancel_background_io`, which sets the bucket's `cancelled` flag and wakes its
+condvar; every subsequent charge is free. `close` cancels **first**, before the
+`pending_flush` spin-wait, because that wait would otherwise last as long as the
+configured rate says the final flush's bytes take — and after close is called
+there is no foreground latency left to protect. `SystemClock::wait` additionally
+caps a single park at 50 ms, so even a lost wakeup cannot hang a waiter.
+
 ## Rotation protocol (`ColumnFamily::rotate_memtable`)
 
 Writers: under `rot`, wait while `rotating || imm.len() >= stall_threshold`,
@@ -300,8 +358,9 @@ Contract:
 `spawn_workers`: `num_flush_threads.max(1)` flush workers plus
 `num_compaction_threads.max(1)` compaction workers, fed
 by unbounded crossbeam channels, polling with 50 ms tick to observe `stop`.
-`DB::close`: set `closing` → rotate every CF (+unified) with `force` → spin
-until `pending_flush == 0` → set `stop`, join workers → final
+`DB::close`: set `closing` → **cancel the background IO limiter** (0.6: so the
+drain below cannot wait on a rate) → rotate every CF (+unified) with `force` →
+spin until `pending_flush == 0` → set `stop`, join workers → final
 `persist_manifest` → close WALs/readers. `DB::clone` increments an explicit
 public-handle count; `DB::drop` closes only when that count reaches zero.
 Worker-held `Arc<DbInner>` references therefore cannot keep the directory lock

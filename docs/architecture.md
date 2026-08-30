@@ -26,6 +26,7 @@ type/function names — grep for them; line numbers rot.
 | `storage_s3.rs` | *(feature `s3`)* `S3Storage`: object-store backend — range-GET reads, single-PUT writes, own tokio runtime |
 | `parts.rs` | Part lifecycle: `detach_part`/`attach_part`/`freeze_part`, `move_part_to_tier`, the policy-driven part mover, live partition-rule add/remove |
 | `unified.rs` | Optional shared memtable+WAL across CFs (8-byte CF-id key prefix); split flush |
+| `ioctrl.rs` | Background IO classes (`IoClass` in a thread-local, `scoped` guards) and the `IoLimiter` trait with a work-conserving `TokenBucket` on an injectable `Clock`; bounds flush/compaction bandwidth so it cannot inflate foreground p99 |
 | `block.rs` | Block framing: `[alg][comp_len][raw_len][crc]payload`, compress-if-shrinks |
 | `bloom.rs`, `cache/`, `compress.rs`, `comparator.rs`, `encoding.rs`, `format.rs`, `error.rs`, `maintenance.rs` | Support: bloom filters, block/file LRU caches, codecs, key ordering, varints/CRC, flag bits + internal keys, error codes, checkpoint/backup/clone/stats |
 
@@ -536,3 +537,48 @@ storage tiers and durably materialize them into the target's default tier. The
 target manifest clears tier/object metadata and is self-contained.
 `clone_column_family` applies the same rule to one CF under fresh file ids,
 also under a deletion pause.
+
+## Background IO limiter (`ioctrl.rs`)
+
+Compaction debt already paces *writers* by how much work is owed; this bounds
+how fast background work is allowed to consume the device. Two independent
+pieces:
+
+**The class** is a thread-local `IoClass`, `const`-initialized so a foreground
+read pays one TLS load. Workers set it once at spawn (`onda-flush` → `Flush`,
+`onda-compact-{n}` → `Compaction`, inherited by the part mover). The three paths
+that run background-sized IO on the caller's thread — `compaction::run_manual`
+(a whole-level sweep, the largest burst the engine produces), `DB::flush_memtable`,
+and `Ingestion::{add, finish}` — install it with an `ioctrl::scoped` guard that
+restores in LIFO order, including while unwinding. A spawn-time default alone
+would leave all three labelled `Foreground` and unpaced.
+
+**The limiter** is DB-scoped, not thread-local: `Option<Arc<dyn IoLimiter>>` on
+`DbInner` and `CfCtx`, carried into every `Reader` (`open_with_limiter`) and
+`Writer` (`with_limiter`). Two databases in one process therefore pace
+independently, and the default — `Options::background_io_bytes_per_second == 0`
+— builds no limiter at all, leaving one nil check per charge point.
+
+`TokenBucket` is work-conserving: a charge spends whatever tokens are present
+and waits only for the remainder, so a value larger than the whole burst still
+completes rather than deadlocking, and the device is never left idle waiting for
+a large charge to be payable in one piece. `background_io_burst_bytes` of 0
+derives one second of rate. Charges are split into 1 MiB chunks.
+
+Charge points are the paths that actually issue device IO: a block-cache miss
+or the first mmap touch of a block (`Reader::read_data_block`,
+`read_data_block_local`), `read_vlog_into`, and the writer's `flush_block`,
+`write_meta_block` and `write_vlog` — always *before* the IO is issued, so a
+cancelled job never consumes bandwidth it queued for. Cache hits are free
+because they cost no device IO. **The WAL is never charged**: it is foreground
+durability, not background bandwidth. `IoClass::Foreground` never waits.
+
+Close and fail-stop (`DbInner::fail_stop`, which every production `poison.set`
+now routes through) call `cancel_background_io`, which wakes every waiter and
+makes all later charges free. `close` does this *first*, before the flush-drain
+spin-wait, so shutdown durability runs at full speed. The blocking contract and
+the compaction range-lock exception are in `docs/concurrency-and-safety.md`.
+
+Not yet done (review B of this feature): pacing obsolete-SSTable deletion.
+`IoClass::ObsoleteDelete` exists and is unused; `remove_sst_file` still unlinks
+inline.

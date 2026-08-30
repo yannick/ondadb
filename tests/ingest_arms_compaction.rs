@@ -165,3 +165,47 @@ fn a_single_ingestion_below_the_trigger_is_left_alone() {
     );
     db.close().expect("close");
 }
+
+/// 0.6-A: bulk ingest writes L0 tables on the *caller's* thread, so a
+/// spawn-time-only IO class would leave the whole load unclassified.
+#[test]
+fn ingest_finish_is_charged_as_flush() {
+    use ondadb::ioctrl::{IoClass, IoLimiter, RecordingLimiter};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(RecordingLimiter::default());
+    let limiter: Arc<dyn IoLimiter> = recorder.clone();
+    let db = DB::open(Options {
+        path: dir.path().to_string_lossy().into_owned(),
+        io_limiter: Some(limiter),
+        ..Options::default()
+    })
+    .expect("open");
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .expect("cf");
+    recorder.clear();
+
+    let mut ingestion = db.start_ingestion(&cf).expect("start");
+    let value = vec![b'v'; 256];
+    for i in 0..5000u32 {
+        ingestion
+            .write(format!("k{i:07}").as_bytes(), &value, Duration::ZERO)
+            .expect("write");
+    }
+    let written = ingestion.finish().expect("finish");
+    assert_eq!(written, 5000);
+
+    // Ingest output is L0, exactly like a flush, and is classified as such.
+    assert!(
+        recorder.bytes_for(IoClass::Flush) > 0,
+        "ingest must charge under Flush"
+    );
+    assert_eq!(
+        recorder.count_for(IoClass::Foreground),
+        0,
+        "no ingest byte may be charged as foreground"
+    );
+    db.close().expect("close");
+}

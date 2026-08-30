@@ -113,6 +113,11 @@ pub(crate) struct CfCtx {
     /// directory, so untiered tables resolve exactly as before tiering existed.
     pub tiers: Arc<TierRegistry>,
     pub bc: Arc<BlockCache>,
+    /// Bandwidth admission for background IO, or `None` when unlimited. Carried
+    /// into every reader this CF opens and every writer it creates: the class
+    /// comes from the thread, but the limiter is DB-scoped, so two databases in
+    /// one process pace independently.
+    pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
     /// Bounded cache of open SSTable readers — see [`crate::table_cache`].
     pub tables: Arc<crate::table_cache::TableCache>,
     pub flush_tx: Sender<FlushJob>,
@@ -343,6 +348,7 @@ impl ColumnFamily {
             file_id: meta.id,
             cmp: self.cmp.clone(),
             vlog_cache_limit: self.opts.max_cached_vlog_value_bytes,
+            io_limiter: self.ctx.io_limiter.clone(),
         };
         Arc::new(SstHandle {
             meta,
@@ -353,13 +359,14 @@ impl ColumnFamily {
 
     pub(crate) fn open_reader_for(&self, meta: &SstMeta) -> Result<Arc<Reader>> {
         let storage = self.ctx.tiers.storage_for(meta.tier.as_deref());
-        Reader::open(
+        Reader::open_with_limiter(
             &self.klog_path_for(meta),
             storage,
             self.ctx.bc.clone(),
             meta.id,
             self.cmp.clone(),
             self.opts.max_cached_vlog_value_bytes,
+            self.ctx.io_limiter.clone(),
         )
     }
 
@@ -472,6 +479,7 @@ impl ColumnFamily {
                 file_id: s.id,
                 cmp: cmp.clone(),
                 vlog_cache_limit: opts.max_cached_vlog_value_bytes,
+                io_limiter: ctx.io_limiter.clone(),
             };
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),
@@ -856,7 +864,7 @@ impl ColumnFamily {
 
     /// Open a fresh SSTable writer for this CF (used by bulk ingestion).
     pub(crate) fn new_sst_writer(&self, file_id: u64, expected: usize) -> Result<Writer> {
-        Writer::new(&self.klog_path(file_id), self.writer_opts(expected))
+        self.new_writer(&self.klog_path(file_id), expected)
     }
 
     /// Stream a sealed memtable to a new L0 SSTable without materializing
@@ -868,7 +876,7 @@ impl ColumnFamily {
             return Ok(());
         }
         let klog = self.klog_path(file_id);
-        let mut w = Writer::new(&klog, self.writer_opts(mem.num_entries().max(0) as usize))?;
+        let mut w = self.new_writer(&klog, mem.num_entries().max(0) as usize)?;
         while m.valid() {
             let c = m.top();
             w.add(
@@ -890,7 +898,7 @@ impl ColumnFamily {
             return Ok(());
         }
         let klog = self.klog_path(file_id);
-        let mut w = Writer::new(&klog, self.writer_opts(entries.len()))?;
+        let mut w = self.new_writer(&klog, entries.len())?;
         for e in entries {
             w.add(
                 &e.user_key,
@@ -942,6 +950,13 @@ impl ColumnFamily {
             use_btree: self.opts.use_btree,
             restart_interval: crate::sst::RESTART_INTERVAL,
         }
+    }
+
+    /// A writer for this CF's flush/ingest output, already carrying the
+    /// database's IO limiter.
+    fn new_writer(&self, klog: &str, expected: usize) -> Result<Writer> {
+        Ok(Writer::new(klog, self.writer_opts(expected))?
+            .with_limiter(self.ctx.io_limiter.clone()))
     }
 
     fn key_in_range(th: &SstHandle, cmp: &ComparatorRef, user_key: &[u8]) -> bool {

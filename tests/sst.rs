@@ -930,3 +930,169 @@ fn legacy_v1_vlog_frames_are_cached() {
     assert_eq!(warm.vlog_reads, 0);
     assert_eq!(warm.vlog_cache_hits, 1);
 }
+
+// ---------------------------------------------------------------------------
+// 0.6-A: what the SSTable reader and writer charge the IO limiter.
+// ---------------------------------------------------------------------------
+
+use ondadb::ioctrl::{IoClass, IoLimiter, RecordingLimiter, MAX_CHARGE_CHUNK};
+
+#[test]
+fn cached_block_reads_are_not_charged() {
+    // A cache hit — or, under `mmap-reads`, a block this reader has already
+    // faulted in and verified — costs no device IO, so it must cost no
+    // bandwidth either. Only the fetch is charged.
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("1.klog");
+    let klog = klog.to_str().unwrap();
+    // One block, so every key below resolves through the same fetch.
+    let mut w = Writer::new(klog, opts(Compression::None, 4, 1 << 20, 1 << 20)).unwrap();
+    for i in 0..4u32 {
+        let k = format!("key{i:06}");
+        w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, false, false)
+            .unwrap();
+    }
+    w.finish().unwrap();
+
+    let recorder = Arc::new(RecordingLimiter::default());
+    let limiter: Option<Arc<dyn IoLimiter>> = Some(recorder.clone());
+    let r = Reader::open_with_limiter(
+        klog,
+        LocalStorage::new(Arc::new(FileCache::new(16)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        1,
+        default_comparator(),
+        0,
+        limiter,
+    )
+    .unwrap();
+
+    assert_eq!(r.get(b"key000000", u64::MAX, 0).unwrap().0.unwrap(), b"value");
+    let first = recorder.charges();
+    assert_eq!(first.len(), 1, "the fetch is one charge: {first:?}");
+    assert_eq!(first[0].0, IoClass::Foreground);
+    assert!(first[0].1 > 0, "the framed block length must be charged");
+
+    for _ in 0..8 {
+        assert_eq!(r.get(b"key000001", u64::MAX, 0).unwrap().0.unwrap(), b"value");
+    }
+    assert_eq!(
+        recorder.charges(),
+        first,
+        "re-reading a resident block must charge nothing"
+    );
+}
+
+#[test]
+fn written_bytes_are_charged_once() {
+    // Everything the writer puts on the device is charged exactly once, and
+    // the total matches the files it produced (the footer and the trailing
+    // index/bloom are the documented metadata allowance).
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("2.klog");
+    let klog = klog.to_str().unwrap();
+    let recorder = Arc::new(RecordingLimiter::default());
+    let limiter: Option<Arc<dyn IoLimiter>> = Some(recorder.clone());
+    let mut w =
+        Writer::new(klog, opts(Compression::None, 2000, 64, 1024)).unwrap().with_limiter(limiter);
+    let value = vec![b'v'; 200]; // over the klog threshold: every value goes to the vlog
+    for i in 0..2000u32 {
+        w.add(
+            format!("key{i:06}").as_bytes(),
+            &value,
+            (i + 1) as u64,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+    }
+    w.finish().unwrap();
+
+    let charged: u64 = recorder.charges().iter().map(|(_, b)| b).sum();
+    let on_disk = std::fs::metadata(klog).unwrap().len()
+        + std::fs::metadata(dir.path().join("2.vlog")).unwrap().len();
+    assert!(charged > 0, "the writer charged nothing");
+    assert!(
+        charged <= on_disk,
+        "charged {charged} must not exceed the {on_disk} bytes written"
+    );
+    // The unaccounted remainder is the footer plus the index and bloom blocks;
+    // it must be a small fraction, not most of the file.
+    assert!(
+        charged * 100 >= on_disk * 90,
+        "charged {charged} of {on_disk} written bytes — the write path is \
+         missing a charge point"
+    );
+}
+
+#[test]
+fn large_write_charges_in_bounded_chunks() {
+    // A value far larger than any plausible bucket capacity must still be
+    // admitted, in pieces, rather than deadlocking on a charge nothing can pay.
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("3.klog");
+    let klog = klog.to_str().unwrap();
+    let recorder = Arc::new(RecordingLimiter::default());
+    let limiter: Option<Arc<dyn IoLimiter>> = Some(recorder.clone());
+    let mut w = Writer::new(klog, opts(Compression::None, 1, 64, 1024))
+        .unwrap()
+        .with_limiter(limiter);
+    let huge = vec![b'x'; (MAX_CHARGE_CHUNK as usize) * 3 + 4096];
+    w.add(b"big", &huge, 1, 0, false, false).unwrap();
+    w.finish().unwrap();
+
+    let charges = recorder.charges();
+    assert!(
+        charges.iter().all(|(_, b)| *b <= MAX_CHARGE_CHUNK),
+        "no single charge may exceed MAX_CHARGE_CHUNK: {charges:?}"
+    );
+    let charged: u64 = charges.iter().map(|(_, b)| b).sum();
+    assert!(
+        charged >= huge.len() as u64,
+        "the whole value must be charged: {charged} < {}",
+        huge.len()
+    );
+}
+
+#[test]
+fn vlog_reads_are_charged() {
+    // Separated values are read straight from the vlog, outside the block
+    // cache on the buffered path; that IO must be paced too.
+    let dir = tempfile::tempdir().unwrap();
+    let klog = dir.path().join("4.klog");
+    let klog = klog.to_str().unwrap();
+    let mut w = Writer::new(klog, opts(Compression::None, 8, 64, 1024)).unwrap();
+    let value = vec![b'v'; 4096];
+    for i in 0..8u32 {
+        w.add(
+            format!("key{i:06}").as_bytes(),
+            &value,
+            (i + 1) as u64,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+    }
+    w.finish().unwrap();
+
+    let recorder = Arc::new(RecordingLimiter::default());
+    let limiter: Option<Arc<dyn IoLimiter>> = Some(recorder.clone());
+    let r = Reader::open_with_limiter(
+        klog,
+        LocalStorage::new(Arc::new(FileCache::new(16)), cfg!(feature = "mmap-reads")),
+        Arc::new(BlockCache::new(1 << 20)),
+        4,
+        default_comparator(),
+        0,
+        limiter,
+    )
+    .unwrap();
+    assert_eq!(r.get(b"key000003", u64::MAX, 0).unwrap().0.unwrap().len(), 4096);
+    let charged: u64 = recorder.charges().iter().map(|(_, b)| b).sum();
+    assert!(
+        charged >= 4096,
+        "the vlog frame must be charged: {charged} bytes"
+    );
+}

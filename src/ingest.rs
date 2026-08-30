@@ -88,6 +88,12 @@ impl Ingestion {
     }
 
     fn add(&mut self, key: &[u8], value: &[u8], ttl: Duration, tombstone: bool) -> Result<()> {
+        // Ingest output is L0, exactly like a flush — and it is written on the
+        // caller's thread. The guard belongs here as well as in `finish`,
+        // because the writer flushes full blocks and vlog frames from `add`:
+        // most of a bulk load's bytes leave the device before `finish` is ever
+        // called.
+        let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Flush);
         if self.finished {
             return Err(OndaError::InvalidArgs("ingestion already finished".into()));
         }
@@ -126,6 +132,7 @@ impl Ingestion {
     /// Finish the ingestion: fsync the last table, install every table into
     /// L0 atomically, and persist the manifest. Returns the entry count.
     pub fn finish(mut self) -> Result<u64> {
+        let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Flush);
         self.finished = true;
         if let Some((w, file_id)) = self.writer.take() {
             self.done.push(self.cf.finish_writer_to_handle(w, file_id)?);

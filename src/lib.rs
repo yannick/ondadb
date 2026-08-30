@@ -50,6 +50,7 @@ pub mod encoding;
 pub mod error;
 pub mod format;
 pub mod ingest;
+pub mod ioctrl;
 pub mod iterator;
 pub mod maintenance;
 pub mod manifest;

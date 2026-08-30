@@ -64,6 +64,10 @@ use crate::util::now_nanos;
 /// "empty" partition this way). Background workers keep using `run`; only
 /// the user-invoked path pays for the full sweep.
 pub(crate) fn run_manual(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
+    // A whole-level sweep is the largest burst the engine produces, and it runs
+    // on the *caller's* thread. Classifying only at worker spawn would leave
+    // every byte of it labelled `Foreground` and therefore unpaced.
+    let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Compaction);
     run(db, cf)?;
     if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
         return Ok(()); // FIFO never merges; eviction already ran above
@@ -794,6 +798,7 @@ impl<'a> CompactionOutputBuilder<'a> {
         let id = self.db.next_file_id();
         let klog = self.cf.klog_path(id);
         let writer = match Writer::new(&klog, cf_writer_opts(self.cf, self.cmp, self.target as u32))
+        .map(|w| w.with_limiter(self.cf.ctx.io_limiter.clone()))
         {
             Ok(writer) => writer,
             Err(error) => {

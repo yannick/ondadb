@@ -3,6 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::{
     data_block_alg, encode_entry, vlog_path_for, BlockHandle, FileMeta, IndexEntry,
@@ -99,6 +100,10 @@ pub struct Writer {
     klog_off: u64,
     vlog_off: u64,
 
+    /// Background-IO admission, or `None` when unlimited. Every byte this
+    /// writer puts on the device is charged before the write is issued.
+    limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+
     /// One hash per key written, or `None` when the filter is disabled.
     ///
     /// The filter is built in [`finish`](Self::finish), not here, because a
@@ -139,6 +144,17 @@ impl std::fmt::Debug for Writer {
 impl Writer {
     /// Create an SSTable writer for `klog_path`. The vlog path is derived and
     /// created lazily on the first large value.
+    /// Charge every byte this writer emits against `limiter`, under the writing
+    /// thread's [`IoClass`](crate::ioctrl::IoClass).
+    ///
+    /// A builder rather than a [`WriterOptions`] field: the limiter is a
+    /// property of the database that owns the writer, not of the table format,
+    /// and every existing `WriterOptions` literal describes only the latter.
+    pub fn with_limiter(mut self, limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>) -> Writer {
+        self.limiter = limiter;
+        self
+    }
+
     pub fn new(klog_path: &str, mut opts: WriterOptions) -> Result<Writer> {
         if opts.block_size == 0 {
             opts.block_size = DEFAULT_BLOCK_SIZE;
@@ -177,6 +193,7 @@ impl Writer {
             pending_index: None,
             klog_off: 0,
             vlog_off: 0,
+            limiter: None,
             bloom_hashes,
             num_entries: 0,
             num_tombstones: 0,
@@ -322,6 +339,11 @@ impl Writer {
         put_u32(&mut hdr[0..4], checksum(stored));
         hdr[4] = used_alg as u8;
         put_u32(&mut hdr[5..9], stored_len);
+        // The frame, header included, is what reaches the device.
+        crate::ioctrl::charge(
+            &self.limiter,
+            VLOG_V2_HDR_LEN as u64 + stored.len() as u64,
+        );
         let w = self.vlog.as_mut().unwrap();
         w.write_all(&hdr)?;
         w.write_all(stored)?;
@@ -353,6 +375,7 @@ impl Writer {
             data_block_alg(self.cur_block_alg),
             &self.cur_block,
         )?;
+        crate::ioctrl::charge(&self.limiter, n as u64);
         self.klog.as_mut().unwrap().write_all(&framed)?;
         // Defer the index entry: `add` shortens the separator once the next
         // block's first key is known; `finish` stores the full last key so the
@@ -374,6 +397,7 @@ impl Writer {
     fn write_meta_block(&mut self, payload: &[u8]) -> Result<BlockHandle> {
         let mut framed = Vec::new();
         let n = write_block(&mut framed, Compression::None, payload)?;
+        crate::ioctrl::charge(&self.limiter, n as u64);
         self.klog.as_mut().unwrap().write_all(&framed)?;
         let h = BlockHandle {
             offset: self.klog_off,

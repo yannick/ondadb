@@ -113,6 +113,9 @@ pub(crate) struct TableRef {
     /// because the table cache opens readers lazily, long after the family
     /// that named the table is out of scope.
     pub vlog_cache_limit: usize,
+    /// Background-IO admission for reads served by this table's reader, or
+    /// `None` when unlimited.
+    pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
 }
 
 /// One cached reader with its second-chance bit.
@@ -287,13 +290,14 @@ impl TableCache {
         }
 
         // `Reader::open` already yields an `Arc`.
-        let reader = Reader::open(
+        let reader = Reader::open_with_limiter(
             &t.klog,
             Arc::clone(&t.storage),
             Arc::clone(&t.bc),
             t.file_id,
             t.cmp.clone(),
             t.vlog_cache_limit,
+            t.io_limiter.clone(),
         )?;
         self.opens.fetch_add(1, Ordering::Relaxed);
 
