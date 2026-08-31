@@ -1,5 +1,167 @@
 # Changelog
 
+## 0.9.0 (unreleased)
+
+**The wavesdb roadmap, phases 0-3.** Twenty features across the runtime, the
+record-kind system, the on-disk formats and the transaction layer. The theme is
+extensibility with an escape hatch: everything that changes a stored byte is
+gated behind a manifest capability bit, nothing is enabled by default, and an
+upgraded database keeps writing 0.8.2 bytes until an operator asks otherwise.
+
+### Breaking changes
+
+- `wal::Record`, `wal::RecordRef`, `memtable::Entry`, `sst::Writer::add` and
+  `PointResult` carry a single `kind: u64` where they carried
+  `(tombstone: bool, single_delete: bool)`. The pair could express
+  `single_delete && !tombstone`, a state no writer produces; the kind cannot.
+  `Record::tombstone()` and `single_delete()` remain as accessors.
+- `wal` replay callbacks take a `ReplayRecord` enum rather than a `Record`, so a
+  kind this binary does not implement can never be replayed as a put.
+- `flags::DELTA_SEQ` is removed and `0x08` is reserved-unknown. Entry flags,
+  footer flags and manifest tags now **fail closed**: bytes naming a feature
+  this binary lacks are the new `OndaError::UnsupportedFormat` (code `-16`),
+  distinct from `Corruption`.
+
+### Format capabilities (all opt-in, all one-way)
+
+`DB::enable_format_capabilities` persists a capability bit before the first byte
+using it exists. Seven bits are defined, pinned for wavesdb compatibility and
+never reused: `CAP_EXTENDED_RECORDS`, `CAP_MERGE_OPERANDS`, `CAP_RANGE_DELETES`,
+`CAP_PREFIX_DELTA`, `CAP_MANIFEST_EDITS`, `CAP_PERIODIC_AGE`,
+`CAP_TXN_DECISIONS`. Record kinds are pinned the same way (1 put, 2 delete,
+3 single-delete, 4 merge, 5 range delete, 6-15 reserved, 16-31 transaction
+control, 32-63 reserved, above 63 never assigned).
+
+A database that enables nothing is byte-identical to 0.8.2 and remains readable
+by 0.8.2. That is what makes every feature below individually rollback-safe.
+
+### Transactions
+
+- **Merge operators (1.1).** `DB::merge(cf, key, operand)` and
+  `Txn::merge(..)` append a merge operand with no read of the current value and
+  no conflict window; the operand is folded against everything below it at read
+  time by the family's registered `MergeOperator`. Measured against the
+  equivalent Get+Put at equal durability: 1.15x uncontended, **3.02x
+  contended**, with zero retries against 1,231-2,278. Compaction folds operand
+  suffixes at or below the oldest snapshot (`Options::enable_merge_folding`, a
+  rollout switch), which keeps read cost flat where an unfolded 160k-operand
+  chain costs 8.8x. A family with no operator runs exactly the pre-1.1 code on
+  the point-read path; its scans measure 1.05x, reported honestly and left
+  unexplained rather than guessed at.
+- **Range tombstones (1.2).** `DB::delete_range(cf, start, end)` records the
+  deletion of a half-open comparator interval **once**, at a single sequence,
+  instead of one tombstone per key. Honored on every read path, in flush
+  fragmentation, in compaction retention and in conflict detection. A commit
+  holding a span takes the database-wide commit lock at every isolation level,
+  so its span check and its installation are atomic; range commits are meant to
+  be rare and bulk.
+- **Delete-only excise (1.2).** Retires a whole SSTable by catalog edit, without
+  reading a byte of it, when durable fragments prove every key it holds is
+  already deleted. Runs as a pre-pass in the compaction picker and as
+  `DB::excise_covered(cf)`; reports through `CfStats::excised_tables` /
+  `excised_bytes`.
+- **Prepared transactions (3.2).** `Txn::prepare(&id)` durably prepares a
+  transaction; `DB::commit_prepared` / `abort_prepared` / `list_prepared`
+  resolve it by a stable external id, across a process restart. A
+  storage-engine **participant** only: no coordinator election, no consensus, no
+  timeout decisions, and nothing is ever aborted automatically. A `prepare` that
+  returns `Ok` cannot subsequently lose a conflict. Unified layout only.
+
+### Reads
+
+- **MultiGet (0.4).** `DB::multi_get` / `Txn::multi_get` resolve N keys of one
+  family in one snapshot-consistent pass, with one block fetch and one
+  decompression per distinct block however many of the batch's keys land in it.
+  Batches of 16-256 run 2.4x-3.4x faster than the equivalent sequential `get`s
+  at equal cache state; batch size 1 is unchanged.
+- **Tailing iterators (0.9).** `DB::new_tailing_iterator(cf)` is a forward-only
+  cursor over an append-only keyspace that can be advanced past its own end
+  rather than rebuilt per poll: 12.4 ns per idle poll against 427.7 ns to
+  rebuild. Deliberately not a change feed — a refreshed tail observes only keys
+  strictly greater than its last yielded key.
+- **Per-level Bloom policy (0.1).** `bloom_fpr_per_level` and
+  `optimize_filters_for_hits`, both defaulting to today's behaviour.
+- **vlog value cache (0.5).** Per-family `max_cached_vlog_value_bytes`
+  (default 0 = off) caches decoded vlog values. It carries a correctness fix
+  that stays regardless: the block cache's key now names a `BlockDomain`, so a
+  klog block and a vlog frame at the same offset of the same file can no longer
+  alias.
+- **PerfContext (0.10).** Caller-owned, per-operation read-path counters —
+  bloom probes, memtable and SSTable probes, block-cache hits and misses, bytes
+  decompressed, vlog reads, iterator seeks and steps — so a performance claim
+  can be attributed to a mechanism instead of inferred from wall time. No
+  DB-wide atomic is touched; the nil path is one thread-local load and a
+  compare.
+
+### Compaction and IO
+
+- **Minimum-overlap-ratio picking (0.2).** Within a level, candidates are
+  visited cheapest-first by overlap bytes per byte of candidate. On a fixture
+  with varying key density, compaction bytes per ingested byte fall from 2.768
+  to 2.452 — 4.7x the run-to-run noise band. On a uniform fixture the effect is
+  0.2%, which is recorded rather than hidden: once a tree settles there is
+  nothing to choose between candidates.
+- **Parallel subcompactions (0.8).** One large bounded compaction may partition
+  its key range into half-open spans merged concurrently into **one** atomic
+  install. Off by default (`max_subcompactions = 1`).
+- **Periodic compaction (0.3).** `periodic_compaction_interval` revisits tables
+  after a configured age so an idle family reclaims expired TTL entries,
+  tombstones and shadowed versions. Backed by a new durable
+  `SstMeta::last_compaction_time` under `CAP_PERIODIC_AGE` — deliberately not
+  `max_entry_time`, which the part mover's `min_age` gate needs to mean
+  something else.
+- **Background IO classes and rate limiter (0.6).** Bounds background bandwidth
+  so flush and compaction cannot monopolise the device, with a work-conserving
+  token bucket and an injectable clock (so every pacing assertion is exact and
+  instant rather than spending the wall time it simulates). Obsolete-file
+  deletion is a paced worker of its own. All rates default to 0 = off.
+
+### Formats
+
+- **Prefix-delta data blocks (2.1).** Each data-block user key is stored as the
+  bytes it does not share with its predecessor, behind `FOOTER_PREFIX_DELTA` and
+  a per-family option. A space-for-CPU trade, opt-in.
+- **Manifest edit log (2.2).** `MANIFEST-EDITS` replaces O(catalog) full
+  manifest rewrites with a periodic snapshot plus an append-only log of
+  numbered, CRC-framed catalog edits. **Every catalog mutation now goes through
+  `DbInner::catalog_txn`**, which makes the edit durable before it publishes and
+  hands the publish closure a token — publishing outside a transaction no longer
+  compiles. Two prerequisites landed with it and matter on their own:
+  `Manifest::save`'s post-rename directory fsync propagates its error instead of
+  discarding it, and `close()` no longer discards its final persist result.
+- **Strict legacy decoding (1.0).** A frozen corpus of 0.8.2-generated fixtures
+  (`tests/fixtures/phase1/`) is committed and pinned *before* any strictness
+  landed, and every fail-closed check above is proven against it. Per-decoder
+  fuzz corpora seeded from those fixtures found two hardening fixes: the entry
+  decoder's offset arithmetic is now checked, and the manifest's count fields no
+  longer pre-allocate unbounded capacity.
+
+### Cross-feature rules
+
+Two rules exist only where features meet, and belong to no single feature's
+author. They are implemented once each and pinned in `tests/composition.rs`:
+
+- A range delete is, for one key, a **deleted base at its sequence**. A merge
+  chain's operands above the span survive and fold onto nothing; operands at or
+  below it, and the base under them, are masked. This holds identically for
+  point reads, batch reads, both scan directions and compaction.
+- A prepare frame carries a **merge operand** but never a range delete. An
+  operand is one key and one value, which is what the replay path has a shape
+  for; two keys and no value is not, and `Txn::prepare` refuses it at the API
+  rather than letting replay discover it.
+
+### Measurement honesty
+
+This machine is thermally noisy (±15-20% run-to-run, worse under sustained
+load), and several of these features were measured while sibling builds were
+running. Where a benchmark did not decisively meet its acceptance criterion the
+feature ships **default-off** and its `bench-results/<feature>/<date>/summary.md`
+records what a valid re-measurement would require, rather than reporting a
+number nobody believes. That applies to 0.1 (miss-heavy), 0.5, 0.6, 0.8, 0.9's
+streaming phase and 2.2's write-time ratio. The S3-gated acceptance arms of 0.4
+and 0.5 were **not run** — no `ONDADB_S3_ENDPOINT` was available — and are not
+claimed.
+
 ## 0.8.2
 
 **August 2026 code-review corrective release.** This release closes the five
