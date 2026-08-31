@@ -12,6 +12,9 @@ type/function names — grep for them; line numbers rot.
 | `db.rs` | `DB`/`DbInner`: CF registry, global sequence + publish machinery, snapshot refcounts, background flush/compaction workers, recovery, manifest persistence, deferred SST deletion, `LOCK` file, fail-stop poisoning |
 | `column_family.rs` | `ColumnFamily`: per-CF memtable + WAL + LSM levels; commit application, memtable rotation, flush to L0, point reads (incl. merge-chain folding), iterator construction |
 | `txn.rs` | `Txn`: arena-buffered writes, five isolation levels, conflict detection, savepoints; also the `DB::put/get/delete` single-op helpers |
+| `txn_lock.rs` | Pessimistic point locks (3.3): the `LockTable`, FIFO grant order with wait-die on `Txn::txn_id`, and the hand-off that denies waiters younger than the new holder. Acquired **outside** `commit_mu` and never held across it |
+| `prepared.rs` | Prepared-transaction registry (3.2): the durable writeset a `prepare` reserves, its key reservations, and the WAL-generation pins that keep an unresolved prepare recoverable across reopen |
+| `perf.rs` | `PerfContext` (0.10): caller-owned, per-operation read-path counters on a thread-local scope stack; the nil path is one `Cell` load and a compare |
 | `memtable.rs` | Sharded (16) MVCC write buffer; `put_batch` shard-grouped inserts; `snapshot()`/`MemIterator`; `FlushMerge` (fastpath); the per-memtable `RangeTombstoneSet` |
 | `range_tombstone.rs` | Range deletes (1.2): the live `RangeTombstoneSet` beside the point shards, the durable `Fragment` form, the aux-section codec, and the `RangeMask` cursors the read paths apply |
 | `span_index.rs` | Committed-span index (1.2): the conflict domain a range delete needs, bounded by `Options::span_index_capacity` and pruned at the oldest live snapshot |

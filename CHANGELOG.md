@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.9.0 (unreleased)
+## 0.9.0
 
-**The wavesdb roadmap, phases 0-3.** Twenty features across the runtime, the
-record-kind system, the on-disk formats and the transaction layer. The theme is
+**The wavesdb roadmap, phases 0-3.** Sixteen features, in twenty commits, across
+the runtime, the record-kind system, the on-disk formats and the transaction
+layer. The theme is
 extensibility with an escape hatch: everything that changes a stored byte is
 gated behind a manifest capability bit, nothing is enabled by default, and an
 upgraded database keeps writing 0.8.2 bytes until an operator asks otherwise.
@@ -214,9 +215,8 @@ and the mode degenerates into spin-abort-retry.
 alternatives (retaining a restarted transaction's timestamp; wound-wait) that
 would be expected to change it.
 
-The S3-gated acceptance arms of 0.4
-and 0.5 were **not run** — no `ONDADB_S3_ENDPOINT` was available — and are not
-claimed.
+The S3-gated acceptance arms of 0.4 and 0.5 were **not run** — no
+`ONDADB_S3_ENDPOINT` was available — and are not claimed.
 
 ## 0.8.2
 

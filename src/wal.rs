@@ -1688,7 +1688,7 @@ mod tests {
     #[test]
     fn envelope_unknown_kind_is_unsupported_format() {
         const UNASSIGNED_DATA_KIND: u64 = 6;
-        assert!(UNASSIGNED_DATA_KIND <= crate::format::MAX_ASSIGNABLE_KIND);
+        const { assert!(UNASSIGNED_DATA_KIND <= crate::format::MAX_ASSIGNABLE_KIND) };
         let p = envelope_with_body(&envelope_body(UNASSIGNED_DATA_KIND, 0));
         let err = decode_envelope_payload(&p).expect_err("kind 6 is not assigned yet");
         assert_eq!(err.kind(), "unsupported_format");
