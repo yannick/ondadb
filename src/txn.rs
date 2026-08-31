@@ -139,6 +139,23 @@ pub struct Txn {
     /// Named savepoints: `(name, writes_len, buf_len, read_log_len)`.
     savepoints: Vec<(String, usize, usize, usize)>,
     state: TxnState,
+    /// This transaction's identity, and the wait-die age order (3.3): lower is
+    /// older. Reassigned by [`reset`](Self::reset), because a reset transaction
+    /// is a new transaction — a reused handle that stayed the oldest forever
+    /// would starve every other transaction in the database.
+    txn_id: u64,
+    /// Whether this transaction takes point locks (3.3). Off unless it was
+    /// begun with [`DB::begin_pessimistic`]; an optimistic transaction never
+    /// touches the lock table, neither taking a lock nor waiting for one.
+    pessimistic: bool,
+    /// The sequence this transaction committed at, or `None` on every path that
+    /// published nothing (3.3).
+    ///
+    /// It becomes the outgoing lock owner's `LockEntry::last_commit_seq` stamp,
+    /// which is what lets the next holder wait out the publication gap instead
+    /// of aborting on a write it cannot see yet. A rolled-back owner stamps
+    /// nothing, because there is nothing to wait for.
+    committed_at: Option<u64>,
 }
 
 /// Where a transaction sits in the shared state machine
@@ -163,7 +180,9 @@ enum TxnState {
 impl std::fmt::Debug for Txn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Txn")
+            .field("txn_id", &self.txn_id)
             .field("isolation", &self.isolation)
+            .field("pessimistic", &self.pessimistic)
             .field("read_seq", &self.read_seq)
             .field("writes", &self.writes.len())
             .finish()
@@ -258,6 +277,56 @@ impl DB {
 
     /// Begin a transaction at a specific isolation level.
     pub fn begin_with_isolation(&self, level: IsolationLevel) -> Txn {
+        self.begin_inner(level, false)
+    }
+
+    /// Begin a **pessimistic** transaction at the default (Snapshot) isolation
+    /// level (3.3).
+    ///
+    /// See [`begin_pessimistic_with_isolation`](Self::begin_pessimistic_with_isolation)
+    /// for what changes; everything else is [`begin`](Self::begin).
+    pub fn begin_pessimistic(&self) -> Txn {
+        self.begin_pessimistic_with_isolation(IsolationLevel::Snapshot)
+    }
+
+    /// Begin a **pessimistic** transaction: one that takes a point lock on
+    /// every key it reads for update or writes, and **waits** for ownership
+    /// instead of abort-retrying through optimistic validation (3.3).
+    ///
+    /// Opt-in, and off by default. Optimistic transactions are unchanged: they
+    /// never take a lock, never wait for one, and at commit they validate
+    /// exactly as before. Locks are advisory *pre-commit coordination* — MVCC
+    /// remains the authority, so an ordinary optimistic writer that ignores the
+    /// lock can still make a pessimistic transaction conflict.
+    ///
+    /// Three things change for the caller, and all three belong in an
+    /// application's error handling:
+    ///
+    /// * **`put` can block.** It is an arena memcpy in an optimistic
+    ///   transaction; here it may wait for another transaction's lock. Holding
+    ///   a *foreign* lock (a `Mutex` of your own, say) across a `put` adds a
+    ///   deadlock edge that wait-die does not cover — wait-die orders
+    ///   transactions, not foreign locks.
+    /// * **A conflict can surface from `put`, `merge` or `get_for_update`**,
+    ///   not only from `commit`. Wait-die kills a transaction younger than the
+    ///   lock's current holder immediately, with
+    ///   [`Conflict`](crate::OndaError::Conflict); the caller retries with a
+    ///   new transaction, exactly as it would after a commit conflict.
+    /// * **At `Snapshot`, the transaction is no longer snapshot-isolated across
+    ///   lock grants.** A grant refreshes the read snapshot — which is what
+    ///   makes lock serialization actually prevent the abort — so reads taken
+    ///   before an acquisition may be older than reads taken after it. Read
+    ///   skew (G-single) becomes possible where snapshot isolation prevented
+    ///   it. At `Serializable` the same situation becomes an earlier
+    ///   `Conflict` instead, because the read set is revalidated before the
+    ///   snapshot moves. [`RepeatableRead`](IsolationLevel::RepeatableRead)
+    ///   never refreshes, so it keeps its snapshot — and can therefore still
+    ///   lose an update it read before the grant.
+    pub fn begin_pessimistic_with_isolation(&self, level: IsolationLevel) -> Txn {
+        self.begin_inner(level, true)
+    }
+
+    fn begin_inner(&self, level: IsolationLevel, pessimistic: bool) -> Txn {
         let fixed = matches!(
             level,
             IsolationLevel::RepeatableRead
@@ -293,6 +362,9 @@ impl DB {
             read_cfs: HashMap::new(),
             savepoints: Vec::new(),
             state: TxnState::Active,
+            txn_id: self.inner.next_txn_id(),
+            pessimistic,
+            committed_at: None,
         }
     }
 
@@ -432,7 +504,24 @@ impl DB {
 }
 
 impl Txn {
-    fn buffer(&mut self, cf: &Arc<ColumnFamily>, key: &[u8], value: &[u8], ttl: i64, kind: u64) {
+    /// Buffer one write, taking its point lock first in pessimistic mode.
+    ///
+    /// **Upgrade on write**: any buffered write to a key this transaction does
+    /// not already hold acquires its lock here, at buffer time, not at commit.
+    /// That is what makes the lock cover the whole read-modify-write window
+    /// rather than the instant of the commit, and it is why this is fallible
+    /// where it used to return `()`.
+    fn buffer(
+        &mut self,
+        cf: &Arc<ColumnFamily>,
+        key: &[u8],
+        value: &[u8],
+        ttl: i64,
+        kind: u64,
+    ) -> Result<()> {
+        if self.pessimistic {
+            self.lock_key(cf, key)?;
+        }
         let koff = self.buf.len();
         self.buf.extend_from_slice(key);
         let voff = self.buf.len();
@@ -444,6 +533,114 @@ impl Txn {
             ttl,
             kind,
         });
+        Ok(())
+    }
+
+    /// Take (or wait for) the point lock on `key`, then refresh the snapshot if
+    /// this transaction's level says a grant should move it.
+    ///
+    /// Only ever reached from a pessimistic transaction.
+    fn lock_key(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<()> {
+        // The DURABLE column-family id, not `cf_id`'s pointer identity: a
+        // family dropped and recreated reuses the allocation, and this is also
+        // the id 3.2's reservation registry uses, so the two subsystems index
+        // one space.
+        match self.db.txn_locks.acquire(self.txn_id, cf.id(), key)? {
+            // A grant: adopt what the outgoing owner published.
+            Some(stamp) => self.refresh_snapshot(stamp),
+            // Re-entrant. Nothing changed hands, so there is nothing to refresh
+            // onto — and at `Serializable` the refresh revalidates the whole
+            // read set, which a second write to a key already held must not pay
+            // for on every call.
+            None => Ok(()),
+        }
+    }
+
+    /// Adopt a new read snapshot on a lock grant (3.3).
+    ///
+    /// Without this the feature buys nothing at the fixed levels: holding a
+    /// lock does not move `read_seq`, so a transaction that waits politely for
+    /// the hot key, is granted it, and commits still finds
+    /// `peek_seq(key) > read_seq` and aborts on the very write it waited for.
+    ///
+    /// `stamp` is the sequence the outgoing owner committed at, or 0.
+    ///
+    /// Four steps, in this order:
+    ///
+    /// 1. Wait (bounded) for publication to reach `stamp`. Publication is
+    ///    gap-free (invariant 5), so the wait is transient by construction and
+    ///    the bound only guards a torn process — the same shape as
+    ///    `wait_visible_at_own_floor`.
+    /// 2. At `Serializable`, revalidate the read set against the **old**
+    ///    snapshot. This is what makes the refresh sound: the reads are proven
+    ///    unchanged at the new snapshot, so it is as if they had all happened
+    ///    there. A changed read-set key returns `Conflict` now rather than
+    ///    silently validating under an adopted snapshot.
+    /// 3. Adopt `visible_seq()`, acquiring the new snapshot **before**
+    ///    releasing the old one, so `oldest_snapshot()` never transiently jumps
+    ///    forward and lets compaction GC a version this transaction still
+    ///    needs.
+    ///
+    /// `RepeatableRead` does not refresh: it runs no validation, so it has no
+    /// conflict to avoid, and refreshing would break the one thing its contract
+    /// promises. `ReadCommitted`/`ReadUncommitted` hold no snapshot at all.
+    fn refresh_snapshot(&mut self, stamp: u64) -> Result<()> {
+        if !matches!(
+            self.isolation,
+            IsolationLevel::Snapshot | IsolationLevel::Serializable
+        ) {
+            return Ok(());
+        }
+        if self.db.visible_seq() < stamp {
+            let start = std::time::Instant::now();
+            while self.db.visible_seq() < stamp && start.elapsed() < Duration::from_secs(1) {
+                std::thread::yield_now();
+            }
+        }
+        if self.isolation == IsolationLevel::Serializable {
+            self.validate_read_conflicts()?;
+        }
+        let new_seq = self.db.visible_seq();
+        if new_seq > self.read_seq && self.snapshot_held {
+            let old = self.read_seq;
+            self.db.acquire_snapshot(new_seq);
+            self.read_seq = new_seq;
+            self.db.release_snapshot(old);
+        }
+        Ok(())
+    }
+
+    /// Take (or wait for) the lock on `key`, then read it (3.3).
+    ///
+    /// At `Snapshot` and `Serializable` the grant refreshes this transaction's
+    /// snapshot — see
+    /// [`DB::begin_pessimistic_with_isolation`](crate::DB::begin_pessimistic_with_isolation)
+    /// for what that costs and buys. Returns
+    /// [`Conflict`](OndaError::Conflict) if wait-die kills this transaction, or
+    /// if the refresh's read-set revalidation fails at `Serializable`.
+    ///
+    /// Refused with [`InvalidArgs`](OndaError::InvalidArgs) on an optimistic
+    /// transaction: there is no lock to take, and silently degrading to `get`
+    /// would hand back a value the caller believes is protected.
+    pub fn get_for_update(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<Vec<u8>> {
+        if self.state != TxnState::Active {
+            return Err(OndaError::InvalidArgs(
+                "transaction already finished".into(),
+            ));
+        }
+        if !self.pessimistic {
+            return Err(OndaError::InvalidArgs(
+                "get_for_update requires a transaction begun with DB::begin_pessimistic \
+                 or DB::begin_pessimistic_with_isolation"
+                    .into(),
+            ));
+        }
+        // BEFORE the read, and therefore before `get`'s buffered-write scan:
+        // that scan returns early for a key this transaction already wrote, and
+        // acquiring after it would let a transaction read a key it wrote
+        // without ever holding the key's lock.
+        self.lock_key(cf, key)?;
+        self.get(cf, key)
     }
 
     /// Buffer a range delete of `[start, end)`.
@@ -453,6 +650,15 @@ impl Txn {
     /// The one check that *cannot* live here — a point write of this
     /// transaction landing inside this span — needs the whole write set and is
     /// made at commit ([`Txn::check_own_range_overlap`]).
+    ///
+    /// **Takes no lock, even in a pessimistic transaction (3.3).** What a range
+    /// delete needs is a lock on the *interval*, and span locks are v2; a point
+    /// lock on the start bound would protect one key and read as if it
+    /// protected the span, which is worse than protecting nothing. So a
+    /// pessimistic transaction that issues a range delete is, for that span,
+    /// an ordinary optimistic writer: the span index decides its conflicts at
+    /// commit exactly as it always has. This is also why `delete_range` does
+    /// not go through [`buffer`](Self::buffer).
     pub fn delete_range(&mut self, cf: &Arc<ColumnFamily>, start: &[u8], end: &[u8]) -> Result<()> {
         if self.state != TxnState::Active {
             return Err(OndaError::InvalidArgs(
@@ -537,8 +743,7 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
-        self.buffer(cf, key, value, ttl_to_abs(ttl), crate::format::KIND_PUT);
-        Ok(())
+        self.buffer(cf, key, value, ttl_to_abs(ttl), crate::format::KIND_PUT)
     }
 
     /// Buffer a delete (tombstone).
@@ -548,8 +753,7 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
-        self.buffer(cf, key, &[], 0, crate::format::KIND_DELETE);
-        Ok(())
+        self.buffer(cf, key, &[], 0, crate::format::KIND_DELETE)
     }
 
     /// Buffer a single-delete marker for format compatibility. It currently
@@ -561,8 +765,7 @@ impl Txn {
                 "transaction already finished".into(),
             ));
         }
-        self.buffer(cf, key, &[], 0, crate::format::KIND_SINGLE_DELETE);
-        Ok(())
+        self.buffer(cf, key, &[], 0, crate::format::KIND_SINGLE_DELETE)
     }
 
     /// Buffer a merge operand for `key`.
@@ -599,8 +802,16 @@ impl Txn {
                     .into(),
             ));
         }
-        self.buffer(cf, key, operand, 0, crate::format::KIND_MERGE);
-        Ok(())
+        // A merge takes the key's lock in pessimistic mode, like any other
+        // write, and the reason is that in this engine a merge *is* a write for
+        // conflict purposes: `validate_write_conflicts` walks the whole write
+        // order without looking at kinds, so an unlocked merge on a hot key
+        // aborts at commit exactly as an unlocked put would. Exempting it would
+        // hand the caller a pessimistic transaction that still loses the race
+        // it opted in to avoid. (Operands do commute, so if
+        // `validate_write_conflicts` ever stops checking them, this lock should
+        // go with it — the two decisions are the same decision.)
+        self.buffer(cf, key, operand, 0, crate::format::KIND_MERGE)
     }
 
     /// This transaction's buffered chain for `key` in column family `id`, in
@@ -1456,6 +1667,9 @@ impl Txn {
             crate::db::commit_park::park_if_armed(self.db.instance_id);
         }
         self.db.note_thread_commit(commit_seq);
+        // The stamp the next holder of this transaction's locks waits for. Set
+        // only here, on the one path that published data.
+        self.committed_at = Some(commit_seq);
         drop(_guard);
         // Unconsumed slots go back here as well as on the error paths; the
         // reservation's `Drop` is the backstop, this keeps the index from
@@ -1679,6 +1893,16 @@ impl Txn {
         reg.register(entry);
         self.db.note_prepared_count(&reg);
         drop(reg);
+        // The lock-to-reservation conversion (3.3 × 3.2), inside the same
+        // `commit_mu` acquisition that registered the prepare. In-memory locks
+        // are volatile and reservations are durable, so from this instant the
+        // reservation is the authority and the lock is noise: a waiter granted
+        // it would be granted a lock whose commit is guaranteed to fail against
+        // the reservation it cannot see. Waking every waiter with `Conflict`
+        // now is strictly better than granting it and refusing it later.
+        if self.pessimistic {
+            self.db.txn_locks.deny_all(self.txn_id);
+        }
         self.db.wal_gens.lock().pin(prepare_gen);
         drop(_guard);
         self.writes.clear();
@@ -1710,6 +1934,22 @@ impl Txn {
             spans.push(((at, scratch.len() - at), i));
         }
         (scratch, spans)
+    }
+
+    /// The sequence this transaction reads at.
+    ///
+    /// The 3.3 snapshot refresh is only observable through it: whether a lock
+    /// grant moved the snapshot is the difference between `Snapshot` and
+    /// `RepeatableRead` in pessimistic mode.
+    #[doc(hidden)]
+    pub fn read_seq_for_tests(&self) -> u64 {
+        self.read_seq
+    }
+
+    /// This transaction's wait-die id. Lower is older.
+    #[doc(hidden)]
+    pub fn txn_id_for_tests(&self) -> u64 {
+        self.txn_id
     }
 
     /// Discard all buffered writes.
@@ -1763,13 +2003,33 @@ impl Txn {
         self.read_cfs.clear();
         self.savepoints.clear();
         self.state = TxnState::Active;
+        // A reset transaction is a NEW transaction and must be younger than
+        // everything already running: a reused handle that kept its original
+        // id would only get older relative to the rest of the database and
+        // would win every wait-die race forever.
+        self.txn_id = self.db.next_txn_id();
+        self.committed_at = None;
         Ok(())
     }
 
+    /// The one funnel every terminal path goes through.
+    ///
+    /// `commit` has five distinct returns that each call this, `rollback` calls
+    /// it, `reset` calls it via `rollback`, `Drop` calls it — and the poison
+    /// check at the top of `commit` returns *without* calling it, relying on
+    /// `Drop`. Lock release lives here rather than in those call sites for
+    /// exactly that reason: wiring it into the explicit paths would miss the
+    /// `Drop`-only one, and it must also be correct when the releasing thread
+    /// is not the acquiring thread, since `Txn` is `Send` and may be dropped
+    /// anywhere.
     fn release(&mut self) {
         if self.snapshot_held {
             self.db.release_snapshot(self.read_seq);
             self.snapshot_held = false;
+        }
+        if self.pessimistic {
+            self.db.release_txn_locks(self.txn_id, self.committed_at);
+            self.committed_at = None;
         }
     }
 }
@@ -1817,6 +2077,96 @@ mod tests {
         );
         helper.join().unwrap();
         txn.rollback().unwrap();
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn txn_ids_are_monotonic_and_unique() {
+        // Mirrors `database_instance_ids_are_monotonic_and_unique`: wait-die
+        // needs a total order, and a repeated id would mean "the holder is the
+        // requester" for two different transactions.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::open(Options::new(dir.path().to_str().unwrap())).unwrap());
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let db = db.clone();
+            threads.push(std::thread::spawn(move || {
+                (0..125)
+                    .map(|_| db.begin_with_isolation(IsolationLevel::ReadCommitted).txn_id)
+                    .collect::<Vec<u64>>()
+            }));
+        }
+        let mut ids: Vec<u64> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1000);
+        // Each thread's own ids increase; across threads the counter is shared,
+        // so the union must simply be distinct.
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "two transactions shared an id");
+        assert!(ids[0] >= 1, "0 is reserved for 'no owner'");
+    }
+
+    #[test]
+    fn reset_assigns_a_younger_txn_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let mut txn = db.begin();
+        let first = txn.txn_id;
+        txn.reset(IsolationLevel::Snapshot).unwrap();
+        assert!(
+            txn.txn_id > first,
+            "a reset transaction must be younger: {} -> {}",
+            first,
+            txn.txn_id
+        );
+        txn.rollback().unwrap();
+        db.close().unwrap();
+    }
+
+    /// A lock grant hands over a stamp that publication has not reached yet.
+    /// The refresh must wait it out rather than adopt a watermark that excludes
+    /// the very write it waited for — and must not hang doing so.
+    ///
+    /// In-module because it needs `reserve_seq`/`publish_range` to hold the
+    /// gap-free cursor down on purpose.
+    #[test]
+    fn refresh_waits_out_publication_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("default", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"k", b"v0", Duration::ZERO).unwrap();
+
+        // A third party holds an EARLIER range unpublished, so the cursor
+        // cannot advance past it however many commits complete above.
+        let held = db.inner.reserve_seq(1);
+        // Begun BEFORE the write it is going to wait for, so its own snapshot
+        // is stale by construction and only the refresh can save it.
+        let mut next = db.begin_pessimistic();
+        let mut writer = db.begin_pessimistic();
+        writer.put(&cf, b"k", b"v1", Duration::ZERO).unwrap();
+        writer.commit().unwrap();
+        let visible = db.inner.visible_seq();
+        assert!(
+            visible < held,
+            "the gap should still be open: visible {visible}, held {held}"
+        );
+
+        let inner = db.inner.clone();
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            inner.publish_range(held, held + 1);
+        });
+        // The grant refreshes onto the committed write once the gap closes.
+        assert_eq!(next.get_for_update(&cf, b"k").unwrap(), b"v1");
+        next.put(&cf, b"k", b"v2", Duration::ZERO).unwrap();
+        next.commit().expect("no conflict across a publication gap");
+        opener.join().unwrap();
         db.close().unwrap();
     }
 

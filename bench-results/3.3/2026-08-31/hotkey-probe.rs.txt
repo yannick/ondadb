@@ -1,0 +1,206 @@
+//! 3.3 hot-key contention probe: optimistic abort-retry versus pessimistic
+//! wait-serialize on ONE key.
+//!
+//! The workload is the read-modify-write every abort-storm complaint is really
+//! about: read the counter, write counter+1, commit; on any conflict, retry
+//! with a fresh transaction until the round succeeds. Both arms run the same
+//! binary against the same engine, so the only difference is
+//! `begin` vs `begin_pessimistic`.
+//!
+//! What is measured, and why it is measured that way:
+//!
+//! * **Retry-corrected throughput** — *successful* rounds per second. Counting
+//!   attempts would flatter the optimistic arm, which does its aborting fast.
+//! * **Retry-corrected latency** — per round, from the FIRST attempt to the
+//!   successful commit, retries included. That is the number an application
+//!   sees; per-attempt latency hides the storm entirely.
+//! * **Aborts, split two ways.** `commit` conflicts are what the feature is
+//!   supposed to remove. `acquire` conflicts are wait-die killing a younger
+//!   requester — a real cost of pessimistic mode that a caller pays as a
+//!   retry, and it must not be swept into the same bucket.
+//!
+//! `SyncMode::None` (the default) and a 1 GiB write buffer: an fsync or a
+//! flush stall on every commit would bury the effect under background IO, the
+//! same reason 3.2's probe made those two choices.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
+
+use ondadb::{ColumnFamily, ColumnFamilyConfig, OndaError, Options, DB};
+
+const KEY: &[u8] = b"hot";
+
+struct Arm {
+    rounds: u64,
+    elapsed: Duration,
+    commit_conflicts: u64,
+    acquire_conflicts: u64,
+    /// Per-round latency in nanoseconds, first attempt to successful commit.
+    latencies: Vec<u64>,
+}
+
+impl Arm {
+    fn throughput(&self) -> f64 {
+        self.rounds as f64 / self.elapsed.as_secs_f64()
+    }
+    fn pct(&self, p: f64) -> u64 {
+        let i = ((self.latencies.len() as f64 - 1.0) * p).round() as usize;
+        self.latencies[i]
+    }
+}
+
+/// How long the transaction lives before it asks for the hot key.
+///
+/// `0` is the tight loop: begin, acquire, commit. Because transaction ids
+/// increase, a tight-loop requester is essentially always *younger* than
+/// whoever holds the lock, so wait-die kills it and the "older waits" arm never
+/// runs. `pre_reads > 0` puts unrelated reads between `begin` and the
+/// acquisition, which is what a real read-modify-write transaction does and
+/// what mixes the ages enough for both arms of wait-die to be exercised.
+fn pre_read(t: &mut ondadb::txn::Txn, cf: &Arc<ColumnFamily>, pre_reads: u64) {
+    for i in 0..pre_reads {
+        let _ = t.get(cf, &i.to_be_bytes());
+    }
+}
+
+fn run(
+    dir: &str,
+    pessimistic: bool,
+    threads: usize,
+    rounds_per_thread: u64,
+    pre_reads: u64,
+    yield_on_death: bool,
+) -> Arm {
+    let _ = std::fs::remove_dir_all(dir);
+    let mut opts = Options::new(dir);
+    opts.unified_memtable = false;
+    let db = Arc::new(DB::open(opts).unwrap());
+    let cf: Arc<ColumnFamily> = db
+        .create_column_family(
+            "d",
+            ColumnFamilyConfig {
+                // Never rotate: flush backpressure is background-IO latency and
+                // has nothing to do with the commit path being measured.
+                write_buffer_size: 1 << 30,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    db.put(&cf, KEY, &0u64.to_be_bytes(), Duration::ZERO).unwrap();
+    for i in 0..pre_reads {
+        db.put(&cf, &i.to_be_bytes(), b"filler", Duration::ZERO).unwrap();
+    }
+
+    let commit_conflicts = Arc::new(AtomicU64::new(0));
+    let acquire_conflicts = Arc::new(AtomicU64::new(0));
+    let start_line = Arc::new(Barrier::new(threads + 1));
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let (db, cf) = (db.clone(), cf.clone());
+        let (cc, ac) = (commit_conflicts.clone(), acquire_conflicts.clone());
+        let start_line = start_line.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut lat = Vec::with_capacity(rounds_per_thread as usize);
+            start_line.wait();
+            for _ in 0..rounds_per_thread {
+                let t0 = Instant::now();
+                loop {
+                    let mut t = if pessimistic {
+                        db.begin_pessimistic()
+                    } else {
+                        db.begin()
+                    };
+                    pre_read(&mut t, &cf, pre_reads);
+                    let read = if pessimistic {
+                        t.get_for_update(&cf, KEY)
+                    } else {
+                        t.get(&cf, KEY)
+                    };
+                    let n = match read {
+                        Ok(v) => u64::from_be_bytes(v.try_into().unwrap()),
+                        Err(OndaError::NotFound) => 0,
+                        Err(_) => {
+                            ac.fetch_add(1, Ordering::Relaxed);
+                            if yield_on_death {
+                                std::thread::yield_now();
+                            }
+                            continue;
+                        }
+                    };
+                    if t.put(&cf, KEY, &(n + 1).to_be_bytes(), Duration::ZERO)
+                        .is_err()
+                    {
+                        ac.fetch_add(1, Ordering::Relaxed);
+                        if yield_on_death {
+                            std::thread::yield_now();
+                        }
+                        continue;
+                    }
+                    match t.commit() {
+                        Ok(()) => break,
+                        Err(_) => {
+                            cc.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                lat.push(t0.elapsed().as_nanos() as u64);
+            }
+            lat
+        }));
+    }
+    start_line.wait();
+    let wall = Instant::now();
+    let mut latencies: Vec<u64> = Vec::new();
+    for h in handles {
+        latencies.extend(h.join().unwrap());
+    }
+    let elapsed = wall.elapsed();
+    latencies.sort_unstable();
+
+    let final_value = u64::from_be_bytes(db.get(&cf, KEY).unwrap().try_into().unwrap());
+    let rounds = threads as u64 * rounds_per_thread;
+    assert_eq!(final_value, rounds, "an increment was lost — the run is void");
+    Arc::try_unwrap(db).unwrap().close().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+
+    Arm {
+        rounds,
+        elapsed,
+        commit_conflicts: commit_conflicts.load(Ordering::Relaxed),
+        acquire_conflicts: acquire_conflicts.load(Ordering::Relaxed),
+        latencies,
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let threads: usize = args.get(1).map_or(4, |s| s.parse().unwrap());
+    let rounds: u64 = args.get(2).map_or(2000, |s| s.parse().unwrap());
+    let pairs: usize = args.get(3).map_or(5, |s| s.parse().unwrap());
+    let pre_reads: u64 = args.get(4).map_or(0, |s| s.parse().unwrap());
+    let yield_on_death = std::env::var("PROBE_YIELD").is_ok();
+    let dir = std::env::var("PROBE_DIR").unwrap_or_else(|_| "/tmp/onda-hotkey-probe".into());
+
+    println!(
+        "# threads={threads} rounds/thread={rounds} pairs={pairs} \
+         pre_reads={pre_reads} yield_on_death={yield_on_death}"
+    );
+    println!("arm run throughput_ops_s p50_ns p99_ns p999_ns commit_conflicts acquire_conflicts");
+    // Alternate A/B/A/B so drift and external load are shared between the arms
+    // rather than attributed to one.
+    for run_index in 1..=pairs {
+        for (name, pessimistic) in [("optimistic", false), ("pessimistic", true)] {
+            let a = run(&dir, pessimistic, threads, rounds, pre_reads, yield_on_death);
+            println!(
+                "{name} {run_index} {:.1} {} {} {} {} {}",
+                a.throughput(),
+                a.pct(0.50),
+                a.pct(0.99),
+                a.pct(0.999),
+                a.commit_conflicts,
+                a.acquire_conflicts
+            );
+        }
+    }
+}

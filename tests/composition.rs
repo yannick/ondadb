@@ -315,3 +315,203 @@ fn a_prepared_range_delete_is_still_refused() {
     assert_eq!(err.kind(), "invalid_args", "{err}");
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 3.3 composed with 3.2: in-memory locks become durable reservations
+// ---------------------------------------------------------------------------
+
+/// A pessimistic database with 2PC enabled, and one column family.
+fn open_pessimistic_2pc(dir: &std::path::Path) -> (DB, Arc<ColumnFamily>) {
+    let mut opts = Options::new(dir.to_str().unwrap());
+    opts.unified_memtable = true;
+    let db = DB::open(opts).unwrap();
+    db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS)
+        .unwrap();
+    let cf = db
+        .create_column_family("d", ColumnFamilyConfig::default())
+        .unwrap();
+    (db, cf)
+}
+
+/// At `prepare`, a point lock (3.3) becomes a reservation (3.2) on the same
+/// `(cf.id(), key)` — and every waiter is woken with `Conflict` rather than
+/// granted a lock whose commit is guaranteed to fail against the reservation
+/// it cannot see. The reservation is the authority from that instant.
+#[test]
+fn waiter_on_prepared_owner_sees_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_pessimistic_2pc(dir.path());
+    let db = Arc::new(db);
+    db.put(&cf, b"k", b"v0", Duration::ZERO).unwrap();
+
+    // The waiter's transaction is begun first, so wait-die lets it wait; the
+    // holder takes the lock before the waiter asks. Both pinned by barriers.
+    let begun = Arc::new(std::sync::Barrier::new(2));
+    let held = Arc::new(std::sync::Barrier::new(2));
+    let waiter = {
+        let (db, cf) = (db.clone(), cf.clone());
+        let (begun, held) = (begun.clone(), held.clone());
+        std::thread::spawn(move || {
+            let mut t = db.begin_pessimistic();
+            begun.wait();
+            held.wait();
+            let err = t.get_for_update(&cf, b"k").unwrap_err();
+            assert_eq!(err.kind(), "conflict", "{err}");
+            t.rollback().unwrap();
+        })
+    };
+    begun.wait();
+    let mut holder = db.begin_pessimistic();
+    holder.put(&cf, b"k", b"prepared", Duration::ZERO).unwrap();
+    held.wait();
+    while db.txn_lock_waiters_for_tests(&cf, b"k") == 0 {
+        std::thread::yield_now();
+    }
+    holder.prepare(&[11u8; 16]).unwrap();
+    waiter.join().unwrap();
+    assert!(
+        db.txn_locks_idle_for_tests(),
+        "the prepare handed its keys to the registry"
+    );
+    db.abort_prepared(&[11u8; 16]).unwrap();
+    Arc::try_unwrap(db).unwrap().close().unwrap();
+}
+
+/// After recovery only the **reservation** exists: in-memory locks are
+/// volatile. A new pessimistic transaction takes the lock (nothing holds it)
+/// and its commit is refused against the recovered reservation until a
+/// coordinator resolves the prepare — so a waiter never hangs on a crashed
+/// owner, it is simply told no.
+#[test]
+fn recovered_reservation_reblocks_lock_waiters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let id = [12u8; 16];
+    {
+        let (db, cf) = open_pessimistic_2pc(dir.path());
+        let mut t = db.begin_pessimistic();
+        t.put(&cf, b"k", b"prepared", Duration::ZERO).unwrap();
+        t.prepare(&id).unwrap();
+        drop(db); // crash
+    }
+    let mut opts = Options::new(&path);
+    opts.unified_memtable = true;
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("d").unwrap();
+    assert_eq!(db.list_prepared().len(), 1);
+
+    let mut t = db.begin_pessimistic();
+    // The lock is free — nothing survived the crash to hold it.
+    t.put(&cf, b"k", b"other", Duration::ZERO).unwrap();
+    let err = t.commit().unwrap_err();
+    assert_eq!(
+        err.kind(),
+        "conflict",
+        "the recovered reservation must refuse the commit: {err}"
+    );
+    db.abort_prepared(&id).unwrap();
+    db.close().unwrap();
+}
+
+/// The coordinator commits: the reservation clears, and the next pessimistic
+/// transaction commits without `Conflict` — after its refresh, which is what
+/// carries its snapshot over the sequences `commit_prepared` just assigned.
+#[test]
+fn commit_prepared_unblocks_pessimistic_waiter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_pessimistic_2pc(dir.path());
+    db.put(&cf, b"k", b"v0", Duration::ZERO).unwrap();
+    let mut t = db.begin_pessimistic();
+    t.put(&cf, b"k", b"prepared", Duration::ZERO).unwrap();
+    t.prepare(&[13u8; 16]).unwrap();
+    db.commit_prepared(&[13u8; 16]).unwrap();
+
+    let mut next = db.begin_pessimistic();
+    assert_eq!(next.get_for_update(&cf, b"k").unwrap(), b"prepared");
+    next.put(&cf, b"k", b"after", Duration::ZERO).unwrap();
+    next.commit().expect("the reservation is gone");
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"after");
+    db.close().unwrap();
+}
+
+/// The coordinator aborts: same unblocking, and the aborted writeset is not
+/// visible — the next transaction reads what was there before the prepare.
+#[test]
+fn abort_prepared_unblocks_pessimistic_waiter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_pessimistic_2pc(dir.path());
+    db.put(&cf, b"k", b"v0", Duration::ZERO).unwrap();
+    let mut t = db.begin_pessimistic();
+    t.put(&cf, b"k", b"prepared", Duration::ZERO).unwrap();
+    t.prepare(&[14u8; 16]).unwrap();
+    db.abort_prepared(&[14u8; 16]).unwrap();
+
+    let mut next = db.begin_pessimistic();
+    assert_eq!(
+        next.get_for_update(&cf, b"k").unwrap(),
+        b"v0",
+        "an aborted writeset is not visible"
+    );
+    next.put(&cf, b"k", b"after", Duration::ZERO).unwrap();
+    next.commit().expect("the reservation is gone");
+    db.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 3.3 composed with 1.1 and 1.2: what a pessimistic transaction locks
+// ---------------------------------------------------------------------------
+
+/// A **merge** operand takes the key's lock, because in this engine a merge is
+/// a write for conflict purposes: `validate_write_conflicts` walks the write
+/// order without looking at kinds, so an unlocked merge on a hot key would
+/// abort at commit exactly as an unlocked put would. Exempting it would hand
+/// the caller a pessimistic transaction that still loses the race it opted in
+/// to avoid.
+#[test]
+fn a_pessimistic_merge_takes_the_keys_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_merge_ranged(dir.path());
+    db.put(&cf, b"k", b"base", Duration::ZERO).unwrap();
+
+    let mut older = db.begin_pessimistic();
+    let mut younger = db.begin_pessimistic();
+    older.merge(&cf, b"k", b"op").unwrap();
+    let err = younger
+        .get_for_update(&cf, b"k")
+        .expect_err("a merged key is a locked key");
+    assert_eq!(err.kind(), "conflict", "{err}");
+    // ...and so is the reverse: a merge onto a key someone else holds.
+    let err = younger.merge(&cf, b"k", b"other").unwrap_err();
+    assert_eq!(err.kind(), "conflict", "{err}");
+    younger.rollback().unwrap();
+    older.commit().unwrap();
+    assert_eq!(db.get(&cf, b"k").unwrap(), b"base|op");
+    db.close().unwrap();
+}
+
+/// A **range delete** takes no lock, even in a pessimistic transaction. What it
+/// would need is a lock on the *interval*, and span locks are v2; a point lock
+/// on the start bound would protect one key while reading as if it protected
+/// the span. So for its span a pessimistic transaction is an ordinary
+/// optimistic writer, and the span index decides its conflicts at commit
+/// exactly as it always has.
+#[test]
+fn a_pessimistic_range_delete_takes_no_point_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_merge_ranged(dir.path());
+    db.put(&cf, b"b", b"v", Duration::ZERO).unwrap();
+
+    let mut older = db.begin_pessimistic();
+    let mut younger = db.begin_pessimistic();
+    older.delete_range(&cf, b"a", b"z").unwrap();
+    assert!(
+        db.txn_locks_idle_for_tests(),
+        "a range delete must not take a point lock"
+    );
+    // Neither the start bound nor a covered key is locked.
+    younger.get_for_update(&cf, b"a").unwrap_err();
+    assert_eq!(younger.get_for_update(&cf, b"b").unwrap(), b"v");
+    younger.rollback().unwrap();
+    older.commit().unwrap();
+    db.close().unwrap();
+}

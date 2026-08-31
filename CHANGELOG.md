@@ -66,6 +66,35 @@ by 0.8.2. That is what makes every feature below individually rollback-safe.
   storage-engine **participant** only: no coordinator election, no consensus, no
   timeout decisions, and nothing is ever aborted automatically. A `prepare` that
   returns `Ok` cannot subsequently lose a conflict. Unified layout only.
+- **Pessimistic locking (3.3).** `DB::begin_pessimistic` /
+  `begin_pessimistic_with_isolation` begin a transaction that takes a **point
+  lock** on every key it writes or reads through the new
+  `Txn::get_for_update(cf, key)`, and waits for ownership instead of
+  abort-retrying. Opt-in per transaction and off by default; an optimistic
+  transaction is unchanged and never touches the lock table. Deadlock freedom is
+  **wait-die** on a new per-database transaction id: an older requester waits, a
+  younger one dies immediately with `Conflict`. Three consequences a caller has
+  to plan for:
+  - **`put` can block**, where it was an arena memcpy. Holding a foreign lock
+    across one adds a deadlock edge wait-die does not cover — it orders
+    transactions, not foreign locks.
+  - **A conflict can surface from `put`, `merge` or `get_for_update`**, not only
+    from `commit`. That is wait-die killing the younger transaction, and the
+    caller retries exactly as it would after a commit conflict.
+  - **At `Snapshot`, a lock grant refreshes the read snapshot.** Without it the
+    feature buys nothing — the transaction waits for the hot key, is granted it,
+    and still aborts on the write it waited for (measured: 85 commit conflicts
+    over 2,000 contended rounds without the refresh, zero with it). The price is
+    that pessimistic `Snapshot` is no longer snapshot-isolated across grants:
+    read skew becomes possible. `Serializable` revalidates its read set before
+    adopting the new snapshot, turning the same situation into an earlier abort.
+    `RepeatableRead` never refreshes, so it keeps its snapshot and can still lose
+    an update it read before the grant — locks add ordering, not isolation.
+  Span locks are **not** in v1, so a range delete in a pessimistic transaction
+  takes no lock at all. A `prepare` converts the transaction's locks into 3.2
+  reservations and wakes every waiter with `Conflict`, because from that instant
+  the durable reservation is the authority. **The throughput case is not made** —
+  see "Measurement honesty" below and `bench-results/3.3/2026-08-31/`.
 
 ### Reads
 
@@ -149,6 +178,17 @@ author. They are implemented once each and pinned in `tests/composition.rs`:
   operand is one key and one value, which is what the replay path has a shape
   for; two keys and no value is not, and `Txn::prepare` refuses it at the API
   rather than letting replay discover it.
+- A pessimistic transaction's **point lock becomes a durable reservation at
+  `prepare`**, on the same `(cf_id, key)` pair and inside the same `commit_mu`
+  acquisition, and every waiter is woken with `Conflict` rather than granted a
+  lock whose commit is guaranteed to fail. After a crash only the reservation
+  exists: a new transaction takes the lock and is refused at *commit* until a
+  coordinator resolves the prepare, so nobody hangs on a crashed owner.
+- A pessimistic **merge** takes its key's lock and a pessimistic **range
+  delete** takes none. A merge is a write for conflict purposes in this engine,
+  so an unlocked one would abort at commit exactly as an unlocked put would; a
+  range delete needs a lock on the *interval*, and a point lock on its start
+  bound would protect one key while reading as if it protected the span.
 
 ### Measurement honesty
 
@@ -158,7 +198,23 @@ running. Where a benchmark did not decisively meet its acceptance criterion the
 feature ships **default-off** and its `bench-results/<feature>/<date>/summary.md`
 records what a valid re-measurement would require, rather than reporting a
 number nobody believes. That applies to 0.1 (miss-heavy), 0.5, 0.6, 0.8, 0.9's
-streaming phase and 2.2's write-time ratio. The S3-gated acceptance arms of 0.4
+streaming phase and 2.2's write-time ratio.
+
+**3.3 is the one that missed its throughput criterion outright, and it ships
+anyway** because it is opt-in per transaction and its *correctness* criterion is
+met unconditionally: zero commit conflicts in every pessimistic run, against
+thousands in every optimistic one. On retry-corrected throughput a tight
+begin-acquire-commit loop on one key is **0.61x** at two threads and **0.17x** at
+eight; p99 is 3.2-3.8x better at two threads and in a realistic transaction
+shape, and 3.0x worse in the eight-thread tight loop. The cause is understood and
+written down: wait-die kills the *younger* requester, and in a tight loop the
+requester is always the younger party, so the "older waits" arm almost never runs
+and the mode degenerates into spin-abort-retry.
+`bench-results/3.3/2026-08-31/README.md` has the tables and names the two design
+alternatives (retaining a restarted transaction's timestamp; wound-wait) that
+would be expected to change it.
+
+The S3-gated acceptance arms of 0.4
 and 0.5 were **not run** — no `ONDADB_S3_ENDPOINT` was available — and are not
 claimed.
 

@@ -102,6 +102,7 @@ the two unexamined candidates.
 |---|---|---|
 | `DbInner::commit_mu` | **every** commit, at every isolation level (3.2 phase rule 5); before that, only Snapshot/Serializable validation + apply and any commit containing a range delete (1.2) | reservation check → conflict check → apply → publish → span-marker insert. In `commit_prepared` it additionally spans the **decision fsync** |
 | `DbInner::prepared` (Mutex) | the prepared-transaction reservation registry (3.2) | one hash probe on the commit path; the whole of `Txn::prepare`'s validate-and-register; the whole of `commit_prepared`/`abort_prepared` including their decision fsync. Taken **inside** `commit_mu`, never outside it on a write path, and never while `wal_gens` is held |
+| `DbInner::txn_locks` (Mutex + per-entry Condvars) | point locks held by pessimistic transactions (3.3) | one acquire, one release, or one mass wake. A **leaf** on the acquisition path: `acquire` parks holding nothing else, and a parked waiter holds the table mutex only between wake-ups. The one nesting is `commit_mu` → `txn_locks` (`Txn::prepare`'s lock-to-reservation conversion, and `commit`'s early returns, which call `release` under the guard); **never** the reverse |
 | `DbInner::wal_gens` (Mutex) | unified WAL generation pins and the retirement sweep (3.2) | one pin, one release, or one sweep. A **leaf**: flush workers take it holding nothing, and the unlinking itself happens after it is dropped |
 | `DbInner::span_index` (Mutex+Condvar) | committed-span markers (1.2) | one check, one insert, or one prune; **never held across IO**. Also taken alone, ahead of `commit_mu`, for the capacity reservation |
 | `DbInner::cf_lifecycle_mu` (2.2) | the catalog-shape changes that validate before they publish: CF create / create-many / drop / clear, partition-rule add/remove | validation → `catalog_txn` → publish. Taken **before** `manifest_mu`, never after |
@@ -256,6 +257,136 @@ decision and inserts **nothing** into the memtable; pass 2
 `observe_seq(unified_max_seq)`) matches them. A commit decision raises the
 watermark to `commit_seq + count - 1` **before** applying, so a decision whose
 records fail to apply has still reserved its sequences.
+
+### Pessimistic transaction locks (3.3)
+
+`DbInner::txn_locks` (`src/txn_lock.rs`) is a per-database table of **point
+locks**, taken only by transactions begun with `DB::begin_pessimistic` /
+`begin_pessimistic_with_isolation`. An optimistic transaction never touches it:
+it takes no lock, waits for none, and validates at commit exactly as before.
+The table is empty and untouched in every database that never opts in.
+
+It is **not** `ColumnFamily::range_locks`. That is the compaction/parts span
+lock: no per-owner identity, background waiters, span-shaped. This one has an
+owner (the transaction id), a deadlock rule, and a hand-off order. The two
+never meet.
+
+**Key.** `(cf.id(), key)` — the durable column-family id, not
+`txn::cf_id`'s pointer identity. A family dropped and recreated reuses the
+allocation (the bug L2 fixed for `THREAD_COMMIT_FLOOR`), and this is also the
+key 3.2's reservation registry uses, so the two subsystems index one space.
+
+**Wait-die.** Ids come from one `DbInner::txn_ids` counter, so lower is
+strictly older and a tie is impossible. A requester **older** than the holder
+waits; a **younger** one dies at once with `Conflict`. Equal ids mean the
+holder *is* the requester — a re-entrant acquisition, granted immediately.
+Waits therefore always point older→younger, a cycle would need the id order to
+cycle, and there is no cycle detection and no lock ordering imposed on callers.
+`Txn::reset` re-mints the id: a reset transaction is a new transaction, and a
+reused handle that stayed the oldest would win every race forever.
+
+FIFO hand-off costs one extra rule. Waiters queue in arrival order, not age
+order, so handing the lock to the front of the queue can leave a *younger*
+waiter behind an older new holder — the one edge wait-die forbids, and enough
+to deadlock against a second key (holder T5, waiters T2 then T4: T5 releases to
+T2, and T4 would now wait on T2 while T2 may already be waiting on T4
+elsewhere). A hand-off therefore **denies** every remaining waiter younger than
+the new holder, with the same `Conflict` it would have got had it arrived an
+instant later. FIFO order survives among the rest.
+
+**Two consequences for callers**, both in the API docs and the release notes: a
+conflict can now surface from `put`/`merge`/`get_for_update` rather than only
+from `commit`, and **`put` can block** — a caller holding a foreign lock across
+one gains a deadlock edge wait-die does not cover, because wait-die orders
+transactions, not foreign locks.
+
+**Snapshot refresh on grant — the semantic.** Holding a lock does not move
+`read_seq`, so without this the feature buys nothing at the fixed levels: a
+transaction waits politely for the hot key, is granted it, and
+`validate_write_conflicts` then finds `peek_seq(key) > read_seq` — the
+predecessor's write, committed while it waited — and aborts on the very thing
+it waited for. Measured: with the refresh disabled the two-thread hot-key test
+takes 85 commit conflicts over 2,000 rounds; with it, zero.
+
+So at `Snapshot` and `Serializable` a successful acquisition refreshes the
+transaction's snapshot, in this order:
+
+1. The outgoing owner stamps its entry with the sequence it committed at
+   (`LockEntry::last_commit_seq`, from `Txn::committed_at`); a rolled-back owner
+   stamps nothing. A stamped entry outlives its owner's release while
+   publication has not reached it, because the *next* holder of that key needs
+   it whether or not it was queued at the time.
+2. On grant the new owner waits (bounded, `yield_now`, one second — the shape of
+   `wait_visible_at_own_floor`) for `visible_seq() >= last_commit_seq`.
+   Publication is gap-free (invariant 5), so this is transient by construction
+   and the bound only guards a torn process.
+3. At `Serializable`, `validate_read_conflicts` re-runs against the **old**
+   `read_seq` first. That is what makes the refresh sound: the reads are proven
+   unchanged at the new snapshot, so it is as if they had all happened there.
+4. `acquire_snapshot(new)` **before** `release_snapshot(old)`, so
+   `oldest_snapshot()` never transiently jumps forward and lets compaction GC a
+   version this transaction still needs.
+
+What it costs, stated plainly:
+
+- **A pessimistic `Snapshot` transaction is no longer snapshot-isolated across
+  lock grants.** Read skew (G-single) becomes possible where snapshot isolation
+  prevented it. That is the documented semantic, not a bug
+  (`snapshot_refresh_admits_read_skew` pins it).
+- At `Serializable`, step 3 turns the same situation into an *earlier* abort.
+  Pessimistic `Serializable` is therefore not conflict-free in general — only
+  for write-write contention with an unchanged read set.
+- `RepeatableRead` does **not** refresh: it runs no validation, so it has no
+  conflict to avoid, and refreshing would break the one thing its contract
+  promises. The consequence is that a `RepeatableRead` transaction can still
+  lose an update it read before the grant — the lock made the writes ordered,
+  but it cannot make a stale read fresh. Locks add ordering, not isolation
+  (`repeatable_read_keeps_its_snapshot_and_can_lose_an_update`).
+- The conflict-free guarantee holds **between transactions that both take the
+  lock**. `peek_seq` reads at `u64::MAX` and can see an in-flight, unpublished
+  write, so an ordinary optimistic writer ignoring the lock can still make a
+  pessimistic transaction abort. Locks are advisory *pre-commit* coordination;
+  MVCC remains the authority.
+
+**Composition with prepared transactions (3.2).** In-memory locks are volatile;
+reservations are durable. At `prepare` — inside the same `commit_mu`
+acquisition that registers it — the transaction's locks are dropped and every
+waiter on them is woken with `Conflict` rather than granted a lock whose commit
+is guaranteed to fail against the reservation it cannot see. After a crash only
+the reservation exists: a new pessimistic transaction takes the lock and its
+*commit* is refused until a coordinator resolves the prepare, so a waiter is
+told no rather than left hanging on an owner that is never coming back.
+
+**Release.** `Txn::release` is the one funnel: commit's five returns, rollback,
+reset, `Drop`, and the poison check that returns *without* calling release and
+relies on `Drop`. Release must be correct when the releasing thread is not the
+acquiring one — `Txn` is `Send`. `DB::close` shuts the table down (waiters woken
+with `InvalidDb`, later acquisitions refused); fail-stop wakes waiters with
+`Poisoned` but leaves the table usable, because a poisoned database still lets a
+transaction buffer writes and fail at `commit` and 3.3 does not move that
+failure earlier.
+
+**Measured cost, and it is the uncomfortable one**
+(`bench-results/3.3/2026-08-31/`). The conflict-free guarantee holds everywhere
+— zero commit conflicts in all 20 benchmark runs against thousands optimistic —
+but on retry-corrected *throughput* a tight begin-acquire-commit loop on one key
+is **0.61x** at two threads and **0.17x** at eight. The reason is wait-die's
+direction: it kills the **younger** requester, ids increase, and a tight-loop
+requester is essentially always the younger party, so the "older waits" arm
+almost never runs and the mode degenerates into spin-abort-retry. Give the
+transaction some life before it asks for the lock (sixteen unrelated reads) and
+ages mix, deaths per successful round fall from ~33 to ~5.6, throughput reaches
+parity and p99 improves 3.8x. **So: use pessimistic mode for transactions that
+do real work around a contended key, not for a one-key increment loop** — and
+do not "fix" the loop case by tuning. The two things that would change it are
+design changes, both out of scope: retaining a restarted transaction's timestamp
+(the textbook wait-die formulation, which the plan explicitly rejected for
+`reset`), or switching to wound-wait.
+
+**Not in v1:** span locks (`lock_range`), and therefore range deletes take no
+lock at all — a point lock on a start bound would protect one key while reading
+as if it protected the span. Phantom protection is unchanged and still out of
+scope.
 
 ### Range deletes and the committed-span index (1.2)
 

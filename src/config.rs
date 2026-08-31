@@ -104,20 +104,44 @@ impl SyncMode {
 }
 
 /// Transaction isolation level.
+///
+/// Each variant describes an **optimistic** transaction, the default. A
+/// pessimistic one ([`DB::begin_pessimistic`](crate::DB::begin_pessimistic),
+/// 3.3) takes point locks and waits for them, which changes two of the five
+/// levels; each variant below says how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
     /// Reads observe the latest committed sequence at read time; no conflict
     /// detection on commit.
+    ///
+    /// Pessimistic mode adds lock ordering and nothing else — there is no
+    /// snapshot to refresh, and reads already float.
     ReadUncommitted,
     /// Reads observe the latest committed sequence at read time; no conflict
     /// detection on commit. (The default for the single-op helpers.)
+    ///
+    /// Pessimistic mode adds lock ordering and nothing else — there is no
+    /// snapshot to refresh, and reads already float.
     ReadCommitted,
     /// Reads are pinned to a snapshot taken at `begin`; no conflict detection on
     /// commit.
+    ///
+    /// **Pessimistic mode does not refresh this snapshot**, because not moving
+    /// is the one thing this level promises. Locks therefore order the writes
+    /// (a dirty write is impossible) but cannot make a stale read fresh: a
+    /// read-modify-write that reads before the grant can still lose its update.
+    /// Use [`Snapshot`](Self::Snapshot) if you want the lock to prevent that.
     RepeatableRead,
     /// Snapshot isolation: reads are pinned to the `begin` snapshot and commit
     /// aborts with [`Conflict`](crate::OndaError::Conflict) on a write-write
     /// conflict (first-committer-wins). Permits write skew.
+    ///
+    /// **In pessimistic mode a lock grant refreshes the snapshot**, so a
+    /// transaction that waited for a key commits against what it waited for
+    /// instead of aborting on it. The price is that reads taken before an
+    /// acquisition may be older than reads taken after it: read skew
+    /// (G-single) becomes possible where snapshot isolation prevented it. That
+    /// is the documented semantic of pessimistic `Snapshot`, not a bug.
     Snapshot,
     /// Snapshot isolation plus validation, on commit, that every key the
     /// transaction *read by point lookup* is unchanged since its snapshot.
@@ -126,6 +150,12 @@ pub enum IsolationLevel {
     /// phantoms (rows inserted into a scanned range by a concurrent committer) are
     /// not detected. Use only point `get`s if you rely on the conflict check.
     /// (TODO:  implement full SSI with rw-antidependency)
+    ///
+    /// **In pessimistic mode a lock grant refreshes the snapshot**, after
+    /// revalidating the read set against the old one — so a changed read-set
+    /// key aborts at the acquisition rather than at the commit. Pessimistic
+    /// `Serializable` is therefore not conflict-free in general, only for
+    /// write-write contention with an unchanged read set.
     Serializable,
 }
 

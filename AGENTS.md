@@ -158,6 +158,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | Range tombstones (1.2) | `range_tombstone.rs`, `span_index.rs` | A commit holding a span takes `commit_mu` at every isolation level |
 | Delete-only excise (1.2) | `excise.rs` | Retires a whole table by catalog edit without reading it |
 | Prepared transactions (3.2) | `prepared.rs`, `txn.rs`, `db.rs` | Unified layout only |
+| Pessimistic locking (3.3) | `txn_lock.rs`, `txn.rs`, `db.rs` | Opt-in per transaction (`DB::begin_pessimistic`); point locks only, wait-die, and a snapshot refresh on grant that costs `Snapshot` its read-skew guarantee |
 | Prefix-delta blocks (2.1) | `sst/mod.rs` (`encode_entry_delta`) | |
 | Manifest edit log (2.2) | `manifest_edit.rs` | See invariants 1 and 2 |
 | PerfContext (0.10) | `perf.rs` | |
@@ -177,9 +178,10 @@ is implemented), range compaction, `Serializable` phantom protection (point-read
 validation only — documented on `IsolationLevel::Serializable`),
 rename/hot-reconfig of column families, write-amp statistics. Also: coordinator
 election, consensus and automatic abort for prepared transactions (3.2 is a
-*participant* only), span locks and phantom protection for pessimistic
-transactions, managed sequence mode, large-transaction private spill, and
-tiered/lazy-leveling compaction.
+*participant* only), **span locks** and phantom protection for pessimistic
+transactions (3.3 is point locks only — a range delete in a pessimistic
+transaction takes no lock at all), managed sequence mode, large-transaction
+private spill, and tiered/lazy-leveling compaction.
 
 **Two-phase commit (3.2) is implemented** and is no longer a non-goal:
 `Txn::prepare` / `DB::commit_prepared` / `abort_prepared` / `list_prepared`,

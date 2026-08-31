@@ -282,6 +282,23 @@ pub struct DbInner {
     visible: AtomicU64,
     publish: Mutex<PublishState>,
     snapshots: Mutex<BTreeMap<u64, usize>>,
+    /// Transaction ids, for pessimistic locking's wait-die age order (3.3).
+    ///
+    /// A counter of its own, not `next_seq`: transactions that never commit
+    /// must not burn sequence numbers. And `read_seq` cannot serve as an
+    /// identity — it is `visible_seq()` at the fixed levels but
+    /// `read_floor_seq()` at the others, many concurrent transactions pin the
+    /// same watermark (which is why `acquire_snapshot` is refcounted), and
+    /// `reset` reassigns it.
+    txn_ids: AtomicU64,
+    /// Point locks held by pessimistic transactions (3.3).
+    ///
+    /// Empty — and untouched — in every database that never calls
+    /// [`DB::begin_pessimistic`]. Its mutex is a **leaf** on the acquisition
+    /// path: `acquire` blocks holding nothing else. The one nesting is
+    /// `commit_mu` → `txn_locks`, in `Txn::prepare`'s lock-to-reservation
+    /// conversion and on `commit`'s early-return paths; never the reverse.
+    pub(crate) txn_locks: crate::txn_lock::LockTable,
     pub(crate) commit_mu: Mutex<()>,
     /// Committed-span index (1.2), or `None` when the build never needs one.
     ///
@@ -737,6 +754,24 @@ impl DbInner {
 
     pub(crate) fn next_file_id(&self) -> u64 {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    // ---- pessimistic transaction locking (3.3) ------------------------------
+
+    /// Mint the next transaction id. Lower is older; ids start at 1 because 0
+    /// names "no owner" in the lock table.
+    pub(crate) fn next_txn_id(&self) -> u64 {
+        self.txn_ids.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Release every point lock `txn_id` holds, stamping the outgoing entries
+    /// with `committed_at` (`None` for a transaction that published nothing).
+    ///
+    /// The published watermark is read here rather than inside the table so
+    /// `txn_lock` stays free of any dependency on the database.
+    pub(crate) fn release_txn_locks(&self, txn_id: u64, committed_at: Option<u64>) {
+        self.txn_locks
+            .release_all(txn_id, committed_at, self.visible_seq());
     }
 
     // ---- durable prepared transactions (3.2) -------------------------------
@@ -1411,8 +1446,18 @@ impl DbInner {
     /// failure the workers are on their way out, and a compaction thread parked
     /// on the IO limiter would otherwise sit out its full refill first.
     pub(crate) fn fail_stop(&self, why: String) {
-        self.poison.set(why);
+        self.trip_poison(why);
         self.cancel_background_io();
+    }
+
+    /// Set the fail-stop flag and free everything parked on transaction locks.
+    ///
+    /// A fail-stopped database accepts no further commit, so a transaction
+    /// waiting for another's lock is waiting for a release that may never come;
+    /// nothing in 3.3 may hang a caller past a poisoning (phase rule 7).
+    pub(crate) fn trip_poison(&self, why: String) {
+        self.poison.set(why.clone());
+        self.txn_locks.wake_all_with_error(OndaError::Poisoned(why));
     }
 
     /// Mark a part operation in flight until the returned guard drops. See
@@ -1756,6 +1801,9 @@ fn build_db_inner(
             completed: HashMap::new(),
         }),
         snapshots: Mutex::new(BTreeMap::new()),
+        // 1, not 0: 0 names "no owner" in the lock table.
+        txn_ids: AtomicU64::new(1),
+        txn_locks: crate::txn_lock::LockTable::new(),
         commit_mu: Mutex::new(()),
         span_index: span_index.clone(),
         prepared: Mutex::new(crate::prepared::PreparedRegistry::new(
@@ -2881,13 +2929,37 @@ impl DB {
         self.inner.visible_seq()
     }
 
+    /// Transactions parked on the 3.3 point lock for `key` in `cf`.
+    ///
+    /// A lock is not directly observable, so the tests that pin "this caller
+    /// waits" and "this caller does not" observe the queue instead of sleeping
+    /// and hoping.
+    #[doc(hidden)]
+    pub fn txn_lock_waiters_for_tests(&self, cf: &Arc<ColumnFamily>, key: &[u8]) -> usize {
+        self.inner.txn_locks.waiters(cf.id(), key)
+    }
+
+    /// Whether no transaction holds any 3.3 point lock — the release funnel's
+    /// postcondition.
+    #[doc(hidden)]
+    pub fn txn_locks_idle_for_tests(&self) -> bool {
+        self.inner.txn_locks.is_idle()
+    }
+
+    /// The oldest live snapshot sequence, which compaction's version GC keys
+    /// off. The 3.3 refresh must never move it forward early.
+    #[doc(hidden)]
+    pub fn oldest_snapshot_for_tests(&self) -> u64 {
+        self.inner.oldest_snapshot()
+    }
+
     /// Trip the fail-stop flag, as a durability failure would.
     ///
     /// A test lever. Production code reaches this only through
     /// `DbInner::fail_stop`, on a real failure.
     #[doc(hidden)]
     pub fn fail_stop_for_tests(&self, why: &str) {
-        self.inner.poison.set(why.to_string());
+        self.inner.trip_poison(why.to_string());
     }
 
     /// Close the unified WAL's files underneath the store, so the next append
@@ -3024,6 +3096,12 @@ impl DB {
         if self.inner.closing.swap(true, Ordering::SeqCst) {
             return Ok(()); // already closing
         }
+        // Free every transaction-lock waiter first: close waits for the flush
+        // queue to drain below, and a caller parked on a lock held by a
+        // transaction that will never commit would outlive the database.
+        self.inner
+            .txn_locks
+            .shut_down(OndaError::InvalidDb("database is closing".into()));
         // Stop pacing background IO *before* anything waits on it. The final
         // flushes below are drained by a spin-wait, and a flush worker parked on
         // the limiter would make that wait as long as the configured rate says

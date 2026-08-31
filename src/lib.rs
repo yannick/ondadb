@@ -91,6 +91,7 @@ pub mod storage_s3;
 pub mod table_cache;
 pub mod tailing;
 pub mod txn;
+pub(crate) mod txn_lock;
 pub mod unified;
 pub mod util;
 pub mod wal;
