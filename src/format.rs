@@ -1,6 +1,11 @@
 //! On-disk constants shared by the memtable, WAL and SSTable layers: per-entry
 //! flag bits and the MVCC internal-key trailer.
 //!
+//! Every number assigned here is shared with wavesdb, the format sibling whose
+//! objects this engine can mount. `docs/format-registry.md` is the registry;
+//! [`wavesdb_reserved`] pins the numbers wavesdb owns, with build-time
+//! assertions so ondaDB cannot claim one.
+//!
 //! An *internal key* is `user_key` followed by an 8-byte big-endian trailer
 //! holding the bitwise complement of the sequence number.  Complementing makes
 //! higher sequence numbers sort *first* within the same user key, so a forward
@@ -21,9 +26,14 @@ pub mod flags {
 
 /// Mask of every entry-flag bit this binary implements (`0x17`).
 ///
-/// `0x08` is deliberately absent: it named a `DELTA_SEQ` encoding no writer
-/// ever produced, so it is reserved-unknown and the decoders reject it. Record
-/// extensibility comes from kinds, not from the remaining flag bits.
+/// `0x08` is deliberately absent. It once named a `DELTA_SEQ` encoding no
+/// writer ever produced; it is now permanently assigned to wavesdb's
+/// [`wavesdb_reserved::FLAG_VLOG_GROUPED`] and must never be reused here.
+/// The decoders reject it, which is the correct outcome — a grouped vlog
+/// pointer addresses a compression group this binary cannot decompress — but
+/// they must keep rejecting it as *someone else's feature* rather than
+/// reclaiming it. Record extensibility comes from kinds, not from the
+/// remaining flag bits.
 pub const KNOWN_ENTRY_FLAGS: u8 =
     flags::TOMBSTONE | flags::HAS_TTL | flags::HAS_VLOG | flags::SINGLE_DELETE;
 
@@ -193,6 +203,49 @@ pub mod modifiers {
     /// Mask of every modifier bit this binary implements.
     pub const KNOWN: u64 = HAS_TTL | HAS_VLOG;
 }
+
+/// Bits, modifiers and kinds permanently assigned to **wavesdb**, the format
+/// sibling these files are shared with (`attach_part_by_ref` here, mounts
+/// there). They are listed as constants rather than prose so that the
+/// compile-time assertions below can hold ondaDB to them: the failure this
+/// prevents is not a missing feature but a *silent misread* — the same mask
+/// meaning two different things in two engines that mount each other's
+/// objects.
+///
+/// ondaDB implements none of these. Encountering one is
+/// [`OndaError::UnsupportedFormat`](crate::OndaError), which is correct and
+/// must stay correct; the reservation is what stops a future ondaDB feature
+/// from claiming a number and decoding wavesdb's bytes as its own.
+pub mod wavesdb_reserved {
+    /// Entry flag `0x08`: the vlog pointer addresses a shared compression
+    /// GROUP frame, with a uvarint in-group offset following the 16-byte
+    /// pointer. wavesdb gates it behind [`CAP_VLOG_GROUPING`].
+    pub const FLAG_VLOG_GROUPED: u8 = 0x08;
+    /// The same encoding named in an extended record's modifier word.
+    pub const MOD_VLOG_GROUPED: u64 = 0x08;
+    /// Capability bit 7: wavesdb managed-sequence mode — persisted sequence
+    /// ownership and a durable discard floor.
+    pub const CAP_MANAGED_MODE: u64 = 1 << 7;
+    /// Capability bit 8: wavesdb vlog compression grouping, the permission
+    /// for [`FLAG_VLOG_GROUPED`].
+    pub const CAP_VLOG_GROUPING: u64 = 1 << 8;
+    /// Kind 19: wavesdb large-transaction spill descriptor.
+    pub const KIND_SPILL_DESCRIPTOR: u64 = 19;
+    /// Kind 32: wavesdb managed-sequence ownership record.
+    pub const KIND_MANAGED_OWNERSHIP: u64 = 32;
+    /// Kind 33: wavesdb managed-sequence discard floor.
+    pub const KIND_MANAGED_DISCARD_FLOOR: u64 = 33;
+}
+
+// ondaDB must never assign a number wavesdb already writes. These fail the
+// BUILD, not a test, because the damage is done at the moment such a constant
+// is written down — every artifact produced afterwards carries the collision.
+const _: () = assert!(KNOWN_ENTRY_FLAGS & wavesdb_reserved::FLAG_VLOG_GROUPED == 0);
+const _: () = assert!(modifiers::KNOWN & wavesdb_reserved::MOD_VLOG_GROUPED == 0);
+const _: () = assert!(
+    KNOWN_CAPS & (wavesdb_reserved::CAP_MANAGED_MODE | wavesdb_reserved::CAP_VLOG_GROUPING) == 0
+);
+const _: () = assert!(wavesdb_reserved::KIND_MANAGED_DISCARD_FLOOR <= MAX_ASSIGNABLE_KIND);
 
 /// Reject a record kind this binary cannot honor.
 ///

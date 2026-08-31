@@ -329,3 +329,17 @@ manifest is still `VERSION = 1`. A one-page shared registry (which engine owns
 which bits/kinds, and the agreed meaning of `0x08`) would prevent the
 "same mask, different meaning" failure wavesdb's own risk register names as its
 top compatibility risk.
+
+> **Resolved, 2026-08-31 — and not entirely in time.** The registry asked for
+> above is [`format-registry.md`](format-registry.md). Capability bits 0–6 and
+> record kinds 1–5 / 16–18 turned out to have been assigned *identically* by
+> both engines independently, which is the part of the contract that held.
+> `0x08` did not: 0.9.0 retired `DELTA_SEQ` and made the bit reserved-unknown
+> while wavesdb was already writing it as `FlagVlogGrouped`. The bit is
+> wavesdb's — ondaDB never wrote it, wavesdb does — and ondaDB's rejection of
+> it stays, because a grouped pointer addresses a compression group this engine
+> cannot decompress; failing closed beats misreading. `format::wavesdb_reserved`
+> now pins that assignment and the other wavesdb-owned numbers with build-time
+> assertions, so the bit can never be reclaimed here. wavesdb gated the encoding
+> behind capability bit 8 (`CapVlogGrouping`) so the incompatibility is declared
+> in the manifest and surfaces at open rather than mid-scan.
