@@ -81,6 +81,28 @@ reserves them so it cannot assign them to something else.
 | 34–63 | reserved | — | — |
 | > 63 | never assigned to anything, by either engine | — | — |
 
+## Compression codec ids
+
+Stored per block and per blob frame, so this byte is read from every file
+either engine opens.
+
+| Id | Codec | ondaDB | wavesdb |
+| ---: | --- | --- | --- |
+| 0–5 | none, snappy, lz4, zstd, lz4-fast, flate | yes | yes |
+| 6 | LZ4 native block format | *reserved to wavesdb* | `LZ4Native` |
+| 7 | zstd with a per-blob-file trained dictionary | *reserved to wavesdb* | `ZstdDict` |
+| 8 | brotli | *reserved to wavesdb* | `Brotli` |
+
+0–5 agree by independent assignment, as the capability bits did.
+`Compression::from_u8` returns `None` for 6–8, so ondaDB already fails closed
+on a wavesdb block using one — the entry here is to keep those numbers from
+being handed to a different codec later, which is the failure that would not
+fail closed.
+
+The practical consequence is the same as for grouping: a database whose blocks
+or blob frames use a wavesdb-only codec is not readable by ondaDB. Both engines
+default to codecs in the shared range.
+
 ## The rule going forward
 
 Assign from this page, then implement. A number that is written down here and
