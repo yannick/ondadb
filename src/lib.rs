@@ -1,14 +1,33 @@
 //! # ondaDB
 //!
-//! A safe, performance-focused Rust key/value
-//! LSM storage engine.  ondaDB targets feature parity with the C engine — column
+//! A safe, performance-focused Rust key/value LSM storage engine: column
 //! families, MVCC transactions with five isolation levels, savepoints, TTL,
-//! WiscKey value separation, bloom filters, leveled ("Spooky") compaction, a
-//! group-commit WAL, block/file caches, and object-store replication — while
-//! staying in safe Rust wherever it does not cost measurable performance.
+//! WiscKey value separation, Bloom filters, leveled compaction, a group-commit
+//! WAL, block and file caches, partitioned parts with storage tiers, and
+//! optional S3-backed bottom levels — staying in safe Rust wherever that does
+//! not cost measurable performance. (`#![deny(unsafe_code)]` by default; the
+//! `unsafe-fastpath` feature lifts it for exactly two localized paths.)
 //!
-//! The crate is built bottom-up; modules are added phase by phase. See the
-//! implementation plan for the full roadmap.
+//! Beyond the ordinary key/value surface:
+//!
+//! * [`DB::merge`](crate::DB::merge) appends a **merge operand** resolved at
+//!   read time by the family's [`MergeOperator`] — a read-modify-write with no
+//!   read and no conflict window.
+//! * [`DB::delete_range`](crate::DB::delete_range) records the deletion of a
+//!   whole comparator interval as **one** record at one sequence.
+//! * [`DB::multi_get`](crate::DB::multi_get) resolves many keys in one
+//!   snapshot-consistent pass, fetching each distinct block once.
+//! * [`Txn::prepare`](crate::Txn::prepare) durably prepares a transaction for
+//!   two-phase commit, resolvable by external id across a restart.
+//! * [`DB::new_tailing_iterator`](crate::DB::new_tailing_iterator) follows an
+//!   append-only keyspace without rebuilding a cursor per poll.
+//! * [`PerfContext`] attributes one operation's cost to a mechanism.
+//!
+//! **Formats are capability-gated.** Every stored byte that is not 0.8.2's sits
+//! behind a `CAP_*` bit in [`mod@format`], enabled explicitly and one-way by
+//! [`DB::enable_format_capabilities`](crate::DB::enable_format_capabilities).
+//! Nothing is on by default, so an upgraded database keeps writing bytes an
+//! older binary can read until an operator decides otherwise.
 
 // The default build is safe Rust.  The optional `mmap-reads` and
 // `arena-memtable` features each lift this to allow the localized `unsafe` in,
