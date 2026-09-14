@@ -174,6 +174,7 @@ impl std::fmt::Debug for Clock {
 /// falls back to the precise clock.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)] // the crate's single audited exception; see lib.rs
+#[allow(clippy::unnecessary_cast)] // timespec field widths depend on the Linux target
 pub fn coarse_now_nanos() -> i64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
