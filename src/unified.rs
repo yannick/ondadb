@@ -587,18 +587,20 @@ impl UnifiedStore {
         best
     }
 
-    /// Fragments of the shared store's spans that fall inside `[lower, upper)`
-    /// for column family `id`, with the cf-id prefix stripped.
+    /// Add each shared store generation separately, windowed to this family.
+    /// Cursors compare user keys without copying or stripping fragment storage.
     ///
     /// Used to build a scan's range mask. The bounds handed in are user keys;
     /// the whole family's keyspace is `[id, id+1)` in prefixed order, which is
     /// what an unbounded scan clips to.
-    pub(crate) fn fragments_for(
+    pub(crate) fn add_range_sources(
         &self,
+        mask: &mut crate::range_tombstone::RangeMask,
         id: u64,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
-    ) -> Vec<crate::range_tombstone::Fragment> {
+        registry: &Arc<crate::range_tombstone::FragmentRegistry>,
+    ) {
         let s = self.state.read();
         let lo = prefixed(id, lower.unwrap_or_default());
         // The exclusive top of this family's keyspace is the next cf id; a
@@ -607,22 +609,27 @@ impl UnifiedStore {
             Some(u) => Some(prefixed(id, u)),
             None => id.checked_add(1).map(|next| next.to_be_bytes().to_vec()),
         };
-        let mut out = Vec::new();
         for mem in std::iter::once(&s.mem).chain(s.imm.iter().map(|i| &i.mem)) {
-            if mem.ranges().is_empty() {
-                continue;
+            if !mem.ranges().is_empty() {
+                mem.ranges().track_snapshots(registry);
+                mask.push_snapshot(
+                    mem.ranges().fragment_snapshot(),
+                    &default_comparator(),
+                    Some(&lo),
+                    hi.as_deref(),
+                    Some(id.to_be_bytes()),
+                );
             }
-            out.extend(
-                mem.ranges()
-                    .fragments(Some(&lo), hi.as_deref())
-                    .map(|mut f| {
-                        f.start.drain(..8);
-                        f.end.drain(..8);
-                        f
-                    }),
-            );
         }
-        out
+    }
+
+    pub(crate) fn range_cache_stats(&self) -> crate::range_tombstone::RangeCacheStats {
+        let s = self.state.read();
+        let mut stats = s.mem.ranges().stats();
+        for imm in &s.imm {
+            stats += imm.mem.ranges().stats();
+        }
+        stats
     }
 
     /// Walk every version of `user_key` for column family `id` visible at
@@ -767,6 +774,7 @@ impl UnifiedStore {
         let _g = self.rot.lock();
         let mut s = self.state.write();
         if let Some(pos) = s.imm.iter().position(|i| Arc::ptr_eq(i, imm)) {
+            imm.mem.ranges().retire();
             s.imm.remove(pos);
         }
         drop(s);
@@ -941,6 +949,85 @@ mod tests {
         )
         .unwrap();
         store
+    }
+
+    #[test]
+    fn cached_range_sources_survive_rotation_and_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            unified_memtable: true,
+            ..Options::new(dir.path().to_str().unwrap())
+        };
+        let (flush_tx, flush_rx) = unbounded();
+        let (store, _, _) = UnifiedStore::open(
+            dir.path().to_str().unwrap(),
+            &opts,
+            flush_tx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::util::Poison::new()),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        store
+            .apply_with_ranges(
+                &[],
+                &[(
+                    7,
+                    wal::RangeRef {
+                        start: b"f",
+                        end: b"z",
+                        seq: 5,
+                    },
+                )],
+            )
+            .unwrap();
+        let registry = Arc::new(crate::range_tombstone::FragmentRegistry::default());
+        let mut old = crate::range_tombstone::RangeMask::default();
+        store.add_range_sources(&mut old, 7, None, None, &registry);
+        let old_bytes = registry.stats().0;
+        store.rotate(true);
+        assert_eq!(store.state.read().imm.len(), 1);
+        store
+            .apply_with_ranges(
+                &[],
+                &[(
+                    7,
+                    wal::RangeRef {
+                        start: b"a",
+                        end: b"m",
+                        seq: 10,
+                    },
+                )],
+            )
+            .unwrap();
+        let cmp = default_comparator();
+        for _ in 0..100 {
+            let mut mask = crate::range_tombstone::RangeMask::default();
+            store.add_range_sources(&mut mask, 7, Some(b"g"), Some(b"y"), &registry);
+            for (key, seq, want) in [
+                (b"g", 5, Some(5)),
+                (b"g", 10, Some(10)),
+                (b"x", 10, Some(5)),
+                (b"g", 9, Some(5)),
+            ] {
+                assert_eq!(mask.covering_seq(&cmp, key, seq), want);
+            }
+        }
+        assert_eq!(old.covering_seq(&cmp, b"g", 10), Some(5));
+        assert_eq!(store.range_cache_stats().builds, 2);
+        assert_eq!(store.range_cache_stats().hits, 199);
+        let bytes = old_bytes;
+        let imm = match flush_rx.recv().unwrap() {
+            FlushJob::Unified { imm } => imm,
+            FlushJob::PerCf { .. } => panic!("expected unified flush"),
+        };
+        store.remove_imm(&imm);
+        assert_eq!(registry.stats().1, bytes);
+        drop(imm);
+        assert_eq!(registry.stats().1, bytes);
+        drop(old);
+        assert_eq!(registry.stats().1, 0);
     }
 
     fn wal_len(dir: &tempfile::TempDir, gen: u64) -> u64 {

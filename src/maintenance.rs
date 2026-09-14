@@ -130,6 +130,17 @@ pub struct CfStats {
 /// Database-wide statistics.
 #[derive(Debug, Clone, Default)]
 pub struct DbStats {
+    /// Range spans and estimated owned bytes in active/sealed memtables (unified counted once).
+    pub range_memtable_spans: u64,
+    pub range_memtable_bytes: u64,
+    /// Resident memtable fragment snapshots, excluding allocator headers.
+    /// SST-reader fragments and transaction overlays are not included.
+    pub range_fragment_cache_bytes: u64,
+    /// Memtable snapshots retained by readers after mutation or retirement.
+    pub range_fragment_retained_bytes: u64,
+    /// Builds/hits for currently live memtable sets; these reset as sets retire.
+    pub range_fragment_cache_builds: u64,
+    pub range_fragment_cache_hits: u64,
     pub num_column_families: usize,
     pub total_sstables: usize,
     pub total_bytes: u64,
@@ -208,7 +219,21 @@ impl DB {
             }
         }
         let bc = self.inner.ctx.bc.stats();
+        let mut ranges = crate::range_tombstone::RangeCacheStats::default();
+        for cf in &cfs {
+            ranges += cf.range_cache_stats();
+        }
+        if let Some(u) = &self.inner.unified {
+            ranges += u.range_cache_stats();
+        }
+        let (cache_bytes, retained_bytes) = self.inner.ctx.range_fragment_registry.stats();
         DbStats {
+            range_memtable_spans: ranges.spans,
+            range_memtable_bytes: ranges.span_bytes,
+            range_fragment_cache_bytes: cache_bytes,
+            range_fragment_retained_bytes: retained_bytes,
+            range_fragment_cache_builds: ranges.builds,
+            range_fragment_cache_hits: ranges.hits,
             num_column_families: cfs.len(),
             total_sstables,
             total_bytes,

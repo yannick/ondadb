@@ -20,44 +20,47 @@
 //! * [`RangeMask`] — the *read* form: several fragment lists plus a cursor
 //!   each, answering "what is the newest covering sequence at this key".
 //!
-//! Fragmentation happens only at flush and compaction, never on the write path:
-//! a `delete_range` call appends one span and touches nothing else.
+//! Fragmentation happens at flush/compaction and once per range-set generation
+//! on the first iterator read. Writes invalidate the cache without rebuilding it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::comparator::ComparatorRef;
 use crate::encoding::{append_uvarint, uvarint};
 use crate::error::{OndaError, Result};
 
-/// Fragment vectors materialized for a read (debug builds only).
-///
-/// The zero-cost gate is a claim about *allocation*, so it is proved with a
-/// counter rather than by inspection: a column family that never issues a range
-/// delete must leave this at zero across any number of reads and scans. Mirrors
-/// [`crate::memtable::snapshot_calls`], and compiles out of release builds.
+// Nonempty fragment sources attached to reads (debug builds only).
+//
+// The zero-cost gate is a claim about *allocation*, so it is proved with a
+// counter rather than by inspection: a column family that never issues a range
+// delete must leave this at zero across any number of reads and scans. Mirrors
+// [`crate::memtable::snapshot_calls`], and compiles out of release builds.
 #[cfg(debug_assertions)]
-static MASK_SOURCES: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    static MASK_SOURCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Read the debug-build range-mask materialization counter.
+/// Read the debug-build range-mask source counter.
 #[doc(hidden)]
 #[cfg(debug_assertions)]
 pub fn mask_sources() -> usize {
-    MASK_SOURCES.load(Ordering::Relaxed)
+    MASK_SOURCES.with(std::cell::Cell::get)
 }
 
-/// Reset the debug-build range-mask materialization counter.
+/// Reset the debug-build range-mask source counter.
 #[doc(hidden)]
 #[cfg(debug_assertions)]
 pub fn reset_mask_sources() {
-    MASK_SOURCES.store(0, Ordering::Relaxed);
+    MASK_SOURCES.with(|n| n.set(0));
 }
 
 #[inline]
 fn note_mask_source() {
     #[cfg(debug_assertions)]
-    MASK_SOURCES.fetch_add(1, Ordering::Relaxed);
+    MASK_SOURCES.with(|n| n.set(n.get() + 1));
 }
 
 /// One live range tombstone.
@@ -140,6 +143,10 @@ impl std::fmt::Debug for FragmentIter {
 #[derive(Default)]
 struct SetInner {
     spans: Vec<Span>,
+    cache: Option<Arc<[Fragment]>>,
+    resident: Option<Arc<()>>,
+    retired: bool,
+    builds: u64,
     /// `prefix_max_end[i]` is the greatest `end` among `spans[..=i]`.
     ///
     /// This is the bound the design calls "the set's longest span": a backward
@@ -166,6 +173,8 @@ pub struct RangeTombstoneSet {
     /// range delete pays one relaxed load per source per read and never touches
     /// the lock or allocates anything.
     len: AtomicUsize,
+    hits: AtomicUsize,
+    registry: OnceLock<Arc<FragmentRegistry>>,
 }
 
 impl std::fmt::Debug for RangeTombstoneSet {
@@ -182,6 +191,8 @@ impl RangeTombstoneSet {
             cmp,
             inner: RwLock::new(SetInner::default()),
             len: AtomicUsize::new(0),
+            hits: AtomicUsize::new(0),
+            registry: OnceLock::new(),
         }
     }
 
@@ -200,6 +211,8 @@ impl RangeTombstoneSet {
     /// Insert `[start, end)` at `seq`.
     pub(crate) fn add(&self, start: &[u8], end: &[u8], seq: u64) {
         let mut g = self.inner.write();
+        g.cache = None;
+        g.resident = None;
         let at = g
             .spans
             .partition_point(|s| self.cmp.compare(&s.start, start).is_le());
@@ -276,11 +289,144 @@ impl RangeTombstoneSet {
         }
     }
 
+    /// Bind committed sets before their first snapshot. Transaction overlays
+    /// and standalone tests use a private registry instead.
+    pub(crate) fn track_snapshots(&self, registry: &Arc<FragmentRegistry>) {
+        let bound = self.registry.get_or_init(|| registry.clone());
+        debug_assert!(Arc::ptr_eq(bound, registry));
+    }
+
+    /// A flushed set may remain owned by an iterator's point cursor. Its
+    /// fragments are reader-retained even while that Memtable Arc still lives.
+    pub(crate) fn retire(&self) {
+        let mut g = self.inner.write();
+        g.retired = true;
+        g.resident = None;
+        g.cache = None;
+    }
+
+    /// Full immutable fragments, shared until a range mutation invalidates them.
+    pub(crate) fn fragment_snapshot(&self) -> Arc<[Fragment]> {
+        if let Some(snapshot) = &self.inner.read().cache {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return snapshot.clone();
+        }
+        // Recheck under the mutation lock: concurrent cold readers build once,
+        // and a writer cannot invalidate then be overwritten by an old build.
+        let mut g = self.inner.write();
+        if let Some(snapshot) = &g.cache {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return snapshot.clone();
+        }
+        let snapshot: Arc<[Fragment]> = fragment_spans(&self.cmp, &g.spans, None, None).into();
+        g.builds += 1;
+        g.resident = (!g.retired).then(|| Arc::new(()));
+        self.registry.get_or_init(Default::default).register(
+            &snapshot,
+            g.resident.as_ref().map_or_else(Weak::new, Arc::downgrade),
+        );
+        g.cache = Some(snapshot.clone());
+        snapshot
+    }
+
+    pub(crate) fn stats(&self) -> RangeCacheStats {
+        let g = self.inner.read();
+        RangeCacheStats {
+            spans: g.spans.len() as u64,
+            span_bytes: (g.spans.capacity() * std::mem::size_of::<Span>()
+                + g.prefix_max_end.capacity() * std::mem::size_of::<Vec<u8>>()
+                + g.spans
+                    .iter()
+                    .map(|s| s.start.capacity() + s.end.capacity())
+                    .sum::<usize>()
+                + g.prefix_max_end.iter().map(Vec::capacity).sum::<usize>())
+                as u64,
+            builds: g.builds,
+            hits: self.hits.load(Ordering::Relaxed) as u64,
+        }
+    }
+
     /// Every span, in `start` order. Used by the WAL-replay and flush paths.
     #[cfg(test)]
     fn spans(&self) -> Vec<Span> {
         self.inner.read().spans.clone()
     }
+}
+
+/// Allocation estimates exclude allocator headers. Counters cover currently
+/// live active/sealed memtables; retired generations reset when a set is freed.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RangeCacheStats {
+    pub spans: u64,
+    pub span_bytes: u64,
+
+    pub builds: u64,
+    pub hits: u64,
+}
+
+impl std::ops::AddAssign for RangeCacheStats {
+    fn add_assign(&mut self, other: Self) {
+        self.spans += other.spans;
+        self.span_bytes += other.span_bytes;
+
+        self.builds += other.builds;
+        self.hits += other.hits;
+    }
+}
+
+/// DB-wide lifetime accounting, registered only on cold builds. It never
+/// acquires a range-set lock; readers of an unchanged cache never lock it.
+#[derive(Default)]
+pub(crate) struct FragmentRegistry {
+    snapshots: Mutex<Vec<TrackedFragment>>,
+}
+
+struct TrackedFragment {
+    snapshot: Weak<[Fragment]>,
+    resident: Weak<()>,
+    bytes: u64,
+}
+
+impl FragmentRegistry {
+    fn register(&self, snapshot: &Arc<[Fragment]>, resident: Weak<()>) {
+        let mut snapshots = self.snapshots.lock();
+        snapshots.retain(|s| s.snapshot.strong_count() != 0);
+        snapshots.push(TrackedFragment {
+            snapshot: Arc::downgrade(snapshot),
+            resident,
+            bytes: fragment_bytes(snapshot),
+        });
+    }
+
+    /// Resident cache bytes and reader-retained bytes, including flushed sets.
+    pub(crate) fn stats(&self) -> (u64, u64) {
+        let mut snapshots = self.snapshots.lock();
+        // A Weak keeps the Arc slice allocation itself alive after the last
+        // reader drops its elements. Release dead Weak references before
+        // reporting zero bytes, including on an otherwise idle database.
+        snapshots.retain(|s| s.snapshot.strong_count() != 0);
+        let (mut resident, mut retained) = (0, 0);
+        for snapshot in snapshots.iter() {
+            if snapshot.resident.strong_count() != 0 {
+                resident += snapshot.bytes;
+            } else {
+                retained += snapshot.bytes;
+            }
+        }
+        (resident, retained)
+    }
+}
+
+fn fragment_bytes(frags: &[Fragment]) -> u64 {
+    (std::mem::size_of_val(frags)
+        + frags
+            .iter()
+            .map(|f| {
+                f.start.capacity()
+                    + f.end.capacity()
+                    + f.seqs.capacity() * std::mem::size_of::<u64>()
+            })
+            .sum::<usize>()) as u64
 }
 
 /// Fragment an arbitrary (overlapping, unsorted-stack) span list over
@@ -507,29 +653,43 @@ pub(crate) fn covering_seq_in(
 ///
 /// The scan shape: `covering_seq` walks the cursor to the key rather than
 /// binary-searching, so a forward or backward scan costs amortized O(1) per
-/// key however many fragments the source holds. Bounds are **owned** copies
-/// taken out of the source, so nothing here borrows a pinned block
-/// (invariant 8).
+/// key however many fragments the source holds. Each cursor owns an Arc and
+/// an independent window/index; nothing borrows a pinned block (invariant 8).
 struct FragCursor {
-    frags: Vec<Fragment>,
+    frags: Arc<[Fragment]>,
     idx: usize,
+    window: std::ops::Range<usize>,
+    prefix: Option<[u8; 8]>,
 }
 
 impl FragCursor {
+    fn compare(&self, cmp: &ComparatorRef, bound: &[u8], key: &[u8]) -> std::cmp::Ordering {
+        match self.prefix {
+            Some(prefix) => bound[..8]
+                .cmp(&prefix)
+                .then_with(|| cmp.compare(&bound[8..], key)),
+            None => cmp.compare(bound, key),
+        }
+    }
+
     fn covering_seq(&mut self, cmp: &ComparatorRef, key: &[u8], read_seq: u64) -> Option<u64> {
-        let n = self.frags.len();
-        // Forward to the first fragment whose `end` is past the key ...
-        while self.idx < n && cmp.compare(&self.frags[self.idx].end, key).is_le() {
+        while self.idx < self.window.end
+            && self.compare(cmp, &self.frags[self.idx].end, key).is_le()
+        {
             self.idx += 1;
         }
-        // ... and back, so a reverse scan converges just as cheaply. Starting
-        // from any index is correct: the two loops together land on the unique
-        // first fragment with `end > key`.
-        while self.idx > 0 && cmp.compare(&self.frags[self.idx - 1].end, key).is_gt() {
+        while self.idx > self.window.start
+            && self
+                .compare(cmp, &self.frags[self.idx - 1].end, key)
+                .is_gt()
+        {
             self.idx -= 1;
         }
-        let f = self.frags.get(self.idx)?;
-        if cmp.compare(&f.start, key).is_gt() {
+        if self.idx == self.window.end {
+            return None;
+        }
+        let f = &self.frags[self.idx];
+        if self.compare(cmp, &f.start, key).is_gt() {
             return None;
         }
         f.visible_seq(read_seq)
@@ -554,13 +714,42 @@ impl std::fmt::Debug for RangeMask {
 }
 
 impl RangeMask {
-    /// Add one source's fragments. Empty lists are dropped, so an unused
-    /// feature leaves the mask empty and [`is_empty`](Self::is_empty) true.
+    #[cfg(test)]
     pub(crate) fn push(&mut self, frags: Vec<Fragment>) {
-        if !frags.is_empty() {
+        self.push_snapshot(
+            frags.into(),
+            &crate::comparator::default_comparator(),
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Select a window without copying fragments. Unified sources retain their
+    /// prefixed storage; comparison translates only the endpoints being visited.
+    pub(crate) fn push_snapshot(
+        &mut self,
+        frags: Arc<[Fragment]>,
+        cmp: &ComparatorRef,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        prefix: Option<[u8; 8]>,
+    ) {
+        let start = lower.map_or(0, |k| {
+            frags.partition_point(|f| cmp.compare(&f.end, k).is_le())
+        });
+        let end = upper.map_or(frags.len(), |k| {
+            frags.partition_point(|f| cmp.compare(&f.start, k).is_lt())
+        });
+        if start < end {
             note_mask_source();
             crate::perf::bump(|p| p.range_sources += 1);
-            self.sources.push(FragCursor { frags, idx: 0 });
+            self.sources.push(FragCursor {
+                frags,
+                idx: start,
+                window: start..end,
+                prefix,
+            });
         }
     }
 
@@ -610,6 +799,99 @@ mod tests {
             end: end.as_bytes().to_vec(),
             seqs: seqs.to_vec(),
         }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn mask_source_probe_is_local_to_the_reading_thread() {
+        reset_mask_sources();
+        std::thread::spawn(|| {
+            let mut mask = RangeMask::default();
+            mask.push(vec![f("a", "z", &[1])]);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(mask_sources(), 0);
+    }
+
+    #[test]
+    fn unchanged_reads_share_fragment_storage() {
+        let s = set();
+        s.add(b"a", b"m", 5);
+        s.add(b"f", b"z", 10);
+        let first = s.fragment_snapshot();
+        for _ in 0..100 {
+            let next = s.fragment_snapshot();
+            assert!(
+                Arc::ptr_eq(&first, &next),
+                "unchanged reads rebuilt fragments"
+            );
+            let mut a = RangeMask::default();
+            a.push_snapshot(next.clone(), &s.cmp, None, None, None);
+            let mut b = RangeMask::default();
+            b.push_snapshot(next, &s.cmp, None, None, None);
+            assert_eq!(a.covering_seq(&s.cmp, b"x", 10), Some(10));
+            assert_eq!(b.covering_seq(&s.cmp, b"b", 10), Some(5));
+            assert_eq!(a.covering_seq(&s.cmp, b"b", 10), Some(5));
+        }
+        assert_eq!(s.stats().builds, 1);
+        assert_eq!(s.stats().hits, 100);
+    }
+
+    #[test]
+    fn overlapping_sources_keep_independent_windows() {
+        let a = set();
+        let b = set();
+        a.add(b"a", b"m", 5);
+        b.add(b"f", b"z", 10);
+        let mut mask = RangeMask::default();
+        mask.push_snapshot(a.fragment_snapshot(), &a.cmp, Some(b"g"), Some(b"q"), None);
+        mask.push_snapshot(b.fragment_snapshot(), &a.cmp, Some(b"g"), Some(b"q"), None);
+        for (key, seq, want) in [
+            (b"g", 4, None),
+            (b"g", 5, Some(5)),
+            (b"g", 10, Some(10)),
+            (b"p", 9, None),
+            (b"g", 9, Some(5)),
+        ] {
+            assert_eq!(mask.covering_seq(&a.cmp, key, seq), want);
+        }
+        assert!(Arc::ptr_eq(&mask.sources[0].frags, &a.fragment_snapshot()));
+        assert!(Arc::ptr_eq(&mask.sources[1].frags, &b.fragment_snapshot()));
+    }
+
+    #[test]
+    fn mutation_keeps_old_snapshot_and_accounts_retention() {
+        let s = set();
+        s.add(b"a", b"z", 5);
+        let old = s.fragment_snapshot();
+        let bytes = s.registry.get().unwrap().stats().0;
+        s.add(b"f", b"m", 10);
+        assert_eq!(s.registry.get().unwrap().stats().1, bytes);
+        let new = s.fragment_snapshot();
+        assert!(!Arc::ptr_eq(&old, &new));
+        for seq in [4, 5, 6, 9, 10, 11] {
+            assert_eq!(
+                covering_seq_in(&s.cmp, &old, b"h", seq),
+                (seq >= 5).then_some(5)
+            );
+            assert_eq!(
+                covering_seq_in(&s.cmp, &new, b"h", seq),
+                if seq >= 10 {
+                    Some(10)
+                } else {
+                    (seq >= 5).then_some(5)
+                }
+            );
+        }
+        assert_eq!(s.stats().builds, 2);
+        drop(old);
+        assert_eq!(s.registry.get().unwrap().stats().1, 0);
+        assert_eq!(s.registry.get().unwrap().snapshots.lock().len(), 1);
+        s.retire();
+        drop(new);
+        assert_eq!(s.registry.get().unwrap().stats(), (0, 0));
+        assert!(s.registry.get().unwrap().snapshots.lock().is_empty());
     }
 
     #[test]
