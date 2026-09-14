@@ -1771,6 +1771,7 @@ fn build_db_inner(
     let ctx = Arc::new(CfCtx {
         tiers,
         bc: block_cache,
+        range_fragment_registry: Arc::new(crate::range_tombstone::FragmentRegistry::default()),
         io_limiter: io_limiter.clone(),
         tables,
         flush_tx,

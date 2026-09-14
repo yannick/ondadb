@@ -123,6 +123,7 @@ pub(crate) struct CfCtx {
     /// directory, so untiered tables resolve exactly as before tiering existed.
     pub tiers: Arc<TierRegistry>,
     pub bc: Arc<BlockCache>,
+    pub range_fragment_registry: Arc<crate::range_tombstone::FragmentRegistry>,
     /// Bandwidth admission for background IO, or `None` when unlimited. Carried
     /// into every reader this CF opens and every writer it creates: the class
     /// comes from the thread, but the limiter is DB-scoped, so two databases in
@@ -1148,6 +1149,7 @@ impl ColumnFamily {
             s.levels[0].insert(0, handle); // newest first
         }
         if let Some(pos) = s.imm.iter().position(|i| Arc::ptr_eq(i, imm)) {
+            imm.mem.ranges().retire();
             s.imm.remove(pos);
         }
     }
@@ -2275,17 +2277,37 @@ impl ColumnFamily {
         };
         if let Some(extra) = extra {
             if !extra.ranges().is_empty() {
-                mask.push(extra.ranges().fragments(lower, upper).collect());
+                mask.push_snapshot(
+                    extra.ranges().fragment_snapshot(),
+                    &self.cmp,
+                    lower,
+                    upper,
+                    None,
+                );
             }
         }
         if let Some(u) = &self.ctx.unified {
             if u.has_ranges() {
-                mask.push(u.fragments_for(self.id, lower, upper));
+                u.add_range_sources(
+                    &mut mask,
+                    self.id,
+                    lower,
+                    upper,
+                    &self.ctx.range_fragment_registry,
+                );
             }
         }
         for mem in std::iter::once(&state.mem).chain(state.imm.iter().map(|i| &i.mem)) {
             if !mem.ranges().is_empty() {
-                mask.push(mem.ranges().fragments(lower, upper).collect());
+                mem.ranges()
+                    .track_snapshots(&self.ctx.range_fragment_registry);
+                mask.push_snapshot(
+                    mem.ranges().fragment_snapshot(),
+                    &self.cmp,
+                    lower,
+                    upper,
+                    None,
+                );
             }
         }
         for level in state.levels.iter() {
@@ -2293,7 +2315,13 @@ impl ColumnFamily {
                 if !th.meta.has_ranges() || !self.span_in_bounds(&th.meta, bounds) {
                     continue;
                 }
-                mask.push(th.reader()?.range_fragments().to_vec());
+                mask.push_snapshot(
+                    th.reader()?.range_fragment_snapshot(),
+                    &self.cmp,
+                    lower,
+                    upper,
+                    None,
+                );
             }
         }
         Ok(mask)
@@ -2367,6 +2395,15 @@ impl ColumnFamily {
             .iter()
             .map(|lvl| lvl.iter().map(|th| th.meta.clone()).collect())
             .collect()
+    }
+
+    pub(crate) fn range_cache_stats(&self) -> crate::range_tombstone::RangeCacheStats {
+        let s = self.state.read();
+        let mut stats = s.mem.ranges().stats();
+        for imm in &s.imm {
+            stats += imm.mem.ranges().stats();
+        }
+        stats
     }
 
     /// Whether any catalogued table of this family carries range-delete
@@ -2443,6 +2480,10 @@ impl ColumnFamily {
     /// Close the active WAL and all open readers.
     pub(crate) fn close_resources(&self) {
         let mut s = self.state.write();
+        s.mem.ranges().retire();
+        for imm in &s.imm {
+            imm.mem.ranges().retire();
+        }
         if let Some(w) = s.wal.take() {
             let _ = w.close();
         }

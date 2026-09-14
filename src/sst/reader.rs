@@ -60,10 +60,10 @@ pub struct Reader {
     /// makes the read path's gate a single `is_empty` test.
     ///
     /// Held as owned data rather than a borrowed block: the read path hands
-    /// bounds to cursors that outlive any pinned block (invariant 8), and one
+    /// storage to cursors that outlive any pinned block (invariant 8), and one
     /// table's fragment list is orders of magnitude smaller than its point
     /// stream.
-    fragments: Vec<crate::range_tombstone::Fragment>,
+    fragments: Arc<[crate::range_tombstone::Fragment]>,
 
     /// Background-IO admission, or `None` when unlimited. Charged on the paths
     /// that actually issue device IO — a cache hit and an already-faulted mmap
@@ -268,7 +268,7 @@ impl Reader {
             prefix_delta: false,
             bytewise: false,
             aux_handle: None,
-            fragments: Vec::new(),
+            fragments: Arc::from([]),
             vlog_verified: OnceLock::new(),
             vlog_cache_limit,
             #[cfg(feature = "mmap-reads")]
@@ -348,7 +348,7 @@ impl Reader {
                 let (payload, _) = read_block_at(&*f, handle.offset, handle.length)?;
                 for (tag, section) in decode_aux_sections(&payload)? {
                     if tag == crate::sst::AUX_SECTION_RANGE {
-                        r.fragments = crate::range_tombstone::decode_fragments(section)?;
+                        r.fragments = crate::range_tombstone::decode_fragments(section)?.into();
                     }
                 }
                 // Fragments are written sorted and disjoint; the read path's
@@ -571,6 +571,10 @@ impl Reader {
     /// legacy table.
     pub fn range_fragments(&self) -> &[crate::range_tombstone::Fragment] {
         &self.fragments
+    }
+
+    pub(crate) fn range_fragment_snapshot(&self) -> Arc<[crate::range_tombstone::Fragment]> {
+        self.fragments.clone()
     }
 
     /// Newest sequence at or below `read_seq` of a fragment covering `key`.
