@@ -1622,6 +1622,12 @@ impl ColumnFamily {
             });
             break; // a base terminates this table's contribution
         }
+        // A chain that straddles a block boundary reads on into the next
+        // block; if that block fails, the older operands (and the base) are
+        // missing, and folding what was gathered would be a wrong answer.
+        if let Some(error) = it.err() {
+            return Err(error.duplicate());
+        }
         Ok(())
     }
 

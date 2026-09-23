@@ -476,6 +476,17 @@ fsynced → new levels installed → inputs deleted via `DbInner::remove_sst_fil
 compacted input that lived on a named tier is not unlinked there (a storage
 leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
 
+**An input that fails is not an input that ran out.** An `SstIterator` that
+hits an unreadable or checksum-failing block reports `!valid()`, exactly as an
+exhausted one does; only `err()` tells them apart. `smallest_input` asks every
+invalid input for its error on every step and fails the span, so the job aborts
+before `outputs.finish()` and before any catalog edit: the partial outputs are
+removed on drop and every input stays installed. The same rule holds for every
+entry-by-entry table walk: `MergingIter` records the first child error and the
+public `Iterator` reports it through `err()` (a group resolved while a child
+failed is not surfaced), and a point read's merge-chain walk
+(`collect_table_chain`) returns it. `tests/corrupt_block.rs` pins all three.
+
 ### Merge-operand retention and folding (1.1)
 
 `VersionRetention::decide` takes the record **kind**, because the "keep exactly

@@ -33,6 +33,15 @@ impl ChildIter {
             ChildIter::Sst(s) => s.valid(),
         }
     }
+    /// Why this child went invalid, when it was not simply exhausted.
+    /// Memtables cannot fail; an SSTable child fails on a block that does not
+    /// read or does not pass its checksum.
+    fn err(&self) -> Option<&crate::error::OndaError> {
+        match self {
+            ChildIter::Mem(_) | ChildIter::Unified(_) => None,
+            ChildIter::Sst(s) => s.err(),
+        }
+    }
     #[inline]
     fn user_key(&self) -> &[u8] {
         match self {
@@ -173,6 +182,12 @@ struct MergingIter {
     /// The comparator is plain byte-wise ordering (the default); hot-loop
     /// comparisons then use an inlined slice compare instead of a virtual call.
     bytewise: bool,
+    /// The first error a child went invalid with. A failed child leaves the
+    /// heap exactly like an exhausted one, so this is the only record that
+    /// the merge is missing entries; [`Iterator`] turns it into its own
+    /// `err()` instead of reporting a short walk as a complete one. Sticky: a
+    /// failed `SstIterator` never becomes valid again.
+    err: Option<crate::error::OndaError>,
 }
 
 impl MergingIter {
@@ -185,6 +200,16 @@ impl MergingIter {
             dir: 1,
             cmp,
             bytewise,
+            err: None,
+        }
+    }
+
+    /// Note why child `i` left the heap, if it failed rather than ran out.
+    /// Only reached when a child goes invalid, never per entry.
+    #[cold]
+    fn note_invalid(&mut self, i: usize) {
+        if self.err.is_none() {
+            self.err = self.children[i].err().map(|e| e.duplicate());
         }
     }
 
@@ -249,9 +274,11 @@ impl MergingIter {
 
     fn rebuild(&mut self) {
         self.heap.clear();
-        for (i, c) in self.children.iter().enumerate() {
-            if c.valid() {
+        for i in 0..self.children.len() {
+            if self.children[i].valid() {
                 self.heap.push(i);
+            } else {
+                self.note_invalid(i);
             }
         }
         if self.heap.len() > 1 {
@@ -337,6 +364,7 @@ impl MergingIter {
             self.children[idx].prev();
         }
         if !self.children[idx].valid() {
+            self.note_invalid(idx);
             let last = self.heap.len() - 1;
             self.heap[0] = self.heap[last];
             self.heap.pop();
@@ -935,8 +963,23 @@ impl Iterator {
         self.advance_backward();
     }
 
+    /// Fail the iterator if a child has failed. Checked before a group is
+    /// entered (a seek may have failed a child) and again after it resolves:
+    /// a child that fails mid-group may have held the group's newest version,
+    /// so the group itself cannot be trusted either.
+    fn child_failed(&mut self) -> bool {
+        match &self.m.err {
+            None => false,
+            Some(error) => {
+                self.err = Some(error.duplicate());
+                self.valid = false;
+                true
+            }
+        }
+    }
+
     fn advance_forward(&mut self) {
-        while self.m.valid() {
+        while !self.child_failed() && self.m.valid() {
             // Capture the current user key as the group key (borrowed or copied).
             self.capture_group_key();
             let visible = match self.resolve_current_group(true) {
@@ -947,6 +990,9 @@ impl Iterator {
                     return;
                 }
             };
+            if self.child_failed() {
+                return;
+            }
             if visible.is_live(self.now) && !self.masked_by_range(&visible) {
                 self.valid = true;
                 // Terminate at the first group past the declared upper bound.
@@ -965,7 +1011,7 @@ impl Iterator {
     }
 
     fn advance_backward(&mut self) {
-        while self.m.valid() {
+        while !self.child_failed() && self.m.valid() {
             self.capture_group_key();
             let visible = match self.resolve_current_group(false) {
                 Ok(visible) => visible,
@@ -975,6 +1021,9 @@ impl Iterator {
                     return;
                 }
             };
+            if self.child_failed() {
+                return;
+            }
             if visible.is_live(self.now) && !self.masked_by_range(&visible) {
                 self.valid = true;
                 // Terminate at the first group below the declared lower bound.

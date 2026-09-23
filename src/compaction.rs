@@ -1326,10 +1326,21 @@ fn span_edges<'a>(
     (lo, hi)
 }
 
-fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Option<usize> {
+/// The input whose current entry sorts first, or `None` once every input is
+/// exhausted.
+///
+/// An input that went invalid because a block failed its checksum or could not
+/// be read looks exactly like an exhausted one, so it is asked for its error
+/// here, on every step: skipping it would merge the rest of the job without
+/// that table's remaining entries, and the catalog edit would then retire the
+/// only copy of them.
+fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Result<Option<usize>> {
     let mut best = None;
     for (index, iterator) in its.iter().enumerate() {
         if !iterator.valid() {
+            if let Some(error) = iterator.err() {
+                return Err(error.duplicate());
+            }
             continue;
         }
         match best {
@@ -1345,7 +1356,7 @@ fn smallest_input(its: &[SstIterator], cmp: &ComparatorRef) -> Option<usize> {
             }
         }
     }
-    best
+    Ok(best)
 }
 
 /// Every decision a compaction job makes **once**, before any merge work
@@ -1555,7 +1566,7 @@ fn run_span(
     // which is every iteration for a family with no operator, and every
     // iteration of a merge family's non-merge keys.
     let mut pending: Option<PendingFold> = None;
-    while let Some(index) = smallest_input(&iterators, cmp) {
+    while let Some(index) = smallest_input(&iterators, cmp)? {
         let (key, seq, tombstone, ttl, kind) = {
             let iterator = &iterators[index];
             (
