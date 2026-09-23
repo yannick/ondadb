@@ -427,6 +427,16 @@ both conflict checks report a conflict for any reader at or below it. That is
 conservative in exactly one direction — it can refuse a commit that would have
 been safe, never admit one that would not.
 
+**Serializable read validation asks the index too.** A range delete leaves no
+point version at the keys it covers, so `peek_seq` over the read set cannot see
+it; `validate_read_conflicts` therefore also runs `point_conflict` for every key
+the transaction read. That is a point check over keys actually read, not
+phantom protection, and it inherits the overflow watermark: a Serializable
+transaction reading below it conflicts, like any point writer would. The check
+runs wherever read validation does — at commit, at prepare, and on a
+pessimistic lock grant (there without `commit_mu`, taking the index mutex
+alone, which rule 1 permits).
+
 The index holds no durable state. A reopen with no active transactions starts
 empty, which is correct: every marker described a window that no live
 transaction can still be reading in.

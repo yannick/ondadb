@@ -288,6 +288,64 @@ fn conflict_outcomes_per_isolation_level() {
     }
 }
 
+/// A range delete over a key a Serializable transaction **read** invalidates
+/// that read exactly as a point overwrite would, even when every write of the
+/// transaction lies outside the span.
+///
+/// This is a point conflict, not phantom protection: the key was read, and the
+/// value that read returned is no longer current. `peek_seq` cannot see it —
+/// the delete leaves no point version at the key — so the check has to ask the
+/// span index. Snapshot does not validate reads, so it commits.
+#[test]
+fn range_delete_over_a_serializable_read_conflicts() {
+    for (level, want_conflict) in [
+        (IsolationLevel::Snapshot, false),
+        (IsolationLevel::Serializable, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = open_ranged(dir.path());
+        db.put(&cf, b"m1", b"old", Duration::ZERO).unwrap();
+        let mut t = db.begin_with_isolation(level);
+        assert_eq!(t.get(&cf, b"m1").unwrap(), b"old");
+        db.delete_range(&cf, b"a", b"z").unwrap();
+        // Outside the span: the write itself conflicts with nothing.
+        t.put(&cf, b"zz", b"v", Duration::ZERO).unwrap();
+        let got = t.commit();
+        assert_eq!(
+            got.is_err(),
+            want_conflict,
+            "{level:?}: {:?}",
+            got.as_ref().err().map(|e| e.to_string())
+        );
+        if want_conflict {
+            assert!(
+                matches!(got, Err(OndaError::Conflict(_))),
+                "{level:?}: {got:?}"
+            );
+        }
+        db.close().unwrap();
+    }
+
+    // A span that just covers the read key conflicts the same way.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = open_ranged(dir.path());
+    db.put(&cf, b"m1", b"old", Duration::ZERO).unwrap();
+    let mut t = db.begin_with_isolation(IsolationLevel::Serializable);
+    t.get(&cf, b"m1").unwrap();
+    db.delete_range(&cf, b"m", b"n").unwrap();
+    t.put(&cf, b"other", b"v", Duration::ZERO).unwrap();
+    assert!(matches!(t.commit(), Err(OndaError::Conflict(_))));
+
+    // A range delete that does NOT cover the read key is not a conflict.
+    db.put(&cf, b"m2", b"v2", Duration::ZERO).unwrap();
+    let mut t = db.begin_with_isolation(IsolationLevel::Serializable);
+    t.get(&cf, b"m2").unwrap();
+    db.delete_range(&cf, b"p", b"q").unwrap();
+    t.put(&cf, b"other", b"v", Duration::ZERO).unwrap();
+    t.commit().unwrap();
+    db.close().unwrap();
+}
+
 /// A ReadCommitted commit **containing a range delete** takes `commit_mu`,
 /// which point-only ReadCommitted commits do not.
 ///

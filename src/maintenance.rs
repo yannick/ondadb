@@ -267,6 +267,14 @@ impl DB {
         for cf in &cfs {
             self.flush_memtable(cf)?;
         }
+        let read_only = self.inner.opts.read_only;
+        if read_only {
+            // Same effect as the per-family rotations above: seal the unified
+            // store's replayed data so `write_sealed_memtables` sees all of it.
+            if let Some(u) = &self.inner.unified {
+                u.rotate(true);
+            }
+        }
         self.inner.persist_manifest()?;
 
         std::fs::create_dir_all(dir)?;
@@ -305,6 +313,9 @@ impl DB {
                 sst.object = None;
             }
         }
+        if read_only {
+            self.write_sealed_memtables(dir, &cfs, &mut manifest)?;
+        }
         // Persist the same manifest we linked against, so the backup catalog matches
         // its files exactly. The destination is **snapshot-only**: a fresh
         // generation, nothing applied, and no `MANIFEST-EDITS` beside it. It
@@ -315,6 +326,93 @@ impl DB {
         manifest.applied_through = 0;
         manifest.next_edit_id = 1;
         manifest.save(dir.join("MANIFEST"))?;
+        Ok(())
+    }
+
+    /// Carry a read-only database's memtable data into a snapshot.
+    ///
+    /// A read-only open replays the WAL into memtables but runs no flush
+    /// worker, so `flush_memtable` above only sealed that data — no table was
+    /// written and the catalog does not know it. The snapshot has no WAL, so
+    /// copying the catalog alone would silently drop every write that was only
+    /// in the WAL. Instead each sealed memtable is written, **into the
+    /// destination only**, as the L0 table a flush would have produced, and
+    /// added to the destination catalog as the newest L0 entry of its family.
+    /// The source directory is never written.
+    ///
+    /// The tables use the same writer and capability gates as a flush, so the
+    /// destination needs nothing the source catalog did not already declare;
+    /// ids come from this handle's counter, which starts above every id the
+    /// source catalog holds, and `global_seq`/`next_file_id` are raised to
+    /// cover what was written.
+    fn write_sealed_memtables(
+        &self,
+        dir: &Path,
+        cfs: &[Arc<ColumnFamily>],
+        manifest: &mut crate::manifest::Manifest,
+    ) -> Result<()> {
+        // Per family, the new tables oldest first; prepended in reverse so the
+        // catalog's L0 stays newest first.
+        let mut added: Vec<(String, Vec<SstMeta>)> = Vec::new();
+        let mut write = |cf: &ColumnFamily,
+                         entries: &[crate::memtable::Entry],
+                         fragments: Vec<crate::range_tombstone::Fragment>|
+         -> Result<()> {
+            let id = self.inner.next_file_id();
+            let klog = dir.join(format!("cf-{}", cf.name())).join(format!("{id}.klog"));
+            let klog = klog.to_str().ok_or_else(|| {
+                OndaError::InvalidArgs(format!("snapshot path {klog:?} is not UTF-8"))
+            })?;
+            if let Some(meta) = cf.write_detached_l0(klog, entries, fragments, id)? {
+                match added.iter_mut().find(|(name, _)| name == cf.name()) {
+                    Some((_, metas)) => metas.push(meta),
+                    None => added.push((cf.name().to_string(), vec![meta])),
+                }
+            }
+            Ok(())
+        };
+        // Per-family memtables hold data older than the unified store's (a
+        // family only has them before a migration to the unified layout).
+        for cf in cfs {
+            for (entries, fragments) in cf.sealed_contents() {
+                write(cf, &entries, fragments)?;
+            }
+        }
+        if let Some(u) = &self.inner.unified {
+            for imm in u.sealed() {
+                let mut ranges = crate::unified::split_ranges_by_cf(&imm);
+                let mut slices = crate::unified::split_by_cf(&imm);
+                for (cf_id, _) in &ranges {
+                    if !slices.iter().any(|(id, _)| id == cf_id) {
+                        slices.push((*cf_id, Vec::new()));
+                    }
+                }
+                for (cf_id, mut entries) in slices {
+                    let Some(cf) = cfs.iter().find(|cf| cf.id() == cf_id) else {
+                        continue;
+                    };
+                    let fragments = ranges
+                        .iter_mut()
+                        .find(|(id, _)| *id == cf_id)
+                        .map(|(_, f)| std::mem::take(f))
+                        .unwrap_or_default();
+                    cf.sort_internal(&mut entries);
+                    write(cf, &entries, fragments)?;
+                }
+            }
+        }
+        for (name, metas) in added {
+            let cfm = manifest
+                .cfs
+                .iter_mut()
+                .find(|cfm| cfm.name == name)
+                .ok_or(OndaError::NotFound)?;
+            for meta in metas {
+                manifest.global_seq = manifest.global_seq.max(meta.max_seq);
+                manifest.next_file_id = manifest.next_file_id.max(meta.id + 1);
+                cfm.sstables.insert(0, meta);
+            }
+        }
         Ok(())
     }
 

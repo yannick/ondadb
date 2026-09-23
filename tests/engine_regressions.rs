@@ -857,6 +857,85 @@ fn snapshot_repeatable_read_during_destructive_compaction() {
     db.close().unwrap();
 }
 
+/// A size-triggered output cut must never fall between two versions of one
+/// user key. Level >= 1 tables are disjoint by contract and a point read
+/// probes exactly one table per level (the first whose `max_key` reaches the
+/// key), so a version chain split across two outputs hides every version in
+/// the second one: a snapshot reading an older version sees the key as absent.
+#[test]
+fn compaction_output_cut_never_splits_one_keys_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                // Several versions of K overflow one output on their own.
+                target_file_size: 2048,
+                // Two flushes trigger L0 -> L1, so the output lands in a
+                // level >= 1, where a point read probes one table per level.
+                l1_file_count_trigger: 2,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+
+    let version = |i: u64| {
+        let mut v = format!("v{i:03}-").into_bytes();
+        v.extend_from_slice(&val(i, 200));
+        v
+    };
+    for i in 0..20u64 {
+        db.put(&cf, format!("A{i:03}").as_bytes(), &val(i, 200), ZERO)
+            .unwrap();
+    }
+    // One snapshot per version of K: every version stays live through the
+    // compaction, and each must stay readable at its own snapshot.
+    let mut snapshots = Vec::new();
+    for i in 0..60u64 {
+        db.put(&cf, b"K", &version(i), ZERO).unwrap();
+        let mut t = db.begin();
+        assert_eq!(t.get(&cf, b"K").unwrap(), version(i));
+        snapshots.push((i, t));
+        if i == 30 {
+            db.flush_memtable(&cf).unwrap();
+        }
+    }
+    for i in 0..20u64 {
+        db.put(&cf, format!("Z{i:03}").as_bytes(), &val(i, 200), ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+
+    let levels = cf.table_metadata();
+    assert!(
+        levels.iter().skip(1).any(|l| l.len() > 1),
+        "the test needs a multi-table level >= 1 to mean anything: {levels:?}"
+    );
+    for (n, level) in levels.iter().enumerate().skip(1) {
+        for pair in level.windows(2) {
+            assert!(
+                pair[0].max_key < pair[1].min_key,
+                "L{n}: tables {} and {} share user key {:?}",
+                pair[0].id,
+                pair[1].id,
+                String::from_utf8_lossy(&pair[0].max_key)
+            );
+        }
+    }
+    for (i, t) in &mut snapshots {
+        let got = t.get(&cf, b"K").unwrap_or_else(|e| {
+            panic!("snapshot of version {i} lost K after compaction: {e:?}")
+        });
+        assert_eq!(got, version(*i), "snapshot of version {i}");
+    }
+    for (_, mut t) in snapshots {
+        t.rollback().unwrap();
+    }
+    db.close().unwrap();
+}
+
 // ------------------------------------------------------- key/bound semantics
 
 /// A comparable engine's `get("hello-key-99999")` returned the value stored

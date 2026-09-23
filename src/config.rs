@@ -144,7 +144,8 @@ pub enum IsolationLevel {
     /// is the documented semantic of pessimistic `Snapshot`, not a bug.
     Snapshot,
     /// Snapshot isolation plus validation, on commit, that every key the
-    /// transaction *read by point lookup* is unchanged since its snapshot.
+    /// transaction *read by point lookup* is unchanged since its snapshot —
+    /// overwritten, deleted, or covered by a range delete.
     ///
     /// **Not full serializability.** Range/iterator reads are not tracked, so
     /// phantoms (rows inserted into a scanned range by a concurrent committer) are

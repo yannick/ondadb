@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.9.1
+
+**Shared-bug corrective release.** Five defects that wavesdb fixed after
+ondaDB's last audit of it (`1a052a4..v0.8.6`) were checked against ondaDB;
+four were present and are fixed here, each with a regression test that failed
+first. No on-disk byte and no public signature changes: a 0.9.1 database is a
+0.9.0 database, and rolling back is a binary swap.
+
+### Correctness and durability
+
+- **Compaction no longer loses data on a read error.** An SSTable iterator
+  that hit a bad block or I/O error looked exhausted, so compaction merged
+  the rest of the job without that input's remaining entries, installed the
+  short output and retired the inputs (a reproduction kept 813 of 2,000
+  keys). The job now fails before any output is installed and the inputs
+  stay. The same pattern is fixed in user scans, where `Iterator::err()`
+  now reports a child's failure instead of the walk ending early, and in
+  merge-chain point reads. (wavesdb `eacc833`)
+- **A compaction size cut never splits one key's versions** across two
+  output tables. A point read probes only the first matching table in a
+  level, so a snapshot read of an older version in the second table
+  returned `NotFound`. An output may now exceed `target_file_size` by one
+  key's version chain. (wavesdb `fc32015`)
+- **Checkpoint and backup of a read-only database keep WAL-only data.** A
+  read-only open replays the WAL into memtables but runs no flush, so the
+  copy silently lacked those records (a deleted key came back). The
+  snapshot now writes the sealed memtables as the destination's newest L0
+  tables, touching only the destination.
+- **A range delete over a key a `Serializable` transaction read is a
+  conflict.** Validation checked point versions only; it now also asks the
+  span index. This is still point-read validation, not phantom protection.
+  (wavesdb `3591223`)
+
+### Scheduling
+
+- Periodic (age) compaction takes at most four jobs per pass, then
+  re-queues its family, so a whole database aging at once no longer holds a
+  worker for its entire backlog. Capacity work is unaffected. (wavesdb
+  `887f8ad`)
+
 ## 0.9.0
 
 **The wavesdb roadmap, phases 0-3.** Sixteen features, in twenty commits, across

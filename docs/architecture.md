@@ -448,7 +448,9 @@ Classic leveled: L0→L1 on file count, Li→Li+1 when level bytes exceed
 overlapping next-level tables; keeps the newest version per key plus every
 version newer than `DbInner::oldest_snapshot()`; drops tombstones and expired
 TTL entries only at the bottom level. Output SSTs are split at
-`target_file_size` and, at the bottom level, additionally **cut at partition
+`target_file_size` — but never between two versions of one user key: a level
+≥ 1 point read probes a single table per level, so a version chain split across
+two outputs would hide the older versions a snapshot still reads — and, at the bottom level, additionally **cut at partition
 boundaries** (see § Partitions).
 
 **Range fragments (1.2)** are merged over the job span and re-fragmented over
@@ -475,6 +477,17 @@ fsynced → new levels installed → inputs deleted via `DbInner::remove_sst_fil
 § Paced obsolete-file deletion). Input deletion resolves **default-tier paths only** — a
 compacted input that lived on a named tier is not unlinked there (a storage
 leak, never a correctness issue; see `docs/parts-and-tiers.md` § Known gaps).
+
+**An input that fails is not an input that ran out.** An `SstIterator` that
+hits an unreadable or checksum-failing block reports `!valid()`, exactly as an
+exhausted one does; only `err()` tells them apart. `smallest_input` asks every
+invalid input for its error on every step and fails the span, so the job aborts
+before `outputs.finish()` and before any catalog edit: the partial outputs are
+removed on drop and every input stays installed. The same rule holds for every
+entry-by-entry table walk: `MergingIter` records the first child error and the
+public `Iterator` reports it through `err()` (a group resolved while a child
+failed is not surfaced), and a point read's merge-chain walk
+(`collect_table_chain`) returns it. `tests/corrupt_block.rs` pins all three.
 
 ### Merge-operand retention and folding (1.1)
 
@@ -954,6 +967,11 @@ would make the next open replay more than it should).
 **exactly the files the freshly-loaded manifest references** through their
 storage tiers and durably materialize them into the target's default tier. The
 target manifest clears tier/object metadata and is self-contained.
+A **read-only** source has no flush worker, so its WAL-replayed memtables
+cannot be flushed; `write_sealed_memtables` instead writes each sealed memtable
+(per-family and unified) as the L0 table a flush would have produced — **into
+the destination only**, the source is never written — and prepends it to the
+destination catalog, raising `global_seq` and `next_file_id` to cover it.
 `clone_column_family` applies the same rule to one CF under fresh file ids,
 also under a deletion pause.
 
