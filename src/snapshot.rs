@@ -75,6 +75,12 @@ impl SnapshotHandle {
         cf.get(key, self.pin.seq)
     }
 
+    /// [`get`](Self::get), appending the value to `buf` instead of allocating
+    /// one; see [`DB::get_into`]. Returns the value's length.
+    pub fn get_into(&self, cf: &Arc<ColumnFamily>, key: &[u8], buf: &mut Vec<u8>) -> Result<usize> {
+        cf.get_into(key, self.pin.seq, buf)
+    }
+
     /// Batched point read as of the snapshot; see [`DB::multi_get`].
     pub fn multi_get(&self, cf: &Arc<ColumnFamily>, keys: &[&[u8]]) -> Vec<Result<Vec<u8>>> {
         cf.multi_get(keys, self.pin.seq)

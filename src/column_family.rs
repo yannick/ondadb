@@ -281,6 +281,182 @@ impl PointReadCandidate {
     }
 }
 
+/// Where a point read collects its winning version: the owned
+/// [`PointReadCandidate`] behind `get`, or [`BufCandidate`] behind `get_into`.
+///
+/// One generic resolution pass (`ColumnFamily::resolve_point`) drives both, so
+/// the source order, the range-delete rule and the `max_seq` early exit cannot
+/// drift apart between the two reads; monomorphization keeps `get`'s path
+/// exactly what it was.
+trait PointSink {
+    fn found(&self) -> bool;
+    fn seq(&self) -> u64;
+    fn probe_unified(
+        &mut self,
+        u: &crate::unified::UnifiedStore,
+        id: u64,
+        key: &[u8],
+        read_seq: u64,
+        now: i64,
+    );
+    fn probe_mem(&mut self, mem: &Memtable, key: &[u8], read_seq: u64, now: i64);
+    fn probe_table(&mut self, rd: &Reader, key: &[u8], read_seq: u64, now: i64) -> Result<()>;
+    fn apply_mask(&mut self, covering: Option<u64>);
+}
+
+impl PointSink for PointReadCandidate {
+    fn found(&self) -> bool {
+        self.found
+    }
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn probe_unified(
+        &mut self,
+        u: &crate::unified::UnifiedStore,
+        id: u64,
+        key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) {
+        self.consider_memtable(u.get(id, key, read_seq, now));
+    }
+    fn probe_mem(&mut self, mem: &Memtable, key: &[u8], read_seq: u64, now: i64) {
+        self.consider_memtable(mem.get(key, read_seq, now));
+    }
+    fn probe_table(&mut self, rd: &Reader, key: &[u8], read_seq: u64, now: i64) -> Result<()> {
+        let (value, seq, found, deleted, kind) = rd.get_unfiltered(key, read_seq, now)?;
+        self.consider(value, seq, found, deleted, kind);
+        Ok(())
+    }
+    fn apply_mask(&mut self, covering: Option<u64>) {
+        self.mask(covering);
+    }
+}
+
+/// [`PointReadCandidate`] for `get_into`: the winning value lives in the
+/// caller's buffer, at `out[start..start + len]`, and nothing is allocated
+/// beyond that buffer's growth.
+///
+/// Memtable versions are copied straight out of the skiplist through the
+/// borrowing `chain` walk. A table's value is appended *after* the current
+/// winner and only moved down over it if it wins, so a losing probe costs a
+/// truncate, never the winner.
+struct BufCandidate<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+    found: bool,
+    seq: u64,
+    deleted: bool,
+    kind: u64,
+    range_floor: Option<u64>,
+}
+
+impl<'a> BufCandidate<'a> {
+    fn new(out: &'a mut Vec<u8>) -> BufCandidate<'a> {
+        let start = out.len();
+        BufCandidate {
+            out,
+            start,
+            found: false,
+            seq: 0,
+            deleted: false,
+            kind: crate::format::KIND_PUT,
+            range_floor: None,
+        }
+    }
+
+    /// `consider` for a borrowed memtable version: `value` is `None` for a
+    /// tombstone or an expired entry, exactly as `Memtable::chain` reports it.
+    fn offer(&mut self, seq: u64, kind: u64, value: Option<&[u8]>) {
+        if self.found && seq <= self.seq {
+            return;
+        }
+        self.out.truncate(self.start);
+        if let Some(v) = value {
+            self.out.extend_from_slice(v);
+        }
+        self.found = true;
+        self.seq = seq;
+        self.deleted = value.is_none();
+        self.kind = kind;
+    }
+
+    /// The value's length, or `NotFound` (with the buffer restored).
+    fn finish(self) -> Result<usize> {
+        if self.found && !self.deleted {
+            Ok(self.out.len() - self.start)
+        } else {
+            self.out.truncate(self.start);
+            Err(OndaError::NotFound)
+        }
+    }
+}
+
+impl PointSink for BufCandidate<'_> {
+    fn found(&self) -> bool {
+        self.found
+    }
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn probe_unified(
+        &mut self,
+        u: &crate::unified::UnifiedStore,
+        id: u64,
+        key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) {
+        // `chain` walks the store's memtables newest first and stops when the
+        // callback says so — after the first version, which is what `get`
+        // returns.
+        u.chain(id, key, read_seq, now, |seq, kind, value| {
+            self.offer(seq, kind, value);
+            false
+        });
+    }
+    fn probe_mem(&mut self, mem: &Memtable, key: &[u8], read_seq: u64, now: i64) {
+        mem.chain(key, read_seq, now, |seq, kind, value| {
+            self.offer(seq, kind, value);
+            false
+        });
+    }
+    fn probe_table(&mut self, rd: &Reader, key: &[u8], read_seq: u64, now: i64) -> Result<()> {
+        let tail = self.out.len();
+        let (seq, found, deleted, kind) =
+            match rd.get_unfiltered_into(key, read_seq, now, self.out) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.out.truncate(tail);
+                    return Err(e);
+                }
+            };
+        if found && (!self.found || seq > self.seq) {
+            // The new winner sits after the old one; close the gap.
+            self.out.drain(self.start..tail);
+            self.found = true;
+            self.seq = seq;
+            self.deleted = deleted;
+            self.kind = kind;
+        } else {
+            self.out.truncate(tail);
+        }
+        Ok(())
+    }
+    fn apply_mask(&mut self, covering: Option<u64>) {
+        let Some(seq) = covering else { return };
+        self.range_floor = Some(seq);
+        if !self.found || seq > self.seq {
+            self.out.truncate(self.start);
+            self.found = true;
+            self.seq = seq;
+            self.deleted = true;
+            self.kind = crate::format::KIND_DELETE;
+        }
+    }
+}
+
 /// One version of a key gathered while resolving a merge chain.
 ///
 /// Sources are walked newest-first and each contributes its own run — every
@@ -1617,9 +1793,9 @@ impl ColumnFamily {
         Ok(best)
     }
 
-    fn consider_sstables(
+    fn consider_sstables<S: PointSink>(
         &self,
-        candidate: &mut PointReadCandidate,
+        candidate: &mut S,
         tables: &[Arc<SstHandle>],
         user_key: &[u8],
         read_seq: u64,
@@ -1641,7 +1817,7 @@ impl ColumnFamily {
             // collected from every source before this loop (and has already
             // been folded into `candidate`), and a winning operand sends the
             // read down `fold_point_chain`, which walks every table itself.
-            if early_exit && candidate.found && th.meta.max_seq <= candidate.seq {
+            if early_exit && candidate.found() && th.meta.max_seq <= candidate.seq() {
                 continue;
             }
             // One bloom hash + one check per table; the probe below skips the
@@ -1659,8 +1835,7 @@ impl ColumnFamily {
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
             crate::perf::bump(|p| p.sstable_probes += 1);
-            let (value, seq, found, deleted, kind) = rd.get_unfiltered(user_key, read_seq, now)?;
-            candidate.consider(value, seq, found, deleted, kind);
+            candidate.probe_table(&rd, user_key, read_seq, now)?;
         }
         Ok(())
     }
@@ -1795,54 +1970,108 @@ impl ColumnFamily {
         let now = coarse_now_nanos();
         let sources = self.point_read_sources(user_key);
         let mut candidate = PointReadCandidate::default();
+        self.resolve_point(&mut candidate, &sources, user_key, read_seq, now, early_exit)?;
+        if candidate.kind == crate::format::KIND_MERGE {
+            return self.fold_winning_operand(&sources, user_key, read_seq, now, candidate.range_floor);
+        }
+        candidate.finish()
+    }
 
+    /// [`get`](Self::get), **appending** the value to `out` instead of
+    /// allocating one. Returns the value's length; on `NotFound` or any error
+    /// `out` is exactly as it was.
+    ///
+    /// No allocation on a hit beyond `out`'s own growth — except for a merge
+    /// family whose winning version is an operand, where the operator's fold
+    /// produces a fresh value by construction.
+    pub(crate) fn get_into(&self, user_key: &[u8], read_seq: u64, out: &mut Vec<u8>) -> Result<usize> {
+        self.point_reads.fetch_add(1, Ordering::Relaxed);
+        let now = coarse_now_nanos();
+        let sources = self.point_read_sources(user_key);
+        let start = out.len();
+        let mut candidate = BufCandidate::new(out);
+        if let Err(e) = self.resolve_point(&mut candidate, &sources, user_key, read_seq, now, true) {
+            candidate.out.truncate(start);
+            return Err(e);
+        }
+        if candidate.kind == crate::format::KIND_MERGE {
+            let floor = candidate.range_floor;
+            candidate.out.truncate(start);
+            let value = self.fold_winning_operand(&sources, user_key, read_seq, now, floor)?;
+            out.extend_from_slice(&value);
+            return Ok(value.len());
+        }
+        candidate.finish()
+    }
+
+    /// The candidate pass shared by `get` and `get_into`: every memtable
+    /// source newest first, then range coverage, then the tables (with the
+    /// `max_seq` early exit when `early_exit`).
+    fn resolve_point<S: PointSink>(
+        &self,
+        candidate: &mut S,
+        sources: &PointReadSources,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        early_exit: bool,
+    ) -> Result<()> {
         // Unified-memtable mode: the shared store holds this CF's hot data.
         if let Some(u) = &self.ctx.unified {
             crate::perf::bump(|p| p.memtable_probes += 1);
-            candidate.consider_memtable(u.get(self.id, user_key, read_seq, now));
+            candidate.probe_unified(u, self.id, user_key, read_seq, now);
         }
         crate::perf::bump(|p| p.memtable_probes += 1);
-        candidate.consider_memtable(sources.mem.get(user_key, read_seq, now));
+        candidate.probe_mem(&sources.mem, user_key, read_seq, now);
         for imm in sources.imms.iter().rev() {
             crate::perf::bump(|p| p.memtable_probes += 1);
-            candidate.consider_memtable(imm.mem.get(user_key, read_seq, now));
+            candidate.probe_mem(&imm.mem, user_key, read_seq, now);
         }
         // Coverage before the tables, as `multi_get` does: `mask` and
         // `consider` commute (each keeps the strictly newer of the two, and a
         // span never shares a sequence with a point write), and applying the
         // span first lets a range delete newer than every table end the read
         // without a single point probe.
-        candidate.mask(self.covering_range_seq(&sources, user_key, read_seq)?);
+        candidate.apply_mask(self.covering_range_seq(sources, user_key, read_seq)?);
         self.consider_sstables(
-            &mut candidate,
+            candidate,
             &sources.tables,
             user_key,
             read_seq,
             now,
             early_exit,
-        )?;
-        if candidate.kind == crate::format::KIND_MERGE {
-            if let Some(op) = self.opts.merge_operator.as_ref() {
-                return self.fold_point_chain(
-                    op,
-                    &sources.mem,
-                    &sources.imms,
-                    sources.tables.iter(),
-                    user_key,
-                    read_seq,
-                    now,
-                    candidate.range_floor,
-                );
-            }
-            // An operand with no operator can only come from a hand-edited
-            // config blob: `resolve_merge_operator` fails the open otherwise.
-            return Err(OndaError::Corruption(format!(
-                "column family {:?} holds a merge operand for key {:?} but has no merge operator",
-                self.name,
-                String::from_utf8_lossy(user_key)
-            )));
+        )
+    }
+
+    /// Resolve a key whose winning version is a merge operand: walk and fold
+    /// its whole chain (see [`get`](Self::get) for why the winner decides).
+    fn fold_winning_operand(
+        &self,
+        sources: &PointReadSources,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        range_floor: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        if let Some(op) = self.opts.merge_operator.as_ref() {
+            return self.fold_point_chain(
+                op,
+                &sources.mem,
+                &sources.imms,
+                sources.tables.iter(),
+                user_key,
+                read_seq,
+                now,
+                range_floor,
+            );
         }
-        candidate.finish()
+        // An operand with no operator can only come from a hand-edited
+        // config blob: `resolve_merge_operator` fails the open otherwise.
+        Err(OndaError::Corruption(format!(
+            "column family {:?} holds a merge operand for key {:?} but has no merge operator",
+            self.name,
+            String::from_utf8_lossy(user_key)
+        )))
     }
 
     /// [`point_read_sources`](Self::point_read_sources) for a whole batch, in
@@ -3567,7 +3796,7 @@ mod tests {
     /// The early exit (wavesdb 5ef39df) is an optimization, never a semantic:
     /// random puts, deletes, TTL writes, merge operands, range deletes,
     /// flushes, ingestions and compactions, in both layouts, read at the head
-    /// and at pinned snapshots — `get` and `multi_get` must answer exactly what
+    /// and at pinned snapshots — `get`, `get_into` and `multi_get` must answer exactly what
     /// the exhaustive reference (every candidate table probed) answers.
     #[test]
     fn point_read_early_exit_matches_exhaustive() {
@@ -3617,6 +3846,23 @@ mod tests {
                             "{when}: unified={unified} key {:?} at seq {seq}: get",
                             String::from_utf8_lossy(k)
                         );
+                        let mut buf = b"p".to_vec();
+                        let got = cf
+                            .get_into(k, seq, &mut buf)
+                            .map(|n| {
+                                assert_eq!(n, buf.len() - 1);
+                                buf[1..].to_vec()
+                            })
+                            .map_err(|e| e.to_string());
+                        assert_eq!(
+                            got,
+                            want,
+                            "{when}: unified={unified} key {:?} at seq {seq}: get_into",
+                            String::from_utf8_lossy(k)
+                        );
+                        if got.is_err() {
+                            assert_eq!(buf, b"p", "a miss changed the caller's buffer");
+                        }
                         let got = batch[i].as_ref().map(Vec::clone).map_err(|e| e.to_string());
                         assert_eq!(
                             got,

@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`get_into`** caller-buffer point reads on `DB`, `Txn` and
+  `SnapshotHandle`: the value is appended to a caller-owned `Vec<u8>` (its
+  length is returned; a miss leaves the buffer unchanged), so a reused buffer
+  makes a hit allocation-free for the value — from the memtable and from a
+  cached table block alike. Same candidate pass as `get`, so results are
+  identical (checked by the randomized read oracle).
 - **Standalone read snapshots** (wavesdb `SnapshotHandle`): `DB::snapshot()`
   returns a refcounted `SnapshotHandle` that pins its sequence exactly as a
   `Snapshot` transaction does, so compaction retains every version it can

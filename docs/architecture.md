@@ -206,6 +206,19 @@ branch for every legacy or point-only table; a column family that never issues a
 range delete allocates nothing (pinned by
 `no_range_cf_allocates_nothing_on_read`).
 
+**Caller-buffer reads (`get_into`).** `DB::get_into` / `Txn::get_into` /
+`SnapshotHandle::get_into` run the *same* candidate pass as `get` —
+`ColumnFamily::resolve_point` is generic over a `PointSink`, with the owned
+`PointReadCandidate` behind `get` and `BufCandidate` behind `get_into`, so
+source order, range masking and the early exit cannot drift apart. The buffer
+sink copies a memtable version out of the skiplist through the borrowing
+`Memtable::chain` walk (stopping after the first version) and a table's value
+through `Reader::get_unfiltered_into`, appended after the current winner and
+moved down over it only if it wins. The value is appended to the caller's
+buffer; a miss or an error leaves the buffer as it was. A winning merge operand
+still folds into a fresh value. The default (crossbeam) memtable allocates an
+owned probe key per lookup for both reads; the arena memtable does not.
+
 Iterators apply the same rule per surfaced group, through a monotonic cursor per
 source that walks with the scan in either direction. SSTable get: bloom filter →
 `find_block` binary search on the in-memory index → linear entry scan inside
