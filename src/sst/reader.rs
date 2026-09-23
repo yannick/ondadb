@@ -1386,7 +1386,7 @@ mod tests {
     /// open-coded binary search returned over a frozen legacy fixture.
     #[test]
     fn restart_lower_bound_matches_legacy_scan_offset() {
-        let path = crate::util::phase1_fixture("klog_legacy_flat_restarts_bloom.klog");
+        let path = crate::util::legacy_fixture("klog_legacy_flat_restarts_bloom.klog");
         let path = path.to_str().unwrap();
         let r = open_at(path).unwrap();
         assert!(r.has_restarts && !r.prefix_delta);

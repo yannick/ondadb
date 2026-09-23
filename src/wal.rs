@@ -1212,53 +1212,75 @@ impl Wal {
             Err(e) => return Err(e.into()),
         };
         let mut r = BufReader::with_capacity(64 << 10, file);
-        let mut last_seq = 0u64;
-        let mut header = [0u8; HEADER_SIZE];
-        loop {
-            if read_full(&mut r, &mut header)?.is_none() {
-                return Ok(last_seq); // clean EOF or partial header
-            }
-            let plen = read_u32(&header[0..4]) as usize;
-            let want = read_u32(&header[4..8]);
-            let mut payload = vec![0u8; plen];
-            if read_full(&mut r, &mut payload)?.is_none() {
-                return Ok(last_seq); // torn payload at tail
-            }
-            if checksum(&payload) != want {
-                return Ok(last_seq); // corrupted tail
-            }
-            // Decode every record in the (verified) frame.
-            // Past this point the bytes are known-intact: any decode failure
-            // is corruption, not a torn tail, and must not be swallowed.
-            //
-            // The first payload byte selects the form: an envelope frame
-            // (0xFF) or the legacy record stream. Both forms may appear in one
-            // file — enabling the capability changes what is written next, not
-            // what is already there.
-            if payload.first() == Some(&ENVELOPE_TAG) {
-                let seq = decode_envelope(&payload, |rec| {
-                    // `last_seq` accounting covers range records too: a WAL
-                    // whose newest record is a range delete must still restore
-                    // the sequence it committed at. Control records (3.2)
-                    // contribute nothing — see `ReplayRecord::replay_seq`.
-                    let seq = rec.replay_seq();
-                    f(rec)?;
-                    Ok(seq)
-                })?;
-                last_seq = last_seq.max(seq);
-                continue;
-            }
-            let mut p = &payload[..];
-            while !p.is_empty() {
-                let (rec, used) = decode_record(p)?;
-                p = &p[used..];
-                if rec.seq > last_seq {
-                    last_seq = rec.seq;
-                }
-                f(ReplayRecord::Point(rec))?;
-            }
-        }
+        replay_frames(&mut r, checksum, f)
     }
+}
+
+/// Replay every frame from `r` until a clean end or a torn tail, checking each
+/// payload with `crc`. Returns the highest record sequence seen.
+///
+/// Shared with the 0.9 decoder (`legacy_onda::wal`), whose frames are the same
+/// shape under a different checksum. The split between the two tail cases is
+/// the contract of [`Wal::replay`]: a short header, a short payload or a CRC
+/// mismatch ends the stripe cleanly; anything that fails to decode *inside* a
+/// verified frame is `Corruption`.
+pub(crate) fn replay_frames<R, F>(r: &mut R, crc: fn(&[u8]) -> u32, f: &mut F) -> Result<u64>
+where
+    R: Read,
+    F: FnMut(ReplayRecord) -> Result<()>,
+{
+    let mut last_seq = 0u64;
+    let mut header = [0u8; HEADER_SIZE];
+    loop {
+        if read_full(r, &mut header)?.is_none() {
+            return Ok(last_seq); // clean EOF or partial header
+        }
+        let plen = read_u32(&header[0..4]) as usize;
+        let want = read_u32(&header[4..8]);
+        let mut payload = vec![0u8; plen];
+        if read_full(r, &mut payload)?.is_none() {
+            return Ok(last_seq); // torn payload at tail
+        }
+        if crc(&payload) != want {
+            return Ok(last_seq); // corrupted tail
+        }
+        let seq = decode_frame_payload(&payload, f)?;
+        last_seq = last_seq.max(seq);
+    }
+}
+
+/// Decode one CRC-verified frame payload, handing each record to `f`, and
+/// return the highest sequence it carried.
+///
+/// Past the CRC the bytes are known-intact: any decode failure is corruption,
+/// not a torn tail, and must not be swallowed. The first payload byte selects
+/// the form — an envelope frame (0xFF) or the flags-byte record stream — and
+/// both may appear in one file: enabling the capability changes what is
+/// written next, not what is already there.
+pub(crate) fn decode_frame_payload<F>(payload: &[u8], f: &mut F) -> Result<u64>
+where
+    F: FnMut(ReplayRecord) -> Result<()>,
+{
+    if payload.first() == Some(&ENVELOPE_TAG) {
+        return decode_envelope(payload, |rec| {
+            // `last_seq` accounting covers range records too: a WAL whose
+            // newest record is a range delete must still restore the sequence
+            // it committed at. Control records (3.2) contribute nothing — see
+            // `ReplayRecord::replay_seq`.
+            let seq = rec.replay_seq();
+            f(rec)?;
+            Ok(seq)
+        });
+    }
+    let mut last_seq = 0u64;
+    let mut p = payload;
+    while !p.is_empty() {
+        let (rec, used) = decode_record(p)?;
+        p = &p[used..];
+        last_seq = last_seq.max(rec.seq);
+        f(ReplayRecord::Point(rec))?;
+    }
+    Ok(last_seq)
 }
 
 impl Drop for Wal {
@@ -1352,7 +1374,7 @@ mod tests {
             "wal_legacy_torn_tail.bin",
             "wal_legacy_crc_valid_undecodable.bin",
         ] {
-            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
             // Frame headers included and excluded: the record decoder must
             // survive both a payload and the raw file it came from.
             seeds.push(bytes[HEADER_SIZE.min(bytes.len())..].to_vec());
@@ -1418,7 +1440,7 @@ mod tests {
     fn replay_fixture(name: &str) -> (tempfile::TempDir, Result<(Vec<Record>, u64)>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        std::fs::copy(crate::util::phase1_fixture(name), &path).unwrap();
+        std::fs::copy(crate::util::legacy_fixture(name), &path).unwrap();
         let mut got = Vec::new();
         let res = Wal::replay(&path, |r| {
             got.push(point(r));
@@ -1766,7 +1788,7 @@ mod tests {
     /// The committed schema-1 range fixture pins the wire bytes.
     #[test]
     fn range_record_golden_bytes() {
-        let bytes = std::fs::read(crate::util::phase1_fixture("wal_v2_range_schema1.bin")).unwrap();
+        let bytes = std::fs::read(crate::util::legacy_fixture("wal_v2_range_schema1.bin")).unwrap();
         let recs = range_records();
         assert_eq!(
             encode_frame(ENVELOPE_SCHEMA_PER_CF.into(), &range_envelope(&recs)),
@@ -1937,7 +1959,7 @@ mod tests {
                 ]
             }),
         ] {
-            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
             assert_eq!(encode_frame(Some(schema), &env(&recs)), bytes, "{name}");
             // And the committed bytes decode back to the same records.
             let got = decode_envelope_payload(&bytes[HEADER_SIZE..]).unwrap();

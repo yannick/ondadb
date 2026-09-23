@@ -9,6 +9,7 @@
 //!
 //! Nothing here may be changed to follow a format change. If a future version
 //! makes this file fail, the fix is in the new format, not in this copy.
+#![cfg(feature = "legacy-onda")]
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +19,7 @@ const VERSION: u32 = 1;
 
 fn fixture(name: &str) -> Vec<u8> {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1")
+        .join("tests/fixtures/legacy-onda/phase1")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()))
 }
@@ -36,8 +37,8 @@ fn frozen_v1_decode_header(data: &[u8]) -> Result<(u64, u64), &'static str> {
     }
     let (body, stored_crc) = data.split_at(data.len() - 4);
     // The CRC algorithm is not what this test freezes — the version check is —
-    // so the engine's own CRC32-C is used rather than a second copy of it.
-    if read_u32(stored_crc) != ondadb::encoding::checksum(body) {
+    // so the 0.9 IEEE CRC is taken from the legacy decoder rather than copied.
+    if read_u32(stored_crc) != ondadb::legacy_onda::checksum_ieee(body) {
         return Err("corrupt");
     }
     if body.len() < 24 {
@@ -77,11 +78,8 @@ fn frozen_v1_decoder_refuses_v2_manifest() {
         "a pre-1.0 binary must refuse a manifest that announces capabilities"
     );
 
-    // And the current decoder reads the same bytes: the refusal is the old
+    // And the 0.9 decoder reads the same bytes: the refusal is the old
     // binary's, not a property of the file being broken.
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("MANIFEST");
-    std::fs::write(&path, &v2).unwrap();
-    let m = ondadb::manifest::Manifest::load(&path).unwrap();
+    let m = ondadb::legacy_onda::manifest::decode(&v2).unwrap();
     assert_eq!(m.caps, ondadb::format::CAP_EXTENDED_RECORDS);
 }

@@ -851,7 +851,7 @@ mod tests {
             "klog_legacy_flat_restarts_bloom.klog",
             "klog_legacy_btree_norestarts_nobloom.klog",
         ] {
-            seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
+            seeds.push(std::fs::read(crate::util::legacy_fixture(name)).unwrap());
         }
         // A well-formed entry stream, so mutations start from valid framing.
         let mut buf = Vec::new();
@@ -1120,7 +1120,7 @@ mod tests {
         }
         let mut seeds = vec![buf];
         for name in ["klog_legacy_flat_restarts_bloom.klog", "klog_extended.klog"] {
-            seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
+            seeds.push(std::fs::read(crate::util::legacy_fixture(name)).unwrap());
         }
 
         let mut rng = crate::util::FuzzRng::new(0x51E7_9C42_0AB3_1DD7);

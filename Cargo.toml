@@ -16,7 +16,12 @@ name = "onda_bench"
 path = "src/bin/onda_bench.rs"
 
 [features]
-default = []
+default = ["legacy-onda"]
+# Read-only decoders for the ondaDB 0.9.x on-disk formats (`src/legacy_onda/`):
+# what opens a pre-epoch-1 directory read-only, and what the epoch-1 auto-upgrade
+# reads its source through. Default-on; building without it makes a 0.9
+# directory a hard `UnsupportedFormat` refusal.
+legacy-onda = []
 # Object-store (S3) support pulls in network deps; gated so the core build stays lean.
 s3 = ["dep:rust-s3", "dep:tokio"]
 # Opt-in performance fast paths that use localized `unsafe`. The default build

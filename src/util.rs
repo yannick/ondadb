@@ -243,13 +243,21 @@ impl Poison {
     }
 }
 
-/// Path of one frozen phase-1 fixture (`tests/fixtures/phase1/`, committed to
-/// git). Unit tests in the decoder modules read the corpus through this.
+/// Path of one frozen 0.9 byte-level fixture
+/// (`tests/fixtures/legacy-onda/phase1/`). Unit tests in the decoder modules
+/// read the corpus through this.
 #[cfg(test)]
-pub(crate) fn phase1_fixture(name: &str) -> std::path::PathBuf {
+pub(crate) fn legacy_fixture(name: &str) -> std::path::PathBuf {
+    legacy_fixture_path(&format!("phase1/{name}"))
+}
+
+/// Path of anything under `tests/fixtures/legacy-onda/` — the 0.9 corpus and
+/// the three 0.9.1-written database directories.
+#[cfg(test)]
+pub(crate) fn legacy_fixture_path(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1")
-        .join(name)
+        .join("tests/fixtures/legacy-onda")
+        .join(rel)
 }
 
 /// Deterministic xorshift64 PRNG driving the fuzz-corpus tests. A real PRNG

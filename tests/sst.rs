@@ -578,7 +578,7 @@ fn per_prefix_compression_rules() {
 fn footer_unknown_flag_bit_is_unsupported_format() {
     const FOOTER_SIZE: usize = 64;
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
+        .join("tests/fixtures/legacy-onda/phase1/klog_legacy_flat_restarts_bloom.klog");
     let mut bytes = std::fs::read(&src).unwrap();
     let flags_at = bytes.len() - FOOTER_SIZE + 48;
     // 0x40 is above every assigned footer bit (0x10 is 1.0B's extended-block
@@ -613,7 +613,7 @@ fn footer_unknown_flag_bit_is_unsupported_format() {
 fn fuzz_footer_flags_never_panic() {
     const FOOTER_SIZE: usize = 64;
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
+        .join("tests/fixtures/legacy-onda/phase1/klog_legacy_flat_restarts_bloom.klog");
     let original = std::fs::read(&src).unwrap();
     let vlog = std::fs::read(src.with_extension("vlog")).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1176,7 +1176,7 @@ fn writer_writes_a_bloom_block_when_fpr_is_some() {
 /// Path of a frozen phase-1 fixture.
 fn phase1_fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1")
+        .join("tests/fixtures/legacy-onda/phase1")
         .join(name)
 }
 

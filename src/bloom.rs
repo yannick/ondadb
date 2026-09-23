@@ -15,7 +15,9 @@ use crate::error::{OndaError, Result};
 /// times cheaper for long keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashKind {
-    Fnv,
+    /// 0.9's FNV-1a with the truncated offset basis
+    /// ([`crate::legacy_onda::fnv1a64_09`]).
+    Fnv09,
     Xxh3,
 }
 
@@ -72,6 +74,14 @@ impl Bloom {
         self.bits.len() * std::mem::size_of::<u64>()
     }
 
+    /// Assemble a decoded filter. For decoders outside this module (the 0.9
+    /// reader); `m` and `k` must already be validated against `bits`.
+    #[cfg(feature = "legacy-onda")]
+    pub(crate) fn from_parts(bits: Vec<u64>, m: u64, k: u32, hash: HashKind) -> Bloom {
+        debug_assert_eq!(bits.len() as u64, m.div_ceil(64));
+        Bloom { bits, m, k, hash }
+    }
+
     /// Build an empty filter sized for `n` entries at `fpr`.
     pub fn new(n: usize, fpr: f64) -> Bloom {
         let (m, k) = bloom_params(n, fpr);
@@ -89,7 +99,7 @@ impl Bloom {
     #[inline]
     pub fn hash_of(&self, key: &[u8]) -> u64 {
         match self.hash {
-            HashKind::Fnv => hash_key(key),
+            HashKind::Fnv09 => hash_key(key),
             HashKind::Xxh3 => xxhash_rust::xxh3::xxh3_64(key),
         }
     }
@@ -230,7 +240,7 @@ impl Bloom {
 
 fn hash_id(h: HashKind) -> u8 {
     match h {
-        HashKind::Fnv => 0,
+        HashKind::Fnv09 => 0,
         HashKind::Xxh3 => 1,
     }
 }
@@ -239,7 +249,7 @@ fn hash_id(h: HashKind) -> u8 {
 /// is the legacy FNV encoding.
 fn hash_kind(id: Option<u8>) -> Result<HashKind> {
     match id {
-        None | Some(0) => Ok(HashKind::Fnv),
+        None | Some(0) => Ok(HashKind::Fnv09),
         Some(1) => Ok(HashKind::Xxh3),
         Some(other) => Err(OndaError::Corruption(format!(
             "bloom: unknown hash id {other}"
@@ -323,7 +333,7 @@ mod tests {
         // ...but stripping only the trailing hash tag is a valid LEGACY (FNV)
         // encoding, by construction.
         let legacy = Bloom::decode(&enc[..enc.len() - 1]).unwrap();
-        assert_eq!(legacy.hash, HashKind::Fnv);
+        assert_eq!(legacy.hash, HashKind::Fnv09);
     }
 
     #[test]
@@ -331,14 +341,14 @@ mod tests {
         // Build under FNV (as a pre-tag writer would have), encode WITHOUT the
         // tag byte, and verify decode finds every key — no false negatives.
         let mut b = Bloom::new(1000, 0.01);
-        b.hash = HashKind::Fnv;
+        b.hash = HashKind::Fnv09;
         for i in 0..1000u32 {
             b.add(&i.to_be_bytes());
         }
         let mut enc = b.encode();
         enc.pop(); // strip the hash tag -> legacy format
         let d = Bloom::decode(&enc).unwrap();
-        assert_eq!(d.hash, HashKind::Fnv);
+        assert_eq!(d.hash, HashKind::Fnv09);
         for i in 0..1000u32 {
             assert!(d.may_contain(&i.to_be_bytes()), "missing {i}");
         }

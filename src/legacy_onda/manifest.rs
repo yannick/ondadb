@@ -1,21 +1,30 @@
-//! Durable catalog: the next file id, the global commit sequence, and, per
-//! column family, its serialized config and the set of SSTables organized by
-//! level.
+//! 0.9.x `MANIFEST` decoder (magic `WVMF`, versions 1 and 2).
 //!
-//! The manifest is rewritten in full on every structural change (flush or
-//! compaction).  Writes are crash-atomic: a temp file is written, fsynced, and
-//! renamed over the live manifest, then the directory is fsynced.  Per-CF config
-//! is an opaque blob supplied by the caller, keeping this module decoupled from
-//! the engine's option types.
+//! A frozen copy of the 0.9.1 decode path: a positional body, the three
+//! positional tail sections, and the `ONDA*` 8-byte tagged tails, all under a
+//! whole-file **IEEE** CRC-32 (see [`super::checksum_ieee`]). Nothing here may
+//! change to follow an epoch-1 format change — the bytes it reads were written
+//! by a binary that no longer exists. The only encoder is `#[cfg(test)]`.
+//!
+//! Layout, as 0.9 wrote it:
+//!
+//! ```text
+//! magic u32 = 0x5756_4D46 ("WVMF") | version u32 in {1, 2}
+//! | next_file_id u64 | global_seq u64 | cf_count uvarint
+//! | per CF: name* | config* | sst_count uvarint
+//!   | per SST: id, level, num_entries, num_tombstones, max_seq,
+//!              klog_size, vlog_size (uvarint) | min_key* | max_key*
+//! | positional tails: partition | tier | max_entry_time
+//! | tagged tails: ONDAOBJ1 ONDAINS1 ONDACAP1 ONDARNG1 ONDAAGE1 ONDAMED1 ONDAWAL1
+//! | crc32-ieee u32
+//! ```
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
-use crate::encoding::{
-    append_u32, append_u64, append_uvarint, checksum, read_u32, read_u64, uvarint,
-};
+use super::checksum_ieee as checksum;
+#[cfg(test)]
+use crate::encoding::{append_u32, append_u64, append_uvarint};
+use crate::encoding::{read_u32, read_u64, uvarint};
 use crate::error::{OndaError, Result};
+use crate::manifest::{CfManifest, Manifest, SstMeta, WalLayout};
 
 const MAGIC: u32 = 0x5756_4D46; // "WVMF"
 /// Lowest manifest version, and the one still written whenever the database
@@ -49,304 +58,72 @@ const RANGE_TAG: &[u8; 8] = b"ONDARNG1";
 /// database's bytes are unchanged.
 const MANIFEST_EDITS_TAG: &[u8; 8] = b"ONDAMED1";
 
-/// WAL/memtable layout persisted for the whole database.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WalLayout {
-    /// Legacy/default layout: one WAL and memtable per column family.
-    #[default]
-    PerColumnFamily,
-    /// One database-wide WAL and memtable, with CF-id-prefixed keys.
-    Unified,
+/// Decode a 0.9.x `MANIFEST` (magic `WVMF`, version 1 or 2, IEEE CRC).
+///
+/// Per-CF config blobs are returned **as stored** — the 0.9 positional
+/// encoding. [`super::recover_catalog`] converts them; this function only
+/// decodes the container, so it can be pinned against the frozen fixtures
+/// byte for byte.
+pub fn decode(data: &[u8]) -> Result<Manifest> {
+    let body = verified_manifest_body(data)?;
+    let mut cursor = ManifestCursor::new(body);
+    let header = decode_manifest_header(&mut cursor)?;
+    let mut cfs = decode_manifest_column_families(&mut cursor, header.column_family_count)?;
+    let p = decode_positional_tails(cursor.into_remaining(), &mut cfs)?;
+    let tags = decode_tagged_tails(p, &mut cfs)?;
+    // Version gate, after the tail: a capability word may only appear in a
+    // manifest that already announces itself as v2.
+    if (tags.caps != 0 || tags.edits.is_some()) && header.version == VERSION_V1 {
+        return Err(corrupt_manifest());
+    }
+    if tags.last_compaction && tags.caps & crate::format::CAP_PERIODIC_AGE == 0 {
+        return Err(corrupt_manifest());
+    }
+    if tags.range && tags.caps & crate::format::CAP_RANGE_DELETES == 0 {
+        return Err(corrupt_manifest());
+    }
+    crate::format::check_caps(tags.caps)?;
+    let edits = tags.edits.unwrap_or(EditLogTail {
+        generation: 0,
+        applied_through: 0,
+        next_edit_id: 1,
+    });
+    if edits.applied_through.checked_add(1) != Some(edits.next_edit_id) {
+        return Err(corrupt_manifest());
+    }
+    Ok(Manifest {
+        next_file_id: header.next_file_id,
+        global_seq: header.global_seq,
+        cfs,
+        wal_layout: tags.wal_layout,
+        instance_nonce: tags.instance_nonce,
+        caps: tags.caps,
+        generation: edits.generation,
+        applied_through: edits.applied_through,
+        next_edit_id: edits.next_edit_id,
+    })
 }
 
-/// One SSTable in the catalog.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SstMeta {
-    pub id: u64,
-    pub level: u32,
-    pub num_entries: u64,
-    pub num_tombstones: u64,
-    pub max_seq: u64,
-    pub klog_size: u64,
-    pub vlog_size: u64,
-    pub min_key: Vec<u8>,
-    pub max_key: Vec<u8>,
-    /// Partition this table belongs to, set only for bottom-level files that
-    /// compaction cut on a partition boundary (see
-    /// [`ColumnFamilyConfig::partition_rules`](crate::config::ColumnFamilyConfig::partition_rules)).
-    /// `None` means the implicit default partition (or a file written before
-    /// partitioning existed — old manifests decode every table to `None`).
-    pub partition: Option<String>,
-    /// Storage tier holding this table's files, by name (see
-    /// [`TierDef`](crate::config::TierDef)). `None` means the implicit default
-    /// tier — the database directory. Only bottom-level parts may carry a tier;
-    /// WAL and upper levels always live on the default tier. Old manifests
-    /// (written before tiering) decode every table to `None`.
-    pub tier: Option<String>,
-    /// Wall-clock time (nanoseconds since the Unix epoch) of the newest entry in
-    /// this table, stamped approximately by the writer: flush/ingest output takes
-    /// the write time, and compaction carries forward the maximum over its
-    /// inputs so re-compacting cold data does not make it look freshly written.
-    /// Drives the age gate of the part mover
-    /// ([`TierRule::min_age`](crate::config::TierRule::min_age)). `None` means
-    /// the age is unknown (a legacy manifest, or a table whose lineage never
-    /// carried a timestamp); the mover treats an unknown age as ineligible.
-    pub max_entry_time: Option<i64>,
-    /// Tier-root-relative path stem of this table's files on a **shared** tier
-    /// (A2): the klog lives at `{tier_root}/{object}.klog`. `None` for every
-    /// table on the default or a non-shared tier, and for all pre-A2 manifests
-    /// — those resolve by the legacy id-derived path. Set by a part move onto
-    /// a shared tier (`cf-{cf}/{instance:016x}-{id}`) or adopted verbatim by
-    /// [`attach_part_by_ref`](crate::DB::attach_part_by_ref), so the name a
-    /// table was published under never changes, whichever database reads it.
-    pub object: Option<String>,
-    /// Wall-clock time (nanoseconds since the Unix epoch) at which this table
-    /// was last *written by a compaction* — the age state periodic compaction
-    /// (0.3) revisits tables against
-    /// ([`ColumnFamilyConfig::periodic_compaction_interval`](crate::config::ColumnFamilyConfig::periodic_compaction_interval)).
-    ///
-    /// Deliberately **not** [`max_entry_time`](Self::max_entry_time): that field
-    /// carries the maximum forward over a compaction's inputs so cold data does
-    /// not look freshly written, which is what the part mover's age gate needs
-    /// and exactly what a periodic trigger must not have — carrying it forward
-    /// would leave a just-rewritten table instantly re-eligible.
-    ///
-    /// `None` means *unknown*, and unknown is never eligible: a legacy manifest,
-    /// a table written before the capability was enabled, a foreign mount, or a
-    /// part attached from another database whose compaction history this one
-    /// does not own. Persisted only behind
-    /// [`CAP_PERIODIC_AGE`](crate::format::CAP_PERIODIC_AGE).
-    pub last_compaction_time: Option<i64>,
-
-    /// Range-tombstone fragments this table's aux section carries (1.2).
-    ///
-    /// `0` for every legacy table and for every table written before
-    /// [`CAP_RANGE_DELETES`](crate::format::CAP_RANGE_DELETES) was enabled —
-    /// which is exactly what makes the read path's gate free: one comparison
-    /// against zero skips the whole feature for a point-only table.
-    pub range_count: u64,
-    /// Lowest sequence in any of this table's fragment stacks; `0` when
-    /// `range_count == 0`.
-    pub range_min_seq: u64,
-    /// Highest sequence in any of this table's fragment stacks; `0` when
-    /// `range_count == 0`.
-    pub range_max_seq: u64,
-    /// Lowest fragment `start` in this table, or `None` when it carries none.
-    ///
-    /// May sort **below** [`min_key`](Self::min_key): fragments are clipped to
-    /// the *output interval* a compaction assigns, and the first output of a
-    /// job owns everything from the job span's lower edge — including the gap
-    /// between that edge and its own first point key.
-    pub range_min_key: Option<Vec<u8>>,
-    /// Highest fragment `end` in this table (exclusive), or `None`.
-    ///
-    /// May sort **above** [`max_key`](Self::max_key), by the mirror of the rule
-    /// above. The read path's gap-owner rule reads exactly this field.
-    pub range_max_key: Option<Vec<u8>>,
-}
-
-impl SstMeta {
-    /// Whether this table carries range-tombstone fragments.
-    #[inline]
-    pub fn has_ranges(&self) -> bool {
-        self.range_count > 0
-    }
-
-    /// Lowest key this table has anything to say about — its point minimum, or
-    /// the fragment minimum when that sorts lower.
-    pub fn span_min<'a>(&'a self, cmp: &crate::comparator::ComparatorRef) -> &'a [u8] {
-        match &self.range_min_key {
-            Some(k) if cmp.compare(k, &self.min_key).is_lt() => k,
-            _ => &self.min_key,
-        }
-    }
-
-    /// Highest key this table has anything to say about.
-    ///
-    /// Inclusive, like [`max_key`](Self::max_key): a fragment's `end` is
-    /// exclusive, so the last key it can cover is strictly below it and
-    /// `range_max_key` is a safe inclusive upper bound.
-    pub fn span_max<'a>(&'a self, cmp: &crate::comparator::ComparatorRef) -> &'a [u8] {
-        match &self.range_max_key {
-            Some(k) if cmp.compare(k, &self.max_key).is_gt() => k,
-            _ => &self.max_key,
-        }
-    }
-
-    /// Does this table's **span** (points plus fragments) contain `key`?
-    pub fn span_contains(&self, cmp: &crate::comparator::ComparatorRef, key: &[u8]) -> bool {
-        cmp.compare(key, self.span_min(cmp)).is_ge() && cmp.compare(key, self.span_max(cmp)).is_le()
-    }
-}
-#[derive(Debug, Clone, Default)]
-pub struct CfManifest {
-    pub name: String,
-    pub config: Vec<u8>, // opaque, caller-defined serialization
-    pub sstables: Vec<SstMeta>,
-}
-
-/// The whole database catalog.
-#[derive(Debug, Clone)]
-pub struct Manifest {
-    pub next_file_id: u64,
-    pub global_seq: u64,
-    pub cfs: Vec<CfManifest>,
-    pub wal_layout: WalLayout,
-    /// Per-database nonce naming this instance's objects on shared tiers
-    /// (A2). Minted once, the first time a shared tier is configured, and
-    /// never changed afterwards: object names embed it, so a new nonce would
-    /// orphan every object the old one named. `None` until minted — a
-    /// database with no shared tier never mints one, keeping its manifest
-    /// readable by pre-A2 binaries.
-    pub instance_nonce: Option<u64>,
-    /// Format capabilities this database has durably enabled (see
-    /// [`crate::format::KNOWN_CAPS`]). `0` — the default — means the database
-    /// writes only legacy artifacts, and its manifest stays VERSION 1.
-    pub caps: u64,
-    /// Snapshot generation, incremented by each snapshot compaction (2.2).
-    /// **Informational**: recovery logs it and the golden fixtures pin it, but
-    /// it carries no decision power — see [`Manifest::applied_through`].
-    pub generation: u64,
-    /// Highest edit id this snapshot already contains. Recovery skips log
-    /// records at or below it and applies the rest, and the log header's
-    /// `base_applied_through` must not exceed it.
-    pub applied_through: u64,
-    /// Id the next appended edit takes. Always `applied_through + 1` at the
-    /// moment a snapshot is written; a manifest with no edit-log tail decodes
-    /// to `1`, which is the same "nothing has been appended" statement a fresh
-    /// database makes.
-    pub next_edit_id: u64,
-}
-
-impl Default for Manifest {
-    fn default() -> Self {
-        Manifest {
-            next_file_id: 1,
-            global_seq: 0,
-            cfs: Vec::new(),
-            wal_layout: WalLayout::PerColumnFamily,
-            instance_nonce: None,
-            caps: 0,
-            generation: 0,
-            applied_through: 0,
-            next_edit_id: 1,
-        }
-    }
-}
-
-/// Path of the manifest within a database directory.
-pub fn manifest_path(db_dir: impl AsRef<Path>) -> PathBuf {
-    db_dir.as_ref().join("MANIFEST")
-}
-
-impl Manifest {
-    /// Read the manifest at `path`. A missing file yields an empty manifest.
-    pub fn load(path: impl AsRef<Path>) -> Result<Manifest> {
-        let data = match std::fs::read(path.as_ref()) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Manifest::default()),
-            Err(e) => return Err(e.into()),
-        };
-        Manifest::decode(&data)
-    }
-
-    /// Atomically write the manifest to `path`.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let data = self.encode();
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)?;
-            crate::util::fault::check(crate::util::fault::Call::Write)?;
-            f.write_all(&data)?;
-            crate::util::fault::check(crate::util::fault::Call::Sync)?;
-            f.sync_all()?;
-        }
-        crate::util::fault::check(crate::util::fault::Call::Rename)?;
-        std::fs::rename(&tmp, path)?;
-        // fsync the directory so the rename is durable. The error propagates:
-        // under the edit-log protocol two renames in a row are load-bearing
-        // (snapshot compaction), and a dropped directory fsync there can lose
-        // the rename that makes a fresh log authoritative.
-        crate::util::sync_parent_dir(path)?;
-        Ok(())
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::new();
-        encode_manifest_header(&mut b, self);
-        encode_manifest_column_families(&mut b, &self.cfs);
-        let tails = ManifestTailPresence::detect(self);
-        encode_positional_tails(&mut b, &self.cfs, tails);
-        encode_tagged_tails(&mut b, self, tails);
-        let crc = checksum(&b);
-        append_u32(&mut b, crc);
-        b
-    }
-
-    fn decode(data: &[u8]) -> Result<Manifest> {
-        let body = verified_manifest_body(data)?;
-        let mut cursor = ManifestCursor::new(body);
-        let header = decode_manifest_header(&mut cursor)?;
-        let mut cfs = decode_manifest_column_families(&mut cursor, header.column_family_count)?;
-        let p = decode_positional_tails(cursor.into_remaining(), &mut cfs)?;
-        let tags = decode_tagged_tails(p, &mut cfs)?;
-        // Version gate, after the tail: a capability word may only appear in a
-        // manifest that already announces itself as v2, so an old binary's
-        // exact-equality version check is a complete fence.
-        if (tags.caps != 0 || tags.edits.is_some()) && header.version == VERSION_V1 {
-            return Err(corrupt_manifest());
-        }
-        // Same fence one level down: the age tail is written only by a database
-        // that holds CAP_PERIODIC_AGE, so a file carrying stamps without the bit
-        // was truncated, hand-edited, or produced by a writer that skipped the
-        // enable — none of which may be read as valid age state.
-        if tags.last_compaction && tags.caps & crate::format::CAP_PERIODIC_AGE == 0 {
-            return Err(corrupt_manifest());
-        }
-        // And once more for the range summary: fragments exist only in a
-        // database that holds CAP_RANGE_DELETES, so a summary without the bit
-        // was truncated, hand-edited, or produced by a writer that skipped the
-        // enable.
-        if tags.range && tags.caps & crate::format::CAP_RANGE_DELETES == 0 {
-            return Err(corrupt_manifest());
-        }
-        crate::format::check_caps(tags.caps)?;
-        // A manifest with no edit-log tail is one that has never had a log:
-        // generation 0, nothing applied, and the next id is the first one.
-        let edits = tags.edits.unwrap_or(EditLogTail {
-            generation: 0,
-            applied_through: 0,
-            next_edit_id: 1,
-        });
-        // `next_edit_id` names the id the next append takes, so it is always one
-        // past what the snapshot contains. Any other pairing is bytes no writer
-        // produces.
-        if edits.applied_through.checked_add(1) != Some(edits.next_edit_id) {
-            return Err(corrupt_manifest());
-        }
-        Ok(Manifest {
-            next_file_id: header.next_file_id,
-            global_seq: header.global_seq,
-            cfs,
-            wal_layout: tags.wal_layout,
-            instance_nonce: tags.instance_nonce,
-            caps: tags.caps,
-            generation: edits.generation,
-            applied_through: edits.applied_through,
-            next_edit_id: edits.next_edit_id,
-        })
-    }
+/// Test-only 0.9 encoder, kept solely to build decoder inputs the frozen
+/// fixtures do not cover. No production path writes a 0.9 manifest.
+#[cfg(test)]
+pub(crate) fn encode(manifest: &Manifest) -> Vec<u8> {
+    let mut b = Vec::new();
+    encode_manifest_header(&mut b, manifest);
+    encode_manifest_column_families(&mut b, &manifest.cfs);
+    let tails = ManifestTailPresence::detect(manifest);
+    encode_positional_tails(&mut b, &manifest.cfs, tails);
+    encode_tagged_tails(&mut b, manifest, tails);
+    let crc = checksum(&b);
+    append_u32(&mut b, crc);
+    b
 }
 
 fn corrupt_manifest() -> OndaError {
     OndaError::Corruption("manifest: corrupt or invalid".into())
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ManifestTailPresence {
     partition: bool,
@@ -362,6 +139,7 @@ struct ManifestTailPresence {
     layout: bool,
 }
 
+#[cfg(test)]
 impl ManifestTailPresence {
     fn detect(manifest: &Manifest) -> Self {
         let has =
@@ -405,6 +183,7 @@ impl ManifestTailPresence {
     }
 }
 
+#[cfg(test)]
 fn encode_manifest_header(b: &mut Vec<u8>, manifest: &Manifest) {
     append_u32(b, MAGIC);
     // Lowest version that can express this manifest: a database using no
@@ -422,6 +201,7 @@ fn encode_manifest_header(b: &mut Vec<u8>, manifest: &Manifest) {
     append_uvarint(b, manifest.cfs.len() as u64);
 }
 
+#[cfg(test)]
 fn encode_manifest_column_families(b: &mut Vec<u8>, cfs: &[CfManifest]) {
     for cf in cfs {
         append_bytes(b, cf.name.as_bytes());
@@ -441,6 +221,7 @@ fn encode_manifest_column_families(b: &mut Vec<u8>, cfs: &[CfManifest]) {
     }
 }
 
+#[cfg(test)]
 fn encode_positional_tails(b: &mut Vec<u8>, cfs: &[CfManifest], presence: ManifestTailPresence) {
     // Later positional sections imply all earlier sections. Tagged tails also
     // imply all three so an old positional reader never mistakes a tag for data.
@@ -456,6 +237,7 @@ fn encode_positional_tails(b: &mut Vec<u8>, cfs: &[CfManifest], presence: Manife
     }
 }
 
+#[cfg(test)]
 fn encode_tagged_tails(b: &mut Vec<u8>, manifest: &Manifest, presence: ManifestTailPresence) {
     if presence.object {
         b.extend_from_slice(OBJECT_TAG);
@@ -747,6 +529,7 @@ fn decode_layout_byte(p: &[u8]) -> Result<WalLayout> {
 
 /// Encode one tail section: for each CF in order, a uvarint count of tables
 /// carrying a name (as selected by `pick`), then `(table_index, name)` pairs.
+#[cfg(test)]
 fn encode_name_section(
     b: &mut Vec<u8>,
     cfs: &[CfManifest],
@@ -794,6 +577,7 @@ fn decode_name_section<'a>(
 /// order, a uvarint count of tables carrying a value (as selected by `pick`),
 /// then `(table_index, value)` uvarint pairs. Mirrors [`encode_name_section`]
 /// with a numeric payload in place of a byte string.
+#[cfg(test)]
 fn encode_u64_section(b: &mut Vec<u8>, cfs: &[CfManifest], pick: impl Fn(&SstMeta) -> Option<u64>) {
     for cf in cfs {
         let valued: Vec<(usize, u64)> = cf
@@ -846,6 +630,7 @@ fn decode_u64_section<'a>(
 /// The bounds are unconditional rather than optional: a table with
 /// `range_count > 0` has both by construction (a fragment has two bounds), so
 /// an optional tag would encode a state no writer can produce.
+#[cfg(test)]
 fn encode_range_section(b: &mut Vec<u8>, cfs: &[CfManifest]) {
     for cf in cfs {
         let with_ranges: Vec<(usize, &SstMeta)> = cf
@@ -901,6 +686,7 @@ fn decode_range_section<'a>(mut p: &'a [u8], cfs: &mut [CfManifest]) -> Result<&
     Ok(p)
 }
 
+#[cfg(test)]
 fn append_bytes(dst: &mut Vec<u8>, b: &[u8]) {
     append_uvarint(dst, b.len() as u64);
     dst.extend_from_slice(b);
@@ -958,12 +744,12 @@ mod tests {
         for seed in &seeds {
             for _ in 0..2000 {
                 let case = crate::util::fuzz_mutate(&mut rng, seed);
-                let _ = Manifest::decode(&case);
+                let _ = decode(&case);
                 if case.len() > 4 {
                     let mut body = case[..case.len() - 4].to_vec();
                     let crc = checksum(&body);
                     append_u32(&mut body, crc);
-                    let _ = Manifest::decode(&body);
+                    let _ = decode(&body);
                 }
             }
         }
@@ -973,9 +759,9 @@ mod tests {
     fn all_v1_tail_fixtures_decode_identically() {
         for name in V1_FIXTURES {
             let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let m = decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
-                m.encode(),
+                encode(&m),
                 bytes,
                 "{name}: re-encode must be byte-identical"
             );
@@ -985,7 +771,7 @@ mod tests {
     #[test]
     fn unknown_tag_is_corruption() {
         let bytes = fixture_with_extra_tail("manifest_v1_object.bin", b"ONDAXXX1\0\0\0\0\0\0\0\0");
-        let err = Manifest::decode(&bytes).expect_err("an unknown tail tag must fail closed");
+        let err = decode(&bytes).expect_err("an unknown tail tag must fail closed");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -994,14 +780,14 @@ mod tests {
         let mut extra = INSTANCE_TAG.to_vec();
         extra.extend_from_slice(&[0u8; 8]);
         let bytes = fixture_with_extra_tail("manifest_v1_nonce.bin", &extra);
-        let err = Manifest::decode(&bytes).expect_err("a repeated tail tag must fail closed");
+        let err = decode(&bytes).expect_err("a repeated tail tag must fail closed");
         assert_eq!(err.kind(), "corruption");
     }
 
     #[test]
     fn short_residual_is_corruption() {
         let bytes = fixture_with_extra_tail("manifest_v1_object.bin", b"ONDAWAL");
-        let err = Manifest::decode(&bytes).expect_err("a short tail residual must fail closed");
+        let err = decode(&bytes).expect_err("a short tail residual must fail closed");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -1040,9 +826,9 @@ mod tests {
     #[test]
     fn sst_meta_range_tail_round_trips() {
         let m = sample_with_ranges();
-        let enc = m.encode();
+        let enc = encode(&m);
         assert_eq!(encoded_version(&enc), VERSION_V2);
-        let d = Manifest::decode(&enc).unwrap();
+        let d = decode(&enc).unwrap();
         let t = &d.cfs[0].sstables[1];
         assert_eq!(t.range_count, 3);
         assert_eq!(t.range_min_seq, 17);
@@ -1053,7 +839,7 @@ mod tests {
         let t0 = &d.cfs[0].sstables[0];
         assert_eq!(t0.range_count, 0);
         assert_eq!(t0.range_min_key, None);
-        assert_eq!(d.encode(), enc, "re-encode must be byte-identical");
+        assert_eq!(encode(&d), enc, "re-encode must be byte-identical");
         // Position: after ONDACAP1, before ONDAWAL1.
         let caps = tag_offset(&enc, FORMAT_CAPS_TAG).expect("caps tag");
         let range = tag_offset(&enc, RANGE_TAG).expect("range tag");
@@ -1069,7 +855,7 @@ mod tests {
         let m = sample_with_ranges();
         assert_eq!(m.wal_layout, WalLayout::PerColumnFamily, "no layout tail");
         assert!(m.instance_nonce.is_none(), "no nonce tail");
-        let enc = m.encode();
+        let enc = encode(&m);
         let range = tag_offset(&enc, RANGE_TAG).expect("range tag");
         // Everything between the CF bodies and the first tag is positional, and
         // the tag must not be the first thing after them.
@@ -1088,7 +874,7 @@ mod tests {
             "the positional sections must appear ahead of ONDARNG1"
         );
         // And it round-trips through the real decoder.
-        assert_eq!(Manifest::decode(&enc).unwrap().encode(), enc);
+        assert_eq!(encode(&decode(&enc).unwrap()), enc);
     }
 
     /// Every table of every frozen legacy fixture decodes to "no fragments",
@@ -1097,7 +883,7 @@ mod tests {
     fn legacy_table_reports_range_count_zero() {
         for name in V1_FIXTURES.iter().chain([V2_FIXTURE].iter()) {
             let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let m = decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(tag_offset(&bytes, RANGE_TAG).is_none(), "{name}");
             for cf in &m.cfs {
                 for t in &cf.sstables {
@@ -1115,7 +901,7 @@ mod tests {
     #[test]
     fn range_tail_without_the_capability_is_corruption() {
         let mut m = sample_with_ranges();
-        let enc = m.encode();
+        let enc = encode(&m);
         // Rewrite the caps word in place, clearing only CAP_RANGE_DELETES.
         let caps_at = tag_offset(&enc, FORMAT_CAPS_TAG).unwrap() + TAG_LEN;
         let mut bad = enc.clone();
@@ -1124,12 +910,12 @@ mod tests {
         let crc_at = bad.len() - 4;
         let crc = checksum(&bad[..crc_at]);
         bad[crc_at..].copy_from_slice(&crc.to_le_bytes());
-        let err = Manifest::decode(&bad).expect_err("a summary without the bit must fail closed");
+        let err = decode(&bad).expect_err("a summary without the bit must fail closed");
         assert_eq!(err.kind(), "corruption");
         // And with the bit cleared at the source, the summary is simply not
         // emitted — the encoder never writes an unauthorized artifact.
         m.caps = stripped;
-        assert!(tag_offset(&m.encode(), RANGE_TAG).is_none());
+        assert!(tag_offset(&encode(&m), RANGE_TAG).is_none());
     }
 
     /// A record naming zero fragments, or an empty bound, is a state the
@@ -1170,13 +956,13 @@ mod tests {
         m.generation = 5;
         m.applied_through = 4_096;
         m.next_edit_id = 4_097;
-        let enc = m.encode();
+        let enc = encode(&m);
         assert_eq!(encoded_version(&enc), VERSION_V2);
-        let d = Manifest::decode(&enc).unwrap();
+        let d = decode(&enc).unwrap();
         assert_eq!(d.generation, 5);
         assert_eq!(d.applied_through, 4_096);
         assert_eq!(d.next_edit_id, 4_097);
-        assert_eq!(d.encode(), enc);
+        assert_eq!(encode(&d), enc);
     }
 
     /// The tail's bytes are the interoperability contract: tag, then three
@@ -1190,7 +976,7 @@ mod tests {
         m.generation = 0x0102_0304_0506_0708;
         m.applied_through = 6;
         m.next_edit_id = 7;
-        let enc = m.encode();
+        let enc = encode(&m);
         let at = tag_offset(&enc, MANIFEST_EDITS_TAG).expect("the tag must be present");
         assert_eq!(&enc[at..at + 8], b"ONDAMED1");
         assert_eq!(&enc[at + 8..at + 16], &[8, 7, 6, 5, 4, 3, 2, 1]);
@@ -1211,8 +997,8 @@ mod tests {
         m.generation = 2;
         m.applied_through = 9;
         m.next_edit_id = 10;
-        let enc = m.encode();
-        let d = Manifest::decode(&enc).unwrap();
+        let enc = encode(&m);
+        let d = decode(&enc).unwrap();
         assert_eq!(d.instance_nonce, m.instance_nonce);
         assert_eq!(d.cfs[0].sstables[0].object.as_deref(), Some("cf-default/1"));
         assert_eq!(d.cfs[0].sstables[1].tier.as_deref(), Some("cold"));
@@ -1220,7 +1006,7 @@ mod tests {
             (d.generation, d.applied_through, d.next_edit_id),
             (2, 9, 10)
         );
-        assert_eq!(d.encode(), enc);
+        assert_eq!(encode(&d), enc);
         assert!(
             tag_offset(&enc, OBJECT_TAG).unwrap() < tag_offset(&enc, MANIFEST_EDITS_TAG).unwrap()
         );
@@ -1232,11 +1018,11 @@ mod tests {
     fn a_manifest_without_the_edits_tail_decodes_as_generation_zero() {
         for name in V1_FIXTURES {
             let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let m = decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(m.generation, 0, "{name}");
             assert_eq!(m.applied_through, 0, "{name}");
             assert_eq!(m.next_edit_id, 1, "{name}");
-            assert_eq!(m.encode(), bytes, "{name}: still byte-identical");
+            assert_eq!(encode(&m), bytes, "{name}: still byte-identical");
         }
     }
 
@@ -1248,7 +1034,7 @@ mod tests {
         extra.extend_from_slice(&[0u8; 24]);
         let bytes = fixture_with_extra_tail("manifest_v1_object.bin", &extra);
         assert_eq!(
-            Manifest::decode(&bytes).unwrap_err().kind(),
+            decode(&bytes).unwrap_err().kind(),
             "corruption",
             "an edit-log tail under VERSION 1 must fail closed"
         );
@@ -1261,13 +1047,13 @@ mod tests {
         m.generation = 1;
         m.applied_through = 1;
         m.next_edit_id = 2;
-        let enc = m.encode();
+        let enc = encode(&m);
         let mut body = enc[..enc.len() - 4].to_vec();
         body.extend_from_slice(MANIFEST_EDITS_TAG);
         body.extend_from_slice(&[0u8; 24]);
         let crc = checksum(&body);
         append_u32(&mut body, crc);
-        assert_eq!(Manifest::decode(&body).unwrap_err().kind(), "corruption");
+        assert_eq!(decode(&body).unwrap_err().kind(), "corruption");
     }
 
     /// `next_edit_id` is always one past `applied_through`; any other pairing
@@ -1279,22 +1065,22 @@ mod tests {
         m.generation = 1;
         m.applied_through = 10;
         m.next_edit_id = 10;
-        let enc = m.encode();
-        assert_eq!(Manifest::decode(&enc).unwrap_err().kind(), "corruption");
+        let enc = encode(&m);
+        assert_eq!(decode(&enc).unwrap_err().kind(), "corruption");
     }
 
     #[test]
     fn caps_tail_round_trips() {
         let mut m = sample();
         m.caps = crate::format::CAP_EXTENDED_RECORDS | crate::format::CAP_PERIODIC_AGE;
-        let enc = m.encode();
+        let enc = encode(&m);
         assert_eq!(encoded_version(&enc), VERSION_V2);
-        let d = Manifest::decode(&enc).unwrap();
+        let d = decode(&enc).unwrap();
         assert_eq!(d.caps, m.caps);
         // The tag sits between ONDAINS1 and ONDAWAL1, and the positional
         // sections still round-trip beside it.
         assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
-        assert_eq!(d.encode(), enc);
+        assert_eq!(encode(&d), enc);
     }
 
     /// A caps word with no partition/tier/time data must still emit all three
@@ -1307,7 +1093,7 @@ mod tests {
             s.partition = None;
         }
         m.caps = crate::format::CAP_EXTENDED_RECORDS;
-        let enc = m.encode();
+        let enc = encode(&m);
 
         // Three all-empty positional sections (one uvarint count per CF, and
         // the sample has one CF) precede the tag.
@@ -1317,7 +1103,7 @@ mod tests {
             .expect("the caps tag must be emitted");
         assert_eq!(&enc[tag_at - 3..tag_at], &[0u8, 0, 0], "empty sections");
 
-        let d = Manifest::decode(&enc).unwrap();
+        let d = decode(&enc).unwrap();
         assert_eq!(d.caps, crate::format::CAP_EXTENDED_RECORDS);
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
         assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
@@ -1326,7 +1112,7 @@ mod tests {
 
     #[test]
     fn zero_caps_writes_version_1() {
-        let enc = sample().encode();
+        let enc = encode(&sample());
         assert_eq!(encoded_version(&enc), VERSION_V1);
         assert!(
             !enc.windows(TAG_LEN).any(|w| w == FORMAT_CAPS_TAG),
@@ -1338,7 +1124,7 @@ mod tests {
     fn unknown_caps_bit_is_unsupported_format() {
         let mut m = sample();
         m.caps = 1 << 40; // never assigned
-        let err = Manifest::decode(&m.encode()).expect_err("unknown caps must fail closed");
+        let err = decode(&encode(&m)).expect_err("unknown caps must fail closed");
         assert_eq!(err.kind(), "unsupported_format");
     }
 
@@ -1348,13 +1134,13 @@ mod tests {
     fn caps_tag_under_version_1_is_corruption() {
         let mut m = sample();
         m.caps = crate::format::CAP_EXTENDED_RECORDS;
-        let mut enc = m.encode();
+        let mut enc = encode(&m);
         let body_len = enc.len() - 4;
         enc.truncate(body_len);
         enc[4..8].copy_from_slice(&VERSION_V1.to_le_bytes());
         let crc = checksum(&enc);
         append_u32(&mut enc, crc);
-        let err = Manifest::decode(&enc).expect_err("a v1 manifest may not carry caps");
+        let err = decode(&enc).expect_err("a v1 manifest may not carry caps");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -1363,7 +1149,7 @@ mod tests {
         let mut extra = FORMAT_CAPS_TAG.to_vec();
         extra.extend_from_slice(&1u64.to_le_bytes());
         let bytes = fixture_with_extra_tail(V2_FIXTURE, &extra);
-        let err = Manifest::decode(&bytes).expect_err("a repeated caps tag must fail closed");
+        let err = decode(&bytes).expect_err("a repeated caps tag must fail closed");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -1373,13 +1159,13 @@ mod tests {
     fn frozen_v2_caps_fixture_round_trips() {
         let bytes = std::fs::read(crate::util::legacy_fixture(V2_FIXTURE)).unwrap();
         assert_eq!(encoded_version(&bytes), VERSION_V2);
-        let m = Manifest::decode(&bytes).unwrap();
+        let m = decode(&bytes).unwrap();
         assert_eq!(m.caps, crate::format::CAP_EXTENDED_RECORDS);
         assert!(m.cfs.iter().all(|cf| cf
             .sstables
             .iter()
             .all(|s| s.partition.is_none() && s.tier.is_none() && s.max_entry_time.is_none())));
-        assert_eq!(m.encode(), bytes);
+        assert_eq!(encode(&m), bytes);
     }
 
     // ---- 0.3: periodic-compaction age state -------------------------------
@@ -1393,11 +1179,11 @@ mod tests {
         m.caps = crate::format::CAP_PERIODIC_AGE;
         m.cfs[0].sstables[0].last_compaction_time = Some(1_700_000_000_000_000_000);
         m.cfs[0].sstables[1].last_compaction_time = None;
-        let enc = m.encode();
+        let enc = encode(&m);
         assert_eq!(encoded_version(&enc), VERSION_V2);
         assert!(enc.windows(TAG_LEN).any(|w| w == LAST_COMPACTION_TAG));
 
-        let d = Manifest::decode(&enc).unwrap();
+        let d = decode(&enc).unwrap();
         assert_eq!(
             d.cfs[0].sstables[0].last_compaction_time,
             Some(1_700_000_000_000_000_000)
@@ -1405,14 +1191,14 @@ mod tests {
         assert_eq!(d.cfs[0].sstables[1].last_compaction_time, None);
         // The age stamp must not have leaked into the mover's field.
         assert!(d.cfs[0].sstables.iter().all(|s| s.max_entry_time.is_none()));
-        assert_eq!(d.encode(), enc);
+        assert_eq!(encode(&d), enc);
 
         // All-`None` under the same capability emits no tail at all.
         let mut none = sample();
         none.caps = crate::format::CAP_PERIODIC_AGE;
-        let enc = none.encode();
+        let enc = encode(&none);
         assert!(!enc.windows(TAG_LEN).any(|w| w == LAST_COMPACTION_TAG));
-        let d = Manifest::decode(&enc).unwrap();
+        let d = decode(&enc).unwrap();
         assert!(d.cfs[0]
             .sstables
             .iter()
@@ -1425,7 +1211,7 @@ mod tests {
     fn legacy_manifest_decodes_last_compaction_time_as_none() {
         for name in V1_FIXTURES.iter().chain(std::iter::once(&V2_FIXTURE)) {
             let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let m = decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(
                 m.cfs
                     .iter()
@@ -1433,7 +1219,7 @@ mod tests {
                 "{name}: a pre-0.3 manifest carries no age state"
             );
             // And the field's mere existence must not change the bytes.
-            assert_eq!(m.encode(), bytes, "{name}: re-encode must be identical");
+            assert_eq!(encode(&m), bytes, "{name}: re-encode must be identical");
         }
     }
 
@@ -1448,7 +1234,7 @@ mod tests {
         append_uvarint(&mut extra, 0);
         append_uvarint(&mut extra, 7);
         let bytes = fixture_with_extra_tail(V2_FIXTURE, &extra);
-        let err = Manifest::decode(&bytes).expect_err("age state needs its capability bit");
+        let err = decode(&bytes).expect_err("age state needs its capability bit");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -1457,13 +1243,13 @@ mod tests {
         let mut m = sample();
         m.caps = crate::format::CAP_PERIODIC_AGE;
         m.cfs[0].sstables[0].last_compaction_time = Some(5);
-        let enc = m.encode();
+        let enc = encode(&m);
         let mut body = enc[..enc.len() - 4].to_vec();
         body.extend_from_slice(LAST_COMPACTION_TAG);
         append_uvarint(&mut body, 0);
         let crc = checksum(&body);
         append_u32(&mut body, crc);
-        let err = Manifest::decode(&body).expect_err("a repeated age tag must fail closed");
+        let err = decode(&body).expect_err("a repeated age tag must fail closed");
         assert_eq!(err.kind(), "corruption");
     }
 
@@ -1522,14 +1308,14 @@ mod tests {
 
     #[test]
     fn every_checksummed_manifest_truncation_is_panic_free() {
-        let encoded = sample().encode();
+        let encoded = encode(&sample());
         let body_len = encoded.len() - 4;
 
         for cut in 0..body_len {
             let mut truncated = encoded[..cut].to_vec();
             let crc = checksum(&truncated);
             append_u32(&mut truncated, crc);
-            let decoded = std::panic::catch_unwind(|| Manifest::decode(&truncated));
+            let decoded = std::panic::catch_unwind(|| decode(&truncated));
             assert!(decoded.is_ok(), "decoder panicked at body length {cut}");
         }
     }
@@ -1537,8 +1323,8 @@ mod tests {
     #[test]
     fn encode_decode_round_trip() {
         let m = sample();
-        let enc = m.encode();
-        let d = Manifest::decode(&enc).unwrap();
+        let enc = encode(&m);
+        let d = decode(&enc).unwrap();
         assert_eq!(d.next_file_id, 42);
         assert_eq!(d.global_seq, 99);
         assert_eq!(d.cfs.len(), 1);
@@ -1549,7 +1335,7 @@ mod tests {
 
     #[test]
     fn legacy_manifest_decodes_as_per_column_family_wal_layout() {
-        let d = Manifest::decode(&sample().encode()).unwrap();
+        let d = decode(&encode(&sample())).unwrap();
         assert_eq!(d.wal_layout, WalLayout::PerColumnFamily);
     }
 
@@ -1557,96 +1343,24 @@ mod tests {
     fn unified_wal_layout_survives_manifest_round_trip() {
         let mut m = sample();
         m.wal_layout = WalLayout::Unified;
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert_eq!(d.wal_layout, WalLayout::Unified);
         assert_eq!(d.cfs[0].sstables, m.cfs[0].sstables);
     }
 
     #[test]
-    fn save_load_atomic() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = manifest_path(dir.path());
-        sample().save(&path).unwrap();
-        let d = Manifest::load(&path).unwrap();
-        assert_eq!(d.next_file_id, 42);
-        assert_eq!(d.cfs[0].sstables.len(), 2);
-        // No stray temp file left behind.
-        assert!(!path.with_extension("tmp").exists());
-    }
-
-    /// A directory whose read bit is clear still accepts a rename (write+search
-    /// are enough) but refuses `File::open`, which is exactly the call the
-    /// post-rename directory fsync makes. Returns `false` when the process can
-    /// read such a directory anyway (root), in which case the test is skipped.
-    #[cfg(unix)]
-    fn directory_permissions_are_enforced(probe: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(probe).unwrap();
-        std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let readable = std::fs::File::open(probe).is_ok();
-        std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        !readable
-    }
-
-    /// The directory fsync after the rename must propagate its error: snapshot
-    /// compaction performs two renames whose durability is load-bearing, and a
-    /// dropped fsync there can lose the rename that makes a fresh edit log
-    /// authoritative.
-    #[cfg(unix)]
-    #[test]
-    fn save_propagates_a_directory_fsync_failure() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        if !directory_permissions_are_enforced(&root.path().join("probe")) {
-            return; // running as root: directory permission bits do not apply
-        }
-        let dir = root.path().join("db");
-        std::fs::create_dir(&dir).unwrap();
-        let path = manifest_path(&dir);
-        let m = sample();
-        m.save(&path).expect("baseline save must succeed");
-        // Pre-create the temp file so reopening it needs only search permission,
-        // leaving the directory `File::open` as the single failing call.
-        std::fs::write(path.with_extension("tmp"), b"").unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let res = m.save(&path);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let err = res.expect_err("an unreadable parent directory must fail the save");
-        assert_eq!(err.kind(), "io");
-    }
-
-    #[test]
-    fn save_still_round_trips_after_the_fsync_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = manifest_path(dir.path());
-        let m = sample();
-        m.save(&path).unwrap();
-        assert_eq!(Manifest::load(&path).unwrap().encode(), m.encode());
-        assert!(!path.with_extension("tmp").exists());
-    }
-
-    #[test]
-    fn missing_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = Manifest::load(manifest_path(dir.path())).unwrap();
-        assert_eq!(m.next_file_id, 1);
-        assert_eq!(m.global_seq, 0);
-        assert!(m.cfs.is_empty());
-    }
-
-    #[test]
     fn corruption_detected() {
         let m = sample();
-        let mut enc = m.encode();
+        let mut enc = encode(&m);
         let n = enc.len();
         enc[n / 2] ^= 0xFF;
-        assert!(Manifest::decode(&enc).is_err());
+        assert!(decode(&enc).is_err());
     }
 
     #[test]
     fn partition_survives_round_trip() {
         // The sample tags table #2 with partition "img"; #1 has none.
-        let d = Manifest::decode(&sample().encode()).unwrap();
+        let d = decode(&encode(&sample())).unwrap();
         assert_eq!(d.cfs[0].sstables[0].partition, None);
         assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
     }
@@ -1663,8 +1377,8 @@ mod tests {
                 s.partition = None;
             }
         }
-        let enc = m.encode();
-        let d = Manifest::decode(&enc).unwrap();
+        let enc = encode(&m);
+        let d = decode(&enc).unwrap();
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
     }
 
@@ -1674,7 +1388,7 @@ mod tests {
         // partition and the tier must survive independently.
         let mut m = sample();
         m.cfs[0].sstables[1].tier = Some("hdd".into());
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert_eq!(d.cfs[0].sstables[0].partition, None);
         assert_eq!(d.cfs[0].sstables[0].tier, None);
         assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
@@ -1691,7 +1405,7 @@ mod tests {
             s.partition = None;
         }
         m.cfs[0].sstables[0].tier = Some("hdd".into());
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
         assert_eq!(d.cfs[0].sstables[0].tier.as_deref(), Some("hdd"));
         assert_eq!(d.cfs[0].sstables[1].tier, None);
@@ -1703,7 +1417,7 @@ mod tests {
         // Decoding it under the tier-aware format must leave every `tier` None
         // (the partition section consumes the whole tail, so no tier bytes remain).
         let m = sample(); // table #2 tagged "img", no tiers anywhere
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert_eq!(d.cfs[0].sstables[1].partition.as_deref(), Some("img"));
         assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
     }
@@ -1714,7 +1428,7 @@ mod tests {
         m.cfs[0].sstables[0].max_entry_time = Some(1_700_000_000_000_000_000);
         m.cfs[0].sstables[1].tier = Some("hdd".into());
         m.cfs[0].sstables[1].max_entry_time = Some(1_650_000_000_000_000_000);
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert_eq!(
             d.cfs[0].sstables[0].max_entry_time,
             Some(1_700_000_000_000_000_000)
@@ -1739,7 +1453,7 @@ mod tests {
             s.partition = None;
         }
         m.cfs[0].sstables[0].max_entry_time = Some(42);
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
         assert!(d.cfs[0].sstables.iter().all(|s| s.tier.is_none()));
         assert_eq!(d.cfs[0].sstables[0].max_entry_time, Some(42));
@@ -1750,7 +1464,7 @@ mod tests {
     fn p3_manifest_without_time_section_decodes_time_to_none() {
         // The sample tags a partition but no times; decoding under the
         // time-aware format must leave every max_entry_time None.
-        let d = Manifest::decode(&sample().encode()).unwrap();
+        let d = decode(&encode(&sample())).unwrap();
         assert!(d.cfs[0].sstables.iter().all(|s| s.max_entry_time.is_none()));
     }
 
@@ -1767,39 +1481,24 @@ mod tests {
                 s.partition = None;
             }
         }
-        let legacy_enc = legacy.encode();
-        let d = Manifest::decode(&legacy_enc).unwrap();
+        let legacy_enc = encode(&legacy);
+        let d = decode(&legacy_enc).unwrap();
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
 
         let with_part = sample(); // table #2 tagged "img"
         assert!(
-            with_part.encode().len() > legacy_enc.len(),
+            encode(&with_part).len() > legacy_enc.len(),
             "partition tail must add bytes on top of the legacy body"
         );
     }
-    /// Sizing probe for the whole-manifest rewrite cost.
-    ///
-    /// `save()` encodes and fsyncs the ENTIRE manifest on every flush,
-    /// compaction, and part move. Measured encoded sizes with realistic
-    /// namespace/cluster-key/segment keys:
-    ///
-    /// | parts   | manifest | per persist        |
-    /// |---------|----------|--------------------|
-    /// | 1,000   | 0.1 MiB  | fine               |
-    /// | 10,000  | 1.2 MiB  | noticeable         |
-    /// | 100,000 | 12.4 MiB | untenable          |
-    ///
-    /// At 100k parts a single flush writes and fsyncs 12 MiB of unchanged
-    /// metadata to record one new table. This is the motivation for an
-    /// incremental (edit-log) manifest; the test exists so the number is
-    /// measured rather than estimated, and regressions are visible.
+
     #[test]
     fn object_and_nonce_survive_round_trip() {
         let mut m = sample();
         m.instance_nonce = Some(0xdead_beef_cafe_f00d);
         m.cfs[0].sstables[1].tier = Some("cas".into());
         m.cfs[0].sstables[1].object = Some("cf-default/00c0ffee-7".into());
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert_eq!(d.instance_nonce, Some(0xdead_beef_cafe_f00d));
         assert_eq!(d.cfs[0].sstables[0].object, None);
         assert_eq!(
@@ -1816,7 +1515,7 @@ mod tests {
         // The A2 tags must not appear unless used: a database that never
         // declares a shared tier keeps writing manifests a pre-A2 binary
         // reads. Byte-level check: no tag magic anywhere in the encoding.
-        let enc = sample().encode();
+        let enc = encode(&sample());
         for tag in [&b"ONDAOBJ1"[..], &b"ONDAINS1"[..]] {
             assert!(
                 !enc.windows(tag.len()).any(|w| w == tag),
@@ -1835,57 +1534,9 @@ mod tests {
             s.partition = None;
         }
         m.instance_nonce = Some(7);
-        let d = Manifest::decode(&m.encode()).unwrap();
+        let d = decode(&encode(&m)).unwrap();
         assert_eq!(d.instance_nonce, Some(7));
         assert!(d.cfs[0].sstables.iter().all(|s| s.partition.is_none()));
         assert!(d.cfs[0].sstables.iter().all(|s| s.object.is_none()));
-    }
-
-    #[test]
-    #[ignore = "sizing probe, not a gate — run with --ignored --nocapture"]
-    fn manifest_encoded_size_at_scale() {
-        for n in [1_000usize, 10_000, 100_000] {
-            let ssts: Vec<SstMeta> = (0..n)
-                .map(|i| SstMeta {
-                    id: i as u64,
-                    level: 6,
-                    num_entries: 100_000,
-                    num_tombstones: 0,
-                    max_seq: i as u64,
-                    klog_size: 64 << 20,
-                    vlog_size: 0,
-                    // Realistic spada keys: namespace name + cluster key + segment.
-                    min_key: format!("tenant-{i:06}/2026-07/seg-{i:08}/").into_bytes(),
-                    max_key: format!("tenant-{i:06}/2026-07/seg-{i:08}/~").into_bytes(),
-                    partition: Some(format!("tenant-{i:06}/2026-07")),
-                    tier: Some("s3".to_string()),
-                    max_entry_time: Some(1_700_000_000_000_000),
-                    object: None,
-                    last_compaction_time: Some(1_700_000_000_000_000),
-                    ..Default::default()
-                })
-                .collect();
-            let m = Manifest {
-                next_file_id: n as u64,
-                global_seq: 1,
-                generation: 0,
-                applied_through: 0,
-                next_edit_id: 1,
-                wal_layout: WalLayout::PerColumnFamily,
-                instance_nonce: None,
-                caps: 0,
-                cfs: vec![CfManifest {
-                    name: "t_post".into(),
-                    config: Vec::new(),
-                    sstables: ssts,
-                }],
-            };
-            let bytes = m.encode().len();
-            println!(
-                "parts={n:>7}  manifest={:>8} bytes ({:.1} MiB) — rewritten on EVERY flush/compaction/part-move",
-                bytes,
-                bytes as f64 / (1024.0 * 1024.0)
-            );
-        }
     }
 }

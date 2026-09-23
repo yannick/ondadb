@@ -72,6 +72,8 @@ pub mod format;
 pub mod ingest;
 pub mod ioctrl;
 pub mod iterator;
+#[cfg(feature = "legacy-onda")]
+pub mod legacy_onda;
 pub mod maintenance;
 pub mod manifest;
 pub mod manifest_edit;
