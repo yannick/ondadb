@@ -37,11 +37,16 @@ fn env_s3() -> Option<S3Config> {
 }
 
 fn unique_prefix() -> String {
+    // The clock alone is not unique: macOS reports microseconds, so tests the
+    // harness starts together can mint the same prefix and trample each
+    // other's objects (same table ids, same keys). Add pid + a counter.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("ondadb-tier-test/{nanos}")
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("ondadb-tier-test/{nanos}-{}-{seq}", std::process::id())
 }
 
 /// CF with img/ and log/ partitions; img/ is tiered to `s3` as soon as the part
@@ -159,6 +164,64 @@ fn part_mover_moves_aged_part_to_s3_and_reads_back_across_reopen() {
         db.close().unwrap();
     }
 
+    cleanup(&cfg, &prefix);
+}
+
+/// F9: a part on S3 demotes back to the default tier — its objects are copied
+/// down with range GETs, the catalog flips, and the S3 objects are deleted
+/// through the tier's backend. Values above the klog threshold make the part
+/// carry a vlog, so both object kinds travel.
+#[test]
+fn part_demotes_off_s3_back_to_the_default_tier() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 demote test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::s3("s3", prefix.clone(), cfg.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+    let big = vec![b'V'; 4 << 10];
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let s3_tables = || {
+        s3.list(&format!("{prefix}/cf-default"))
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.ends_with(".klog") || n.ends_with(".vlog"))
+            .count()
+    };
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+        for i in 0..5u32 {
+            db.put(&cf, format!("img/{i:03}").as_bytes(), &big, Duration::ZERO)
+                .unwrap();
+            db.put(&cf, format!("log/{i:03}").as_bytes(), b"LOG", Duration::ZERO)
+                .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        assert_eq!(db.run_part_mover().unwrap(), 1);
+        assert_eq!(s3_tables(), 2, "klog + vlog on s3");
+
+        db.move_part_to_default_tier(&cf, "img").unwrap();
+        assert_eq!(s3_tables(), 0, "the S3 source objects are retired");
+        for i in 0..5u32 {
+            assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), big);
+        }
+        db.close().unwrap();
+    }
+    // Local after reopen — with no S3 tier configured at all.
+    let mut local_only = opts.clone();
+    local_only.tiers.clear();
+    let db = DB::open(local_only).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    for i in 0..5u32 {
+        assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), big);
+    }
+    assert_eq!(db.get(&cf, b"log/000").unwrap(), b"LOG");
+    db.close().unwrap();
     cleanup(&cfg, &prefix);
 }
 

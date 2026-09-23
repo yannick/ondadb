@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Demote a part to the default tier (wavesdb `4fa392c`)
+
+- `DB::move_part_to_default_tier(cf, partition)`; `move_part_to_tier` and
+  `move_part_to_tier_observed` accept the reserved name `"ssd"` for the
+  same thing (it was an "unknown tier" error before). Same crash-safe
+  protocol as a move onto a tier; sources are now read through their own
+  tier's `Storage`, so a part on S3 comes back via range GETs and its S3
+  objects are deleted through the tier's backend, still behind
+  `pause_deletions`. The policy mover does not demote (an `"ssd"` rule still
+  only stops moves).
+- `tests/s3_tier.rs`: prefixes are now unique per test (pid + counter), so
+  parallel S3 tests no longer collide on macOS's microsecond clock.
+
 ### Incremental-backup diff (wavesdb `SSTablesSince`)
 
 - `DB::live_sstables()`, `DB::sstables_since(seq)` and

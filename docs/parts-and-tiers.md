@@ -302,9 +302,18 @@ Notes:
   source) and idempotent; local orphans from a crash mid-move are swept at
   the next open. Reads never block on a move — the flip swaps handles and
   in-flight reads finish on the old ones.
-- The mover only moves parts **onto** named tiers. A rule with
+- The background mover only moves parts **onto** named tiers. A rule with
   `tier: "ssd".into()` (the reserved default-tier name) stops future moves
-  but does not move a part back; there is no automatic demotion in 0.3.0.
+  but does not move a part back — that stays true.
+- **Demotion is manual (0.9.2):** `db.move_part_to_default_tier(&cf, "img")`
+  — or `move_part_to_tier(&cf, "img", "ssd")` — brings a part back from any
+  named tier, local or S3, through the same copy → durable finish → catalog
+  flip → source delete protocol (the source is read with range GETs when it
+  is on S3, and the S3 objects are deleted through the tier afterwards, via
+  the same pausable deletion path). A crash before the flip leaves the part
+  where it was and its partial local copy is swept at open; a crash after it
+  leaves a stale source copy, swept at open on a local tier (not on S3 — the
+  S3 orphan gap below). Tables published on a **shared** tier never move.
 - A partition with no tier rule stays wherever it was written (the default
   tier — compaction output always lands there).
 
