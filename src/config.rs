@@ -440,6 +440,22 @@ pub struct Options {
     /// — the same rule [`max_subcompactions`](Self::max_subcompactions)
     /// follows.
     pub max_prepared_bytes: usize,
+    /// The isolation level [`DB::begin`](crate::DB::begin) and
+    /// [`DB::begin_pessimistic`](crate::DB::begin_pessimistic) use. Default
+    /// [`IsolationLevel::Snapshot`] — what `begin` has always used; any other
+    /// level can still be chosen per transaction with
+    /// [`DB::begin_with_isolation`](crate::DB::begin_with_isolation).
+    ///
+    /// Database-wide on purpose (wavesdb `d789912`): a transaction spans column
+    /// families, so a per-family default cannot say which family's setting
+    /// `begin` should honor — which is why
+    /// [`ColumnFamilyConfig::default_isolation_level`] stays reserved. The
+    /// single-op helpers (`DB::put`, `DB::delete`, ...) are unaffected: they
+    /// always commit at `ReadCommitted`.
+    ///
+    /// **Not persisted.** It is host policy, not a property of the data, so it
+    /// is taken from the options of every open.
+    pub default_isolation: IsolationLevel,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -636,6 +652,7 @@ impl Default for Options {
             max_subcompaction_workers: 0,        // derive num_compaction_threads
             io_limiter: None,
             max_prepared_bytes: 64 << 20,
+            default_isolation: IsolationLevel::Snapshot,
         }
     }
 }
@@ -829,8 +846,10 @@ pub struct ColumnFamilyConfig {
     pub skip_list_max_level: u32,
     /// Reserved memtable tuning; the implementation uses a fixed probability.
     pub skip_list_probability: f64,
-    /// Reserved per-CF default; [`DB::begin`](crate::DB::begin) currently uses
-    /// Snapshot and explicit callers choose via `begin_with_isolation`.
+    /// Reserved, and read by nothing. The default [`DB::begin`](crate::DB::begin)
+    /// uses is database-wide — [`Options::default_isolation`] — because a
+    /// transaction is not scoped to one column family, so no single family's
+    /// setting could decide it. Kept for source compatibility; not persisted.
     pub default_isolation_level: IsolationLevel,
     /// Reserved for a future disk-space admission guard; currently ignored.
     pub min_disk_space: u64,

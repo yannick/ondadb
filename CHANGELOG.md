@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **`Options::default_isolation`** (wavesdb `d789912`): the isolation level
+  `DB::begin` and `DB::begin_pessimistic` use. Defaults to `Snapshot`, so
+  nothing changes unless it is set; not persisted. `Txn::isolation()` reports
+  a transaction's level. The per-family `default_isolation_level` stays
+  reserved (a transaction spans families, so no family's setting could decide).
+
 ### Performance
 
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`

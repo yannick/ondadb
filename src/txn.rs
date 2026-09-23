@@ -270,9 +270,11 @@ fn ttl_to_abs(ttl: Duration) -> i64 {
 }
 
 impl DB {
-    /// Begin a transaction at the default (Snapshot) isolation level.
+    /// Begin a transaction at the database's default isolation level,
+    /// [`Options::default_isolation`](crate::Options::default_isolation)
+    /// (`Snapshot` unless configured otherwise).
     pub fn begin(&self) -> Txn {
-        self.begin_with_isolation(IsolationLevel::Snapshot)
+        self.begin_with_isolation(self.inner.opts.default_isolation)
     }
 
     /// Begin a transaction at a specific isolation level.
@@ -280,13 +282,14 @@ impl DB {
         self.begin_inner(level, false)
     }
 
-    /// Begin a **pessimistic** transaction at the default (Snapshot) isolation
-    /// level (3.3).
+    /// Begin a **pessimistic** transaction at the database's default isolation
+    /// level (3.3), [`Options::default_isolation`](crate::Options::default_isolation)
+    /// (`Snapshot` unless configured otherwise).
     ///
     /// See [`begin_pessimistic_with_isolation`](Self::begin_pessimistic_with_isolation)
     /// for what changes; everything else is [`begin`](Self::begin).
     pub fn begin_pessimistic(&self) -> Txn {
-        self.begin_pessimistic_with_isolation(IsolationLevel::Snapshot)
+        self.begin_pessimistic_with_isolation(self.inner.opts.default_isolation)
     }
 
     /// Begin a **pessimistic** transaction: one that takes a point lock on
@@ -1950,6 +1953,12 @@ impl Txn {
             spans.push(((at, scratch.len() - at), i));
         }
         (scratch, spans)
+    }
+
+    /// The isolation level this transaction runs at — the one it was begun
+    /// with, or the one [`reset`](Self::reset) last gave it.
+    pub fn isolation(&self) -> IsolationLevel {
+        self.isolation
     }
 
     /// The sequence this transaction reads at.

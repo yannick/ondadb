@@ -31,7 +31,8 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   Repeatable-Read/Snapshot/Serializable txns pin their `read_seq` via
   `acquire_snapshot`/`release_snapshot`. Compaction's version GC keeps every
   version newer than `oldest_snapshot()`.
-- Isolation (`txn.rs`): ReadUncommitted/ReadCommitted read live `visible_seq`;
+- Isolation (`txn.rs`): `DB::begin` uses `Options::default_isolation`
+  (default `Snapshot`, not persisted); ReadUncommitted/ReadCommitted read live `visible_seq`;
   the pinned levels read their snapshot. Snapshot+Serializable serialize
   commit-time validation under `commit_mu` and abort with `Conflict` on
   write-write conflicts (first-committer-wins). **Serializable validates point
