@@ -22,6 +22,8 @@ type/function names — grep for them; line numbers rot.
 | `memtable_arena.rs` | *(unsafe-fastpath only)* arena skip-list shard: single-allocation nodes with inline key prefix + seq; `ShardCursor` for zero-copy flush |
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
+| `read_resources.rs` | `ReadResources`: one block cache, file-handle cache and reader cache that many **read-only** opens lease (`Options::read_resources`), keyed per lease namespace so equal file ids of different databases never alias |
+| `snapshot.rs` | `SnapshotHandle` (`DB::snapshot`): a refcounted read snapshot outside a transaction, pinned in the same `snapshots` registry |
 | `table_cache.rs` | `TableCache`: sharded (CLOCK) LRU of open SSTable readers, bounding resident index+bloom memory by reader count (`max_open_readers`) and byte budget (`max_open_reader_bytes`); the `max_open_files` equivalent |
 | `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse, pinned-block borrowed keys/values and the merge-operand arena (1.1) |
 | `tailing.rs` | `TailingIterator`: forward-only keyspace tail that refreshes past its own end (not a change feed) |

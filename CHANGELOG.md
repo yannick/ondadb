@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Shared read resources** (wavesdb `ReadResources`, `23648c8`,
+  `f6b3def`): `ReadResources::new(ReadResourceOptions { block_cache_bytes,
+  max_open_files, max_open_readers, max_reader_bytes })` builds one block
+  cache, file-handle cache and reader cache that any number of **read-only**
+  opens lease through `Options::read_resources`, so N immutable databases
+  share one budget instead of N. Cache keys are namespaced per lease
+  (`Options::read_cache_namespace`, default the directory's canonical path),
+  so identical table ids in different databases never alias. A writable open
+  with resources is `InvalidArgs`; `close()` refuses new leases and the caches
+  are emptied when the last leased database closes. `stats()` reports block
+  hits/misses/evictions/entries/bytes, reader-cache stats, open files,
+  leases and closing. `CacheStats` gains `evictions`.
 - **`get_into`** caller-buffer point reads on `DB`, `Txn` and
   `SnapshotHandle`: the value is appended to a caller-owned `Vec<u8>` (its
   length is returned; a miss leaves the buffer unchanged), so a reused buffer

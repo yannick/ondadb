@@ -143,8 +143,14 @@ fn reader_bytes(reader: &Reader) -> usize {
     index + bloom
 }
 
+/// `(namespace, file id)`. File ids are unique within one database only; the
+/// namespace is what keeps two databases leasing one
+/// [`ReadResources`](crate::read_resources::ReadResources) apart. `0` for every
+/// private cache.
+type Key = (u64, u64);
+
 struct Shard {
-    open: HashMap<u64, Entry>,
+    open: HashMap<Key, Entry>,
 }
 
 /// How many independently locked shards the cache is split into.
@@ -163,6 +169,14 @@ const SHARDS: usize = 16;
 /// evictions take the shard's write lock; the open itself (file I/O, index
 /// and bloom decode) still happens outside any lock.
 pub struct TableCache {
+    core: Arc<Core>,
+    /// This view's namespace; see [`Key`].
+    ns: u64,
+}
+
+/// The storage behind one or more [`TableCache`] views: the bounds are global
+/// to it, whichever view inserted a reader.
+struct Core {
     shards: Vec<RwLock<Shard>>,
     /// Total open readers across shards — the bound is GLOBAL and exact
     /// (it is a memory contract, S-123), even though storage is sharded.
@@ -182,10 +196,11 @@ impl std::fmt::Debug for TableCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (open, _, _, _) = self.stats();
         f.debug_struct("TableCache")
+            .field("ns", &self.ns)
             .field("open", &open)
-            .field("max_open", &self.max_open.load(Ordering::Relaxed))
-            .field("open_bytes", &self.open_bytes.load(Ordering::Relaxed))
-            .field("max_bytes", &self.max_bytes.load(Ordering::Relaxed))
+            .field("max_open", &self.core.max_open.load(Ordering::Relaxed))
+            .field("open_bytes", &self.core.open_bytes.load(Ordering::Relaxed))
+            .field("max_bytes", &self.core.max_bytes.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -206,7 +221,7 @@ impl TableCache {
     /// value (it is clamped to at least one). Eviction runs until **both**
     /// bounds hold.
     pub fn with_byte_budget(max_open: usize, max_bytes: usize) -> TableCache {
-        TableCache {
+        let core = Core {
             shards: (0..SHARDS)
                 .map(|_| {
                     RwLock::new(Shard {
@@ -223,22 +238,39 @@ impl TableCache {
             opens: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             closes: AtomicU64::new(0),
+        };
+        TableCache {
+            core: Arc::new(core),
+            ns: 0,
         }
     }
 
+    /// Another view of this cache's storage, keyed under namespace `ns`.
+    pub(crate) fn namespaced(&self, ns: u64) -> TableCache {
+        TableCache {
+            core: Arc::clone(&self.core),
+            ns,
+        }
+    }
+
+    fn shard_index(&self, file_id: u64) -> usize {
+        // file_ids are sequential, so modulo spreads them evenly; the namespace
+        // offset keeps two databases' table 1 off the same shard.
+        (file_id.wrapping_add(self.ns.wrapping_mul(7)) as usize) % SHARDS
+    }
+
     fn shard(&self, file_id: u64) -> &RwLock<Shard> {
-        // file_ids are sequential, so modulo spreads them evenly.
-        &self.shards[(file_id as usize) % SHARDS]
+        &self.core.shards[self.shard_index(file_id)]
     }
 
     /// `(open readers, opens, hits, closes)`.
     pub fn stats(&self) -> (usize, u64, u64, u64) {
-        let open = self.open_count.load(Ordering::Relaxed);
+        let open = self.core.open_count.load(Ordering::Relaxed);
         (
             open,
-            self.opens.load(Ordering::Relaxed),
-            self.hits.load(Ordering::Relaxed),
-            self.closes.load(Ordering::Relaxed),
+            self.core.opens.load(Ordering::Relaxed),
+            self.core.hits.load(Ordering::Relaxed),
+            self.core.closes.load(Ordering::Relaxed),
         )
     }
 
@@ -251,13 +283,13 @@ impl TableCache {
     /// construction; they are measured the same way.
     pub fn byte_stats(&self) -> (usize, usize) {
         (
-            self.open_bytes.load(Ordering::Relaxed),
-            self.max_bytes.load(Ordering::Relaxed),
+            self.core.open_bytes.load(Ordering::Relaxed),
+            self.core.max_bytes.load(Ordering::Relaxed),
         )
     }
 
     pub fn set_max_open(&self, max_open: usize) {
-        self.max_open.store(max_open.max(1), Ordering::Relaxed);
+        self.core.max_open.store(max_open.max(1), Ordering::Relaxed);
         self.evict_to_bound(0);
     }
 
@@ -267,7 +299,7 @@ impl TableCache {
     /// a memory limit that takes hold only on the next read is not a limit
     /// during the incident you set it in.
     pub fn set_max_bytes(&self, max_bytes: usize) {
-        self.max_bytes.store(max_bytes, Ordering::Relaxed);
+        self.core.max_bytes.store(max_bytes, Ordering::Relaxed);
         self.evict_to_bound(0);
     }
 
@@ -282,9 +314,9 @@ impl TableCache {
     pub(crate) fn get(&self, t: &TableRef) -> Result<Arc<Reader>> {
         {
             let shard = self.shard(t.file_id).read();
-            if let Some(e) = shard.open.get(&t.file_id) {
+            if let Some(e) = shard.open.get(&(self.ns, t.file_id)) {
                 e.referenced.store(true, Ordering::Relaxed);
-                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.core.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Arc::clone(&e.reader));
             }
         }
@@ -299,12 +331,12 @@ impl TableCache {
             t.vlog_cache_limit,
             t.io_limiter.clone(),
         )?;
-        self.opens.fetch_add(1, Ordering::Relaxed);
+        self.core.opens.fetch_add(1, Ordering::Relaxed);
 
         let mut shard = self.shard(t.file_id).write();
         // A racing thread may have inserted first; prefer the resident one so
         // both callers share a single decode.
-        let out = match shard.open.get(&t.file_id) {
+        let out = match shard.open.get(&(self.ns, t.file_id)) {
             Some(e) => {
                 e.referenced.store(true, Ordering::Relaxed);
                 Arc::clone(&e.reader)
@@ -314,20 +346,20 @@ impl TableCache {
                 // across the index walk any longer than the insert needs.
                 let bytes = reader_bytes(&reader);
                 shard.open.insert(
-                    t.file_id,
+                    (self.ns, t.file_id),
                     Entry {
                         reader: Arc::clone(&reader),
                         referenced: AtomicBool::new(true),
                         bytes,
                     },
                 );
-                self.open_count.fetch_add(1, Ordering::Relaxed);
-                self.open_bytes.fetch_add(bytes, Ordering::Relaxed);
+                self.core.open_count.fetch_add(1, Ordering::Relaxed);
+                self.core.open_bytes.fetch_add(bytes, Ordering::Relaxed);
                 reader
             }
         };
         drop(shard);
-        self.evict_to_bound((t.file_id as usize) % SHARDS);
+        self.evict_to_bound(self.shard_index(t.file_id));
         Ok(out)
     }
 
@@ -338,12 +370,39 @@ impl TableCache {
     /// an `Option` rather than opening one in order to close it.
     pub(crate) fn close(&self, file_id: u64) -> Option<Arc<Reader>> {
         let mut shard = self.shard(file_id).write();
-        let out = shard.open.remove(&file_id).map(|e| {
-            self.open_bytes.fetch_sub(e.bytes, Ordering::Relaxed);
+        let out = shard.open.remove(&(self.ns, file_id)).map(|e| {
+            self.core.open_bytes.fetch_sub(e.bytes, Ordering::Relaxed);
             e.reader
         });
         if out.is_some() {
-            self.open_count.fetch_sub(1, Ordering::Relaxed);
+            self.core.open_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Drop every reader of namespace `ns`, returning them for the caller to
+    /// close. Not counted as evictions.
+    pub(crate) fn purge_namespace(&self, ns: u64) -> Vec<Arc<Reader>> {
+        self.purge(|key| key.0 == ns)
+    }
+
+    /// Drop every reader of every namespace sharing this storage.
+    pub(crate) fn purge_all(&self) -> Vec<Arc<Reader>> {
+        self.purge(|_| true)
+    }
+
+    fn purge(&self, doomed: impl Fn(&Key) -> bool) -> Vec<Arc<Reader>> {
+        let mut out = Vec::new();
+        for shard in &self.core.shards {
+            let mut s = shard.write();
+            let keys: Vec<Key> = s.open.keys().filter(|k| doomed(k)).copied().collect();
+            for k in keys {
+                if let Some(e) = s.open.remove(&k) {
+                    self.core.open_bytes.fetch_sub(e.bytes, Ordering::Relaxed);
+                    self.core.open_count.fetch_sub(1, Ordering::Relaxed);
+                    out.push(e.reader);
+                }
+            }
         }
         out
     }
@@ -357,7 +416,7 @@ impl TableCache {
     /// detect it.
     pub fn resident_breakdown(&self) -> (usize, usize, usize, usize, usize) {
         let mut out = (0usize, 0usize, 0usize, 0usize, 0usize);
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let s = shard.read();
             for e in s.open.values() {
                 let (idx, bloom, entries) = e.reader.resident_breakdown();
@@ -381,18 +440,18 @@ impl TableCache {
     /// table's index gets one table's index, and the honest place to see that is
     /// [`byte_stats`](Self::byte_stats), which will read above the budget.
     fn over_bound(&self) -> bool {
-        let open = self.open_count.load(Ordering::Relaxed);
-        if open > self.max_open.load(Ordering::Relaxed) {
+        let open = self.core.open_count.load(Ordering::Relaxed);
+        if open > self.core.max_open.load(Ordering::Relaxed) {
             return true;
         }
-        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
-        max_bytes > 0 && open > 1 && self.open_bytes.load(Ordering::Relaxed) > max_bytes
+        let max_bytes = self.core.max_bytes.load(Ordering::Relaxed);
+        max_bytes > 0 && open > 1 && self.core.open_bytes.load(Ordering::Relaxed) > max_bytes
     }
 
     /// Give one shard a CLOCK visit and evict exactly one reader when it is
     /// non-empty. Returns whether the global bounds made progress.
     fn evict_one_shard(&self, shard_index: usize) -> bool {
-        let mut shard = self.shards[shard_index].write();
+        let mut shard = self.core.shards[shard_index].write();
         if shard.open.is_empty() {
             return false;
         }
@@ -406,17 +465,17 @@ impl TableCache {
         }
         // If every reader used its second chance, evict one anyway so a
         // lowering of the bound takes effect immediately.
-        let victim = victim.or_else(|| shard.open.keys().next().copied());
+        let victim: Option<Key> = victim.or_else(|| shard.open.keys().next().copied());
         let Some(victim) = victim else {
             return false;
         };
         // The cache drops its `Arc`; a caller mid-read still holds one. These
         // counters therefore describe what the cache pins, not process peak.
         if let Some(entry) = shard.open.remove(&victim) {
-            self.open_bytes.fetch_sub(entry.bytes, Ordering::Relaxed);
+            self.core.open_bytes.fetch_sub(entry.bytes, Ordering::Relaxed);
         }
-        self.open_count.fetch_sub(1, Ordering::Relaxed);
-        self.closes.fetch_add(1, Ordering::Relaxed);
+        self.core.open_count.fetch_sub(1, Ordering::Relaxed);
+        self.core.closes.fetch_add(1, Ordering::Relaxed);
         true
     }
 

@@ -131,6 +131,13 @@ pub(crate) struct CfCtx {
     pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
     /// Bounded cache of open SSTable readers — see [`crate::table_cache`].
     pub tables: Arc<crate::table_cache::TableCache>,
+    /// Whether `bc`/`tables` are views leased from a shared
+    /// [`ReadResources`](crate::read_resources::ReadResources). Another
+    /// database of the same cache namespace may be reading through the very
+    /// readers this one opened, so close must leave them to the lease (which
+    /// purges the namespace when its last database goes) instead of closing
+    /// them itself.
+    pub shared_reads: bool,
     pub flush_tx: Sender<FlushJob>,
     pub compact_tx: Sender<Arc<ColumnFamily>>,
     pub closing: Arc<AtomicBool>,
@@ -2861,6 +2868,9 @@ impl ColumnFamily {
         }
         if let Some(w) = s.wal.take() {
             let _ = w.close();
+        }
+        if self.ctx.shared_reads {
+            return;
         }
         for lvl in &s.levels {
             for th in lvl {

@@ -456,6 +456,31 @@ pub struct Options {
     /// **Not persisted.** It is host policy, not a property of the data, so it
     /// is taken from the options of every open.
     pub default_isolation: IsolationLevel,
+    /// Lease this database's block cache, file-handle cache and reader cache
+    /// from a process-wide [`ReadResources`](crate::read_resources::ReadResources)
+    /// instead of building private ones (wavesdb `ReadResources`). Opt-in;
+    /// `None` (the default) keeps today's per-database caches.
+    ///
+    /// **Read-only opens only**: a writable open with this set fails with
+    /// [`InvalidArgs`](crate::OndaError::InvalidArgs), as does an open after
+    /// [`ReadResources::close`](crate::read_resources::ReadResources::close).
+    /// While leased, [`block_cache_size`](Self::block_cache_size),
+    /// [`max_open_sstables`](Self::max_open_sstables),
+    /// [`max_open_readers`](Self::max_open_readers) and
+    /// [`max_open_reader_bytes`](Self::max_open_reader_bytes) are ignored — the
+    /// shared budgets replace them — and `DB::set_max_open_readers` /
+    /// `set_max_open_reader_bytes` retune the *shared* reader budget.
+    pub read_resources: Option<Arc<crate::read_resources::ReadResources>>,
+    /// Cache identity for a leased database (see
+    /// [`read_resources`](Self::read_resources)); ignored without one.
+    ///
+    /// `None` uses the database directory's canonical path, so only opens of
+    /// the same directory share cached readers and blocks. A caller-chosen
+    /// name lets **different** directories share them, and is a promise that
+    /// every database opened under it holds byte-identical tables under the
+    /// same ids (copies of one published checkpoint, say). Two databases with
+    /// different contents must never share a name.
+    pub read_cache_namespace: Option<String>,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -653,6 +678,8 @@ impl Default for Options {
             io_limiter: None,
             max_prepared_bytes: 64 << 20,
             default_isolation: IsolationLevel::Snapshot,
+            read_resources: None,
+            read_cache_namespace: None,
         }
     }
 }
