@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
+  and `multi_get` skip a candidate table whose `max_seq` is at or below the
+  version already in hand (point hit, tombstone, or covering range delete),
+  so a memtable hit reads no table and an L0 hit reads nothing older.
+  Results are unchanged (randomized oracle against the exhaustive walk); a
+  corrupt table older than the answer is no longer probed, so it no longer
+  fails the read.
+
 ## 0.9.1
 
 **Shared-bug corrective release.** Five defects that wavesdb fixed after

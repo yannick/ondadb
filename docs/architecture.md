@@ -177,6 +177,23 @@ unified store (if enabled) → active memtable → immutable memtables (newest
 first) → L0 tables whose [min,max] covers the key (all of them; L0 overlaps) →
 one binary-searched table per level ≥ 1.
 
+**Early exit by `max_seq` (wavesdb `5ef39df`).** Once the read holds a
+version — a point hit, a tombstone, or a covering range delete (coverage is
+folded in *before* the table walk) — a candidate table is skipped when its
+`SstMeta::max_seq` is at or below that version's sequence: nothing it holds
+could displace the candidate, because `consider` keeps only a strictly newer
+version. The gate is per table, not a `break`, because position does not order
+sequences — an ingestion carries the sequence reserved at its *start*, so a
+table flushed after it (and stored above it in L0) can hold an older version of
+the same key. In the ordinary flow it degenerates to "a memtable hit reads no
+table, an L0 hit reads nothing older". A winning merge operand still walks every
+table in `fold_point_chain`, and a miss still probes every candidate.
+`multi_get` applies the same gate per key and skips a table outright when every
+key it could answer is already resolved. A skipped table is never opened, so a
+corrupt table older than the answer no longer fails a `get`. Equivalence to the
+exhaustive walk is pinned by `point_read_early_exit_matches_exhaustive`
+(randomized oracle); the probe counts by `tests/read_early_exit.rs`.
+
 **Range-delete masking (1.2)** runs beside that walk and is resolved against it
 at the end: the maximum *covering* sequence at or below `read_seq` is taken
 across the memtable sets, the unified set, every L0 table whose **span**
@@ -292,7 +309,7 @@ through the same `PointReadCandidate::consider`/`consider_memtable` entry points
 as `get`, so newest-wins (and equal-seq ties) resolve identically. One
 divergence from N `get`s, deliberate: a failing source errors only the keys
 whose resolution needed it — a key a strictly newer source already resolved
-keeps its value, where `get` propagates the error.
+keeps its value, where `get` propagates the error of any table it probes.
 
 A table's filter strength is chosen when it is **written**, from its output
 level: `ColumnFamilyConfig::bloom_fpr_for_level(level, bottom)` returns the

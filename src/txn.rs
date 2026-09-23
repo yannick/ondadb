@@ -418,7 +418,9 @@ impl DB {
     /// * **Isolated failures.** A table that fails to open or whose block fails
     ///   its checksum errors only the keys whose resolution needed it. A key a
     ///   strictly newer source had already resolved still returns its value,
-    ///   where `get` would have propagated the error.
+    ///   where `get` propagates the error of every table it probes (it skips,
+    ///   and so never fails on, only a table whose `max_seq` is at or below the
+    ///   version it already holds).
     ///
     /// The win is deduplicated IO: candidate tables are opened and filtered
     /// once per table rather than once per key, and each distinct data block is
