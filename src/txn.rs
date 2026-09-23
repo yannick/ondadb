@@ -1311,12 +1311,26 @@ impl Txn {
     }
 
     fn validate_read_conflicts(&self) -> Result<()> {
+        // A range delete leaves no point version at the keys it covers, so
+        // `peek_seq` cannot see it; the span index can. This is still a point
+        // check — only keys this transaction actually read — not phantom
+        // protection. `None` until CAP_RANGE_DELETES, when no span can exist.
+        let spans = self.db.span_index();
         for (id, key) in &self.read_set {
             let Some(cf) = self.read_cfs.get(id) else {
                 continue;
             };
             if cf.peek_seq(key)? > self.read_seq {
                 return Err(OndaError::Conflict("read-set changed".into()));
+            }
+            let covered = spans.and_then(|index| {
+                index.point_conflict(cf.id(), cf.comparator(), key, self.read_seq)
+            });
+            if let Some(seq) = covered {
+                return Err(OndaError::Conflict(format!(
+                    "read of key {key:?} is covered by a range delete committed at \
+                     sequence {seq}, after this transaction's snapshot"
+                )));
             }
         }
         Ok(())
