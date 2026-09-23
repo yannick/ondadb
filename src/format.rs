@@ -12,6 +12,50 @@
 //! seek to `(user_key, !read_seq)` lands on the newest version visible at
 //! `read_seq`.
 
+/// Which on-disk format family a reader decodes.
+///
+/// Every artifact this binary **writes** is [`FormatProfile::Epoch1`]. The
+/// other variant exists only to read an ondaDB 0.9.x directory through the
+/// frozen decoders in `legacy_onda`, and only when that feature is compiled
+/// in; it selects whole containers (footer, checksums, codec ids, bloom
+/// encoding), never individual fields, so an epoch-1 reader can never be
+/// talked into accepting a 0.9 byte by one field that happens to parse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormatProfile {
+    /// yoloDB format epoch 1: the only format this binary writes.
+    #[default]
+    Epoch1,
+    /// ondaDB 0.9.x, read-only (`legacy_onda`).
+    #[cfg(feature = "legacy-onda")]
+    Onda09,
+}
+
+impl FormatProfile {
+    /// The integrity checksum of this family's frames (blocks, vlog frames).
+    #[inline]
+    pub fn checksum(self, b: &[u8]) -> u32 {
+        match self {
+            FormatProfile::Epoch1 => crate::encoding::checksum(b),
+            #[cfg(feature = "legacy-onda")]
+            FormatProfile::Onda09 => crate::legacy_onda::checksum_ieee(b),
+        }
+    }
+
+    /// The codec a block or vlog frame names by `id` in this family.
+    #[inline]
+    pub fn codec(self, id: u8) -> crate::error::Result<crate::config::Compression> {
+        match self {
+            FormatProfile::Epoch1 => crate::config::Compression::from_u8(id).ok_or_else(|| {
+                crate::error::OndaError::Corruption(format!("unknown codec id {id}"))
+            }),
+            #[cfg(feature = "legacy-onda")]
+            FormatProfile::Onda09 => crate::legacy_onda::codec(id).ok_or_else(|| {
+                crate::error::OndaError::Corruption(format!("0.9: unknown codec id {id}"))
+            }),
+        }
+    }
+}
+
 /// Per-entry flag bits, persisted in WAL and SSTable klog entries.
 pub mod flags {
     /// Entry is a delete marker.

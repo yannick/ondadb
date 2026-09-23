@@ -159,7 +159,7 @@ pub fn parse_footer(tail: &[u8], file_len: u64) -> Result<Footer> {
 /// 64-byte footer and its flag byte, IEEE block and vlog checksums, 0.9 codec
 /// ids, and the trailing-tag bloom.
 pub fn open_table(klog_path: &str, cmp: crate::comparator::ComparatorRef) -> Result<Arc<Reader>> {
-    Reader::open(
+    Reader::open_profiled(
         klog_path,
         crate::storage::LocalStorage::new(
             Arc::new(crate::cache::FileCache::new(4)),
@@ -169,6 +169,8 @@ pub fn open_table(klog_path: &str, cmp: crate::comparator::ComparatorRef) -> Res
         1,
         cmp,
         0,
+        None,
+        crate::format::FormatProfile::Onda09,
     )
 }
 
@@ -294,6 +296,66 @@ mod tests {
             let k = format!("k{i:02}");
             assert!(bloom.may_contain(k.as_bytes()), "{k}");
         }
+    }
+
+    /// `restart_scan_offset` runs through the shared `restart_lower_bound`, and
+    /// must return byte-for-byte the offsets an open-coded binary search
+    /// returns over a frozen 0.9 table — the reader's restart search is shared
+    /// by both format families.
+    #[test]
+    fn restart_lower_bound_matches_open_coded_scan_offset() {
+        use crate::encoding::read_u32;
+        use crate::sst::{cmp_internal, decode_entry};
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("t.klog");
+        std::fs::write(&klog, fixture("klog_legacy_flat_restarts_bloom.klog")).unwrap();
+        std::fs::write(
+            klog.with_extension("vlog"),
+            fixture("klog_legacy_flat_restarts_bloom.vlog"),
+        )
+        .unwrap();
+        let r = open_table(klog.to_str().unwrap(), crate::comparator::default_comparator()).unwrap();
+        assert!(!r.prefix_delta());
+        let open_coded = |raw: &[u8], restarts: &[u8], key: &[u8], seq: u64| -> usize {
+            if restarts.len() < 8 {
+                return 0;
+            }
+            let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
+            let (mut lo, mut hi) = (0usize, restarts.len() / 4);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (entry, _) = decode_entry(raw, r.entry_layout(), restart_off(mid)).unwrap();
+                if cmp_internal(r.comparator(), entry.user_key(raw), entry.seq, key, seq).is_lt() {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo > 0 {
+                restart_off(lo - 1)
+            } else {
+                0
+            }
+        };
+        let mut probes: Vec<String> = (1..45u64).map(|i| format!("k{i:02}")).collect();
+        probes.extend(["a".into(), "k00".into(), "k99".into(), "zzz".into()]);
+        let mut checked = 0;
+        for bi in 0..r.data_block_count() {
+            let block = r.read_data_block_local(bi).unwrap();
+            let (raw, restarts) = r.split_block(block.bytes()).unwrap();
+            assert!(!restarts.is_empty(), "a restarts fixture has anchors");
+            for probe in &probes {
+                for seq in [0u64, 25, u64::MAX] {
+                    let want = open_coded(raw, restarts, probe.as_bytes(), seq);
+                    let got = r
+                        .restart_scan_offset(raw, restarts, probe.as_bytes(), seq)
+                        .unwrap();
+                    assert_eq!(got, want, "block {bi}, probe {probe}, seq {seq}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "the fixture must exercise the search");
     }
 
     /// A filter with no trailing tag is FNV (0.9's oldest encoding), and it

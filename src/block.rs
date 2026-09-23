@@ -81,6 +81,22 @@ pub fn block_payload_preverified(buf: &[u8]) -> Result<(Compression, &[u8], usiz
     block_payload_inner(buf, false)
 }
 
+/// [`block_payload`] / [`block_payload_preverified`] for a table of format
+/// `profile`: an epoch-1 table takes the fast path below; a 0.9 table (read
+/// through `legacy_onda`) is parsed by the frozen 0.9 decoder.
+#[inline]
+pub(crate) fn block_payload_for(
+    profile: crate::format::FormatProfile,
+    buf: &[u8],
+    verify: bool,
+) -> Result<(Compression, &[u8], usize, usize)> {
+    match profile {
+        crate::format::FormatProfile::Epoch1 => block_payload_inner(buf, verify),
+        #[cfg(feature = "legacy-onda")]
+        crate::format::FormatProfile::Onda09 => crate::legacy_onda::block_payload(buf, verify),
+    }
+}
+
 #[inline]
 fn block_payload_inner(buf: &[u8], verify: bool) -> Result<(Compression, &[u8], usize, usize)> {
     if buf.len() < BLOCK_HEADER {

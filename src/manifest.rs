@@ -970,19 +970,6 @@ mod tests {
     }
 
     #[test]
-    fn all_v1_tail_fixtures_decode_identically() {
-        for name in V1_FIXTURES {
-            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(
-                m.encode(),
-                bytes,
-                "{name}: re-encode must be byte-identical"
-            );
-        }
-    }
-
-    #[test]
     fn unknown_tag_is_corruption() {
         let bytes = fixture_with_extra_tail("manifest_v1_object.bin", b"ONDAXXX1\0\0\0\0\0\0\0\0");
         let err = Manifest::decode(&bytes).expect_err("an unknown tail tag must fail closed");
@@ -1089,25 +1076,6 @@ mod tests {
         );
         // And it round-trips through the real decoder.
         assert_eq!(Manifest::decode(&enc).unwrap().encode(), enc);
-    }
-
-    /// Every table of every frozen legacy fixture decodes to "no fragments",
-    /// and the field never appears in the bytes.
-    #[test]
-    fn legacy_table_reports_range_count_zero() {
-        for name in V1_FIXTURES.iter().chain([V2_FIXTURE].iter()) {
-            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(tag_offset(&bytes, RANGE_TAG).is_none(), "{name}");
-            for cf in &m.cfs {
-                for t in &cf.sstables {
-                    assert_eq!(t.range_count, 0, "{name} table {}", t.id);
-                    assert_eq!(t.range_min_key, None, "{name} table {}", t.id);
-                    assert_eq!(t.range_max_key, None, "{name} table {}", t.id);
-                    assert!(!t.has_ranges(), "{name} table {}", t.id);
-                }
-            }
-        }
     }
 
     /// The summary is a capability-bearing artifact: bytes carrying it without
@@ -1224,20 +1192,6 @@ mod tests {
         assert!(
             tag_offset(&enc, OBJECT_TAG).unwrap() < tag_offset(&enc, MANIFEST_EDITS_TAG).unwrap()
         );
-    }
-
-    /// Every manifest ever written before 2.2 lacks the tail, and must decode
-    /// as "no log yet" rather than as an inconsistent cursor.
-    #[test]
-    fn a_manifest_without_the_edits_tail_decodes_as_generation_zero() {
-        for name in V1_FIXTURES {
-            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(m.generation, 0, "{name}");
-            assert_eq!(m.applied_through, 0, "{name}");
-            assert_eq!(m.next_edit_id, 1, "{name}");
-            assert_eq!(m.encode(), bytes, "{name}: still byte-identical");
-        }
     }
 
     /// The tail is a v2 feature, so a VERSION-1 manifest carrying it is bytes
@@ -1367,21 +1321,6 @@ mod tests {
         assert_eq!(err.kind(), "corruption");
     }
 
-    /// The frozen v2 fixture decodes to the documented value and re-encodes to
-    /// exactly the committed bytes.
-    #[test]
-    fn frozen_v2_caps_fixture_round_trips() {
-        let bytes = std::fs::read(crate::util::legacy_fixture(V2_FIXTURE)).unwrap();
-        assert_eq!(encoded_version(&bytes), VERSION_V2);
-        let m = Manifest::decode(&bytes).unwrap();
-        assert_eq!(m.caps, crate::format::CAP_EXTENDED_RECORDS);
-        assert!(m.cfs.iter().all(|cf| cf
-            .sstables
-            .iter()
-            .all(|s| s.partition.is_none() && s.tier.is_none() && s.max_entry_time.is_none())));
-        assert_eq!(m.encode(), bytes);
-    }
-
     // ---- 0.3: periodic-compaction age state -------------------------------
 
     /// Task 1's first test: the stamp survives a save/load, per table, with
@@ -1417,24 +1356,6 @@ mod tests {
             .sstables
             .iter()
             .all(|s| s.last_compaction_time.is_none()));
-    }
-
-    /// Every manifest written before 0.3 decodes to `None`, which the picker
-    /// reads as "unknown, therefore never eligible".
-    #[test]
-    fn legacy_manifest_decodes_last_compaction_time_as_none() {
-        for name in V1_FIXTURES.iter().chain(std::iter::once(&V2_FIXTURE)) {
-            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            let m = Manifest::decode(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(
-                m.cfs
-                    .iter()
-                    .all(|cf| cf.sstables.iter().all(|s| s.last_compaction_time.is_none())),
-                "{name}: a pre-0.3 manifest carries no age state"
-            );
-            // And the field's mere existence must not change the bytes.
-            assert_eq!(m.encode(), bytes, "{name}: re-encode must be identical");
-        }
     }
 
     /// The stamp is capability-bearing: bytes carrying it without

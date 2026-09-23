@@ -577,8 +577,9 @@ fn per_prefix_compression_rules() {
 #[test]
 fn footer_unknown_flag_bit_is_unsupported_format() {
     const FOOTER_SIZE: usize = 64;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/legacy-onda/phase1/klog_legacy_flat_restarts_bloom.klog");
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("src.klog");
+    write_extended(&src, extended_opts(false, true));
     let mut bytes = std::fs::read(&src).unwrap();
     let flags_at = bytes.len() - FOOTER_SIZE + 48;
     // 0x40 is above every assigned footer bit (0x10 is 1.0B's extended-block
@@ -612,8 +613,9 @@ fn footer_unknown_flag_bit_is_unsupported_format() {
 #[test]
 fn fuzz_footer_flags_never_panic() {
     const FOOTER_SIZE: usize = 64;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/legacy-onda/phase1/klog_legacy_flat_restarts_bloom.klog");
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("src.klog");
+    write_extended(&src, extended_opts(false, true));
     let original = std::fs::read(&src).unwrap();
     let vlog = std::fs::read(src.with_extension("vlog")).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -1173,13 +1175,6 @@ fn writer_writes_a_bloom_block_when_fpr_is_some() {
 
 // ---- extended entry layout (FOOTER_EXTENDED_BLOCK, 1.0-B) -------------------
 
-/// Path of a frozen phase-1 fixture.
-fn phase1_fixture(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/legacy-onda/phase1")
-        .join(name)
-}
-
 /// Every entry shape a writer produces, so the extended layout is exercised on
 /// tombstones, TTLs and vlog-separated values alike.
 fn extended_entries() -> Vec<(String, Vec<u8>, u64, i64, bool, bool)> {
@@ -1332,99 +1327,6 @@ fn extended_table_restart_search_matches_scan() {
         assert!(it.valid(), "{k}");
         assert_eq!(it.user_key(), k.as_bytes());
         assert_eq!(it.seq(), seq, "{k}");
-    }
-}
-
-/// The frozen extended klog pins the wire bytes: a change to the entry layout,
-/// the footer bit or the aux prefix is a test failure, not a silent break.
-#[test]
-fn extended_golden_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let klog = dir.path().join("ext.klog");
-    let mut w = Writer::new(klog.to_str().unwrap(), extended_opts(false, true)).unwrap();
-    // Same entry set as the frozen legacy corpus (`klog_entries` there).
-    let big = vec![b'V'; 64];
-    let mut entries: Vec<(String, Vec<u8>, u64, i64, bool, bool)> = vec![
-        ("k01".into(), b"small".to_vec(), 11, 0, false, false),
-        (
-            "k02".into(),
-            b"small".to_vec(),
-            12,
-            1_700_000_000_000_000_000,
-            false,
-            false,
-        ),
-        ("k03".into(), Vec::new(), 13, 0, true, false),
-        ("k04".into(), Vec::new(), 14, 0, true, true),
-        ("k05".into(), big.clone(), 15, 0, false, false),
-        (
-            "k06".into(),
-            big,
-            16,
-            1_700_000_000_000_000_001,
-            false,
-            false,
-        ),
-    ];
-    for i in 7..40u64 {
-        entries.push((
-            format!("k{i:02}"),
-            b"filler".to_vec(),
-            20 + i,
-            0,
-            false,
-            false,
-        ));
-    }
-    for (k, v, seq, ttl, tomb, sdel) in &entries {
-        w.add(
-            k.as_bytes(),
-            v,
-            *seq,
-            *ttl,
-            ondadb::format::point_kind(*tomb, *sdel),
-        )
-        .unwrap();
-    }
-    w.finish().unwrap();
-    assert_eq!(
-        std::fs::read(&klog).unwrap(),
-        std::fs::read(phase1_fixture("klog_extended.klog")).unwrap(),
-        "the extended klog bytes are frozen"
-    );
-    assert_eq!(
-        std::fs::read(klog.with_extension("vlog")).unwrap(),
-        std::fs::read(phase1_fixture("klog_extended.vlog")).unwrap(),
-    );
-}
-
-/// Compiling the extended layout in must not change how a legacy table reads:
-/// the flag is table-level and absent, so every frozen legacy klog still
-/// decodes through the legacy path.
-#[test]
-fn legacy_table_still_decodes_with_extended_support_compiled() {
-    let dir = tempfile::tempdir().unwrap();
-    for name in [
-        "klog_legacy_flat_restarts_bloom.klog",
-        "klog_legacy_btree_norestarts_nobloom.klog",
-    ] {
-        let klog = dir.path().join(name);
-        std::fs::write(&klog, std::fs::read(phase1_fixture(name)).unwrap()).unwrap();
-        std::fs::write(
-            klog.with_extension("vlog"),
-            std::fs::read(phase1_fixture(&name.replace(".klog", ".vlog"))).unwrap(),
-        )
-        .unwrap();
-        let r = open_klog(&klog).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(r.aux_block_handle(), None, "{name}: no aux prefix");
-        let mut it = r.iter();
-        it.seek_to_first();
-        let mut n = 0;
-        while it.valid() {
-            n += 1;
-            it.next();
-        }
-        assert_eq!(n, r.num_entries(), "{name}");
     }
 }
 

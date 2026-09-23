@@ -80,9 +80,12 @@ ratios between engines, not absolute numbers across sessions. See
    silently lost. `DbInner::catalog_txn` is the only thing that may append.
 3. **WAL batch atomicity**: one frame per committed batch. Replay must never
    surface a partial batch (frame CRC covers the whole payload).
-4. **Every stored byte is checksummed**: WAL frames (CRC32-C), SSTable blocks
-   (CRC32-C), vlog values (per-value CRC32-C prefix), manifest (whole-file
-   CRC32-C), edit-log header and every edit record (CRC32-C). Blocks and vlog frames are verified **at least once per open
+4. **Every stored byte is checksummed**, with **CRC32-C** (Castagnoli,
+   `encoding::checksum` via the `crc32c` crate — pinned by the check value
+   `"123456789"` → `0xE3069283`): WAL frames, SSTable blocks, vlog values
+   (per-value CRC prefix), manifest (whole-file), edit-log header and every
+   edit record. (ondaDB 0.9.x claimed CRC32-C but computed CRC-32/IEEE; that
+   polynomial now exists only in `legacy_onda` to read 0.9 files.) Blocks and vlog frames are verified **at least once per open
    reader** — never fewer (the first read always checks, and a frame that fails
    is never marked verified), and re-verified on re-open. Adding a new persisted
    structure without a checksum is a regression.

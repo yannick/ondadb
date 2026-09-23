@@ -14,7 +14,8 @@ use crate::bloom::Bloom;
 use crate::cache::{BlockCache, BlockDomain};
 use crate::comparator::ComparatorRef;
 use crate::config::Compression;
-use crate::encoding::{checksum, read_u32, read_u64, uvarint};
+use crate::encoding::{read_u32, read_u64, uvarint};
+use crate::format::FormatProfile;
 use crate::error::{OndaError, Result};
 use crate::storage::{ReadHandle, Storage};
 
@@ -51,6 +52,10 @@ pub struct Reader {
     /// `cmp.is_bytewise()`, resolved once: the delta decoder's in-block order
     /// check is exact only under byte-wise ordering (AGENTS.md invariant 7).
     bytewise: bool,
+    /// The format family this table is decoded as — checksums, codec ids and
+    /// footer layout. Always [`FormatProfile::Epoch1`] except for a 0.9 table
+    /// opened through `legacy_onda`.
+    profile: FormatProfile,
     /// Aux-block handle of an extended table (`(0, 0)` when absent), `None` for
     /// a legacy table that has no such prefix at all.
     aux_handle: Option<BlockHandle>,
@@ -248,6 +253,31 @@ impl Reader {
         vlog_cache_limit: usize,
         limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
     ) -> Result<Arc<Reader>> {
+        Reader::open_profiled(
+            klog_path,
+            storage,
+            bc,
+            file_id,
+            cmp,
+            vlog_cache_limit,
+            limiter,
+            FormatProfile::Epoch1,
+        )
+    }
+
+    /// Like [`open_with_limiter`](Self::open_with_limiter), decoding the table
+    /// as format family `profile`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_profiled(
+        klog_path: &str,
+        storage: Arc<dyn Storage>,
+        bc: Arc<BlockCache>,
+        file_id: u64,
+        cmp: ComparatorRef,
+        vlog_cache_limit: usize,
+        limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+        profile: FormatProfile,
+    ) -> Result<Arc<Reader>> {
         let mut r = Reader {
             klog_path: klog_path.to_string(),
             vlog_path: vlog_path_for(klog_path),
@@ -267,6 +297,7 @@ impl Reader {
             entry_layout: EntryLayout::Legacy,
             prefix_delta: false,
             bytewise: false,
+            profile,
             aux_handle: None,
             fragments: Arc::from([]),
             vlog_verified: OnceLock::new(),
@@ -345,7 +376,7 @@ impl Reader {
                 // Decoded at open, not lazily: an aux block naming a section
                 // this binary does not implement must fail the open, not
                 // surface later as a silently missing range delete.
-                let (payload, _) = read_block_at(&*f, handle.offset, handle.length)?;
+                let (payload, _) = read_block_at(&*f, handle.offset, handle.length, profile)?;
                 for (tag, section) in decode_aux_sections(&payload)? {
                     if tag == crate::sst::AUX_SECTION_RANGE {
                         r.fragments = crate::range_tombstone::decode_fragments(section)?.into();
@@ -366,7 +397,7 @@ impl Reader {
         }
 
         if flags & FOOTER_HAS_BLOOM != 0 && bloom_len > 0 {
-            let (raw, _) = read_block_at(&*f, bloom_off, bloom_len)?;
+            let (raw, _) = read_block_at(&*f, bloom_off, bloom_len, profile)?;
             r.bloom = Some(Bloom::decode(&raw)?);
         }
         if flags & FOOTER_BTREE != 0 {
@@ -380,7 +411,7 @@ impl Reader {
                 },
             )?;
         } else {
-            let (idx_raw, _) = read_block_at(&*f, index_off, index_len)?;
+            let (idx_raw, _) = read_block_at(&*f, index_off, index_len, profile)?;
             r.decode_index(&idx_raw)?;
         }
 
@@ -468,7 +499,7 @@ impl Reader {
     }
 
     fn walk_btree_node(&mut self, f: &dyn ReadHandle, h: BlockHandle, is_root: bool) -> Result<()> {
-        let (block, _) = read_block_at(f, h.offset, h.length)?;
+        let (block, _) = read_block_at(f, h.offset, h.length, self.profile)?;
         let mut p = &block[..];
         if p.is_empty() {
             return Err(corrupt());
@@ -611,14 +642,14 @@ impl Reader {
             let (word, bit) = (i / 64, 1u64 << (i % 64));
             let seen = self.verified[word].load(AtOrd::Acquire) & bit != 0;
             let parsed = if seen {
-                crate::block::block_payload_preverified(&mmap[start..end])?
+                crate::block::block_payload_for(self.profile, &mmap[start..end], false)?
             } else {
                 // First touch of this block in this reader: the same point at
                 // which the CRC is paid is the point at which the pages are
                 // actually faulted in, so it is the mmap analogue of a cache
                 // miss and the only place worth charging.
                 crate::ioctrl::charge(&self.limiter, h.length);
-                let p = crate::block::block_payload(&mmap[start..end])?;
+                let p = crate::block::block_payload_for(self.profile, &mmap[start..end], true)?;
                 self.verified[word].fetch_or(bit, AtOrd::AcqRel);
                 p
             };
@@ -667,7 +698,7 @@ impl Reader {
         // never consumes the bandwidth it queued for.
         crate::ioctrl::charge(&self.limiter, h.length);
         let f = self.storage.open_read(&self.klog_path)?;
-        let (raw, alg) = read_block_at(&*f, h.offset, h.length)?;
+        let (raw, alg) = read_block_at(&*f, h.offset, h.length, self.profile)?;
         if alg != Compression::None {
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
         }
@@ -690,10 +721,10 @@ impl Reader {
             let (word, bit) = (i / 64, 1u64 << (i % 64));
             let seen = self.verified[word].load(AtOrd::Acquire) & bit != 0;
             let parsed = if seen {
-                crate::block::block_payload_preverified(&mmap[start..end])?
+                crate::block::block_payload_for(self.profile, &mmap[start..end], false)?
             } else {
                 crate::ioctrl::charge(&self.limiter, h.length);
-                let p = crate::block::block_payload(&mmap[start..end])?;
+                let p = crate::block::block_payload_for(self.profile, &mmap[start..end], true)?;
                 self.verified[word].fetch_or(bit, AtOrd::AcqRel);
                 p
             };
@@ -938,7 +969,7 @@ impl Reader {
         if slot.load(AtOrd::Acquire) == off {
             return Ok(());
         }
-        if checksum(payload) != want {
+        if self.profile.checksum(payload) != want {
             return Err(corrupt());
         }
         slot.store(off, AtOrd::Release);
@@ -962,7 +993,7 @@ impl Reader {
                 return Ok(false);
             };
             let want = read_u32(&header[0..4]);
-            let compression = Compression::from_u8(header[4]).ok_or_else(corrupt)?;
+            let compression = self.profile.codec(header[4])?;
             let payload_len = read_u32(&header[5..9]) as usize;
             if payload_len > len {
                 return Err(corrupt());
@@ -999,7 +1030,7 @@ impl Reader {
             let mut header = [0u8; VLOG_V2_HDR_LEN];
             file.read_exact_at(&mut header, off)?;
             let want = read_u32(&header[0..4]);
-            let compression = Compression::from_u8(header[4]).ok_or_else(corrupt)?;
+            let compression = self.profile.codec(header[4])?;
             let payload_len = read_u32(&header[5..9]) as usize;
             // Bound allocation before a corrupt header can request up to 4 GiB.
             // Writers store compressed bytes only when shorter than the raw
@@ -1148,10 +1179,15 @@ impl Reader {
 /// algorithm the frame was stored with** — a caller cannot otherwise tell a
 /// decompression from a raw copy, and `perf::bytes_decompressed` must count only
 /// the former.
-fn read_block_at(f: &dyn ReadHandle, off: u64, length: u64) -> Result<(Vec<u8>, Compression)> {
+fn read_block_at(
+    f: &dyn ReadHandle,
+    off: u64,
+    length: u64,
+    profile: FormatProfile,
+) -> Result<(Vec<u8>, Compression)> {
     let mut buf = vec![0u8; length as usize];
     f.read_exact_at(&mut buf, off)?;
-    let (alg, payload, raw_len, _total) = crate::block::block_payload(&buf)?;
+    let (alg, payload, raw_len, _total) = crate::block::block_payload_for(profile, &buf, true)?;
     let raw = crate::compress::decompress(alg, payload, raw_len)?;
     if raw.len() != raw_len {
         return Err(OndaError::Corruption("block: raw length mismatch".into()));
@@ -1379,57 +1415,6 @@ mod tests {
         let err = open_at(klog).expect_err("delta without restarts must be refused");
         assert_eq!(err.kind(), "corruption", "{err}");
         assert!(err.to_string().contains("FOOTER_RESTARTS"), "{err}");
-    }
-
-    /// Task-5 refactor guard: `restart_scan_offset` now runs through the shared
-    /// `restart_lower_bound`, and must return byte-for-byte the offsets the
-    /// open-coded binary search returned over a frozen legacy fixture.
-    #[test]
-    fn restart_lower_bound_matches_legacy_scan_offset() {
-        let path = crate::util::legacy_fixture("klog_legacy_flat_restarts_bloom.klog");
-        let path = path.to_str().unwrap();
-        let r = open_at(path).unwrap();
-        assert!(r.has_restarts && !r.prefix_delta);
-        // The pre-refactor body, verbatim.
-        let legacy = |raw: &[u8], restarts: &[u8], key: &[u8], seq: u64| -> usize {
-            if restarts.len() < 8 {
-                return 0;
-            }
-            let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
-            let (mut lo, mut hi) = (0usize, restarts.len() / 4);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let (entry, _) = decode_entry(raw, r.entry_layout, restart_off(mid)).unwrap();
-                if cmp_internal(&r.cmp, entry.user_key(raw), entry.seq, key, seq).is_lt() {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if lo > 0 {
-                restart_off(lo - 1)
-            } else {
-                0
-            }
-        };
-        let mut probes: Vec<String> = (1..45u64).map(|i| format!("k{i:02}")).collect();
-        probes.extend(["a".into(), "k00".into(), "k99".into(), "zzz".into()]);
-        let mut checked = 0;
-        for bi in 0..r.data_block_count() {
-            let block = r.read_data_block_local(bi).unwrap();
-            let (raw, restarts) = r.split_block(block.bytes()).unwrap();
-            for probe in &probes {
-                for seq in [0u64, 25, u64::MAX] {
-                    let want = legacy(raw, restarts, probe.as_bytes(), seq);
-                    let got = r
-                        .restart_scan_offset(raw, restarts, probe.as_bytes(), seq)
-                        .unwrap();
-                    assert_eq!(got, want, "block {bi}, probe {probe}, seq {seq}");
-                    checked += 1;
-                }
-            }
-        }
-        assert!(checked > 100, "the fixture must exercise the search");
     }
 
     /// The batch point-read planner in `column_family.rs` drives the reader's

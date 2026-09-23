@@ -1436,11 +1436,31 @@ mod tests {
         assert_eq!(err.kind(), "corruption");
     }
 
-    /// Replay a frozen corpus fixture from a private directory.
-    fn replay_fixture(name: &str) -> (tempfile::TempDir, Result<(Vec<Record>, u64)>) {
+    /// One point record as a framed batch, exactly as `append_batch` writes it.
+    fn point_frame(key: &[u8], value: &[u8], seq: u64) -> Vec<u8> {
+        let r = Record {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            seq,
+            ..Default::default()
+        };
+        encode_frame(None, &point_envelope(&[r.as_ref()]))
+    }
+
+    /// Frame an arbitrary payload under a valid CRC.
+    fn raw_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; HEADER_SIZE];
+        put_u32(&mut out[0..], payload.len() as u32);
+        put_u32(&mut out[4..], checksum(payload));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Replay `bytes` as a whole stripe from a private directory.
+    fn replay_bytes(bytes: &[u8]) -> (tempfile::TempDir, Result<(Vec<Record>, u64)>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        std::fs::copy(crate::util::legacy_fixture(name), &path).unwrap();
+        std::fs::write(&path, bytes).unwrap();
         let mut got = Vec::new();
         let res = Wal::replay(&path, |r| {
             got.push(point(r));
@@ -1454,7 +1474,10 @@ mod tests {
     /// ends cleanly and every record before the tear is delivered.
     #[test]
     fn torn_payload_stops_replay_cleanly() {
-        let (_dir, res) = replay_fixture("wal_legacy_torn_tail.bin");
+        // A header claiming 32 payload bytes followed by only 3.
+        let mut bytes = point_frame(b"good", b"v", 1);
+        bytes.extend_from_slice(&[32, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
+        let (_dir, res) = replay_bytes(&bytes);
         let (got, last) = res.expect("a torn tail must not fail replay");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].key, b"good");
@@ -1465,7 +1488,10 @@ mod tests {
     /// real corruption: the bytes were written intact and still lie.
     #[test]
     fn crc_valid_undecodable_record_is_corruption() {
-        let (_dir, res) = replay_fixture("wal_legacy_crc_valid_undecodable.bin");
+        // flags 0, klen 5, vlen 0, seq 7 — but only two key bytes follow.
+        let mut bytes = point_frame(b"good", b"v", 1);
+        bytes.extend_from_slice(&raw_frame(&[0x00, 0x05, 0x00, 0x07, b'a', b'b']));
+        let (_dir, res) = replay_bytes(&bytes);
         let err = res.expect_err("a CRC-valid undecodable record must fail replay");
         assert_eq!(err.kind(), "corruption");
     }
@@ -1474,7 +1500,9 @@ mod tests {
     /// replay skips it and keeps reading.
     #[test]
     fn empty_frame_is_skipped_and_replay_continues() {
-        let (_dir, res) = replay_fixture("wal_legacy_empty_frame.bin");
+        let mut bytes = encode_frame(None, &[]);
+        bytes.extend_from_slice(&point_frame(b"after", b"v", 9));
+        let (_dir, res) = replay_bytes(&bytes);
         let (got, last) = res.expect("an empty frame must not fail replay");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].key, b"after");
@@ -1785,15 +1813,17 @@ mod tests {
         ));
     }
 
-    /// The committed schema-1 range fixture pins the wire bytes.
+    /// The committed schema-1 range fixture pins the **payload** wire bytes.
+    /// The frame header differs from the 0.9 fixture by its checksum only
+    /// (IEEE there, CRC32-C here); the envelope inside is unchanged.
     #[test]
     fn range_record_golden_bytes() {
         let bytes = std::fs::read(crate::util::legacy_fixture("wal_v2_range_schema1.bin")).unwrap();
         let recs = range_records();
-        assert_eq!(
-            encode_frame(ENVELOPE_SCHEMA_PER_CF.into(), &range_envelope(&recs)),
-            bytes
-        );
+        let frame = encode_frame(ENVELOPE_SCHEMA_PER_CF.into(), &range_envelope(&recs));
+        assert_eq!(frame[HEADER_SIZE..], bytes[HEADER_SIZE..]);
+        assert_eq!(frame[..4], bytes[..4], "payload length");
+        assert_eq!(read_u32(&frame[4..8]), checksum(&frame[HEADER_SIZE..]));
         let got = decode_envelope_any(&bytes[HEADER_SIZE..]).unwrap();
         assert_eq!(got.len(), recs.len());
     }
@@ -1960,7 +1990,11 @@ mod tests {
             }),
         ] {
             let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
-            assert_eq!(encode_frame(Some(schema), &env(&recs)), bytes, "{name}");
+            // The payload is what is pinned; the frame CRC is IEEE in the 0.9
+            // fixture and CRC32-C here.
+            let frame = encode_frame(Some(schema), &env(&recs));
+            assert_eq!(frame[HEADER_SIZE..], bytes[HEADER_SIZE..], "{name}");
+            assert_eq!(frame[..4], bytes[..4], "{name}: payload length");
             // And the committed bytes decode back to the same records.
             let got = decode_envelope_payload(&bytes[HEADER_SIZE..]).unwrap();
             assert_eq!(got.len(), recs.len(), "{name}");
