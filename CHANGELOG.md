@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### S3 parity with wavesdb v0.8.2–v0.8.6 (feature `s3`)
+
+- `S3Config` gains `session_token`, `anonymous`, `profile` and `read_only`,
+  and derives `Default`. Credential precedence: explicit keys (+ token) >
+  anonymous > named profile (no fallback) > default chain (env → shared file
+  → web-identity STS → instance metadata, resolved lazily).
+  `S3Config::credential_source()` and `S3CredentialSource` expose the choice.
+  **Source-compatibility note:** a struct literal of `S3Config` must now end
+  in `..S3Config::default()`.
+- `read_only` refuses writes locally with `OndaError::ReadOnly`; no bucket
+  probe or create happens in any mode.
+- Uploads send `x-amz-checksum-sha256` and check the store's echo.
+- `Storage` gains default-implemented `put_object` (returns an `ObjectInfo`
+  receipt), `create_if_absent` (`CreateOutcome`), `list_prefixes`
+  (`PrefixPage`, paginated child-prefix listing) and `is_read_only`;
+  `LocalStorage` and `S3Storage` implement them. A 404 now surfaces as
+  `io::ErrorKind::NotFound` (`storage::is_not_found`). `S3Metrics` gains
+  `lists`.
+- Fixed the `--features s3` test build (a stale 4-tuple destructure of
+  `Reader::get`).
+
 ## 0.9.1
 
 **Shared-bug corrective release.** Five defects that wavesdb fixed after

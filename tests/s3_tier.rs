@@ -32,6 +32,7 @@ fn env_s3() -> Option<S3Config> {
         access_key: std::env::var("ONDADB_S3_KEY").unwrap_or_else(|_| "ayu".into()),
         secret_key: std::env::var("ONDADB_S3_SECRET").unwrap_or_else(|_| "ayudevsecret".into()),
         path_style: true,
+        ..S3Config::default()
     })
 }
 

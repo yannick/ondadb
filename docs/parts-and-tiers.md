@@ -331,6 +331,7 @@ let s3cfg = S3Config {
     access_key: "minioadmin".into(),
     secret_key: "minioadmin".into(),
     path_style: true,                         // required by MinIO
+    ..S3Config::default()                     // session_token, anonymous, profile, read_only
 };
 
 let mut opts = Options::new("/data/onda");
@@ -380,6 +381,36 @@ What actually happens on the wire:
   blooms are held by the reader; data blocks compete for the cache). If S3
   reads matter to you, hundreds of MB (`Options::block_cache_size`, default
   64 MiB) is money well spent; watch `range_gets` to confirm your hit rate.
+
+### S3 credentials, read-only buckets and listing (0.9.2)
+
+`S3Config` picks **one** credential source, in this order
+(`S3Config::credential_source()` reports the choice without any I/O):
+
+| # | Configured | Behaviour |
+|---|---|---|
+| 1 | `access_key` + `secret_key` (+ optional `session_token`) | Static keys. The token is what temporary credentials (SSO, IRSA, an instance or assumed role) need; before 0.9.2 it was always sent empty. |
+| 2 | `anonymous: true` | Unsigned requests, for public-read buckets. Beats a profile and the chain. |
+| 3 | `profile: Some(name)` | That section of the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE`, default `~/.aws/credentials`) and **nothing else**: a missing profile fails at `S3Storage::new`, it never falls back to the environment. |
+| 4 | nothing | Default chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` → the shared file (section `AWS_PROFILE`, else `default`) → web-identity STS (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) → ECS/EC2 instance metadata. Resolved **on the first request**, so opening a database never blocks on a metadata service; expiring credentials are refreshed by rust-s3. |
+
+Half a key pair, or a `session_token` without keys, is refused with
+`InvalidArgs`.
+
+`read_only: true` refuses every write (`create`, `put_object`,
+`create_if_absent`, `delete`, `rename`) locally with `OndaError::ReadOnly`,
+before any request. ondaDB never probes or creates the bucket in either mode,
+so a principal holding only `s3:GetObject` + `s3:ListBucket` can read.
+
+Every PUT carries `x-amz-checksum-sha256`; the store recomputes the digest of
+what arrived and refuses a mismatch, and its echo is compared with what was
+sent. `Storage::put_object` returns the result as an `ObjectInfo { size,
+sha256, store_checksum, store_verified }`. `Storage::create_if_absent` is the
+conditional form (`If-None-Match: *`), and `Storage::list_prefixes(prefix,
+token, limit)` lists the immediate child prefixes one page at a time (the
+delimiter listing `list` does not expose) — the cheap way to discover
+checkpoint prefixes in a bucket. A 404 surfaces as `io::ErrorKind::NotFound`
+(`ondadb::storage::is_not_found`), the same as a missing local file.
 
 ## Custom tier backends (`TierBackend::Custom`)
 

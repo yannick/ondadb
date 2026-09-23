@@ -513,8 +513,35 @@ impl Eq for TierBackend {}
 /// Connection parameters for an [`S3-backed tier`](TierBackend::S3). Credentials,
 /// endpoint, bucket and region come straight from `Options`. Use `path_style` for
 /// MinIO and other endpoints that address buckets by path rather than subdomain.
+///
+/// # Credentials
+///
+/// Exactly one source authenticates the backend, chosen in this order (see
+/// [`S3Config::credential_source`]):
+///
+/// 1. **Explicit keys** — `access_key` + `secret_key` both non-empty, with
+///    `session_token` riding along when set (a temporary credential — SSO,
+///    IRSA, an instance or assumed role — is rejected by S3 without it).
+/// 2. **`anonymous`** — sign nothing, for a bucket that grants public reads.
+///    It beats a profile and the chain: it is a decision not to authenticate,
+///    and an ambient credential must not quietly override it.
+/// 3. **Named `profile`** — that section of the shared credentials file
+///    (`AWS_SHARED_CREDENTIALS_FILE`, default `~/.aws/credentials`), and
+///    **nothing else**: a missing or misspelled profile is an error, never a
+///    silent fallback to whatever the environment happens to hold.
+/// 4. **Default chain** — the environment (`AWS_ACCESS_KEY_ID`,
+///    `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), then the shared credentials
+///    file (section `AWS_PROFILE`, else `default`), then web-identity STS
+///    (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`), then the ECS/EC2
+///    instance metadata service. Resolved **lazily**, on the backend's first
+///    request, so constructing a tier never blocks on a metadata service.
+///    Credentials that carry an expiry (STS, instance roles) are refreshed by
+///    rust-s3 before a request once they lapse.
+///
+/// Setting only one of `access_key`/`secret_key`, or a `session_token` without
+/// them, is refused as `InvalidArgs` rather than guessed at.
 #[cfg(feature = "s3")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct S3Config {
     /// Bucket name the tier's objects live in.
     pub bucket: String,
@@ -522,12 +549,83 @@ pub struct S3Config {
     pub region: String,
     /// Endpoint URL, e.g. `http://192.168.65.11:9000` for a local MinIO.
     pub endpoint: String,
-    /// Access key id.
+    /// Access key id. Empty = not configured.
     pub access_key: String,
-    /// Secret access key.
+    /// Secret access key. Empty = not configured.
     pub secret_key: String,
     /// Path-style addressing (`endpoint/bucket/key`). Required by MinIO.
     pub path_style: bool,
+    /// Session token accompanying explicit temporary keys. Only valid together
+    /// with `access_key` + `secret_key`.
+    pub session_token: Option<String>,
+    /// Send unsigned requests (public-read buckets). See the precedence above.
+    pub anonymous: bool,
+    /// Authenticate as this section of the shared credentials file, with no
+    /// fallback. See the precedence above.
+    pub profile: Option<String>,
+    /// Open the bucket for reading only: every write (`create`, `put_object`,
+    /// `create_if_absent`, `delete`, `rename`) is refused locally with
+    /// [`OndaError::ReadOnly`](crate::OndaError::ReadOnly) before any request is
+    /// made. ondaDB never probes or creates the bucket in either mode, so a
+    /// principal holding only `s3:GetObject` + `s3:ListBucket` on someone
+    /// else's published bucket can connect.
+    pub read_only: bool,
+}
+
+/// Which credential source an [`S3Config`] resolves to. See the precedence on
+/// [`S3Config`].
+#[cfg(feature = "s3")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3CredentialSource {
+    /// Explicit keys, with an optional session token.
+    Static {
+        access_key: String,
+        secret_key: String,
+        session_token: Option<String>,
+    },
+    /// Unsigned requests.
+    Anonymous,
+    /// One section of the shared credentials file, no fallback.
+    Profile(String),
+    /// Environment → shared credentials file → web-identity STS → instance
+    /// metadata, resolved lazily on first use.
+    DefaultChain,
+}
+
+#[cfg(feature = "s3")]
+impl S3Config {
+    /// Decide which credential source authenticates this config, without
+    /// touching the network, the environment or any file. Errors on a
+    /// half-configured key pair or an orphan session token.
+    pub fn credential_source(&self) -> crate::error::Result<S3CredentialSource> {
+        let has_access = !self.access_key.is_empty();
+        let has_secret = !self.secret_key.is_empty();
+        if has_access != has_secret {
+            return Err(crate::error::OndaError::InvalidArgs(
+                "S3Config: access_key and secret_key must be set together".into(),
+            ));
+        }
+        let token = self.session_token.clone().filter(|t| !t.is_empty());
+        if has_access {
+            return Ok(S3CredentialSource::Static {
+                access_key: self.access_key.clone(),
+                secret_key: self.secret_key.clone(),
+                session_token: token,
+            });
+        }
+        if token.is_some() {
+            return Err(crate::error::OndaError::InvalidArgs(
+                "S3Config: session_token requires access_key and secret_key".into(),
+            ));
+        }
+        if self.anonymous {
+            return Ok(S3CredentialSource::Anonymous);
+        }
+        if let Some(profile) = self.profile.as_ref().filter(|p| !p.is_empty()) {
+            return Ok(S3CredentialSource::Profile(profile.clone()));
+        }
+        Ok(S3CredentialSource::DefaultChain)
+    }
 }
 
 impl TierDef {

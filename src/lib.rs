@@ -99,7 +99,7 @@ pub mod wal;
 pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
 #[cfg(feature = "s3")]
-pub use config::S3Config;
+pub use config::{S3Config, S3CredentialSource};
 pub use config::{
     ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
     MergeOperator, Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend,
@@ -116,7 +116,7 @@ pub use parts::{
 };
 pub use perf::PerfContext;
 pub use prepared::PreparedInfo;
-pub use storage::{LocalStorage, Storage};
+pub use storage::{CreateOutcome, LocalStorage, ObjectInfo, PrefixPage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;
 pub use tailing::TailingIterator;
