@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Incremental-backup diff (wavesdb `SSTablesSince`)
+
+- `DB::live_sstables()`, `DB::sstables_since(seq)` and
+  `DB::sstables_diff(&prior)` (new module `checkpoint`, types
+  `CheckpointTable`, `TableSetDiff`). `sstables_since` is wavesdb's
+  `max_seq > seq` filter; it cannot see a compaction that rewrites only old
+  data, so `sstables_diff` — by `(cf, id)` identity, reporting `added` and
+  `removed` — is the one an incremental backup should use.
+
 ### S3 parity with wavesdb v0.8.2–v0.8.6 (feature `s3`)
 
 - `S3Config` gains `session_token`, `anonymous`, `profile` and `read_only`,

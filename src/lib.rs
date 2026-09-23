@@ -59,6 +59,7 @@ extern crate self as ondadb;
 pub mod block;
 pub mod bloom;
 pub mod cache;
+pub mod checkpoint;
 pub mod column_family;
 pub mod compaction;
 pub mod comparator;
@@ -96,6 +97,7 @@ pub mod unified;
 pub mod util;
 pub mod wal;
 
+pub use checkpoint::{CheckpointTable, TableSetDiff};
 pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
 #[cfg(feature = "s3")]
