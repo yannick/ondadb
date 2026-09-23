@@ -448,7 +448,9 @@ Classic leveled: L0→L1 on file count, Li→Li+1 when level bytes exceed
 overlapping next-level tables; keeps the newest version per key plus every
 version newer than `DbInner::oldest_snapshot()`; drops tombstones and expired
 TTL entries only at the bottom level. Output SSTs are split at
-`target_file_size` and, at the bottom level, additionally **cut at partition
+`target_file_size` — but never between two versions of one user key: a level
+≥ 1 point read probes a single table per level, so a version chain split across
+two outputs would hide the older versions a snapshot still reads — and, at the bottom level, additionally **cut at partition
 boundaries** (see § Partitions).
 
 **Range fragments (1.2)** are merged over the job span and re-fragmented over

@@ -1020,6 +1020,12 @@ struct CompactionOutputBuilder<'a> {
     /// 1.2 the size cut closed the file immediately, which is equivalent for a
     /// point-only table and wrong for a fragment.
     pending_cut: bool,
+    /// The user key whose write armed `pending_cut`. The cut waits until a
+    /// *different* user key arrives: cutting between two versions of one key
+    /// would leave it in two adjacent tables of a level >= 1, and a point read
+    /// probes only the first — every version in the second one (the older
+    /// versions a live snapshot may still need) would be invisible.
+    cut_after: Vec<u8>,
 }
 
 impl<'a> CompactionOutputBuilder<'a> {
@@ -1053,6 +1059,7 @@ impl<'a> CompactionOutputBuilder<'a> {
             interval_lower: None,
             span_upper: None,
             pending_cut: false,
+            cut_after: Vec::new(),
         }
     }
 
@@ -1173,7 +1180,10 @@ impl<'a> CompactionOutputBuilder<'a> {
     fn write(&mut self, key: &[u8], value: &[u8], seq: u64, ttl: i64, kind: u64) -> Result<()> {
         let partition = self.partitioner.as_ref().and_then(|p| p.name_of(key));
         let (cut, _boundary_changed) = self.output_boundary_change(key, &partition);
-        if cut || (self.pending_cut && self.current.is_some()) {
+        let size_cut = self.pending_cut
+            && self.current.is_some()
+            && !self.cmp.compare(key, &self.cut_after).is_eq();
+        if cut || size_cut {
             #[cfg(debug_assertions)]
             if _boundary_changed {
                 self.record_boundary_crossing(key);
@@ -1195,9 +1205,11 @@ impl<'a> CompactionOutputBuilder<'a> {
         let current = self.current.as_mut().expect("output opened above");
         current.writer.add(key, value, seq, ttl, kind)?;
         current.bytes += (key.len() + value.len()) as u64;
-        if current.bytes >= self.target_bytes {
+        if current.bytes >= self.target_bytes && !self.pending_cut {
             // Deferred: the interval's upper edge is the next key.
             self.pending_cut = true;
+            self.cut_after.clear();
+            self.cut_after.extend_from_slice(key);
         }
         Ok(())
     }
