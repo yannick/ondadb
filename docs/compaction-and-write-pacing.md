@@ -198,6 +198,14 @@ the shallower level. Then:
 The rewrite stamps its outputs with the current reading, so the trigger settles
 instead of looping on its own output.
 
+**Burst limit.** Tables written together age together, so an interval tends to
+make a whole backlog eligible at once. One `run` pass takes at most
+`PERIODIC_BURST` (4) age jobs; if age work is still due it then re-enqueues its
+family at the back of the compact channel and stops taking age work (capacity
+work is still picked). Other families' jobs therefore interleave with a large
+backlog instead of waiting behind all of it. Scheduling order only — nothing is
+persisted and no job changes.
+
 **No new drop rule.** A periodic job is an ordinary compaction: the same
 snapshot, TTL and tombstone retention decides what it may drop. Data hidden
 behind a live snapshot survives a periodic rewrite exactly as it survives a

@@ -148,7 +148,8 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     // unlinked. One relaxed capability load for a family that never issued a
     // range delete.
     crate::excise::pre_pass(db, cf)?;
-    while let Some((job, guard)) = pick_compaction(db, cf) {
+    let mut periodic_left = PERIODIC_BURST;
+    while let Some((job, guard)) = pick_compaction_with(db, cf, periodic_left > 0) {
         cf.compacting
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let reason = job.reason;
@@ -164,6 +165,16 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
         if reason == CompactionReason::Periodic {
             cf.periodic_compactions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            periodic_left -= 1;
+            if periodic_left == 0 && periodic_candidate(db, cf, db.now()).is_some() {
+                // Burst spent with age work still due: go to the back of the
+                // compaction queue instead of draining the rest here, so other
+                // families' jobs interleave with this backlog. Capacity work
+                // for this family is still picked below — it always outranks
+                // age work. A failed send (closing database) just leaves the
+                // rest to the next periodic scan.
+                let _ = cf.ctx.compact_tx.try_send(cf.clone());
+            }
         }
         refresh_compaction_debt(db, cf);
         // A closing DB stops between jobs; the debt it leaves is legal LSM
@@ -266,9 +277,31 @@ pub(crate) fn refresh_compaction_debt(db: &DbInner, cf: &Arc<ColumnFamily>) {
 ///
 /// Levels are considered most-overfull first (`bytes / capacity`, or
 /// `files / trigger` for L0) so the worst backlog is worked down first.
+/// Periodic (age) jobs one [`run`] pass may take before it yields.
+///
+/// An interval that elapses for a whole database at once — the typical case,
+/// since every table written in one ingest burst ages together — would
+/// otherwise be drained back-to-back by a single pass, holding a compaction
+/// worker for the entire backlog while every other family's work queues
+/// behind it. After this many age jobs the pass re-enqueues its family and
+/// stops taking age work; capacity work is unaffected. Not persisted and not
+/// an option: it changes only scheduling order, never what a job does.
+pub(crate) const PERIODIC_BURST: u32 = 4;
+
+#[cfg(test)]
 fn pick_compaction(
     db: &Arc<DbInner>,
     cf: &Arc<ColumnFamily>,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    pick_compaction_with(db, cf, true)
+}
+
+/// The next job for `cf`: capacity work first, then — when `allow_periodic`
+/// — age work.
+fn pick_compaction_with(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    allow_periodic: bool,
 ) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
     let n = cf.with_levels(|levels| levels.len());
     let mut scored: Vec<(f64, usize)> = Vec::new();
@@ -308,6 +341,9 @@ fn pick_compaction(
     // within capacity and every triggered candidate was unusable. A level over
     // capacity is a backlog that grows; a table past its interval is stale
     // space that does not, so capacity must never wait behind it.
+    if !allow_periodic {
+        return None;
+    }
     periodic_pick(db, cf)
 }
 
@@ -3032,6 +3068,48 @@ mod tests {
         );
         assert_eq!(job.inputs.len(), 1);
         assert_eq!(job.inputs[0].meta.id, 2);
+        drop(guard);
+    }
+
+    /// Once a pass has spent its periodic burst, the picker stops offering age
+    /// work but keeps offering capacity work — the burst limit only reorders
+    /// age work, it never delays a growing backlog.
+    #[test]
+    fn periodic_burst_spent_withholds_only_age_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(
+            &dir,
+            crate::config::ColumnFamilyConfig {
+                periodic_compaction_interval: std::time::Duration::from_secs(3600),
+                l1_base_bytes: 1 << 10,
+                ..crate::config::ColumnFamilyConfig::default()
+            },
+        );
+        db.enable_format_capabilities(crate::format::CAP_PERIODIC_AGE)
+            .unwrap();
+        let now = 100 * HOUR;
+        db.set_clock_for_tests(Arc::new(move || now));
+        let fixture = |l1_bytes: u64| {
+            vec![
+                Vec::new(),
+                vec![aged_handle_sized(&cf, 1, 1, b"a", b"m", l1_bytes, Some(now))],
+                vec![aged_handle_sized(&cf, 2, 2, b"n", b"z", 16, Some(now - 24 * HOUR))],
+            ]
+        };
+
+        // Only age work due.
+        cf.replace_levels(fixture(16));
+        assert!(super::pick_compaction_with(&db.inner, &cf, false).is_none());
+        let (job, guard) =
+            super::pick_compaction_with(&db.inner, &cf, true).expect("the age job is due");
+        assert_eq!(job.reason, CompactionReason::Periodic);
+        drop(guard);
+
+        // Capacity work is offered whatever the burst state.
+        cf.replace_levels(fixture(1 << 20));
+        let (job, guard) =
+            super::pick_compaction_with(&db.inner, &cf, false).expect("capacity work is due");
+        assert_eq!(job.reason, CompactionReason::Capacity);
         drop(guard);
     }
 
