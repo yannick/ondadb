@@ -732,6 +732,20 @@ impl DbInner {
         seq
     }
 
+    /// Pin the current published watermark and return it, **atomically**:
+    /// the watermark is read under the same `snapshots` lock that
+    /// [`oldest_snapshot`](Self::oldest_snapshot) holds while it reads, so a
+    /// compaction choosing its GC floor either sees this pin or read a
+    /// watermark no newer than it — never a newer "oldest snapshot" that could
+    /// collect a version this pin is entitled to. (Reading `visible_seq()` and
+    /// then calling `acquire_snapshot` leaves exactly that window open.)
+    pub(crate) fn acquire_visible_snapshot(&self) -> u64 {
+        let mut s = self.snapshots.lock();
+        let seq = self.visible_seq();
+        *s.entry(seq).or_insert(0) += 1;
+        seq
+    }
+
     pub(crate) fn release_snapshot(&self, seq: u64) {
         let mut s = self.snapshots.lock();
         if let Some(c) = s.get_mut(&seq) {

@@ -31,6 +31,16 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   Repeatable-Read/Snapshot/Serializable txns pin their `read_seq` via
   `acquire_snapshot`/`release_snapshot`. Compaction's version GC keeps every
   version newer than `oldest_snapshot()`.
+  A standalone `SnapshotHandle` (`DB::snapshot`, `snapshot.rs`) is one more
+  entry in the same map: it pins through `acquire_visible_snapshot`, which reads
+  `visible_seq()` **under** the `snapshots` lock (the lock `oldest_snapshot()`
+  holds while it reads the watermark), so no compaction can pick a GC floor
+  above the pin in the window between reading the watermark and registering
+  it. Clones share one pin (`Arc`); the last drop releases it. Excise and
+  span-index pruning key off `oldest_snapshot()` too, so a handle holds them
+  back exactly as a transaction does. Transactions still use the two-step
+  `visible_seq()` + `acquire_snapshot` and keep that (narrow) window; closing
+  it there is a separate change.
 - Isolation (`txn.rs`): `DB::begin` uses `Options::default_isolation`
   (default `Snapshot`, not persisted); ReadUncommitted/ReadCommitted read live `visible_seq`;
   the pinned levels read their snapshot. Snapshot+Serializable serialize

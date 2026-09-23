@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Standalone read snapshots** (wavesdb `SnapshotHandle`): `DB::snapshot()`
+  returns a refcounted `SnapshotHandle` that pins its sequence exactly as a
+  `Snapshot` transaction does, so compaction retains every version it can
+  see until the last clone drops. Read through `SnapshotHandle::{get,
+  multi_get, new_iterator, new_iterator_bounded}` or `DB::get_at` /
+  `DB::new_iterator_at`; a handle from another database is `InvalidArgs`.
+  The pin is registered atomically with reading the watermark.
 - **`Options::default_isolation`** (wavesdb `d789912`): the isolation level
   `DB::begin` and `DB::begin_pessimistic` use. Defaults to `Snapshot`, so
   nothing changes unless it is set; not persisted. `Txn::isolation()` reports

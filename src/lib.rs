@@ -84,6 +84,7 @@ pub mod prepared;
 pub(crate) mod range_lock;
 pub mod range_tombstone;
 pub(crate) mod span_index;
+pub mod snapshot;
 pub mod sst;
 pub mod storage;
 #[cfg(feature = "s3")]
@@ -116,6 +117,7 @@ pub use parts::{
 };
 pub use perf::PerfContext;
 pub use prepared::PreparedInfo;
+pub use snapshot::SnapshotHandle;
 pub use storage::{LocalStorage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;
