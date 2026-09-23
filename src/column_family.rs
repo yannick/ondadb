@@ -1162,7 +1162,13 @@ impl ColumnFamily {
     ) -> Result<Arc<SstHandle>> {
         // Flush/ingest output always lands on the default tier (L0), so
         // `meta.tier` is None and `open_reader_for` resolves the default path.
-        let mut meta = w.finish()?.to_sst_meta(file_id, 0);
+        let meta = self.stamp_l0_meta(w.finish()?.to_sst_meta(file_id, 0));
+        Ok(self.handle_for(meta))
+    }
+
+    /// The per-table state a fresh L0 table carries beyond what the writer
+    /// reports.
+    fn stamp_l0_meta(&self, mut meta: SstMeta) -> SstMeta {
         // Stamp the write time as the table's max entry age: flush/ingest output
         // holds freshly committed data, so the file's finish time approximates
         // the newest entry's commit time (see `SstMeta::max_entry_time`).
@@ -1175,7 +1181,77 @@ impl ColumnFamily {
         if self.ctx.caps.load(Ordering::SeqCst) & crate::format::CAP_PERIODIC_AGE != 0 {
             meta.last_compaction_time = Some(self.ctx.clock.now());
         }
-        Ok(self.handle_for(meta))
+        meta
+    }
+
+    /// Write `entries` (in this family's internal order) plus `fragments` as
+    /// an L0 table at `klog` — **outside** this database's directory — and
+    /// return its metadata without opening, installing or persisting it.
+    ///
+    /// The snapshot of a read-only database uses this to carry WAL-replayed
+    /// memtable data into the destination: the source may not be written, and
+    /// there is no flush worker to write it anyway. Same writer, same options
+    /// and same stamps as a flush, so the table is exactly what a flush would
+    /// have produced — only its location differs. Returns `None` when there is
+    /// nothing to write.
+    pub(crate) fn write_detached_l0(
+        &self,
+        klog: &str,
+        entries: &[crate::memtable::Entry],
+        fragments: Vec<crate::range_tombstone::Fragment>,
+        file_id: u64,
+    ) -> Result<Option<SstMeta>> {
+        if entries.is_empty() && fragments.is_empty() {
+            return Ok(None);
+        }
+        let written = (|| {
+            let mut w = self.new_writer(klog, entries.len())?;
+            w.set_range_fragments(fragments);
+            for e in entries {
+                w.add(&e.user_key, &e.value, e.seq, e.ttl, e.kind)?;
+            }
+            w.finish()
+        })();
+        match written {
+            Ok(file) => Ok(Some(self.stamp_l0_meta(file.to_sst_meta(file_id, 0)))),
+            Err(error) => {
+                let _ = std::fs::remove_file(klog);
+                let _ = std::fs::remove_file(crate::sst::vlog_path_for(klog));
+                Err(error)
+            }
+        }
+    }
+
+    /// This family's sealed memtables' contents, oldest first, as
+    /// `(entries in internal order, fragments)` — what a flush of each would
+    /// write. Read-only snapshot helper; see
+    /// [`write_detached_l0`](Self::write_detached_l0).
+    pub(crate) fn sealed_contents(
+        &self,
+    ) -> Vec<(
+        Vec<crate::memtable::Entry>,
+        Vec<crate::range_tombstone::Fragment>,
+    )> {
+        let imms = self.state.read().imm.clone();
+        imms.iter()
+            .map(|imm| {
+                (
+                    imm.mem.snapshot(),
+                    imm.mem.ranges().fragments(None, None).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Sort `entries` into this family's internal order (user key by this
+    /// family's comparator, newest sequence first) — for a slice split out of
+    /// the bytewise-ordered unified memtable.
+    pub(crate) fn sort_internal(&self, entries: &mut [crate::memtable::Entry]) {
+        entries.sort_by(|a, b| {
+            self.cmp
+                .compare(&a.user_key, &b.user_key)
+                .then_with(|| b.seq.cmp(&a.seq))
+        });
     }
 
     /// Register already-finished SSTables as the newest L0 files, atomically.

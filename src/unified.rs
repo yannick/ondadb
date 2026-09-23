@@ -767,6 +767,13 @@ impl UnifiedStore {
         }
     }
 
+    /// Sealed immutables still waiting for a flush, oldest first. Read-only
+    /// snapshot helper: with no flush worker, this is where a read-only open's
+    /// WAL-replayed data stays.
+    pub(crate) fn sealed(&self) -> Vec<Arc<UnifiedImm>> {
+        self.state.read().imm.clone()
+    }
+
     /// Remove a flushed immutable from the queue.
     pub(crate) fn remove_imm(&self, imm: &Arc<UnifiedImm>) {
         // Match the writer predicate's lock order (`rot` then `state`) so a

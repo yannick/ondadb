@@ -135,6 +135,127 @@ fn checkpoint_is_readable() {
     db.close().unwrap();
 }
 
+/// Copy a live database directory: the image a crash would leave, with
+/// committed writes present only in the WAL.
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+/// S4: a read-only open replays the WAL into memtables but runs no flush
+/// worker, so the checkpoint's flush cannot move that data into a table. The
+/// snapshot must still carry it — without writing a byte into the read-only
+/// source.
+#[test]
+fn read_only_checkpoint_and_backup_keep_wal_only_data() {
+    for unified in [false, true] {
+        let src = tempfile::tempdir().unwrap();
+        let crashed = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let options = |path: &std::path::Path, read_only: bool| {
+            let mut o = Options::new(path.to_str().unwrap());
+            o.unified_memtable = unified;
+            o.read_only = read_only;
+            o
+        };
+        {
+            let db = DB::open(options(src.path(), false)).unwrap();
+            let cf = db
+                .create_column_family("default", ColumnFamilyConfig::default())
+                .unwrap();
+            let other = db
+                .create_column_family("other", ColumnFamilyConfig::default())
+                .unwrap();
+            fill_range(&db, &cf, 0, 100);
+            db.flush_memtable(&cf).unwrap();
+            // Everything from here on lives only in the WAL.
+            fill_range(&db, &cf, 100, 200);
+            db.put(&cf, b"k00050", b"newer", Duration::ZERO).unwrap();
+            db.delete(&cf, b"k00010").unwrap();
+            // A range delete over flushed and WAL-only keys alike: the
+            // snapshot's table must carry the fragment, not just points.
+            db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
+                .unwrap();
+            db.delete_range(&cf, b"k00090", b"k00110").unwrap();
+            db.put(&other, b"o", b"only-in-wal", Duration::ZERO).unwrap();
+            db.sync_wal().unwrap();
+            copy_tree(src.path(), crashed.path());
+            db.close().unwrap();
+        }
+        let before: Vec<String> = walk(crashed.path());
+
+        let db = DB::open(options(crashed.path(), true)).unwrap();
+        let cf = db.get_column_family("default").unwrap();
+        assert_eq!(db.get(&cf, b"k00150").unwrap(), b"value", "unified={unified}");
+        db.checkpoint(dest.path().join("ckpt")).unwrap();
+        db.backup(dest.path().join("bk")).unwrap();
+        db.close().unwrap();
+        assert_eq!(
+            walk(crashed.path()),
+            before,
+            "unified={unified}: the read-only source must not change"
+        );
+
+        for name in ["ckpt", "bk"] {
+            let path = dest.path().join(name);
+            for read_only in [true, false] {
+                let db = DB::open(options(&path, read_only)).unwrap();
+                let cf = db.get_column_family("default").unwrap();
+                let other = db.get_column_family("other").unwrap();
+                for i in 0..200u32 {
+                    let key = format!("k{i:05}");
+                    let got = db.get(&cf, key.as_bytes());
+                    match i {
+                        10 | 90..=109 => assert!(
+                            matches!(got, Err(OndaError::NotFound)),
+                            "{name} unified={unified}: deleted key came back: {got:?}"
+                        ),
+                        50 => assert_eq!(got.unwrap(), b"newer", "{name} unified={unified}"),
+                        _ => assert_eq!(
+                            got.unwrap_or_else(|e| panic!(
+                                "{name} unified={unified} read_only={read_only}: {key} lost: {e:?}"
+                            )),
+                            b"value"
+                        ),
+                    }
+                }
+                assert_eq!(db.get(&other, b"o").unwrap(), b"only-in-wal");
+                if !read_only {
+                    // A writable open must not reuse a sequence the snapshot's
+                    // tables already hold: a new write has to win.
+                    db.put(&cf, b"k00050", b"newest", Duration::ZERO).unwrap();
+                    assert_eq!(db.get(&cf, b"k00050").unwrap(), b"newest");
+                }
+                db.close().unwrap();
+            }
+        }
+    }
+}
+
+/// Every file path under `dir` with its size, sorted.
+fn walk(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            out.extend(walk(&entry.path()));
+        } else {
+            let len = entry.metadata().unwrap().len();
+            out.push(format!("{} {len}", entry.path().display()));
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn backup_is_independent_copy() {
     let dir = tempfile::tempdir().unwrap();

@@ -967,6 +967,11 @@ would make the next open replay more than it should).
 **exactly the files the freshly-loaded manifest references** through their
 storage tiers and durably materialize them into the target's default tier. The
 target manifest clears tier/object metadata and is self-contained.
+A **read-only** source has no flush worker, so its WAL-replayed memtables
+cannot be flushed; `write_sealed_memtables` instead writes each sealed memtable
+(per-family and unified) as the L0 table a flush would have produced — **into
+the destination only**, the source is never written — and prepends it to the
+destination catalog, raising `global_seq` and `next_file_id` to cover it.
 `clone_column_family` applies the same rule to one CF under fresh file ids,
 also under a deletion pause.
 
