@@ -277,7 +277,8 @@ both **off by default**, and the measurements are the reason. Harness:
 Large values (`>= klog_value_threshold`) live in the vlog, and every read of one
 used to re-checksum the whole stored payload — a klog data block was verified
 once per open reader, a vlog frame every single time. On a value big enough to
-matter that checksum is most of the read: CRC32-C runs at about 6.3 GB/s here,
+matter that checksum is most of the read: the checksum (in 0.9.x CRC-32/IEEE
+via `crc32fast`, although documented as CRC32-C) ran at about 6.3 GB/s here,
 so a 5 MB value cost roughly 800 µs of pure re-verification per read, and
 spada's S-208 probe measured vlog reads at 6.96 GB/s against 11.3 GB/s for
 cached klog frames.
