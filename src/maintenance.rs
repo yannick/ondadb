@@ -101,6 +101,10 @@ pub struct CfStats {
     /// compaction. Counts completed jobs only: a job that failed leaves its
     /// input's stamp untouched, so the table stays eligible and is retried.
     pub periodic_compactions: u64,
+    /// Subset of `compaction_count` picked by the tombstone-density trigger
+    /// ([`ColumnFamilyConfig::tombstone_density_trigger`](crate::config::ColumnFamilyConfig::tombstone_density_trigger)).
+    /// Completed jobs only; zero while the trigger is off.
+    pub tombstone_density_compactions: u64,
     /// Number of manual or background compaction attempts that returned an
     /// error since this column family was opened.
     pub compaction_failures: u64,
@@ -196,6 +200,13 @@ pub struct DbStats {
     /// released. A number that climbs while `deletions_paused > 0` is the
     /// expected shape of a long backup on a write-heavy database, not a leak.
     pub deletions_queued: usize,
+    /// Entries (either domain) the block cache evicted to stay under
+    /// capacity. With background admission off (the default,
+    /// [`Options::admit_background_scan_blocks`](crate::Options::admit_background_scan_blocks))
+    /// only foreground reads insert, so compaction cannot drive this up.
+    pub block_cache_evictions: u64,
+    /// Bytes the block cache currently holds, both domains.
+    pub block_cache_bytes: i64,
 }
 
 impl ColumnFamily {
@@ -217,6 +228,9 @@ impl ColumnFamily {
                 .load(std::sync::atomic::Ordering::Relaxed),
             periodic_compactions: self
                 .periodic_compactions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            tombstone_density_compactions: self
+                .tombstone_density_compactions
                 .load(std::sync::atomic::Ordering::Relaxed),
             compaction_failures: self
                 .compaction_failures
@@ -286,6 +300,8 @@ impl DB {
             vlog_cache_bytes: bc.vlog_bytes,
             deletions_paused,
             deletions_queued,
+            block_cache_evictions: bc.evictions,
+            block_cache_bytes: bc.bytes,
         }
     }
 

@@ -558,14 +558,24 @@ pub mod cf_config {
         pub const BLOOM_AUTO_ALLOCATE: u64 = 33;
         /// The name tag 33 had while it was reserved.
         pub const RESERVED_BLOOM_AUTO_ALLOCATE: u64 = BLOOM_AUTO_ALLOCATE;
-        /// Highest tag epoch 1 assigns a meaning to.
-        pub const MAX_KNOWN: u64 = BLOOM_AUTO_ALLOCATE;
+        /// `tombstone_density_trigger`, f64 bits (plan C P4).
+        pub const TOMBSTONE_DENSITY_TRIGGER: u64 = 34;
+        /// `tombstone_density_min_entries`, uvarint (plan C P4).
+        pub const TOMBSTONE_DENSITY_MIN_ENTRIES: u64 = 35;
+        /// Highest tag this binary assigns a meaning to. A future reserved tag
+        /// below it would be preserved like any unknown tag, which is why the
+        /// encoder merges unknown tags into tag order rather than appending
+        /// them.
+        pub const MAX_KNOWN: u64 = TOMBSTONE_DENSITY_MIN_ENTRIES;
     }
 }
 
 const _: () = assert!(is_printable_ascii(&cf_config::MAGIC));
-const _: () = assert!(cf_config::tag::MAX_KNOWN == 33);
+const _: () = assert!(cf_config::tag::MAX_KNOWN == 35);
+const _: () = assert!(cf_config::tag::MERGE_OPERATOR_NAME == 32);
 const _: () = assert!(cf_config::tag::BLOOM_AUTO_ALLOCATE == 33);
+const _: () = assert!(cf_config::tag::TOMBSTONE_DENSITY_TRIGGER == 34);
+const _: () = assert!(cf_config::tag::TOMBSTONE_DENSITY_MIN_ENTRIES == 35);
 
 /// Compression codec ids — the `alg` byte of every block frame and vlog frame.
 ///

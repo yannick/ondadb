@@ -2148,3 +2148,71 @@ fn close_compacts_the_log_and_reports_failure() {
     );
     assert_eq!(after.applied_through, after.next_edit_id - 1);
 }
+
+/// Tombstone-density trigger (plan C P4): a flush that leaves a table mostly
+/// tombstones gets it compacted without any size trigger firing, the
+/// tombstones are dropped at the bottom, and the setting survives a reopen.
+fn delete_heavy(dir: &std::path::Path, trigger: f64) -> (DB, std::sync::Arc<ondadb::ColumnFamily>) {
+    let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                tombstone_density_trigger: trigger,
+                tombstone_density_min_entries: 100,
+                // No size trigger: only the density trigger can compact.
+                l1_file_count_trigger: 64,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    fill(&db, &cf, 1_000);
+    db.flush_memtable(&cf).unwrap();
+    for i in 0..900u32 {
+        db.delete(&cf, format!("k{i:05}").as_bytes()).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    (db, cf)
+}
+
+#[test]
+fn tombstone_density_trigger_reclaims_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = delete_heavy(dir.path(), 0.5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // The counter is bumped just after the job installs, so wait for both.
+    while cf.stats().num_tombstones > 0 || cf.stats().tombstone_density_compactions == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tombstones never reclaimed: {:?}",
+            cf.stats()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stats = cf.stats();
+    assert!(stats.tombstone_density_compactions >= 1, "{stats:?}");
+    assert_eq!(stats.num_entries, 100, "only the undeleted keys remain");
+    assert!(db.get(&cf, b"k00000").is_err());
+    assert_eq!(db.get(&cf, b"k00950").unwrap(), b"value");
+    db.close().unwrap();
+
+    // Persisted: a reopen keeps the trigger.
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cfg = db.column_family_config("default").unwrap();
+    assert_eq!(cfg.tombstone_density_trigger, 0.5);
+    assert_eq!(cfg.tombstone_density_min_entries, 100);
+    db.close().unwrap();
+}
+
+/// The control: with the trigger off the same workload keeps its tombstones,
+/// so the test above is measuring the trigger and not some other compaction.
+#[test]
+fn without_the_density_trigger_tombstones_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = delete_heavy(dir.path(), 0.0);
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = cf.stats();
+    assert_eq!(stats.num_tombstones, 900, "{stats:?}");
+    assert_eq!(stats.tombstone_density_compactions, 0);
+    db.close().unwrap();
+}

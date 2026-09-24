@@ -861,6 +861,12 @@ impl DbInner {
             .unwrap_or_else(|| self.visible_seq())
     }
 
+    /// The id the next allocated file will get, without allocating it: every
+    /// table written after this call has an id at or above it.
+    pub(crate) fn file_id_watermark(&self) -> u64 {
+        self.next_file_id.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn next_file_id(&self) -> u64 {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -1837,12 +1843,19 @@ impl OpenResources {
         let (file_cache, block_cache, tables) = match &read_lease {
             Some(lease) => (
                 lease.file_cache(),
-                Arc::new(lease.block_cache()),
+                Arc::new(
+                    lease
+                        .block_cache()
+                        .with_background_admission(opts.admit_background_scan_blocks),
+                ),
                 Arc::new(lease.table_cache()),
             ),
             None => (
                 Arc::new(FileCache::new(opts.max_open_sstables.max(1))),
-                Arc::new(BlockCache::new(opts.block_cache_size as i64)),
+                Arc::new(
+                    BlockCache::new(opts.block_cache_size as i64)
+                        .with_background_admission(opts.admit_background_scan_blocks),
+                ),
                 Arc::new(crate::table_cache::TableCache::with_byte_budget(
                     opts.max_open_readers,
                     opts.max_open_reader_bytes,
@@ -3059,6 +3072,90 @@ impl DB {
         self.inner.local_cache.as_ref().map(|c| c.stats())
     }
 
+    /// Compact the tables of `cf` whose key span reaches into
+    /// `[lower, upper]` down to the bottom level, and wait for it (plan C F3,
+    /// wavesdb `CompactRange`).
+    ///
+    /// Bounds follow [`Txn::new_iterator_bounded`](crate::Txn::new_iterator_bounded):
+    /// `Included`/`Excluded`/`Unbounded` user keys under the family's
+    /// comparator; `(Unbounded, Unbounded)` is the whole family. Selection is
+    /// by **whole table** — a table is taken when its span (point keys plus
+    /// range-tombstone fragments) intersects the bounds, so keys outside the
+    /// bounds that share a table with keys inside are rewritten too, and in L0
+    /// every file older than the newest in-span one moves with it (L0 files
+    /// overlap, and only an oldest-first window can move without reordering
+    /// versions).
+    ///
+    /// The work is ordinary compaction, level by level (`L -> L+1` jobs,
+    /// then an in-place rewrite of in-span bottom tables that no push
+    /// produced), through the normal catalog transaction and retention rules:
+    /// tombstones and expired TTL entries reaching the bottom are dropped
+    /// unless a live snapshot still sees what they shadow, and bottom output is
+    /// cut at partition boundaries. It runs on the caller's thread and holds
+    /// the family's whole key range while it does, like
+    /// [`compact`](Self::compact), so background compaction and parts/tiers
+    /// operations on the family wait; writes and flushes do not. A foreign
+    /// mount blocks only the push that would merge around it. A FIFO family
+    /// never merges: this runs its eviction pass and nothing else.
+    pub fn compact_range(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.inner.poison.check()?;
+        let result = compaction::run_range(&self.inner, cf, lower, upper);
+        if let Err(error) = &result {
+            cf.record_compaction_failure(error);
+        }
+        result
+    }
+
+    /// Flush `cf`'s memtable, then compact its whole key space into the bottom
+    /// level ([`compact_range`](Self::compact_range) over `(Unbounded,
+    /// Unbounded)`), and wait for both — wavesdb `PurgeColumnFamily`.
+    ///
+    /// What it reclaims is what any compaction to the bottom reclaims:
+    /// overwritten versions, tombstones together with the puts they shadow,
+    /// and expired TTL entries — except whatever a live snapshot or iterator
+    /// can still see, which survives exactly as it survives every other
+    /// compaction. Afterwards the family's data sits in its deepest level
+    /// (plus any L0 file a concurrent flush added meanwhile). Nothing is
+    /// deleted that a read could still return; this is reclamation, not
+    /// [`clear_column_family`](Self::clear_column_family). A FIFO family is
+    /// flushed and then runs its eviction pass. `ReadOnly` on a read-only
+    /// handle.
+    pub fn purge_column_family(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.flush_memtable(cf)?;
+        self.compact_range(
+            cf,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+        )
+    }
+
+    /// [`purge_column_family`](Self::purge_column_family) for every column
+    /// family, one after another (wavesdb `Purge`). Stops at the first error;
+    /// families purged before it stay purged.
+    pub fn purge(&self) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        let mut cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
+        // A stable order, so a failure is reproducible.
+        cfs.sort_by(|a, b| a.name().cmp(b.name()));
+        for cf in &cfs {
+            self.purge_column_family(cf)?;
+        }
+        Ok(())
+    }
+
     /// Force an fsync of every write-ahead log (all column families plus the
     /// unified store, when enabled).
     ///
@@ -3745,12 +3842,16 @@ fn should_schedule_compaction(
 fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
     crate::compaction::refresh_compaction_debt(db, cf);
     let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
+    // The density arm (P4) rides on `ranges`' slot: both are "work worth
+    // waking the worker for with L0 nowhere near its trigger". A delete-heavy
+    // flush produces no size pressure at all, so without it the trigger would
+    // only ever be evaluated by a pass something else happened to start.
     if should_schedule_compaction(
         db.closing.load(Ordering::Relaxed),
         fifo,
         cf.l0_len(),
         cf.opts.l1_file_count_trigger as usize,
-        cf.has_range_fragments(),
+        cf.has_range_fragments() || (!fifo && crate::compaction::density_due(db, cf)),
     ) {
         let _ = db.ctx.compact_tx.send(cf.clone());
     }

@@ -861,14 +861,17 @@ entry := tag uvarint | len uvarint | value[len]
 
 One tag per durable `ColumnFamilyConfig` field (the table is in
 [`format-registry.md`](format-registry.md#cf-config-tlv-tags)). Entries are in
-**strictly ascending** tag order; a field at its default is **elided**, so a
-default family's blob is the 12-byte header; durations are **nanoseconds**.
+**strictly ascending** tag order; a field at its default is **elided** —
+except `compression_per_level` (tag 13), written whenever non-empty because
+its default moved in 0.10 and an absent tag 13 must keep meaning *empty* — so a
+default family's blob is the 12-byte header plus tag 13; durations are **nanoseconds**.
 Scalars are exactly one minimal uvarint, booleans one byte `0`/`1`, codec
 fields epoch-1 codec ids, lists `count uvarint | item*` with no bytes left over.
 
 A tag this binary does not know is **preserved**: `decode` keeps it on
 `ColumnFamilyConfig::unknown_config_tags` and the next `encode` writes it back
-verbatim, so rewriting a family's config never strips an option a newer binary
+verbatim, merged into tag order (an unknown tag can sit *below* a known one — the
+reserved tag 33 under the known 34 and 35), so rewriting a family's config never strips an option a newer binary
 — or another yoloDB engine — stored there (plan C step 2 row G). Everything else
 is strict, because the blob sits inside a CRC-verified manifest or edit record:
 a wrong magic, a short entry, a tag out of order or repeated, tag 0, or a known

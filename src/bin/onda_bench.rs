@@ -346,9 +346,17 @@ fn main() {
         }
     }
 
-    let cfg = ColumnFamilyConfig {
-        compression: compression(&a.compression),
-        ..ColumnFamilyConfig::default()
+    // `-compression graduated` keeps the engine's per-level default
+    // ([None, Lz4, Zstd]); any codec name is applied uniformly to every level,
+    // which is what this flag meant before the default became graduated.
+    let cfg = if a.compression == "graduated" {
+        ColumnFamilyConfig::default()
+    } else {
+        ColumnFamilyConfig {
+            compression: compression(&a.compression),
+            compression_per_level: Vec::new(),
+            ..ColumnFamilyConfig::default()
+        }
     };
 
     // ---- Put -----------------------------------------------------------------

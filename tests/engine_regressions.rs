@@ -1381,3 +1381,80 @@ fn delete_all_then_compact_leaves_no_debris() {
     );
     db.close().unwrap();
 }
+
+/// Open iterators pin the pre-compaction files (the documented contract on
+/// `CompactionFilterFn`) — including under buffered reads, where a reader used
+/// to re-open its table *by path* on every uncached block.
+///
+/// No block cache, so every block of the iterator's tables is a file read; the
+/// iterator is opened over four L0 tables, which a manual compaction then
+/// retires and unlinks mid-scan. `evict_readers` additionally shrinks the
+/// reader cache to one, so the iterator's readers are evicted before the
+/// retirement and can no longer be reached through the cache — the second of
+/// the two ways a held reader can outlive its catalog entry.
+fn iterator_survives_retirement(evict_readers: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.block_cache_size = 0;
+    let db = DB::open(opts).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                l1_file_count_trigger: 64, // only the manual compaction below
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    const N: u64 = 4_000;
+    // Some values large enough for the vlog, so both files of a table are
+    // exercised.
+    let len = |i: u64| if i.is_multiple_of(8) { 700 } else { 40 };
+    for round in 0..4u64 {
+        for i in (round..N).step_by(4) {
+            db.put(&cf, format!("k{i:06}").as_bytes(), &val(i, len(i)), Duration::ZERO)
+                .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+    }
+
+    let txn = db.begin();
+    let mut it = txn.new_iterator(&cf);
+    it.seek_to_first();
+    let mut seen = 0u64;
+    // Read a little, so the iterator really holds its readers, then retire
+    // every table it reads from.
+    for _ in 0..10 {
+        assert!(it.valid());
+        it.next();
+        seen += 1;
+    }
+    if evict_readers {
+        db.set_max_open_readers(1);
+    }
+    db.compact(&cf).unwrap();
+    while it.valid() {
+        let i: u64 = std::str::from_utf8(&it.key()[1..])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(it.value(), val(i, len(i)));
+        seen += 1;
+        it.next();
+    }
+    assert!(it.err().is_none(), "iterator failed: {:?}", it.err());
+    assert_eq!(seen, N);
+    drop(it);
+    drop(txn);
+    db.close().unwrap();
+}
+
+#[test]
+fn open_iterator_survives_compaction_unlinking_its_tables() {
+    iterator_survives_retirement(false);
+}
+
+#[test]
+fn open_iterator_survives_retirement_after_reader_eviction() {
+    iterator_survives_retirement(true);
+}

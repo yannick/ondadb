@@ -129,6 +129,15 @@ directory written by this release is not readable by 0.9.x. The crate is still
   between was adopted into the snapshot unvalidated and the transaction
   committed a stale read. The candidate snapshot is now pinned before the
   validation.
+- **Fix: an open iterator no longer fails when compaction unlinks its
+  tables.** Buffered reads re-opened a table by path on every uncached block,
+  so an iterator created before a compaction hit `NotFound` on the first
+  uncached block after the compaction retired its inputs — breaking the
+  documented "open iterators pin the pre-compaction files" contract (mmap
+  builds were affected only for vlog values). `Reader::pin_files` now holds
+  the descriptors of a retired or cache-evicted reader that a caller still
+  holds. Previously masked in practice by compaction admitting every input
+  block into the block cache.
 
 ### Ported from wavesdb (plan C step 1, §1.4)
 
@@ -253,6 +262,56 @@ directory written by this release is not readable by 0.9.x. The crate is still
   a transaction's level. The per-family `default_isolation_level` stays
   reserved (a transaction spans families, so no family's setting could decide).
 
+#### Compaction
+
+- **`DB::compact_range(cf, lower, upper)`** (plan C F3, wavesdb
+  `CompactRange`): manual compaction of the tables whose span reaches into
+  `Bound`-style bounds, level by level to the bottom, through the ordinary job
+  path (catalog transaction, retention, partition cuts), holding the family's
+  range lock like `DB::compact`; returns when done. `ReadOnly` on a read-only
+  handle. See `docs/compaction-and-write-pacing.md`.
+- **`DB::purge()` / `DB::purge_column_family(cf)`** (plan C F4, wavesdb
+  `Purge`/`PurgeColumnFamily`): flush, then `compact_range` over the whole
+  family, so overwritten versions, tombstones and expired TTL entries not
+  pinned by a snapshot are reclaimed and the data ends in the bottom level.
+
+- **Tombstone-density trigger wired** (plan C P4). `ColumnFamilyConfig::
+  tombstone_density_trigger` / `tombstone_density_min_entries`, declared but
+  read by nothing until now, compact a table whose tombstone fraction reaches
+  the trigger even when no size trigger fires: below capacity work, above
+  periodic work, densest first, through the ordinary bounded job (a bottom
+  table in place, once the oldest snapshot has passed it). Default `0.0`
+  (off). Both are now **persisted** as config TLV tags 34 and 35 (registered
+  in `docs/format-registry.md`); `validate` rejects a NaN or negative
+  trigger. A delete-heavy flush now wakes the compaction worker. New
+  `CfStats::tombstone_density_compactions`.
+- The config-blob encoder now merges preserved unknown tags into tag order
+  instead of appending them — required as soon as a known tag (34, 35) sits
+  above a reserved one (33), or a blob carrying 33 would re-encode out of
+  order and be refused by its own decoder.
+
+#### Defaults
+
+- **Graduated default codecs** (plan C P10, wavesdb's default):
+  `ColumnFamilyConfig::compression_per_level` now defaults to
+  `[None, Lz4, Zstd]` — L0 raw, L1 LZ4, L2 and deeper Zstd — instead of
+  empty (uniform `compression`, `None`). **Source-behaviour note:** a config
+  built as `ColumnFamilyConfig { compression: X, ..Default::default() }` no
+  longer applies `X` everywhere, because a non-empty per-level list overrides
+  `compression`; add `compression_per_level: Vec::new()` for a uniform codec.
+  **Existing databases are unaffected:** config TLV tag 13 is now written
+  whenever the list is non-empty (not elided as a default), and an absent tag
+  13 decodes as the empty list — so a family created before this change keeps
+  its uniform codec, and a new family records the graduated list explicitly.
+  The 0.9 legacy decoder uses the same baseline. `onda_bench -compression X`
+  still means uniform `X`; `-compression graduated` measures the default.
+  Provisional numbers (`tests/codec_defaults_bench.rs`, 400k text-like
+  136-byte values compacted to L2, `unsafe-fastpath` release, heavily loaded
+  machine, 2 alternating runs): on-disk **65.6 MB → 21.0 MB (−68%)**, point
+  reads of cold-in-cache blocks **~0.45M/s vs ~0.8–1.0M/s** (Zstd decompression
+  per block miss), full scans within noise (11.3–13.0M vs 12.5–14.0M keys/s),
+  load+compaction time within noise. To be re-measured on a quiet machine.
+
 #### Performance
 
 - **User-space WAL write buffer** (wavesdb `WALWriteBufferSize`, plan C P6):
@@ -317,6 +376,18 @@ directory written by this release is not readable by 0.9.x. The crate is still
   Results are unchanged (randomized oracle against the exhaustive walk); a
   corrupt table older than the answer is no longer probed, so it no longer
   fails the read.
+- **Background reads no longer admit into the block cache** (wavesdb
+  `ac16c8a`). A read on a background thread — compaction and its span
+  workers, the part mover, ingest validation, i.e. any `ioctrl::IoClass`
+  other than `Foreground` — still looks blocks and vlog values up in the
+  cache, but a hit does not refresh the entry's CLOCK bit, a miss is not
+  inserted, and neither is counted in `hits`/`misses`. One large compaction
+  therefore no longer cycles the cache and hands the hot set back cold
+  (`tests/cache_admission.rs`: zero evictions and zero hot-set misses across a
+  compaction of a family 17× the cache, against a flushed hot set with the old
+  policy). `Options::admit_background_scan_blocks` (default `false`, not
+  persisted) restores the old behaviour. `DbStats` gains
+  `block_cache_evictions` and `block_cache_bytes`.
 
 ## 0.9.1
 

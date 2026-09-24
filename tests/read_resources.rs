@@ -28,6 +28,8 @@ fn build(dir: &Path, tag: &str) -> Vec<u64> {
                 // Compressed, so reads go through the block cache under
                 // `mmap-reads` too (uncompressed blocks are zero-copy views).
                 compression: Compression::Zstd,
+                // Uniform, or the graduated default would leave L0 raw.
+                compression_per_level: Vec::new(),
                 ..ColumnFamilyConfig::default()
             },
         )

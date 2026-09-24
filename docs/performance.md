@@ -370,6 +370,53 @@ has always given. The first read of every frame still verifies, and a frame that
 fails verification is never marked, so corruption is reported on every read
 (`tests/sst.rs::corrupt_vlog_value_is_detected_on_every_read`).
 
+## Background reads do not admit into the block cache (plan C P2)
+
+A compaction reads every block of its inputs exactly once, and nothing asks for
+those blocks again: the inputs are retired when the job installs. Admitting
+them into the shared block cache can therefore only evict blocks a foreground
+reader wants. With a 256 KiB cache and a family ~17× that size being compacted
+beside a small hot family, the old policy evicted the entire hot set
+(`tests/cache_admission.rs`, control arm); the new one evicts nothing.
+
+The rule (wavesdb `ac16c8a`): a read on a thread whose `ioctrl` class is not
+`Foreground` uses `BlockCache::peek` — it is served by a resident block for
+free, but its hit sets no CLOCK reference bit and its miss inserts nothing —
+and neither is counted, so `DbStats::block_cache_hits`/`misses` describe
+foreground demand only. The thread class is already set wherever background
+work starts (the worker spawn, `run_manual`, span workers, ingest), and a
+reader is shared through the table cache between foreground and background
+callers, so the policy keys off the thread rather than off the reader.
+`Options::admit_background_scan_blocks = true` restores the old policy for A/B
+runs. Under `mmap-reads` an uncompressed block never touches the cache at all,
+so the change matters there only for compressed blocks and cached vlog
+values. A compaction pins each block for its whole walk over it, so not
+caching a block it missed never costs it a second read.
+
+## Graduated default codecs (plan C P10)
+
+Since 0.10 a family's default `compression_per_level` is `[None, Lz4, Zstd]`:
+L0 is rewritten constantly and stays raw, L1 pays LZ4's near-free pass, and L2
+and deeper — most of the data, the coldest of it — pays Zstd (level 3). The
+trade is space for cold-block point-read CPU. Provisional measurement
+(`tests/codec_defaults_bench.rs`, 400k text-like 136-byte values compacted into
+L2, `unsafe-fastpath` release, two alternating runs on a heavily loaded
+machine — ratios only):
+
+| | uniform `None` | graduated |
+|---|---|---|
+| on-disk SST bytes | 65.6 MB | 21.0 MB (−68%) |
+| random `get` (64 MiB cache, data 3× cache raw) | 0.81–1.03M/s | 0.44–0.49M/s |
+| full scan | 12.5–14.0M keys/s | 11.3–13.0M keys/s |
+
+The point-read cost is a Zstd decompression per block-cache miss: under
+`mmap-reads` an uncompressed block is served straight from the mapping and
+never needs the cache, a compressed one must be decompressed into it. A
+read-latency-bound family whose working set does not fit the block cache
+should set `compression_per_level: vec![]` (uniform `None`) or a lighter
+bottom codec. Persistence rule (tag 13 never elided when non-empty; absent =
+empty) is in `docs/format-registry.md`.
+
 ## Prefix-delta data blocks: why they are opt-in (2.1)
 
 `ColumnFamilyConfig::enable_prefix_delta_keys` (default `false`) stores each

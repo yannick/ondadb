@@ -396,6 +396,24 @@ pub struct Options {
     /// **Not persisted.** It is a policy of this process, not of the stored
     /// data, and already-folded entries stay folded either way.
     pub enable_merge_folding: bool,
+    /// Let **background** reads — compaction and its span workers, the part
+    /// mover, ingest validation — insert the blocks and vlog values they miss
+    /// into the block cache (default `false`).
+    ///
+    /// Such a reader walks every block of a table exactly once and never asks
+    /// for it again, so admitting them can only evict blocks a foreground
+    /// reader does want: one large compaction cycled the whole cache and
+    /// handed the hot set back cold. With the default, background reads still
+    /// read *through* the cache (a block a point read already paid for is
+    /// served to the scan for free), but a hit does not refresh the entry's
+    /// recency and a miss is not inserted, so what stays resident reflects
+    /// foreground demand. Foreground point reads and iterators always admit.
+    /// Ported from wavesdb `ac16c8a` (`AdmitBackgroundScanBlocks`).
+    ///
+    /// Set it `true` to compare the two policies on one binary, or if a
+    /// workload depends on the old behaviour. **Not persisted**: a cache policy
+    /// of this process, not a property of the stored data.
+    pub admit_background_scan_blocks: bool,
     /// Bandwidth ceiling for *background* IO — flush, compaction and the part
     /// mover — in bytes per second. `0` (the default) is unlimited, and costs
     /// exactly one nil check per read/write: no limiter object is built.
@@ -916,6 +934,7 @@ impl Default for Options {
             partition_fns: Vec::new(),
             merge_fns: Vec::new(),
             enable_merge_folding: true,
+            admit_background_scan_blocks: false,
             background_io_bytes_per_second: 0, // unlimited: no limiter object
             background_io_burst_bytes: 0,
             obsolete_delete_bytes_per_second: 0, // unlink inline: no worker thread
@@ -1013,11 +1032,29 @@ pub struct ColumnFamilyConfig {
     /// Must be either 0 or at least `klog_value_threshold` — nothing shorter
     /// than the threshold ever reaches the vlog.
     pub max_cached_vlog_value_bytes: usize,
+    /// The codec for every level — **only when
+    /// [`compression_per_level`](Self::compression_per_level) is empty**,
+    /// which it is not by default. Set `compression_per_level: Vec::new()`
+    /// alongside it for a uniform codec.
     pub compression: Compression,
     /// Per-level override of `compression`. Empty = use `compression` for
     /// every level. Otherwise level L uses `compression_per_level[min(L,
     /// len-1)]` — the last entry repeats for all deeper levels (so
     /// `[None, None, Zstd]` = hot L0/L1 uncompressed, everything below Zstd).
+    ///
+    /// **Default `[None, Lz4, Zstd]`** (since 0.10, plan C P10; wavesdb's
+    /// default): L0 is rewritten constantly and stays raw, L1 pays LZ4's
+    /// near-free pass, and L2 and deeper — most of the data, and the coldest —
+    /// pays Zstd. Before 0.10 the default was empty (uniform `compression`,
+    /// itself `None`).
+    ///
+    /// **Persistence.** Unlike every other field, this one is not elided when
+    /// it equals the default: its TLV tag (13) is written whenever the list is
+    /// non-empty, and an **absent** tag means *empty* — the pre-0.10 default —
+    /// whatever `Default` says. A family created before the change therefore
+    /// keeps its uniform codec after an upgrade, and a new family records the
+    /// graduated list explicitly, so moving the default again can never
+    /// silently re-codec an existing database.
     pub compression_per_level: Vec<Compression>,
     /// Per-key-prefix override of the level compression. The **longest**
     /// matching prefix wins; keys matching no rule use
@@ -1180,9 +1217,33 @@ pub struct ColumnFamilyConfig {
     pub min_disk_space: u64,
     pub l1_file_count_trigger: u32,
     pub l0_queue_stall_threshold: u32,
-    /// Reserved tombstone-density trigger; currently ignored.
+    /// Compact a table whose tombstone fraction (`num_tombstones /
+    /// num_entries`, from its manifest entry) is **at least** this, even when
+    /// no size trigger fires. `0.0` (the default) disables the trigger; a value
+    /// above `1.0` can never be reached and so also never fires. Must be finite
+    /// and non-negative ([`validate`](Self::validate)). Persisted (TLV tag 34).
+    ///
+    /// The point is delete-heavy workloads: a table dominated by tombstones
+    /// costs reads a walk over dead versions and holds space until a compaction
+    /// carries the tombstones to the bottom level, where they are dropped. Size
+    /// triggers alone never do that for a family whose deletes keep its levels
+    /// under capacity.
+    ///
+    /// Density work ranks **below** capacity work and **above** periodic (age)
+    /// work, and takes the densest eligible table first. A dense table above the
+    /// bottom is pushed down one level through the ordinary bounded job (an L0
+    /// table through L0's oldest-first window); a dense **bottom** table is
+    /// rewritten in place, and only once every version in it is older than the
+    /// oldest live snapshot — before that the rewrite could not drop a single
+    /// tombstone. Evaluated whenever the family's compaction runs (after every
+    /// flush and compaction). Ignored by [`CompactionStyle::Fifo`].
+    /// [`CfStats::tombstone_density_compactions`](crate::CfStats::tombstone_density_compactions)
+    /// counts the jobs it picked.
     pub tombstone_density_trigger: f64,
-    /// Reserved tombstone-density trigger; currently ignored.
+    /// Ignore tables with fewer than this many entries for
+    /// [`tombstone_density_trigger`](Self::tombstone_density_trigger) (default
+    /// `0`: any non-empty table). A small table that happens to be mostly
+    /// deletes is not worth a job of its own. Persisted (TLV tag 35).
     pub tombstone_density_min_entries: u64,
     pub use_btree: bool,
     pub compaction_style: CompactionStyle,
@@ -1279,7 +1340,7 @@ impl Default for ColumnFamilyConfig {
             block_restart_interval: crate::sst::RESTART_INTERVAL,
             max_cached_vlog_value_bytes: 0, // vlog value caching off
             compression: Compression::None,
-            compression_per_level: Vec::new(),
+            compression_per_level: vec![Compression::None, Compression::Lz4, Compression::Zstd],
             compression_rules: Vec::new(),
             partition_rules: Vec::new(),
             partition_scheme: PartitionScheme::Rules,
@@ -1818,6 +1879,15 @@ impl ColumnFamilyConfig {
                 self.soft_pending_compaction_bytes, self.hard_pending_compaction_bytes
             ));
         }
+        // A NaN would compare false against every table and silently disable
+        // the trigger; a negative one would make every table eligible. Neither
+        // is what anyone meant.
+        if !self.tombstone_density_trigger.is_finite() || self.tombstone_density_trigger < 0.0 {
+            return Err(format!(
+                "tombstone_density_trigger ({}) must be finite and >= 0 (0 disables)",
+                self.tombstone_density_trigger
+            ));
+        }
         // FIFO never merges — it evicts whole tables by size and file age
         // (`fifo_ttl`). A periodic *rewrite* has nothing to do there, and
         // accepting the option would silently do nothing, reading as a tuning
@@ -1878,6 +1948,7 @@ mod tests {
         assert_eq!(compression_for_key(&rules, b"zz"), None);
         let cfg = ColumnFamilyConfig {
             compression: Compression::Snappy,
+            compression_per_level: Vec::new(),
             compression_rules: rules,
             ..Default::default()
         };
@@ -2250,6 +2321,23 @@ mod tests {
         .expect("periodic compaction is a leveled-family option");
     }
 
+    #[test]
+    fn validate_rejects_a_nan_or_negative_density_trigger() {
+        for bad in [f64::NAN, -0.1, f64::INFINITY] {
+            let cfg = ColumnFamilyConfig {
+                tombstone_density_trigger: bad,
+                ..ColumnFamilyConfig::default()
+            };
+            let error = cfg.validate().unwrap_err();
+            assert!(error.contains("tombstone_density_trigger"), "{error}");
+        }
+        let ok = ColumnFamilyConfig {
+            tombstone_density_trigger: 2.0, // never fires, but legal
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
     /// The API variants map onto the epoch-1 codec registry; LZ4 and its
     /// "fast" alias are the same bytes and the same id.
     #[test]
@@ -2292,8 +2380,23 @@ mod tests {
         assert_eq!(d.compression_for_level(9), Compression::Zstd); // last repeats
         let u = ColumnFamilyConfig {
             compression: Compression::Lz4,
+            compression_per_level: Vec::new(),
             ..ColumnFamilyConfig::default()
         };
         assert_eq!(u.compression_for_level(5), Compression::Lz4);
+        // The default is graduated, and `compression` is then ignored.
+        let g = ColumnFamilyConfig {
+            compression: Compression::Snappy,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(
+            [0, 1, 2, 7].map(|l| g.compression_for_level(l)),
+            [
+                Compression::None,
+                Compression::Lz4,
+                Compression::Zstd,
+                Compression::Zstd
+            ]
+        );
     }
 }

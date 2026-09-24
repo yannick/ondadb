@@ -475,11 +475,24 @@ impl TableCache {
         };
         // The cache drops its `Arc`; a caller mid-read still holds one. These
         // counters therefore describe what the cache pins, not process peak.
-        if let Some(entry) = shard.open.remove(&victim) {
+        let removed = shard.open.remove(&victim);
+        if let Some(entry) = &removed {
             self.core.open_bytes.fetch_sub(entry.bytes, Ordering::Relaxed);
         }
         self.core.open_count.fetch_sub(1, Ordering::Relaxed);
         self.core.closes.fetch_add(1, Ordering::Relaxed);
+        drop(shard);
+        // A reader evicted while a caller still holds it can no longer be
+        // reached by `SstHandle::close`, so a later retirement of its table
+        // could not pin it — and its holder (an open iterator) would lose the
+        // files the moment they are unlinked. Pin it now, outside the lock
+        // (it may open a file). The descriptors live only as long as that
+        // holder does.
+        if let Some(entry) = removed {
+            if Arc::strong_count(&entry.reader) > 1 {
+                entry.reader.pin_files();
+            }
+        }
         true
     }
 
