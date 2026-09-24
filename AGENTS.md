@@ -195,6 +195,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | PerfContext (0.10) | `perf.rs` | |
 | IO classes / rate limiter (0.6) | `ioctrl.rs` | |
 | Tailing iterators (0.9) | `tailing.rs` | |
+| Wide-column entities (F11) | `entity.rs` | Value-level frame shared with wavesdb (`WVE1`); no engine change |
 
 **Cross-feature rules live in `tests/composition.rs`**, not in either feature's
 own file: a range delete is, for one key, a *deleted base at its sequence* (so a

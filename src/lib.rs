@@ -70,6 +70,7 @@ pub mod config;
 pub(crate) mod config_blob;
 pub mod db;
 pub mod encoding;
+pub mod entity;
 pub mod error;
 pub(crate) mod excise;
 pub mod format;
@@ -118,6 +119,7 @@ pub use config::{
     TierDef, TierRule,
 };
 pub use db::{DB, DELETE_METADATA_BYTES};
+pub use entity::{EntityColumn, EntityColumnLike, EntityColumnRef};
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;

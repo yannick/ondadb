@@ -93,6 +93,19 @@ directory written by this release is not readable by 0.9.x. The crate is still
 
 ### Ported from wavesdb (plan C step 1, §1.4)
 
+#### Wide-column entities (wavesdb `entity.go`, F11)
+
+- `DB::put_entity` / `get_entity` / `get_columns` and the same three on `Txn`
+  store a set of named byte columns under one key as one ordinary value — the
+  wavesdb entity frame v1 (`WVE1`), reproduced byte for byte (golden frames in
+  `tests/entity.rs` come from wavesdb's own encoder). `ondadb::entity` has the
+  codec (`encode_entity`, `decode_entity`, `decode_entity_into`,
+  `sort_columns`) and the limits. No engine or on-disk change; the frame is
+  registered in `docs/format-registry.md` as a value-level format.
+- New error variant `OndaError::NotEntity` (code -17) for a value that is not
+  an entity frame. `get_columns` is an ondaDB convenience (wavesdb has none):
+  a projection that still reads and verifies the whole frame.
+
 #### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
 
 - `DB::checkpoint_to_object_store(store, prefix, &ObjectCheckpointOptions)`
