@@ -679,6 +679,20 @@ impl Reader {
         Ok(Block::Owned(arc))
     }
 
+    /// Whether reading data block `i` would go to a **slow** storage backend:
+    /// the table sits on a tier that reports `supports_mmap() == false` (S3,
+    /// a caller's custom backend, a local tier marked `without_mmap`) and the
+    /// block is not in the block cache. The batched point-read planner fans
+    /// only such reads out to parallel workers; everything else keeps the
+    /// sequential path, where a thread hand-off would cost more than the read.
+    pub(crate) fn block_read_is_remote(&self, i: usize) -> bool {
+        if self.storage.supports_mmap() {
+            return false;
+        }
+        let off = self.index[i].handle.offset;
+        !self.bc.contains(self.file_id, off, BlockDomain::Klog)
+    }
+
     /// Like [`read_data_block`](Self::read_data_block), but for callers that
     /// consume the block within the reader's lifetime: the mmap fast path
     /// returns a borrowed slice instead of bumping the mmap's `Arc` refcount
@@ -1215,6 +1229,12 @@ impl Reader {
     pub fn max_key(&self) -> &[u8] {
         &self.max_key
     }
+    /// Size of this table's bloom filter in bits, or `None` if it was written
+    /// without one.
+    pub fn bloom_bits(&self) -> Option<u64> {
+        self.bloom.as_ref().map(|b| b.bits())
+    }
+
     pub fn num_entries(&self) -> u64 {
         self.num_entries
     }

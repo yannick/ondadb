@@ -172,6 +172,61 @@ directory written by this release is not readable by 0.9.x. The crate is still
 
 #### Performance
 
+- **User-space WAL write buffer** (wavesdb `WALWriteBufferSize`, plan C P6):
+  `Options::wal_write_buffer_size` (bytes, default `0` = off, not persisted)
+  coalesces whole frames per WAL stripe — per-CF and unified — into one
+  `write` when the buffer fills, on every sync-interval tick (a flush-only
+  thread runs under `SyncMode::None` too), and before every fsync
+  (`sync_wal`, prepare and decision frames), rotation and close. `SyncMode::Full`
+  ignores it. **Durability trade:** an acknowledged commit still in the
+  buffer is lost on a *process* crash (unbuffered `None` loses it only on
+  power loss); batch atomicity and frame bytes are unchanged, and a crash
+  tearing a buffered write replays a prefix of whole batches. A failed
+  buffered write poisons the database. `Wal::open_buffered`,
+  `Wal::flush_buffer` and `Wal::write_calls` are the WAL-level API;
+  `onda_bench -wal_buffer <bytes>`. Provisional (loaded machine, 5 runs,
+  1 thread, 1 put per commit, 200k ops, `SyncMode::None`): 8.6k–32k ops/s
+  unbuffered vs 166k–387k ops/s with 256 KiB.
+- **Local disk cache for remote tiers** (wavesdb `LocalCachePath`, `f28aecc`,
+  plan C P8): `Options::local_cache_path` / `local_cache_max_bytes` (bytes,
+  `0` = unbounded; not persisted). Every non-local tier (S3, custom, remote
+  checkpoint mounts) reads its `.klog`/`.vlog` range reads through a bounded,
+  LRU, on-disk cache below the block cache, so blocks evicted from memory and
+  every read after a restart skip the range GET. Each entry file carries its
+  key and a CRC32-C; a torn or corrupt entry is a miss that reads through and
+  heals, never wrong bytes. Entries are namespaced by `read_cache_namespace`
+  or by the directory plus its `LOCK` file's identity, so a re-created
+  database never sees its predecessor's entries. New module `local_cache`
+  (`DiskCache`, `CachedStorage`, `LocalCacheStats`), `DB::local_cache_stats`.
+  Verified against MinIO (`tests/s3_tier.rs`,
+  `local_disk_cache_serves_s3_blocks_across_restart`: zero range GETs on a
+  warm restart with the block cache off).
+- **Bloom auto-allocation** (wavesdb `BloomAutoAllocate`, plan C P7):
+  `ColumnFamilyConfig::bloom_auto_allocate` (default `false`) sizes each new
+  table's filter at `bloom_fpr × level_size_ratio^(level − bottom)`, floored
+  at `config::BLOOM_AUTO_FLOOR` (1e-4, or `bloom_fpr` if lower) — the bottom
+  level keeps `bloom_fpr`, upper levels get stronger filters. Persisted as
+  **config TLV tag 33** (the slot epoch 1 reserved for it; `format::cf_config::tag::BLOOM_AUTO_ALLOCATE`,
+  `MAX_KNOWN` is now 33; `RESERVED_BLOOM_AUTO_ALLOCATE` stays as an alias).
+  Mutually exclusive with `bloom_fpr_per_level` (`validate` refuses both).
+  New `ColumnFamilyConfig::bloom_fpr_in_shape(level, bottom, bottom_level)`,
+  `config::bloom_auto_fpr`, `Reader::bloom_bits`. No capability bit: the
+  filters are ordinary filters, and an epoch-1 binary without P7 keeps tag 33
+  as a preserved-unknown tag and writes uniform filters. Opt-in for the reason
+  `docs/performance.md` gives for per-level rates.
+- **MultiGet bounded parallel block reads** (wavesdb
+  `MaxConcurrentBlockReads`, plan C P5): `Options::max_concurrent_block_reads`
+  (default 8; 0/1 = sequential; not persisted) bounds, database-wide, the
+  data-block reads batched gets keep in flight on **slow tiers** (storage with
+  `supports_mmap() == false`: S3, custom, `without_mmap`). A table plan with
+  at least four cold slow-tier blocks fetches them on scoped threads, a window
+  of `4 × bound` blocks at a time; local tables and warm blocks keep the
+  sequential path unchanged, as does `get`. Answers are identical; errors
+  stay per key (a failed block fails exactly its keys — wavesdb's contract).
+  `PerfContext` gains `multiget_parallel_reads` and `multiget_io_waits`
+  (worker counters merge into the caller's scope). Provisional: a 152-key cold
+  batch against a 2 ms-per-read tier took 404 ms at bound 1 and 60 ms at 8
+  (best of 5, loaded machine).
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
   and `multi_get` skip a candidate table whose `max_seq` is at or below the
   version already in hand (point hit, tombstone, or covering range delete),

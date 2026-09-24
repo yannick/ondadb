@@ -167,6 +167,8 @@ pub(crate) struct UnifiedStore {
     write_buffer_size: usize,
     sync_mode: crate::config::SyncMode,
     sync_interval: std::time::Duration,
+    /// [`Options::wal_write_buffer_size`](crate::Options::wal_write_buffer_size).
+    wal_buffer: usize,
     stall_threshold: usize,
     read_only: bool,
     state: RwLock<UState>,
@@ -297,11 +299,12 @@ impl UnifiedStore {
             (None, replay_paths)
         } else {
             let p = wal_path(dir, next_gen);
-            let w = Wal::open(
+            let w = Wal::open_buffered(
                 &p,
                 opts.unified_memtable_sync_mode,
                 opts.unified_memtable_sync_interval,
                 wal::SegmentId::unified(next_gen),
+                opts.wal_write_buffer_size,
             )?;
             w.set_poison(poison.clone());
             w.set_sync_counter(wal_syncs.clone());
@@ -315,6 +318,7 @@ impl UnifiedStore {
             write_buffer_size: wbs,
             sync_mode: opts.unified_memtable_sync_mode,
             sync_interval: opts.unified_memtable_sync_interval,
+            wal_buffer: opts.wal_write_buffer_size,
             stall_threshold: opts.unified_memtable_stall_threshold.max(1),
             read_only: opts.read_only,
             state: RwLock::new(UState {
@@ -745,11 +749,12 @@ impl UnifiedStore {
             let new_wal = if self.read_only {
                 None
             } else {
-                Wal::open(
+                Wal::open_buffered(
                     &new_path,
                     self.sync_mode,
                     self.sync_interval,
                     wal::SegmentId::unified(new_gen),
+                    self.wal_buffer,
                 )
                 .ok()
                 .map(|w| {

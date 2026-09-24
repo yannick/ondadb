@@ -33,6 +33,7 @@ mod writer;
 #[cfg_attr(feature = "arena-memtable", allow(unused_imports))]
 pub(crate) use iter::key_prefix8;
 pub use iter::SstIterator;
+pub(crate) use reader::BlockRef;
 pub use reader::Reader;
 pub use writer::{Writer, WriterOptions};
 

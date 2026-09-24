@@ -394,3 +394,63 @@ fn warm_vlog_value_issues_no_range_get() {
     db.close().unwrap();
     cleanup(&cfg, &prefix);
 }
+
+/// P8: with `Options::local_cache_path`, a restart reads an S3-resident part's
+/// blocks from the local disk cache — **no** range GET — even with the
+/// in-memory block cache off. The tier is `TierDef::custom` over the test's own
+/// `S3Storage` only so `S3Metrics.range_gets` counts the database's requests;
+/// the cache wraps every non-local tier the same way.
+#[test]
+fn local_disk_cache_serves_s3_blocks_across_restart() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 local-cache test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let metrics = s3.metrics();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let opts = || {
+        let mut o = Options::new(dir.path().to_str().unwrap());
+        o.tiers = vec![TierDef::custom("s3", prefix.clone(), s3.clone())];
+        o.part_mover_interval = Duration::ZERO;
+        o.block_cache_size = 0;
+        o.local_cache_path = Some(cache_dir.path().to_str().unwrap().into());
+        o
+    };
+    let gets = || {
+        metrics
+            .range_gets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    {
+        let db = DB::open(opts()).unwrap();
+        let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        assert_eq!(db.run_part_mover().unwrap(), 1, "the img/ part must move");
+        let before = gets();
+        for i in 0..5u32 {
+            assert_eq!(
+                db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+                b"IMG"
+            );
+        }
+        assert!(gets() > before, "the cold pass must reach S3");
+        assert!(db.local_cache_stats().unwrap().admits > 0);
+        db.close().unwrap();
+    }
+    let db = DB::open(opts()).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    let before = gets();
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+    }
+    assert_eq!(gets(), before, "a warm restart issued range GETs");
+    assert!(db.local_cache_stats().unwrap().hits > 0);
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}

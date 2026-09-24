@@ -305,6 +305,18 @@ impl BlockCache {
         out
     }
 
+    /// Whether `(file_id, domain, off)` is resident, without counting a hit or
+    /// a miss or marking the entry referenced: a planner asking "would this
+    /// read go to storage?" is not a read, and must neither skew the hit rate
+    /// nor keep an entry alive.
+    pub(crate) fn contains(&self, file_id: u64, off: u64, domain: BlockDomain) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        let k = self.key(file_id, off, domain);
+        self.shard_for(&k).read().map.contains_key(&k)
+    }
+
     /// Insert a value, evicting not-recently-referenced entries if over
     /// capacity.
     pub fn put(&self, file_id: u64, off: u64, domain: BlockDomain, val: Arc<[u8]>) {

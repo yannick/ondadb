@@ -33,6 +33,7 @@ type/function names — grep for them; line numbers rot.
 | `manifest_edit.rs` | Numbered catalog edits (2.2): `VersionEdit`/`Op` codec, all-or-nothing `apply_edit` with per-op preconditions, the `MANIFEST-EDITS` log writer, the four-step snapshot-compaction protocol and `recover_catalog` |
 | `storage.rs` | `Storage`/`ReadHandle`/`StorageWriter` traits, `LocalStorage`, `TierRegistry` — the choke point all SSTable file access flows through so parts can live on multiple tiers |
 | `storage_s3.rs` | *(feature `s3`)* `S3Storage`: object-store backend — range-GET reads, single-PUT writes, own tokio runtime |
+| `local_cache.rs` | Local disk cache for remote tiers (P8, `Options::local_cache_path`): `DiskCache` (bounded, LRU, CRC32-C-verified entry files, one instance per directory per process) and `CachedStorage`, the `Storage` decorator `build_tier_registry` wraps around every non-local tier; table objects only |
 | `parts.rs` | Part lifecycle: `detach_part`/`attach_part`/`freeze_part`, `move_part_to_tier`, the policy-driven part mover, live partition-rule add/remove |
 | `unified.rs` | Optional shared memtable+WAL across CFs (8-byte CF-id key prefix); split flush |
 | `ioctrl.rs` | Background IO classes (`IoClass` in a thread-local, `scoped` guards) and the `IoLimiter` trait with a work-conserving `TokenBucket` on an injectable `Clock`; bounds flush/compaction bandwidth so it cannot inflate foreground p99 |
@@ -111,7 +112,11 @@ in the database directory; only bottom-level parts may live on a named tier
      or `append_batch_enveloped` for a point-only batch). One frame either way,
      because batch atomicity is per frame. The test is on the batch, not the
      family, so every ordinary commit keeps its 0.8.2 frame bytes, including on
-     a family that merely *has* a merge operator
+     a family that merely *has* a merge operator. With
+     `Options::wal_write_buffer_size` set (non-Full modes), the frame is
+     appended to the stripe's user-space buffer instead and reaches the file
+     when the buffer fills, on the interval tick, or before any fsync, rotation
+     or close (`docs/concurrency-and-safety.md` § WAL concurrency)
    - `Memtable::put_batch(&recs)` — counting-sorts into per-shard runs, one
      shard lock per batch, nodes prebuilt outside locks, counters updated once
    - `Memtable::add_range` per range delete, into the `RangeTombstoneSet`
@@ -326,9 +331,30 @@ divergence from N `get`s, deliberate: a failing source errors only the keys
 whose resolution needed it — a key a strictly newer source already resolved
 keeps its value, where `get` propagates the error of any table it probes.
 
+**Bounded parallel block reads (P5, wavesdb `MaxConcurrentBlockReads`).** The
+distinct blocks of one table's plan are walked in windows of
+`4 × Options::max_concurrent_block_reads`. If a window holds at least four
+blocks that `Reader::block_read_is_remote` (the table's storage reports
+`supports_mmap() == false` — S3, a custom tier, a `without_mmap` local tier —
+and the block is not cached), `ColumnFamily::prefetch_window` fetches exactly
+those with `read_data_block` on scoped `onda-mget-N` threads plus the calling
+thread, each read under one permit of the database-wide `CfCtx::block_reads`
+semaphore; the resolve loop then consumes the fetched blocks in block order,
+exactly as if it had read them itself. A slow-tier block the window left
+inline also takes a permit, so the bound covers every slow-tier data-block read
+batches issue. Local-tier tables, warm blocks, plans below four slow blocks,
+`get`, and a bound of 0/1 all keep the sequential loop. A fetched block's error
+fails exactly its group (same `fail_group` as the inline path). Worker perf
+scopes are merged into the caller's (`multiget_parallel_reads`,
+`multiget_io_waits`). At most one window of blocks is live at a time.
+
 A table's filter strength is chosen when it is **written**, from its output
-level: `ColumnFamilyConfig::bloom_fpr_for_level(level, bottom)` returns the
-rate (`bloom_fpr_per_level`, last entry repeating, or the uniform `bloom_fpr`)
+level: `ColumnFamilyConfig::bloom_fpr_in_shape(level, bottom, bottom_level)`
+returns the rate (`bloom_fpr_per_level`, last entry repeating; else, with
+`bloom_auto_allocate` (P7), `bloom_fpr × level_size_ratio^(level −
+bottom_level)` floored at `BLOOM_AUTO_FLOOR`, where `bottom_level` is the
+family's deepest level index when the writer is created — `levels.len() − 1`,
+or the compaction target if deeper; else the uniform `bloom_fpr`)
 or `None` for "write no filter block" when `optimize_filters_for_hits` is set
 and the output lands in the bottom level (`compaction::is_bottom_target`).
 Flush and ingest always pass `bottom = false`; only compaction can omit a

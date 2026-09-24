@@ -70,6 +70,17 @@ pub struct PerfContext {
     /// Keys this operation found deleted by a covering range tombstone rather
     /// than by a point tombstone or by absence.
     pub range_masked: u64,
+    /// Data blocks a [`crate::DB::multi_get`] fetched through its bounded
+    /// parallel runner ([`Options::max_concurrent_block_reads`]) instead of
+    /// one at a time on the calling thread. Only cold blocks of tables on a
+    /// slow tier (one whose storage reports `supports_mmap() == false`) take
+    /// that path; zero everywhere else.
+    ///
+    /// [`Options::max_concurrent_block_reads`]: crate::Options::max_concurrent_block_reads
+    pub multiget_parallel_reads: u64,
+    /// Parallel block reads that waited for a permit: the database-wide bound,
+    /// not the device, was the limit (wavesdb `MultiGetIOWaits`).
+    pub multiget_io_waits: u64,
 }
 
 impl PerfContext {
@@ -95,7 +106,33 @@ impl PerfContext {
             multiget_blocks_deduped: 0,
             range_sources: 0,
             range_masked: 0,
+            multiget_parallel_reads: 0,
+            multiget_io_waits: 0,
         }
+    }
+
+    /// Add every counter of `o` into `self` — how a worker thread's counters
+    /// reach the scope of the thread that handed it the work.
+    pub(crate) fn absorb(&mut self, o: &PerfContext) {
+        self.bloom_probes += o.bloom_probes;
+        self.bloom_negatives += o.bloom_negatives;
+        self.memtable_probes += o.memtable_probes;
+        self.sstable_probes += o.sstable_probes;
+        self.index_seeks += o.index_seeks;
+        self.block_cache_hits += o.block_cache_hits;
+        self.block_misses += o.block_misses;
+        self.block_read_bytes += o.block_read_bytes;
+        self.bytes_decompressed += o.bytes_decompressed;
+        self.vlog_reads += o.vlog_reads;
+        self.vlog_read_bytes += o.vlog_read_bytes;
+        self.vlog_cache_hits += o.vlog_cache_hits;
+        self.iterator_seeks += o.iterator_seeks;
+        self.iterator_steps += o.iterator_steps;
+        self.multiget_blocks_deduped += o.multiget_blocks_deduped;
+        self.range_sources += o.range_sources;
+        self.range_masked += o.range_masked;
+        self.multiget_parallel_reads += o.multiget_parallel_reads;
+        self.multiget_io_waits += o.multiget_io_waits;
     }
 }
 
@@ -196,6 +233,12 @@ impl Drop for Scope {
         // panic — must still restore the stack to its prior depth.
         pop();
     }
+}
+
+/// Whether this thread has an open scope — so work handed to another thread
+/// knows whether its counters are wanted at all.
+pub(crate) fn active() -> bool {
+    HOT.try_with(|hot| hot.depth.get() > 0).unwrap_or(false)
 }
 
 /// Add to the innermost open scope on this thread; a no-op when none is open.
