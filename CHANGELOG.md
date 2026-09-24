@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
+
+- `DB::checkpoint_to_object_store(store, prefix, &ObjectCheckpointOptions)`
+  uploads `<prefix>/cf-<name>/<id>.{klog,vlog}` then `<prefix>/MANIFEST`
+  last (the commit marker); incremental via `parent`; `receipts` gives
+  create-if-absent publication with per-object size + SHA-256 receipts.
+  Returns an `ObjectCheckpoint { global_seq, next_file_id, tables,
+  receipts }`. A read-only source is accepted (its WAL-only data is written
+  as L0 tables in a scratch dir, per 0.9.1's snapshot rule).
+- `restore_from_object_store(store, prefix, dir)` — MANIFEST fetched first,
+  written last; `NotFound` when the prefix holds no checkpoint.
+- `open_remote_checkpoint(store, prefix, opts)` — lazy, read-only mount:
+  one MANIFEST GET, then range GETs; sizes seeded from the MANIFEST.
+- Internal: `snapshot_to` is split into `plan_snapshot` + placement, so local
+  and object checkpoints copy the identical file set. No on-disk format
+  change: the MANIFEST bytes are the ones a local checkpoint writes.
+
+### Demote a part to the default tier (wavesdb `4fa392c`)
+
+- `DB::move_part_to_default_tier(cf, partition)`; `move_part_to_tier` and
+  `move_part_to_tier_observed` accept the reserved name `"ssd"` for the
+  same thing (it was an "unknown tier" error before). Same crash-safe
+  protocol as a move onto a tier; sources are now read through their own
+  tier's `Storage`, so a part on S3 comes back via range GETs and its S3
+  objects are deleted through the tier's backend, still behind
+  `pause_deletions`. The policy mover does not demote (an `"ssd"` rule still
+  only stops moves).
+- `tests/s3_tier.rs`: prefixes are now unique per test (pid + counter), so
+  parallel S3 tests no longer collide on macOS's microsecond clock.
+
+### Incremental-backup diff (wavesdb `SSTablesSince`)
+
+- `DB::live_sstables()`, `DB::sstables_since(seq)` and
+  `DB::sstables_diff(&prior)` (new module `checkpoint`, types
+  `CheckpointTable`, `TableSetDiff`). `sstables_since` is wavesdb's
+  `max_seq > seq` filter; it cannot see a compaction that rewrites only old
+  data, so `sstables_diff` — by `(cf, id)` identity, reporting `added` and
+  `removed` — is the one an incremental backup should use.
+
+### S3 parity with wavesdb v0.8.2–v0.8.6 (feature `s3`)
+
+- `S3Config` gains `session_token`, `anonymous`, `profile` and `read_only`,
+  and derives `Default`. Credential precedence: explicit keys (+ token) >
+  anonymous > named profile (no fallback) > default chain (env → shared file
+  → web-identity STS → instance metadata, resolved lazily).
+  `S3Config::credential_source()` and `S3CredentialSource` expose the choice.
+  **Source-compatibility note:** a struct literal of `S3Config` must now end
+  in `..S3Config::default()`.
+- `read_only` refuses writes locally with `OndaError::ReadOnly`; no bucket
+  probe or create happens in any mode.
+- Uploads send `x-amz-checksum-sha256` and check the store's echo.
+- `Storage` gains default-implemented `put_object` (returns an `ObjectInfo`
+  receipt), `create_if_absent` (`CreateOutcome`), `list_prefixes`
+  (`PrefixPage`, paginated child-prefix listing) and `is_read_only`;
+  `LocalStorage` and `S3Storage` implement them. A 404 now surfaces as
+  `io::ErrorKind::NotFound` (`storage::is_not_found`). `S3Metrics` gains
+  `lists`.
+- Fixed the `--features s3` test build (a stale 4-tuple destructure of
+  `Reader::get`).
+
 ## 0.9.1
 
 **Shared-bug corrective release.** Five defects that wavesdb fixed after

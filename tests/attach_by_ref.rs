@@ -344,6 +344,7 @@ fn attach_by_ref_mounts_from_s3() {
                 secret_key: std::env::var("ONDADB_S3_SECRET")
                     .unwrap_or_else(|_| "ayudevsecret".into()),
                 path_style: true,
+                ..ondadb::S3Config::default()
             })
     }) else {
         eprintln!("skipping: ONDADB_S3_ENDPOINT not set");

@@ -127,6 +127,22 @@ struct DeleteTask {
     path: String,
     /// The file's size, floored at [`DELETE_METADATA_BYTES`].
     bytes: u64,
+    /// The backend holding `path` when it is not a local file — an object on a
+    /// remote tier a part was demoted off. `None` is a plain local unlink.
+    storage: Option<Arc<dyn crate::storage::Storage>>,
+}
+
+impl DeleteTask {
+    fn run(&self) {
+        match &self.storage {
+            Some(storage) => {
+                let _ = storage.delete(&self.path);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
 }
 
 /// The thread that performs paced unlinks, present only when
@@ -216,7 +232,7 @@ impl FileDeletionState {
             }
             None => task,
         };
-        let _ = std::fs::remove_file(&task.path);
+        task.run();
     }
 
     /// Close the queue and join the worker, unlinking everything already
@@ -257,7 +273,7 @@ fn deletion_worker(rx: Receiver<DeleteTask>, limiter: Option<Arc<dyn crate::ioct
     // on that to guarantee every queued file is gone before it returns.
     for task in rx {
         crate::ioctrl::charge(&limiter, task.bytes);
-        let _ = std::fs::remove_file(&task.path);
+        task.run();
     }
 }
 
@@ -1481,24 +1497,48 @@ impl DbInner {
     /// is charged when pacing is on. Unpaced (the default) it is ignored and
     /// the file is unlinked right here, on the caller's thread.
     pub(crate) fn remove_sst_file(&self, path: &str, bytes: u64) {
+        self.retire_file(path, bytes, None);
+    }
+
+    /// [`remove_sst_file`](Self::remove_sst_file) for a file that lives on a
+    /// tier's [`Storage`](crate::storage::Storage) rather than as a local path —
+    /// the source object of a part demoted off a remote tier. Same pause and
+    /// pacing rules. Returns whether the removal was deferred by a pause.
+    pub(crate) fn remove_tier_file(
+        &self,
+        storage: Arc<dyn crate::storage::Storage>,
+        path: &str,
+        bytes: u64,
+    ) -> bool {
+        self.retire_file(path, bytes, Some(storage))
+    }
+
+    fn retire_file(
+        &self,
+        path: &str,
+        bytes: u64,
+        storage: Option<Arc<dyn crate::storage::Storage>>,
+    ) -> bool {
         // Crash simulation only (`util::fault::Call::Unlink`): leave the file
         // where it is, which is exactly the orphan a crash between the durable
         // catalog edit and this unlink produces. Free — and gone entirely from
         // release builds' behaviour — when no plan is installed.
         if crate::util::fault::check(crate::util::fault::Call::Unlink).is_err() {
-            return;
+            return false;
         }
         let task = DeleteTask {
             path: path.to_string(),
             bytes: bytes.max(DELETE_METADATA_BYTES),
+            storage,
         };
         let mut paused = self.file_deletion.paused.lock();
         if paused.disabled > 0 {
             paused.pending.push(task);
-            return;
+            return true;
         }
         drop(paused);
         self.file_deletion.dispatch(task);
+        false
     }
 
     /// Pause obsolete-file deletion for the lifetime of the returned guard. Nested
