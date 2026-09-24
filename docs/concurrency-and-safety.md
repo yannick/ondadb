@@ -29,8 +29,9 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   Readers snapshot `visible_seq()`; nothing ever reads at `next_seq`.
 - Snapshots: `snapshots: Mutex<BTreeMap<seq, refcount>>`;
   Repeatable-Read/Snapshot/Serializable txns pin their `read_seq` via
-  `acquire_snapshot`/`release_snapshot`. Compaction's version GC keeps every
-  version newer than `oldest_snapshot()`.
+  `acquire_fixed_snapshot` (own-floor wait + `acquire_visible_snapshot`) and
+  `release_snapshot`. Compaction's version GC keeps every version newer than
+  `oldest_snapshot()`.
   A standalone `SnapshotHandle` (`DB::snapshot`, `snapshot.rs`) is one more
   entry in the same map: it pins through `acquire_visible_snapshot`, which reads
   `visible_seq()` **under** the `snapshots` lock (the lock `oldest_snapshot()`
@@ -38,9 +39,20 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   above the pin in the window between reading the watermark and registering
   it. Clones share one pin (`Arc`); the last drop releases it. Excise and
   span-index pruning key off `oldest_snapshot()` too, so a handle holds them
-  back exactly as a transaction does. Transactions still use the two-step
-  `visible_seq()` + `acquire_snapshot` and keep that (narrow) window; closing
-  it there is a separate change.
+  back exactly as a transaction does. **Every** pin is taken this way — there
+  is no two-step "read the watermark, then register it" left: transaction
+  `begin`/`reset`, the pessimistic grant refresh, `SnapshotHandle`, and the
+  transient `pin_read_floor` guard that read-committed `Txn` iterators and
+  tailing-iterator segments hold only while they build (once built, an
+  iterator owns its tables and memtables). A read at a sequence chosen and
+  pinned in two steps could have its version collected by a compaction running
+  in between (regressions: `txn::tests::*_pins_*`, deterministic via the
+  `cfg(test)` `snapshot_pin_hook`).
+  Point reads (`DB::get`, read-committed `Txn::get`) still read the floor and
+  then their sources without a pin: that window spans a whole flush **and**
+  a compaction of the key between two instructions, and closing it on the
+  point-read hot path would put the `snapshots` mutex on every `get`. Known,
+  not fixed.
 - Shared read resources (`read_resources.rs`): `BlockCache` and `TableCache`
   are *views* — `Arc` storage plus a namespace id — and both key on
   `(namespace, file id)`, so leased databases share one budget without ever
@@ -342,12 +354,16 @@ transaction's snapshot, in this order:
    `wait_visible_at_own_floor`) for `visible_seq() >= last_commit_seq`.
    Publication is gap-free (invariant 5), so this is transient by construction
    and the bound only guards a torn process.
-3. At `Serializable`, `validate_read_conflicts` re-runs against the **old**
-   `read_seq` first. That is what makes the refresh sound: the reads are proven
-   unchanged at the new snapshot, so it is as if they had all happened there.
-4. `acquire_snapshot(new)` **before** `release_snapshot(old)`, so
-   `oldest_snapshot()` never transiently jumps forward and lets compaction GC a
-   version this transaction still needs.
+3. The new snapshot is pinned (`acquire_visible_snapshot`) **before**
+   `release_snapshot(old)`, so `oldest_snapshot()` never transiently jumps
+   forward and lets compaction GC a version this transaction still needs.
+4. At `Serializable`, `validate_read_conflicts` then re-runs against the
+   **old** `read_seq`. That is what makes the refresh sound: the reads are
+   proven unchanged at the new snapshot, so it is as if they had all happened
+   there. It must follow step 3: validating first and reading the watermark
+   after let a write to a read-set key land in between, at or below the
+   adopted `read_seq`, where commit-time validation cannot see it
+   (`serializable_refresh_cannot_adopt_an_unvalidated_write`).
 
 What it costs, stated plainly:
 

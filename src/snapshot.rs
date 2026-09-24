@@ -125,8 +125,7 @@ impl DB {
     /// observe a newer "oldest snapshot" in between and collect a version the
     /// handle is entitled to.
     pub fn snapshot(&self) -> SnapshotHandle {
-        self.inner.wait_visible_at_own_floor();
-        let seq = self.inner.acquire_visible_snapshot();
+        let seq = self.inner.acquire_fixed_snapshot();
         SnapshotHandle {
             pin: Arc::new(Pin {
                 db: self.inner.clone(),

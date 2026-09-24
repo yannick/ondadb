@@ -304,7 +304,7 @@ pub struct DbInner {
     /// must not burn sequence numbers. And `read_seq` cannot serve as an
     /// identity — it is `visible_seq()` at the fixed levels but
     /// `read_floor_seq()` at the others, many concurrent transactions pin the
-    /// same watermark (which is why `acquire_snapshot` is refcounted), and
+    /// same watermark (which is why the snapshot pins are refcounted), and
     /// `reset` reassigns it.
     txn_ids: AtomicU64,
     /// Point locks held by pessimistic transactions (3.3).
@@ -668,6 +668,46 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// One-shot pause point on a reader's snapshot-pinning path, per thread.
+    /// Lets a test park a reader right after it has decided its read sequence
+    /// and run a flush + compaction before it builds anything, which is how
+    /// the pin-registration races are reproduced deterministically.
+    static SNAPSHOT_PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the calling thread's one-shot [`snapshot_pin_hook`].
+#[cfg(test)]
+pub(crate) fn set_snapshot_pin_hook(hook: impl FnOnce() + 'static) {
+    SNAPSHOT_PIN_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Test-only pause point; compiles to nothing outside `cfg(test)`.
+#[inline(always)]
+pub(crate) fn snapshot_pin_hook() {
+    #[cfg(test)]
+    {
+        let hook = SNAPSHOT_PIN_HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Guard returned by [`DbInner::pin_read_floor`]; releases its pin on drop.
+pub(crate) struct ReadFloorPin<'a> {
+    db: &'a DbInner,
+    seq: u64,
+}
+
+impl Drop for ReadFloorPin<'_> {
+    fn drop(&mut self) {
+        self.db.release_snapshot(self.seq);
+    }
+}
+
 impl DbInner {
     pub(crate) fn reserve_seq(&self, n: u64) -> u64 {
         self.next_seq.fetch_add(n, Ordering::SeqCst)
@@ -750,23 +790,47 @@ impl DbInner {
         self.visible.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn acquire_snapshot(&self, seq: u64) -> u64 {
-        *self.snapshots.lock().entry(seq).or_insert(0) += 1;
-        seq
-    }
-
     /// Pin the current published watermark and return it, **atomically**:
     /// the watermark is read under the same `snapshots` lock that
     /// [`oldest_snapshot`](Self::oldest_snapshot) holds while it reads, so a
     /// compaction choosing its GC floor either sees this pin or read a
     /// watermark no newer than it — never a newer "oldest snapshot" that could
     /// collect a version this pin is entitled to. (Reading `visible_seq()` and
-    /// then calling `acquire_snapshot` leaves exactly that window open.)
+    /// registering it in a second step leaves exactly that window open, which
+    /// is why no two-step `acquire_snapshot(seq)` exists any more.)
     pub(crate) fn acquire_visible_snapshot(&self) -> u64 {
         let mut s = self.snapshots.lock();
         let seq = self.visible_seq();
         *s.entry(seq).or_insert(0) += 1;
         seq
+    }
+
+    /// The pin a fixed-snapshot reader (a `RepeatableRead`, `Snapshot` or
+    /// `Serializable` transaction, or a [`SnapshotHandle`](crate::SnapshotHandle))
+    /// takes: wait for publication to reach this thread's own last commit (see
+    /// [`wait_visible_at_own_floor`](Self::wait_visible_at_own_floor)), then
+    /// pin the watermark atomically. Released with
+    /// [`release_snapshot`](Self::release_snapshot).
+    pub(crate) fn acquire_fixed_snapshot(&self) -> u64 {
+        self.wait_visible_at_own_floor();
+        self.acquire_visible_snapshot()
+    }
+
+    /// The read-committed floor ([`read_floor_seq`](Self::read_floor_seq)),
+    /// with a transient pin that keeps compaction from collecting any version
+    /// it can see while the guard lives.
+    ///
+    /// For readers that build something which then owns its sources (an
+    /// iterator pins its tables and memtables at construction) but that do not
+    /// hold a snapshot afterwards. The pin sits at the watermark, which may be
+    /// below the returned floor when this thread's own commit is ahead of it;
+    /// that is enough, because compaction keeps every version above its GC
+    /// floor plus the newest one at or below it, so whatever the floor sees
+    /// survives a GC floor at or below the pin.
+    pub(crate) fn pin_read_floor(&self) -> (u64, ReadFloorPin<'_>) {
+        let pinned = self.acquire_visible_snapshot();
+        let floor = pinned.max(self.own_commit_floor());
+        (floor, ReadFloorPin { db: self, seq: pinned })
     }
 
     pub(crate) fn release_snapshot(&self, seq: u64) {

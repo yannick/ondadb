@@ -75,6 +75,22 @@ directory written by this release is not readable by 0.9.x. The crate is still
   the per-CF rotation already did, so the segment-header fsync does not extend
   the write gate.
 
+### Fixed
+
+- **Snapshot pins are atomic everywhere.** Transaction `begin`/`reset` read
+  the published watermark and registered it as a snapshot in two steps; a
+  compaction choosing its GC floor in between could collect the version the
+  new snapshot was entitled to, so the key read as missing. Every pin now goes through
+  `acquire_visible_snapshot`, which reads the watermark under the snapshot
+  lock. Read-committed transaction iterators and tailing-iterator segments had
+  the same window between reading their floor and pinning their sources, and
+  now hold a transient pin while they build.
+- **Pessimistic `Serializable` grant refresh** validated the read set first
+  and read the new watermark after, so a write to a read-set key landing in
+  between was adopted into the snapshot unvalidated and the transaction
+  committed a stale read. The candidate snapshot is now pinned before the
+  validation.
+
 ### Ported from wavesdb (plan C step 1, §1.4)
 
 #### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
