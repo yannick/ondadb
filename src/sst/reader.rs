@@ -656,8 +656,11 @@ impl Reader {
                     len: raw_len,
                 });
             }
-            // Compressed: decompress once, cache the owned result.
-            if let Some(raw) = self.bc.get(self.file_id, h.offset, BlockDomain::Klog) {
+            // Compressed: decompress once, cache the owned result — unless
+            // this is a background scan, which reads through the cache but
+            // never admits (`BlockCache::admits_current_thread`).
+            let (cached, admit) = self.bc.lookup(self.file_id, h.offset, BlockDomain::Klog);
+            if let Some(raw) = cached {
                 crate::perf::bump(|p| p.block_cache_hits += 1);
                 return Ok(Block::Owned(raw));
             }
@@ -672,12 +675,15 @@ impl Reader {
             let raw = crate::compress::decompress(alg, payload, raw_len)?;
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
             let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
-            self.bc
-                .put(self.file_id, h.offset, BlockDomain::Klog, arc.clone());
+            if admit {
+                self.bc
+                    .put(self.file_id, h.offset, BlockDomain::Klog, arc.clone());
+            }
             return Ok(Block::Owned(arc));
         }
 
-        if let Some(raw) = self.bc.get(self.file_id, h.offset, BlockDomain::Klog) {
+        let (cached, admit) = self.bc.lookup(self.file_id, h.offset, BlockDomain::Klog);
+        if let Some(raw) = cached {
             crate::perf::bump(|p| p.block_cache_hits += 1);
             return Ok(Block::Owned(raw));
         }
@@ -694,8 +700,10 @@ impl Reader {
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
         }
         let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
-        self.bc
-            .put(self.file_id, h.offset, BlockDomain::Klog, arc.clone());
+        if admit {
+            self.bc
+                .put(self.file_id, h.offset, BlockDomain::Klog, arc.clone());
+        }
         Ok(Block::Owned(arc))
     }
 
@@ -1154,8 +1162,16 @@ impl Reader {
         // decompressed on every mmap read — `vlog_verified` memoizes only the
         // checksum — so under `mmap-reads` this lookup is the one thing that
         // can remove the decompression, not just the I/O.
+        // Background scans read through the value cache too, and never admit
+        // (same rule as data blocks).
+        let admit = self.bc.admits_current_thread();
         if self.vlog_cache_limit > 0 {
-            if let Some(cached) = self.bc.get(self.file_id, off, BlockDomain::Vlog) {
+            let cached = if admit {
+                self.bc.get(self.file_id, off, BlockDomain::Vlog)
+            } else {
+                self.bc.peek(self.file_id, off, BlockDomain::Vlog)
+            };
+            if let Some(cached) = cached {
                 // The domain tag makes the key unambiguous, so this can only
                 // differ if the cache handed back something that was never
                 // this frame. Trip loudly in debug; in release refuse the read
@@ -1197,7 +1213,8 @@ impl Reader {
         // decode: every error above returned, so nothing cancelled, truncated
         // or CRC-failed can reach this line. An oversized value bypasses
         // without the copy `Arc::from` would cost.
-        if self.vlog_cache_limit > 0 && len <= self.vlog_cache_limit && self.bc.enabled() {
+        if admit && self.vlog_cache_limit > 0 && len <= self.vlog_cache_limit && self.bc.enabled()
+        {
             let decoded = &out[start..];
             debug_assert_eq!(decoded.len(), len, "decoded vlog value length");
             self.bc

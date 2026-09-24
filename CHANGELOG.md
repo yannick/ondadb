@@ -189,6 +189,18 @@ directory written by this release is not readable by 0.9.x. The crate is still
   Results are unchanged (randomized oracle against the exhaustive walk); a
   corrupt table older than the answer is no longer probed, so it no longer
   fails the read.
+- **Background reads no longer admit into the block cache** (wavesdb
+  `ac16c8a`). A read on a background thread — compaction and its span
+  workers, the part mover, ingest validation, i.e. any `ioctrl::IoClass`
+  other than `Foreground` — still looks blocks and vlog values up in the
+  cache, but a hit does not refresh the entry's CLOCK bit, a miss is not
+  inserted, and neither is counted in `hits`/`misses`. One large compaction
+  therefore no longer cycles the cache and hands the hot set back cold
+  (`tests/cache_admission.rs`: zero evictions and zero hot-set misses across a
+  compaction of a family 17× the cache, against a flushed hot set with the old
+  policy). `Options::admit_background_scan_blocks` (default `false`, not
+  persisted) restores the old behaviour. `DbStats` gains
+  `block_cache_evictions` and `block_cache_bytes`.
 
 ## 0.9.1
 

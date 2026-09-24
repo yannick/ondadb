@@ -188,6 +188,12 @@ struct Core {
 pub struct BlockCache {
     core: Arc<Core>,
     ns: u64,
+    /// Whether a *background* read (see [`admits_current_thread`]) inserts
+    /// what it misses. `false` for every view unless the database opts back
+    /// in with `Options::admit_background_scan_blocks`.
+    ///
+    /// [`admits_current_thread`]: BlockCache::admits_current_thread
+    admit_background: bool,
 }
 
 impl std::fmt::Debug for BlockCache {
@@ -195,6 +201,7 @@ impl std::fmt::Debug for BlockCache {
         f.debug_struct("BlockCache")
             .field("shards", &self.core.shards.len())
             .field("ns", &self.ns)
+            .field("admit_background", &self.admit_background)
             .finish()
     }
 }
@@ -244,6 +251,7 @@ impl BlockCache {
         BlockCache {
             core: Arc::new(core),
             ns: 0,
+            admit_background: false,
         }
     }
 
@@ -253,6 +261,74 @@ impl BlockCache {
         BlockCache {
             core: Arc::clone(&self.core),
             ns,
+            admit_background: self.admit_background,
+        }
+    }
+
+    /// This view with its background-admission policy set (see
+    /// [`admits_current_thread`](Self::admits_current_thread)). The policy is
+    /// per view, so two databases leasing one shared storage may differ.
+    pub(crate) fn with_background_admission(mut self, admit: bool) -> BlockCache {
+        self.admit_background = admit;
+        self
+    }
+
+    /// Should a read on the calling thread insert what it misses, and refresh
+    /// the recency of what it hits?
+    ///
+    /// Yes for foreground reads — point reads and user iterators, whatever
+    /// the policy. For a **background** thread (any [`IoClass`] other than
+    /// `Foreground`: compaction and its span workers, the part mover, flush
+    /// and ingest validation) only when the view opted in. Such a reader walks
+    /// every block of a table exactly once and never asks for it again, so
+    /// admitting its blocks can only evict ones a foreground reader does want:
+    /// one large compaction used to cycle the whole cache and hand the hot set
+    /// back cold (wavesdb `ac16c8a`).
+    ///
+    /// The class is the thread's [`crate::ioctrl`] tag rather than a flag
+    /// threaded through every reader, because it is already set at exactly the
+    /// places background work starts, and a reader is shared between the two
+    /// kinds of caller through the table cache.
+    ///
+    /// [`IoClass`]: crate::ioctrl::IoClass
+    #[inline]
+    pub(crate) fn admits_current_thread(&self) -> bool {
+        self.admit_background || crate::ioctrl::current() == crate::ioctrl::IoClass::Foreground
+    }
+
+    /// Look up without touching the entry's reference bit or the hit/miss
+    /// counters: a background read's lookup.
+    ///
+    /// A background scan still *reads through* the cache — a block a point
+    /// read already paid for is served for free — but its hit must not give
+    /// the block a second chance, or what stays resident would reflect the
+    /// scan instead of foreground demand. It is not counted either, so
+    /// `hits`/`misses` keep describing foreground reads, which is what an
+    /// operator sizing the cache is looking at.
+    pub(crate) fn peek(&self, file_id: u64, off: u64, domain: BlockDomain) -> Option<Arc<[u8]>> {
+        if !self.enabled() {
+            return None;
+        }
+        let k = self.key(file_id, off, domain);
+        let s = self.shard_for(&k).read();
+        s.map.get(&k).map(|e| e.data.clone())
+    }
+
+    /// [`get`](Self::get) for a foreground caller, [`peek`](Self::peek) for a
+    /// background one — the lookup half of
+    /// [`admits_current_thread`](Self::admits_current_thread). Returns the
+    /// decision too, so the caller's insert on a miss follows the same one.
+    #[inline]
+    pub(crate) fn lookup(
+        &self,
+        file_id: u64,
+        off: u64,
+        domain: BlockDomain,
+    ) -> (Option<Arc<[u8]>>, bool) {
+        if self.admits_current_thread() {
+            (self.get(file_id, off, domain), true)
+        } else {
+            (self.peek(file_id, off, domain), false)
         }
     }
 
@@ -638,5 +714,45 @@ mod tests {
         let st = c.stats();
         assert!(st.evictions > 0);
         assert_eq!(st.evictions + st.entries as u64, 200);
+    }
+
+    /// A peek finds the entry but neither counts nor sets the reference bit,
+    /// so the next sweep evicts an entry only a background scan touched.
+    #[test]
+    fn peek_neither_counts_nor_refreshes() {
+        let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
+        c.put(1, 0, BlockDomain::Klog, blk(600, 1));
+        assert!(c.peek(1, 0, BlockDomain::Klog).is_some());
+        assert!(c.peek(2, 0, BlockDomain::Klog).is_none());
+        let st = c.stats();
+        assert_eq!((st.hits, st.misses), (0, 0), "a peek is not a foreground access");
+        let k = c.key(1, 0, BlockDomain::Klog);
+        let shard = c.shard_for(&k).read();
+        assert!(
+            !shard.map[&k].referenced.load(Ordering::Relaxed),
+            "a peek must not give the entry a second chance"
+        );
+    }
+
+    /// The lookup policy follows the thread's IO class, and the opt-in view
+    /// admits everywhere.
+    #[test]
+    fn lookup_admits_only_foreground_unless_opted_in() {
+        use crate::ioctrl::{scoped, IoClass};
+        let c = BlockCache::new(1 << 20);
+        c.put(1, 0, BlockDomain::Klog, blk(10, 1));
+        assert!(c.admits_current_thread(), "test threads are foreground");
+        {
+            let _bg = scoped(IoClass::Compaction);
+            assert!(!c.admits_current_thread());
+            let (hit, admit) = c.lookup(1, 0, BlockDomain::Klog);
+            assert!(hit.is_some() && !admit);
+            let opted = c.namespaced(0).with_background_admission(true);
+            assert!(opted.admits_current_thread());
+            assert!(!c.namespaced(0).admits_current_thread(), "views inherit the policy");
+        }
+        let (hit, admit) = c.lookup(1, 0, BlockDomain::Klog);
+        assert!(hit.is_some() && admit);
+        assert_eq!(c.stats().hits, 1, "only the foreground lookup counted");
     }
 }

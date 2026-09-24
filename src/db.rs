@@ -1704,12 +1704,19 @@ impl OpenResources {
         let (file_cache, block_cache, tables) = match &read_lease {
             Some(lease) => (
                 lease.file_cache(),
-                Arc::new(lease.block_cache()),
+                Arc::new(
+                    lease
+                        .block_cache()
+                        .with_background_admission(opts.admit_background_scan_blocks),
+                ),
                 Arc::new(lease.table_cache()),
             ),
             None => (
                 Arc::new(FileCache::new(opts.max_open_sstables.max(1))),
-                Arc::new(BlockCache::new(opts.block_cache_size as i64)),
+                Arc::new(
+                    BlockCache::new(opts.block_cache_size as i64)
+                        .with_background_admission(opts.admit_background_scan_blocks),
+                ),
                 Arc::new(crate::table_cache::TableCache::with_byte_budget(
                     opts.max_open_readers,
                     opts.max_open_reader_bytes,

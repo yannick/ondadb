@@ -363,6 +363,29 @@ has always given. The first read of every frame still verifies, and a frame that
 fails verification is never marked, so corruption is reported on every read
 (`tests/sst.rs::corrupt_vlog_value_is_detected_on_every_read`).
 
+## Background reads do not admit into the block cache (plan C P2)
+
+A compaction reads every block of its inputs exactly once, and nothing asks for
+those blocks again: the inputs are retired when the job installs. Admitting
+them into the shared block cache can therefore only evict blocks a foreground
+reader wants. With a 256 KiB cache and a family ~17× that size being compacted
+beside a small hot family, the old policy evicted the entire hot set
+(`tests/cache_admission.rs`, control arm); the new one evicts nothing.
+
+The rule (wavesdb `ac16c8a`): a read on a thread whose `ioctrl` class is not
+`Foreground` uses `BlockCache::peek` — it is served by a resident block for
+free, but its hit sets no CLOCK reference bit and its miss inserts nothing —
+and neither is counted, so `DbStats::block_cache_hits`/`misses` describe
+foreground demand only. The thread class is already set wherever background
+work starts (the worker spawn, `run_manual`, span workers, ingest), and a
+reader is shared through the table cache between foreground and background
+callers, so the policy keys off the thread rather than off the reader.
+`Options::admit_background_scan_blocks = true` restores the old policy for A/B
+runs. Under `mmap-reads` an uncompressed block never touches the cache at all,
+so the change matters there only for compressed blocks and cached vlog
+values. A compaction pins each block for its whole walk over it, so not
+caching a block it missed never costs it a second read.
+
 ## Prefix-delta data blocks: why they are opt-in (2.1)
 
 `ColumnFamilyConfig::enable_prefix_delta_keys` (default `false`) stores each

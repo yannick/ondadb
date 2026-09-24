@@ -186,6 +186,13 @@ pub struct DbStats {
     /// Bytes of the block cache currently held by decoded vlog values — the
     /// capacity vlog admission is taking from klog data blocks.
     pub vlog_cache_bytes: i64,
+    /// Entries (either domain) the block cache evicted to stay under
+    /// capacity. With background admission off (the default,
+    /// [`Options::admit_background_scan_blocks`](crate::Options::admit_background_scan_blocks))
+    /// only foreground reads insert, so compaction cannot drive this up.
+    pub block_cache_evictions: u64,
+    /// Bytes the block cache currently holds, both domains.
+    pub block_cache_bytes: i64,
 }
 
 impl ColumnFamily {
@@ -273,6 +280,8 @@ impl DB {
             vlog_cache_hits: bc.vlog_hits,
             vlog_cache_misses: bc.vlog_misses,
             vlog_cache_bytes: bc.vlog_bytes,
+            block_cache_evictions: bc.evictions,
+            block_cache_bytes: bc.bytes,
         }
     }
 

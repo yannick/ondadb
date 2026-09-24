@@ -362,6 +362,24 @@ pub struct Options {
     /// **Not persisted.** It is a policy of this process, not of the stored
     /// data, and already-folded entries stay folded either way.
     pub enable_merge_folding: bool,
+    /// Let **background** reads — compaction and its span workers, the part
+    /// mover, ingest validation — insert the blocks and vlog values they miss
+    /// into the block cache (default `false`).
+    ///
+    /// Such a reader walks every block of a table exactly once and never asks
+    /// for it again, so admitting them can only evict blocks a foreground
+    /// reader does want: one large compaction cycled the whole cache and
+    /// handed the hot set back cold. With the default, background reads still
+    /// read *through* the cache (a block a point read already paid for is
+    /// served to the scan for free), but a hit does not refresh the entry's
+    /// recency and a miss is not inserted, so what stays resident reflects
+    /// foreground demand. Foreground point reads and iterators always admit.
+    /// Ported from wavesdb `ac16c8a` (`AdmitBackgroundScanBlocks`).
+    ///
+    /// Set it `true` to compare the two policies on one binary, or if a
+    /// workload depends on the old behaviour. **Not persisted**: a cache policy
+    /// of this process, not a property of the stored data.
+    pub admit_background_scan_blocks: bool,
     /// Bandwidth ceiling for *background* IO — flush, compaction and the part
     /// mover — in bytes per second. `0` (the default) is unlimited, and costs
     /// exactly one nil check per read/write: no limiter object is built.
@@ -799,6 +817,7 @@ impl Default for Options {
             partition_fns: Vec::new(),
             merge_fns: Vec::new(),
             enable_merge_folding: true,
+            admit_background_scan_blocks: false,
             background_io_bytes_per_second: 0, // unlimited: no limiter object
             background_io_burst_bytes: 0,
             obsolete_delete_bytes_per_second: 0, // unlink inline: no worker thread
