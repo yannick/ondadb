@@ -559,6 +559,30 @@ pub struct Options {
     ///
     /// **Not persisted.** Host policy.
     pub max_concurrent_block_reads: usize,
+    /// Directory of a **local disk cache** in front of remote tiers' range
+    /// reads (wavesdb `LocalCachePath`, plan C P8). `None` (the default)
+    /// builds none.
+    ///
+    /// Every tier that is not a plain local directory — S3, and
+    /// [`TierDef::custom`] backends (including an `open_remote_checkpoint`
+    /// mount) — reads its SSTable objects (`.klog` / `.vlog`, immutable once
+    /// written) through the cache: a range read the cache holds is served from
+    /// a local file, a miss is fetched and admitted. It sits below the
+    /// in-memory block cache, so it pays for itself on blocks that memory
+    /// evicted and on every read after a restart. Everything else a tier holds
+    /// reads through. See [`crate::local_cache`] for the entry format, the
+    /// checksum every entry carries (a torn or corrupt entry is a miss, never
+    /// wrong bytes) and how entries are namespaced per database incarnation.
+    ///
+    /// The directory may be shared by many databases (entries are keyed by
+    /// [`read_cache_namespace`](Self::read_cache_namespace), or by the
+    /// database directory and the identity of its `LOCK` file). It must not be
+    /// inside a database directory. **Not persisted.**
+    pub local_cache_path: Option<String>,
+    /// Byte bound of [`local_cache_path`](Self::local_cache_path), counting
+    /// whole entry files; least-recently-used entries are evicted past it.
+    /// `0` = unbounded. A smaller bound given to a later open applies at once.
+    pub local_cache_max_bytes: u64,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -858,6 +882,8 @@ impl Default for Options {
             read_cache_namespace: None,
             wal_write_buffer_size: 0,
             max_concurrent_block_reads: 8,
+            local_cache_path: None,
+            local_cache_max_bytes: 0,
         }
     }
 }

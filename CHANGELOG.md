@@ -187,6 +187,20 @@ directory written by this release is not readable by 0.9.x. The crate is still
   `onda_bench -wal_buffer <bytes>`. Provisional (loaded machine, 5 runs,
   1 thread, 1 put per commit, 200k ops, `SyncMode::None`): 8.6k–32k ops/s
   unbuffered vs 166k–387k ops/s with 256 KiB.
+- **Local disk cache for remote tiers** (wavesdb `LocalCachePath`, `f28aecc`,
+  plan C P8): `Options::local_cache_path` / `local_cache_max_bytes` (bytes,
+  `0` = unbounded; not persisted). Every non-local tier (S3, custom, remote
+  checkpoint mounts) reads its `.klog`/`.vlog` range reads through a bounded,
+  LRU, on-disk cache below the block cache, so blocks evicted from memory and
+  every read after a restart skip the range GET. Each entry file carries its
+  key and a CRC32-C; a torn or corrupt entry is a miss that reads through and
+  heals, never wrong bytes. Entries are namespaced by `read_cache_namespace`
+  or by the directory plus its `LOCK` file's identity, so a re-created
+  database never sees its predecessor's entries. New module `local_cache`
+  (`DiskCache`, `CachedStorage`, `LocalCacheStats`), `DB::local_cache_stats`.
+  Verified against MinIO (`tests/s3_tier.rs`,
+  `local_disk_cache_serves_s3_blocks_across_restart`: zero range GETs on a
+  warm restart with the block cache off).
 - **Bloom auto-allocation** (wavesdb `BloomAutoAllocate`, plan C P7):
   `ColumnFamilyConfig::bloom_auto_allocate` (default `false`) sizes each new
   table's filter at `bloom_fpr × level_size_ratio^(level − bottom)`, floored

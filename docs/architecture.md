@@ -33,6 +33,7 @@ type/function names — grep for them; line numbers rot.
 | `manifest_edit.rs` | Numbered catalog edits (2.2): `VersionEdit`/`Op` codec, all-or-nothing `apply_edit` with per-op preconditions, the `MANIFEST-EDITS` log writer, the four-step snapshot-compaction protocol and `recover_catalog` |
 | `storage.rs` | `Storage`/`ReadHandle`/`StorageWriter` traits, `LocalStorage`, `TierRegistry` — the choke point all SSTable file access flows through so parts can live on multiple tiers |
 | `storage_s3.rs` | *(feature `s3`)* `S3Storage`: object-store backend — range-GET reads, single-PUT writes, own tokio runtime |
+| `local_cache.rs` | Local disk cache for remote tiers (P8, `Options::local_cache_path`): `DiskCache` (bounded, LRU, CRC32-C-verified entry files, one instance per directory per process) and `CachedStorage`, the `Storage` decorator `build_tier_registry` wraps around every non-local tier; table objects only |
 | `parts.rs` | Part lifecycle: `detach_part`/`attach_part`/`freeze_part`, `move_part_to_tier`, the policy-driven part mover, live partition-rule add/remove |
 | `unified.rs` | Optional shared memtable+WAL across CFs (8-byte CF-id key prefix); split flush |
 | `ioctrl.rs` | Background IO classes (`IoClass` in a thread-local, `scoped` guards) and the `IoLimiter` trait with a work-conserving `TokenBucket` on an injectable `Clock`; bounds flush/compaction bandwidth so it cannot inflate foreground p99 |

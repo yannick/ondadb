@@ -449,6 +449,9 @@ pub struct DbInner {
     /// what lets the resources purge this database's namespace and, once
     /// closing, empty the shared caches.
     read_lease: Mutex<Option<crate::read_resources::ReadLease>>,
+    /// The local disk cache remote tiers read through
+    /// ([`Options::local_cache_path`]), or `None`.
+    local_cache: Option<Arc<crate::local_cache::DiskCache>>,
 
     /// Fail-stop flag: tripped by any durability failure (WAL fsync, background
     /// flush, manifest persist); checked at every write commit.
@@ -1681,6 +1684,7 @@ struct OpenResources {
     block_cache: Arc<BlockCache>,
     tables: Arc<crate::table_cache::TableCache>,
     read_lease: Option<crate::read_resources::ReadLease>,
+    local_cache: Option<Arc<crate::local_cache::DiskCache>>,
     flush_tx: Sender<FlushJob>,
     flush_rx: Receiver<FlushJob>,
     compact_tx: Sender<Arc<ColumnFamily>>,
@@ -1716,7 +1720,14 @@ impl OpenResources {
                 )),
             ),
         };
-        let tiers = build_tier_registry(opts, dir, file_cache)?;
+        let local_cache = match &opts.local_cache_path {
+            Some(path) => Some(crate::local_cache::DiskCache::open(
+                path,
+                opts.local_cache_max_bytes,
+            )?),
+            None => None,
+        };
+        let tiers = build_tier_registry(opts, dir, file_cache, local_cache.as_ref())?;
         let (flush_tx, flush_rx) = unbounded::<FlushJob>();
         let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
         Ok(Self {
@@ -1724,6 +1735,7 @@ impl OpenResources {
             block_cache,
             tables,
             read_lease,
+            local_cache,
             flush_tx,
             flush_rx,
             compact_tx,
@@ -1756,7 +1768,11 @@ fn build_tier_registry(
     opts: &Options,
     dir: &str,
     file_cache: Arc<FileCache>,
+    local_cache: Option<&Arc<crate::local_cache::DiskCache>>,
 ) -> Result<Arc<crate::storage::TierRegistry>> {
+    // Computed once, only if some tier will use it: it reads the LOCK file,
+    // which `DB::open` has created by now.
+    let mut cache_ns: Option<String> = None;
     // The default tier permits mmap when built; named local tiers honor their
     // flag so a slow mount can force positioned reads. "ssd" aliases default.
     let default = crate::storage::LocalStorage::new(file_cache.clone(), true);
@@ -1773,6 +1789,25 @@ fn build_tier_registry(
             crate::config::TierBackend::S3(config) => crate::storage_s3::S3Storage::new(config)?,
             // The embedder owns the construction and wrapping of custom stores.
             crate::config::TierBackend::Custom(storage) => storage.clone(),
+        };
+        // Remote tiers (anything but a plain local directory) read through
+        // the local disk cache when one is configured (P8).
+        let storage = match (local_cache, &tier.backend) {
+            (Some(cache), backend) if !matches!(backend, crate::config::TierBackend::Local) => {
+                let ns = match &cache_ns {
+                    Some(ns) => ns.clone(),
+                    None => {
+                        let ns = crate::local_cache::namespace_for(
+                            opts.read_cache_namespace.as_deref(),
+                            dir,
+                        )?;
+                        cache_ns = Some(ns.clone());
+                        ns
+                    }
+                };
+                crate::local_cache::CachedStorage::new(storage, cache.clone(), ns)
+            }
+            _ => storage,
         };
         extra.push((tier.name.clone(), tier.root.clone(), storage));
     }
@@ -1815,6 +1850,7 @@ fn build_db_inner(
         block_cache,
         tables,
         read_lease,
+        local_cache,
         flush_tx,
         flush_rx,
         compact_tx,
@@ -1947,6 +1983,7 @@ fn build_db_inner(
         workers: Mutex::new(Vec::new()),
         lock_file: Mutex::new(Some(lock_file)),
         read_lease: Mutex::new(read_lease),
+        local_cache,
         handles: Arc::new(AtomicUsize::new(1)),
         poison,
         clock,
@@ -2825,6 +2862,15 @@ impl DB {
             cf.record_compaction_failure(error);
         }
         result
+    }
+
+    /// Counters of the local disk cache remote tiers read through
+    /// ([`Options::local_cache_path`](crate::Options::local_cache_path)), or
+    /// `None` when none is configured. The cache may be shared with other
+    /// databases of this process that name the same directory; the counters
+    /// are the cache's, not this database's share.
+    pub fn local_cache_stats(&self) -> Option<crate::local_cache::LocalCacheStats> {
+        self.inner.local_cache.as_ref().map(|c| c.stats())
     }
 
     /// Force an fsync of every write-ahead log (all column families plus the

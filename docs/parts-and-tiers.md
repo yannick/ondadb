@@ -483,6 +483,63 @@ the object durable (it runs *before* the manifest flip that publishes it);
 `delete` of a missing object must succeed; implementations must be
 `Send + Sync` — engine threads call concurrently.
 
+## Local disk cache for remote tiers (`Options::local_cache_path`, P8)
+
+The built-in version of the decorator sketched above (wavesdb
+`LocalCachePath`, `f28aecc`). Set a directory — and, usually, a bound:
+
+```rust
+let mut opts = Options::new("/data/db");
+opts.tiers = vec![TierDef::s3("s3", "onda-prod", s3cfg)];
+opts.local_cache_path = Some("/nvme/onda-cache".into());
+opts.local_cache_max_bytes = 50 << 30; // 50 GiB; 0 = unbounded
+```
+
+What it does:
+
+- **Which reads.** Every tier that is not a plain local directory — S3 and
+  `TierDef::custom` backends, including an `open_remote_checkpoint` mount — is
+  wrapped in `local_cache::CachedStorage`. Range reads of **table objects**
+  (`.klog`, `.vlog`) are looked up on local disk first; a miss is fetched from
+  the tier and admitted. Everything else (a remote checkpoint's `MANIFEST`,
+  listings, writes) passes straight through, because only table objects are
+  immutable once written. Reads larger than `local_cache::MAX_ENTRY_BYTES`
+  (4 MiB — whole-object copies during a demotion or checkpoint) are not
+  admitted.
+- **Where it sits.** Below the in-memory block cache: a block memory still
+  holds never reaches it. It pays on blocks memory evicted and on every read
+  after a restart — the second process to open the database reads warm.
+- **Crash safety.** An entry is written to a temp file and renamed into place,
+  never fsynced; each entry file carries its full key and a CRC32-C over
+  everything. A torn, truncated, or bit-flipped entry fails verification, is
+  deleted, and the read goes to the tier — a damaged cache costs GETs, never
+  wrong bytes. (The reader's own per-block CRC still runs on top.) Stray and
+  temp files are removed when the cache is opened.
+- **Namespacing.** Entries are keyed by `(namespace, object path, offset,
+  length)`. The namespace is `Options::read_cache_namespace` when set — the
+  same promise as for `ReadResources`: databases under one name hold
+  byte-identical tables under the same ids — else the database directory's
+  canonical path plus the inode and birth time of its `LOCK` file. The second
+  half matters: a database wiped and re-created in the same directory restarts
+  its table ids and may overwrite its old objects at the same keys, and must not
+  see the old entries (`tests/local_cache.rs`,
+  `a_recreated_database_does_not_see_the_old_entries`).
+- **Bound and eviction.** `local_cache_max_bytes` counts whole entry files;
+  least-recently-used entries are evicted after each admission. Bookkeeping is
+  in memory, rebuilt at open from a directory listing (entries sit in a
+  two-level hex tree named by SHA-256 of the key). A smaller bound on a later
+  open applies at once.
+- **Sharing.** Many databases in one process may name one directory — they
+  share one bound and one bookkeeping (`DiskCache::open` returns the live
+  instance). Two processes may share a directory safely (every entry is
+  verified on read) but each only accounts for what it has seen, so give each
+  process its own directory if the bound matters.
+- **Observability.** `DB::local_cache_stats()` → `LocalCacheStats { entries,
+  bytes, max_bytes, hits, misses, admits, evictions, corrupt }`.
+
+Nothing here is persisted in the database, and the cache directory must not be
+inside a database directory. Deleting it at any time is safe.
+
 ## Shared tiers & attach-by-reference (A2, 0.7.8)
 
 `TierDef::shared()` declares a tier's root shared between databases, enabling

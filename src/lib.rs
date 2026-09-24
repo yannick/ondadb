@@ -76,6 +76,7 @@ pub mod format;
 pub mod ingest;
 pub mod ioctrl;
 pub mod iterator;
+pub mod local_cache;
 #[cfg(feature = "legacy-onda")]
 pub mod legacy_onda;
 pub mod maintenance;
@@ -126,6 +127,7 @@ pub use parts::{
     DetachedPart, MovePhase, MovePhaseEvent, MovePhaseObserver, PartManifest, PartTable,
     PartitionInfo,
 };
+pub use local_cache::LocalCacheStats;
 pub use perf::PerfContext;
 pub use prepared::PreparedInfo;
 pub use read_resources::{ReadResourceOptions, ReadResourceStats, ReadResources};
