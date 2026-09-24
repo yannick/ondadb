@@ -154,6 +154,10 @@ pub(crate) struct CfCtx {
     /// The same committed-span index `DbInner` holds (1.2), so per-family stats
     /// can report its size without reaching for the whole database.
     pub span_index: Arc<crate::span_index::SpanIndex>,
+    /// The on-disk format family this database's files are decoded as.
+    /// [`FormatProfile::Epoch1`](crate::format::FormatProfile::Epoch1) always,
+    /// except for a 0.9 directory opened read-only through `legacy_onda`.
+    pub format: crate::format::FormatProfile,
 }
 
 impl std::fmt::Debug for CfCtx {
@@ -583,6 +587,7 @@ impl ColumnFamily {
             cmp: self.cmp.clone(),
             vlog_cache_limit: self.opts.max_cached_vlog_value_bytes,
             io_limiter: self.ctx.io_limiter.clone(),
+            format: self.ctx.format,
         };
         Arc::new(SstHandle {
             meta,
@@ -593,7 +598,7 @@ impl ColumnFamily {
 
     pub(crate) fn open_reader_for(&self, meta: &SstMeta) -> Result<Arc<Reader>> {
         let storage = self.ctx.tiers.storage_for(meta.tier.as_deref());
-        Reader::open_with_limiter(
+        Reader::open_profiled(
             &self.klog_path_for(meta),
             storage,
             self.ctx.bc.clone(),
@@ -601,6 +606,7 @@ impl ColumnFamily {
             self.cmp.clone(),
             self.opts.max_cached_vlog_value_bytes,
             self.ctx.io_limiter.clone(),
+            self.ctx.format,
         )
     }
 
@@ -618,7 +624,12 @@ impl ColumnFamily {
         let wal = if ctx.read_only {
             None
         } else {
-            let w = Wal::open(&wal0, opts.sync_mode, opts.sync_interval)?;
+            let w = Wal::open(
+                &wal0,
+                opts.sync_mode,
+                opts.sync_interval,
+                crate::wal::SegmentId::per_cf(0),
+            )?;
             w.set_poison(ctx.poison.clone());
             w.set_sync_counter(ctx.wal_syncs.clone());
             Some(Arc::new(w))
@@ -680,6 +691,7 @@ impl ColumnFamily {
     pub(crate) fn load(
         ctx: Arc<CfCtx>,
         name: String,
+        id: u64,
         dir: String,
         opts: ColumnFamilyConfig,
         cmp: ComparatorRef,
@@ -722,6 +734,7 @@ impl ColumnFamily {
                 cmp: cmp.clone(),
                 vlog_cache_limit: opts.max_cached_vlog_value_bytes,
                 io_limiter: ctx.io_limiter.clone(),
+                format: ctx.format,
             };
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),
@@ -741,7 +754,7 @@ impl ColumnFamily {
         for g in &gens {
             let p = format!("{dir}/wal-{g}.log");
             replay_paths.push(p.clone());
-            let last = Wal::replay(&p, |rec| {
+            let mut apply = |rec| {
                 match rec {
                     crate::wal::ReplayRecord::Point(r) => {
                         mem.put(&r.key, r.value, r.seq, r.ttl, r.kind);
@@ -764,7 +777,16 @@ impl ColumnFamily {
                     }
                 }
                 Ok(())
-            })?;
+            };
+            let last = match ctx.format {
+                crate::format::FormatProfile::Epoch1 => {
+                    Wal::replay(&p, crate::wal::SegmentId::per_cf(*g), &mut apply)?
+                }
+                #[cfg(feature = "legacy-onda")]
+                crate::format::FormatProfile::Onda09 => {
+                    crate::legacy_onda::wal::replay(&p, &mut apply)?
+                }
+            };
             max_seq = max_seq.max(last);
         }
 
@@ -773,7 +795,12 @@ impl ColumnFamily {
             (None, replay_paths)
         } else {
             let p = format!("{dir}/wal-{next_gen}.log");
-            let w = Wal::open(&p, opts.sync_mode, opts.sync_interval)?;
+            let w = Wal::open(
+                &p,
+                opts.sync_mode,
+                opts.sync_interval,
+                crate::wal::SegmentId::per_cf(next_gen),
+            )?;
             w.set_poison(ctx.poison.clone());
             w.set_sync_counter(ctx.wal_syncs.clone());
             let w = Arc::new(w);
@@ -785,7 +812,7 @@ impl ColumnFamily {
         let live_partition_rules = RwLock::new(opts.partition_rules.clone());
         let cf = Arc::new(ColumnFamily {
             ctx,
-            id: crate::unified::cf_id(&name),
+            id,
             name,
             dir,
             opts,
@@ -1045,13 +1072,18 @@ impl ColumnFamily {
             let new_wal = if self.ctx.read_only {
                 None
             } else {
-                Wal::open(&new_path, self.opts.sync_mode, self.opts.sync_interval)
-                    .ok()
-                    .map(|w| {
-                        w.set_poison(self.ctx.poison.clone());
-                        w.set_sync_counter(self.ctx.wal_syncs.clone());
-                        Arc::new(w)
-                    })
+                Wal::open(
+                    &new_path,
+                    self.opts.sync_mode,
+                    self.opts.sync_interval,
+                    crate::wal::SegmentId::per_cf(new_gen),
+                )
+                .ok()
+                .map(|w| {
+                    w.set_poison(self.ctx.poison.clone());
+                    w.set_sync_counter(self.ctx.wal_syncs.clone());
+                    Arc::new(w)
+                })
             };
             let mut g = self.rot.lock();
             while g.active_writers > 0 {

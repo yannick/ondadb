@@ -285,6 +285,10 @@ impl TierRegistry {
 
     /// The per-CF directory for `tier`: `<root>/cf-<cf_name>`.
     pub(crate) fn cf_dir(&self, tier: Option<&str>, cf_name: &str) -> String {
-        format!("{}/cf-{}", self.root_for(tier), cf_name)
+        format!(
+            "{}/{}",
+            self.root_for(tier),
+            crate::format::cf_dir_name(cf_name)
+        )
     }
 }

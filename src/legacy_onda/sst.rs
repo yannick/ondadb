@@ -22,9 +22,9 @@
 use std::sync::Arc;
 
 use crate::bloom::{Bloom, HashKind};
-use crate::sst::Reader;
 use crate::encoding::{read_u64, uvarint};
 use crate::error::{OndaError, Result};
+use crate::sst::Reader;
 
 /// Fixed footer width.
 pub const FOOTER_SIZE: usize = 64;
@@ -152,6 +152,40 @@ pub fn parse_footer(tail: &[u8], file_len: u64) -> Result<Footer> {
     })
 }
 
+/// The 0.9 footer, normalized into the shape the shared [`Reader`] works from.
+///
+/// The flag byte's format meaning becomes the fields epoch 1 carries it in:
+/// `EXTENDED_BLOCK`/`PREFIX_DELTA` become capability bits (the entry layout),
+/// `RESTARTS` the trailer switch, `VLOG_V2` the frame version; the aux handle is
+/// present exactly when the table was extended.
+pub(crate) fn table_footer(tail: &[u8], file_len: u64) -> Result<crate::sst::TableFooter> {
+    use crate::sst::{BlockHandle, TableFooter, VlogFrames};
+    let f = parse_footer(tail, file_len)?;
+    let handle = |(offset, length): (u64, u64)| BlockHandle { offset, length };
+    let mut caps = 0u64;
+    if f.extended() {
+        caps |= crate::format::CAP_EXTENDED_RECORDS;
+    }
+    if f.prefix_delta() {
+        caps |= crate::format::CAP_PREFIX_DELTA;
+    }
+    Ok(TableFooter {
+        index: handle(f.index),
+        bloom: f.has_bloom().then(|| handle(f.bloom)),
+        num_entries: f.num_entries,
+        max_seq: f.max_seq,
+        btree: f.btree(),
+        caps,
+        restarts: f.restarts(),
+        vlog: if f.vlog_v2() {
+            VlogFrames::Onda09V2
+        } else {
+            VlogFrames::Onda09V1
+        },
+        aux: f.aux.map(handle),
+    })
+}
+
 /// Open a 0.9 klog (and the vlog beside it) for reading, on local storage with
 /// a private block cache.
 ///
@@ -242,7 +276,8 @@ mod tests {
     fn fixture_footers_decode_to_their_names() {
         for name in KLOGS {
             let b = fixture(name);
-            let f = parse_footer(tail(&b), b.len() as u64).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let f =
+                parse_footer(tail(&b), b.len() as u64).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(f.btree(), name.contains("btree"), "{name}");
             if name.contains("legacy") {
                 assert_eq!(f.restarts(), !name.contains("norestarts"), "{name}");
@@ -270,7 +305,10 @@ mod tests {
         // Unknown flag bit: a newer format, not a damaged one.
         let mut t = tail(&b).to_vec();
         t[n - FOOTER_SIZE + 48] |= 0x40;
-        assert_eq!(parse_footer(&t, len).unwrap_err().kind(), "unsupported_format");
+        assert_eq!(
+            parse_footer(&t, len).unwrap_err().kind(),
+            "unsupported_format"
+        );
         // Prefix-delta without restarts.
         let mut t = tail(&b).to_vec();
         t[n - FOOTER_SIZE + 48] = FLAG_EXTENDED_BLOCK | FLAG_PREFIX_DELTA | FLAG_VLOG_V2;
@@ -314,7 +352,11 @@ mod tests {
             fixture("klog_legacy_flat_restarts_bloom.vlog"),
         )
         .unwrap();
-        let r = open_table(klog.to_str().unwrap(), crate::comparator::default_comparator()).unwrap();
+        let r = open_table(
+            klog.to_str().unwrap(),
+            crate::comparator::default_comparator(),
+        )
+        .unwrap();
         assert!(!r.prefix_delta());
         let open_coded = |raw: &[u8], restarts: &[u8], key: &[u8], seq: u64| -> usize {
             if restarts.len() < 8 {

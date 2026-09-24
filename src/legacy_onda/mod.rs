@@ -109,9 +109,8 @@ pub fn block_payload(buf: &[u8], verify: bool) -> Result<(Compression, &[u8], us
     if buf.len() < BLOCK_HEADER {
         return Err(OndaError::Corruption("0.9 block: short header".into()));
     }
-    let alg = codec(buf[0]).ok_or_else(|| {
-        OndaError::Corruption(format!("0.9 block: bad algorithm {}", buf[0]))
-    })?;
+    let alg = codec(buf[0])
+        .ok_or_else(|| OndaError::Corruption(format!("0.9 block: bad algorithm {}", buf[0])))?;
     let comp_len = read_u32(&buf[1..]) as usize;
     let raw_len = read_u32(&buf[5..]) as usize;
     let want = read_u32(&buf[9..]);
@@ -139,8 +138,64 @@ pub fn recover_catalog(dir: impl AsRef<std::path::Path>) -> Result<crate::manife
     let mut m = edit_log::recover_raw(dir.as_ref())?;
     for cf in &mut m.cfs {
         cf.config = config::decode(&cf.config).encode();
+        // Every 0.9 family's id is the truncated-basis hash, and a 0.9 unified
+        // WAL's keys carry exactly that prefix; pinning it here is what lets
+        // the epoch-1 engine route those records without translating them.
+        cf.unified_id = Some(cf_id_09(&cf.name));
     }
     Ok(m)
+}
+
+/// Whether `dir` holds an ondaDB 0.9 database: a `MANIFEST` whose first four
+/// bytes are 0.9's `WVMF` magic. `false` for a missing manifest (an empty
+/// directory is nobody's format) and for an epoch-1 one.
+pub fn is_legacy_dir(dir: impl AsRef<std::path::Path>) -> Result<bool> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(crate::manifest::manifest_path(dir)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut magic = [0u8; 4];
+    match f.read_exact(&mut magic) {
+        Ok(()) => Ok(read_u32(&magic) == manifest::MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Open an ondaDB 0.9 database **read-only**, through the engine.
+///
+/// The returned [`DB`](crate::DB) is the ordinary engine over a 0.9 directory:
+/// its catalog comes from [`recover_catalog`], its WAL generations replay
+/// through [`wal::replay`] into memtables (per-CF or unified, whichever the
+/// manifest records), and its tables open with the 0.9 decoding profile —
+/// the `WAVESST1` footer, IEEE checksums, 0.9 codec ids and blooms. Gets,
+/// scans, merge folding and range tombstones all work as they did in 0.9.
+///
+/// Nothing is ever written: `opts.read_only` is forced on, and the WAL layout
+/// is taken from the manifest (`opts.unified_memtable` is set to match). The
+/// caller still supplies what 0.9 needed at open — merge operators and
+/// partition functions by name. This is the source side of the epoch-1
+/// auto-upgrade: stream every family out of this handle into an epoch-1
+/// writer.
+///
+/// Refuses a directory that is not a 0.9 database with `InvalidArgs`.
+pub fn open_read_only(mut opts: crate::Options) -> Result<crate::DB> {
+    let dir = std::path::PathBuf::from(&opts.path);
+    if !is_legacy_dir(&dir)? {
+        return Err(OndaError::InvalidArgs(format!(
+            "{}: not an ondaDB 0.9 database (no WVMF MANIFEST)",
+            dir.display()
+        )));
+    }
+    // The layout comes from the recovered catalog, not the bare snapshot: an
+    // edit-log `SetWalLayout` may have flipped it since the last snapshot.
+    let catalog = recover_catalog(&dir)?;
+    opts.read_only = true;
+    opts.migrate_to_unified = false;
+    opts.unified_memtable = catalog.wal_layout == crate::manifest::WalLayout::Unified;
+    crate::DB::open_with_format(opts, crate::format::FormatProfile::Onda09)
 }
 
 #[cfg(test)]
@@ -197,7 +252,9 @@ mod tests {
                 "{name}"
             );
             for cf in &m.cfs {
-                let _ = crate::ColumnFamilyConfig::decode(&cf.config);
+                crate::ColumnFamilyConfig::decode(&cf.config)
+                    .unwrap_or_else(|e| panic!("{name}/{}: {e}", cf.name));
+                assert_eq!(cf.unified_id, Some(cf_id_09(&cf.name)));
             }
         }
     }

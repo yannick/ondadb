@@ -1235,7 +1235,6 @@ mod per_level_tests {
             other => panic!("partition scheme lost: {other:?}"),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1260,10 +1259,7 @@ mod block_size_tests {
             data_block_size: 64 << 10,
             ..ColumnFamilyConfig::default()
         };
-        assert_eq!(
-            decode(&config.enc09()).data_block_size,
-            64 << 10
-        );
+        assert_eq!(decode(&config.enc09()).data_block_size, 64 << 10);
     }
 
     #[test]
@@ -1304,10 +1300,7 @@ mod block_size_tests {
             max_cached_vlog_value_bytes: 1 << 20,
             ..ColumnFamilyConfig::default()
         };
-        assert_eq!(
-            decode(&config.enc09()).max_cached_vlog_value_bytes,
-            1 << 20
-        );
+        assert_eq!(decode(&config.enc09()).max_cached_vlog_value_bytes, 1 << 20);
     }
 
     #[test]
@@ -1328,7 +1321,6 @@ mod block_size_tests {
             PartitionScheme::Unresolved(ref name) if name == "byhash"
         ));
     }
-
 }
 
 #[cfg(test)]

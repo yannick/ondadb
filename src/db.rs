@@ -1141,6 +1141,8 @@ impl DbInner {
                 name: cf.name().to_string(),
                 config: cf.effective_config().encode(),
                 sstables: cf.snapshot_ssts(),
+                // Stored only when it diverges from the name's FNV-1a.
+                unified_id: Some(cf.id()),
             });
         }
         drop(cfs);
@@ -1421,7 +1423,7 @@ impl DbInner {
     }
 
     pub(crate) fn cf_dir(&self, name: &str) -> String {
-        format!("{}/cf-{}", self.dir, name)
+        format!("{}/{}", self.dir, crate::format::cf_dir_name(name))
     }
 
     /// Release every thread parked on the background IO limiter and stop
@@ -1710,6 +1712,7 @@ fn build_db_inner(
     requested_layout: WalLayout,
     lock_file: std::fs::File,
     resources: OpenResources,
+    format: crate::format::FormatProfile,
 ) -> Result<(Arc<DbInner>, WorkerReceivers)> {
     let OpenResources {
         tiers,
@@ -1749,6 +1752,7 @@ fn build_db_inner(
         &closing,
         &poison,
         &wal_syncs,
+        format,
     )?;
     let tables = Arc::new(crate::table_cache::TableCache::with_byte_budget(
         opts.max_open_readers,
@@ -1785,6 +1789,7 @@ fn build_db_inner(
         caps: caps.clone(),
         clock: clock.clone(),
         span_index: span_index.clone(),
+        format,
     });
     let inner = Arc::new(DbInner {
         opts: opts.clone(),
@@ -2005,6 +2010,7 @@ pub(crate) fn prepared_bytes(arena: usize, writes: usize) -> usize {
     arena + writes * std::mem::size_of::<crate::prepared::PreparedWrite>()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_unified_store(
     opts: &Options,
     dir: &str,
@@ -2013,6 +2019,7 @@ fn open_unified_store(
     closing: &Arc<AtomicBool>,
     poison: &Arc<crate::util::Poison>,
     wal_syncs: &Arc<AtomicU64>,
+    format: crate::format::FormatProfile,
 ) -> Result<(
     Option<Arc<crate::unified::UnifiedStore>>,
     u64,
@@ -2029,6 +2036,7 @@ fn open_unified_store(
         closing.clone(),
         poison.clone(),
         wal_syncs.clone(),
+        format,
     )?;
     Ok((Some(store), max_seq, recovered))
 }
@@ -2039,7 +2047,7 @@ fn recover_column_families(
     opts: &Options,
 ) -> Result<()> {
     for persisted in &manifest.cfs {
-        let mut config = ColumnFamilyConfig::decode(&persisted.config);
+        let mut config = ColumnFamilyConfig::decode(&persisted.config)?;
         let comparator = comparator_by_name(&config.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
         })?;
@@ -2048,6 +2056,7 @@ fn recover_column_families(
         let (cf, max_seq) = ColumnFamily::load(
             inner.ctx.clone(),
             persisted.name.clone(),
+            persisted.effective_unified_id(),
             inner.cf_dir(&persisted.name),
             config,
             comparator,
@@ -2203,6 +2212,24 @@ impl DB {
     /// Open without running layout migration. Kept separate so migration can
     /// recover and flush the legacy layout under the ordinary DB invariants.
     fn open_impl(opts: Options) -> Result<DB> {
+        Self::open_with_format(opts, crate::format::FormatProfile::Epoch1)
+    }
+
+    /// Open a database whose files are in format family `format`.
+    ///
+    /// Anything but [`FormatProfile::Epoch1`](crate::format::FormatProfile)
+    /// is a 0.9 directory read through `legacy_onda`, and only ever read-only:
+    /// this binary cannot write a 0.9 byte, so a writable open of one would
+    /// produce a directory that is neither.
+    pub(crate) fn open_with_format(
+        opts: Options,
+        format: crate::format::FormatProfile,
+    ) -> Result<DB> {
+        if format != crate::format::FormatProfile::Epoch1 && !opts.read_only {
+            return Err(OndaError::InvalidArgs(
+                "a 0.9 database can only be opened read-only".into(),
+            ));
+        }
         std::fs::create_dir_all(&opts.path)?;
         let dir = opts.path.clone();
 
@@ -2224,7 +2251,11 @@ impl DB {
         // The WAL layout is a durable database-wide choice once the catalog
         // contains a column family. Opening under the other layout would make
         // recovery consult one set of WALs while new commits write another.
-        let manifest = crate::manifest_edit::recover_catalog(&dir)?;
+        let manifest = match format {
+            crate::format::FormatProfile::Epoch1 => crate::manifest_edit::recover_catalog(&dir)?,
+            #[cfg(feature = "legacy-onda")]
+            crate::format::FormatProfile::Onda09 => crate::legacy_onda::recover_catalog(&dir)?,
+        };
         let requested_layout = requested_wal_layout(&opts);
         validate_wal_layout(&manifest, requested_layout)?;
         let (inner, receivers) = build_db_inner(
@@ -2234,6 +2265,7 @@ impl DB {
             requested_layout,
             lock_file,
             resources,
+            format,
         )?;
         recover_column_families(&inner, &manifest, &opts)?;
         finish_open(&inner, &manifest, receivers)?;
@@ -3801,7 +3833,7 @@ mod catalog_txn_tests {
             !crate::manifest_edit::edit_log_path(dir.path()).exists(),
             "no capability, no log"
         );
-        assert_eq!(manifest_version(dir.path()), 1);
+        assert_eq!(manifest_caps(dir.path()), 0);
 
         db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
             .unwrap();
@@ -3809,7 +3841,7 @@ mod catalog_txn_tests {
             crate::manifest_edit::edit_log_path(dir.path()).exists(),
             "the capability is durable before the first append, and creates the log"
         );
-        assert_eq!(manifest_version(dir.path()), 2);
+        assert_eq!(manifest_caps(dir.path()), crate::format::CAP_MANIFEST_EDITS);
         db.inner.catalog_txn(add_table(42), |_| {}).unwrap();
         assert_eq!(log_ids(dir.path()), vec![1]);
         db.close().unwrap();
@@ -3846,7 +3878,7 @@ mod catalog_txn_tests {
             db.flush_memtable(&cf).unwrap();
             db.close().unwrap();
         }
-        assert_eq!(manifest_version(dir.path()), 1);
+        assert_eq!(manifest_caps(dir.path()), 0);
         assert!(!crate::manifest_edit::edit_log_path(dir.path()).exists());
         {
             let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
@@ -3889,9 +3921,13 @@ mod catalog_txn_tests {
         db.close().unwrap();
     }
 
-    fn manifest_version(dir: &std::path::Path) -> u32 {
-        let bytes = std::fs::read(manifest_path(dir.to_str().unwrap())).unwrap();
-        u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+    /// The capability word of the manifest on disk. (0.9 bumped the manifest
+    /// version when a capability was enabled; epoch 1 carries the word in a
+    /// fixed header field, so the word itself is what these tests watch.)
+    fn manifest_caps(dir: &std::path::Path) -> u64 {
+        crate::manifest::Manifest::load(manifest_path(dir.to_str().unwrap()))
+            .unwrap()
+            .caps
     }
 
     /// Slice 8's last row, which only becomes checkable once the call sites are
@@ -4429,7 +4465,10 @@ mod tests {
             scope.spawn(|| {
                 done_tx.send(db.flush_memtable(&a)).unwrap();
             });
-            let completed = done_rx.recv_timeout(Duration::from_secs(1));
+            // Generous: the wait under test is unbounded without the fix, and
+            // a rotation fsyncs each new WAL stripe's header, which a loaded
+            // test machine can stretch well past a second.
+            let completed = done_rx.recv_timeout(Duration::from_secs(20));
             // Always release the artificial work before asserting, so the old
             // implementation can exit and the scoped thread cannot deadlock.
             db.inner.pending_flush.fetch_sub(1, Ordering::SeqCst);

@@ -142,7 +142,9 @@ fn klog_names() -> Vec<String> {
     for btree in ["flat", "btree"] {
         for restarts in ["norestarts", "restarts"] {
             for bloom in ["nobloom", "bloom"] {
-                out.push(format!("phase1/klog_legacy_{btree}_{restarts}_{bloom}.klog"));
+                out.push(format!(
+                    "phase1/klog_legacy_{btree}_{restarts}_{bloom}.klog"
+                ));
             }
         }
     }
@@ -190,6 +192,7 @@ fn manifest_base() -> Manifest {
                         ..Default::default()
                     },
                 ],
+                unified_id: None,
             },
             CfManifest {
                 name: "other".into(),
@@ -206,6 +209,7 @@ fn manifest_base() -> Manifest {
                     max_key: b"c".to_vec(),
                     ..Default::default()
                 }],
+                unified_id: None,
             },
         ],
     }
@@ -267,7 +271,10 @@ fn wal_corpus_replays_through_the_0_9_decoder() {
     let tmp = tempfile::tempdir().unwrap();
     // Every writer-produced flag combination, one frame each; and the same
     // records as a schema-1 envelope.
-    for rel in ["phase1/wal_legacy_all_flags.bin", "phase1/wal_v2_envelope_schema1.bin"] {
+    for rel in [
+        "phase1/wal_legacy_all_flags.bin",
+        "phase1/wal_v2_envelope_schema1.bin",
+    ] {
         let recs = replay_fixture(tmp.path(), rel).unwrap();
         let expect = wal_all_flags_records();
         assert_eq!(recs.len(), expect.len(), "{rel}");
@@ -487,7 +494,11 @@ fn block_corpus_decodes_by_hand_and_through_the_0_9_reader() {
     }
 
     let want: Vec<_> = block_entries();
-    for rel in ["blocks/legacy_restarts.klog", "blocks/legacy_no_trailer.klog", "blocks/delta.klog"] {
+    for rel in [
+        "blocks/legacy_restarts.klog",
+        "blocks/legacy_no_trailer.klog",
+        "blocks/delta.klog",
+    ] {
         let r = open_klog(tmp.path(), rel);
         assert_eq!(scan_all(&r), want, "{rel}");
     }
@@ -510,4 +521,164 @@ fn database_catalogs_recover() {
         got.sort();
         assert_eq!(got, cfs, "{name}");
     }
+}
+
+/// The merge operator `db-caps` was written with (see the generator).
+#[derive(Debug)]
+struct Concat;
+
+impl ondadb::MergeOperator for Concat {
+    fn name(&self) -> &str {
+        "fixture.concat.v1"
+    }
+    fn full_merge(
+        &self,
+        _key: &[u8],
+        existing: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> Result<Vec<u8>, String> {
+        let mut out = existing.map(|b| b.to_vec()).unwrap_or_default();
+        for op in operands {
+            if !out.is_empty() {
+                out.push(b'|');
+            }
+            out.extend_from_slice(op);
+        }
+        Ok(out)
+    }
+}
+
+/// Copy a fixture directory somewhere writable: even a read-only open takes a
+/// shared lock on `LOCK`, and the committed fixtures must never change.
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        let to = dst.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), &to).unwrap();
+        }
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// What 0.9.1 itself read from a fixture, per family, as `expected.txt` holds
+/// it: `key-hex value-len sha256(value)-hex`.
+fn expected_scan(name: &str) -> Vec<(String, Vec<String>)> {
+    let text = String::from_utf8(fixture(&format!("{name}/expected.txt"))).unwrap();
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in text.lines() {
+        if let Some(cf) = line.strip_prefix("cf ") {
+            out.push((cf.to_string(), Vec::new()));
+        } else {
+            out.last_mut().unwrap().1.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// The acceptance test for the read-only path the auto-upgrade builds on:
+/// every 0.9.1 directory opens through `legacy_onda::open_read_only`, and a
+/// full scan of every family — tables, WAL-only tail, merge operands, range
+/// tombstones, TTLs, the unified layout's 0.9 cf ids — reads exactly what
+/// 0.9.1 read before the crash image was taken.
+#[test]
+fn database_directories_open_read_only_and_scan_equal() {
+    for name in ["db-percf", "db-caps", "db-unified"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(name);
+        copy_dir(&fixture_root().join(name), &dir);
+        let mut opts = ondadb::Options::new(dir.to_str().unwrap());
+        opts.merge_fns = vec![Arc::new(Concat)];
+        let db = legacy_onda::open_read_only(opts).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (cf_name, want) in expected_scan(name) {
+            let cf = db
+                .get_column_family(&cf_name)
+                .unwrap_or_else(|| panic!("{name}: no family {cf_name}"));
+            let txn = db.begin();
+            let mut it = txn.new_iterator(&cf);
+            it.seek_to_first();
+            let mut got = Vec::new();
+            while it.valid() {
+                let digest = <sha2::Sha256 as sha2::Digest>::digest(it.value());
+                got.push(format!(
+                    "{} {} {}",
+                    hex(it.key()),
+                    it.value().len(),
+                    hex(&digest)
+                ));
+                it.next();
+            }
+            assert!(it.err().is_none(), "{name}/{cf_name}: {:?}", it.err());
+            assert_eq!(got.len(), want.len(), "{name}/{cf_name}: row count");
+            assert_eq!(got, want, "{name}/{cf_name}");
+            // And point reads agree with the scan.
+            if let Some(first) = want.first() {
+                let key: Vec<u8> = (0..first.find(' ').unwrap() / 2)
+                    .map(|i| u8::from_str_radix(&first[2 * i..2 * i + 2], 16).unwrap())
+                    .collect();
+                assert!(db.get(&cf, &key).is_ok(), "{name}/{cf_name}: point read");
+            }
+        }
+        // A 0.9 handle writes nothing: a write on a read-only handle is the
+        // engine's usual no-op, and the byte comparison below proves no file
+        // was touched by it, by replay, or by close.
+        let cf = db.list_column_families().pop().unwrap();
+        let cf = db.get_column_family(&cf).unwrap();
+        let _ = db.put(&cf, b"x", b"y", std::time::Duration::ZERO);
+        db.close().unwrap();
+        // The directory is byte-for-byte what was copied in, apart from LOCK.
+        for e in std::fs::read_dir(fixture_root().join(name)).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_file() {
+                assert_eq!(
+                    std::fs::read(e.path()).unwrap(),
+                    std::fs::read(dir.join(e.file_name())).unwrap(),
+                    "{name}: {:?} changed",
+                    e.file_name()
+                );
+            }
+        }
+    }
+}
+
+/// `open_read_only` refuses a directory that is not a 0.9 database, and a
+/// 0.9 table cannot sneak into an epoch-1 reader.
+#[test]
+fn legacy_open_refuses_non_legacy_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let epoch1 = tmp.path().join("epoch1");
+    {
+        let db = ondadb::DB::open(ondadb::Options::new(epoch1.to_str().unwrap())).unwrap();
+        db.create_column_family("a", ondadb::ColumnFamilyConfig::default())
+            .unwrap();
+        db.close().unwrap();
+    }
+    assert!(!legacy_onda::is_legacy_dir(&epoch1).unwrap());
+    let err = legacy_onda::open_read_only(ondadb::Options::new(epoch1.to_str().unwrap()))
+        .expect_err("an epoch-1 directory is not a 0.9 one");
+    assert_eq!(err.kind(), "invalid_args");
+    assert!(legacy_onda::is_legacy_dir(fixture_root().join("db-percf")).unwrap());
+
+    // A 0.9 klog through the epoch-1 reader is a named refusal.
+    let klog = tmp.path().join("t.klog");
+    std::fs::write(&klog, fixture("phase1/klog_extended.klog")).unwrap();
+    let err = Reader::open(
+        klog.to_str().unwrap(),
+        ondadb::storage::LocalStorage::new(
+            Arc::new(ondadb::cache::FileCache::new(4)),
+            cfg!(feature = "mmap-reads"),
+        ),
+        Arc::new(ondadb::cache::BlockCache::new(1 << 20)),
+        1,
+        default_comparator(),
+        0,
+    )
+    .expect_err("a 0.9 table must not open as epoch 1");
+    assert_eq!(err.kind(), "unsupported_format");
 }

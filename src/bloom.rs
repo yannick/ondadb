@@ -1,24 +1,33 @@
 //! Bloom filter for SSTable negative lookups.
 //!
 //! Classic Bloom filter with `k` hash functions over `m` bits using double
-//! hashing derived from a single 64-bit FNV-1a key hash.  It
-//! is built during SSTable construction and consulted before reading data
-//! blocks.  Two serializations are provided: a dense form and a sparse form
-//! (only non-zero words, with indices)
+//! hashing derived from a single 64-bit xxh3 key hash. It is built during
+//! SSTable construction and consulted before reading data blocks.
+//!
+//! Epoch-1 encoding (a meta block, referenced by the footer):
+//!
+//! ```text
+//! hash u8 = 1 (xxh3-64) | m uvarint | k uvarint | words u64 LE × ceil(m / 64)
+//! ```
+//!
+//! The hash byte **leads** — wavesdb's layout, which epoch 1 adopted; 0.9 put a
+//! tag at the end and read its absence as FNV. The hash, the probing and the bit
+//! order were already identical in both engines. A 0.9 filter is decoded only by
+//! `legacy_onda::sst::decode_bloom`.
 
 use crate::encoding::{append_u64, append_uvarint, read_u64, uvarint};
 use crate::error::{OndaError, Result};
+use crate::format::BLOOM_HASH_XXH3;
 
-/// Which hash function a filter's bits were built with. Legacy filters
-/// (encoded without a trailing hash tag) use byte-at-a-time FNV-1a; new
-/// filters use xxh3, which processes the key in wide lanes and is several
-/// times cheaper for long keys.
+/// Which hash function a filter's bits were built with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashKind {
-    /// 0.9's FNV-1a with the truncated offset basis
-    /// ([`crate::legacy_onda::fnv1a64_09`]).
-    Fnv09,
+    /// xxh3-64, seed 0 — the only hash epoch 1 writes.
     Xxh3,
+    /// 0.9's FNV-1a with the truncated offset basis, readable only through
+    /// `legacy_onda` ([`crate::legacy_onda::fnv1a64_09`]).
+    #[cfg(feature = "legacy-onda")]
+    Fnv09,
 }
 
 /// A built or loaded Bloom filter.
@@ -30,31 +39,21 @@ pub struct Bloom {
     hash: HashKind,
 }
 
+/// Largest `k` a writer produces, and a decoder accepts.
+const MAX_K: u64 = 30;
+
 /// Compute `(m, k)` for `n` expected entries at false-positive rate `fpr`.
 fn bloom_params(n: usize, fpr: f64) -> (u64, u32) {
     let n = n.max(1) as f64;
     let fpr = if fpr <= 0.0 || fpr >= 1.0 { 0.01 } else { fpr };
     const LN2: f64 = std::f64::consts::LN_2;
     let mf = -n * fpr.ln() / (LN2 * LN2);
-    let mut m = mf as u64 + 1;
-    if m < 64 {
-        m = 64;
-    }
+    // Probing reduces modulo `m` as a u32, so a filter never has 2^32 bits or
+    // more (512 MiB of filter — far past any table's).
+    let m = (mf as u64 + 1).clamp(64, u64::from(u32::MAX));
     let kf = (mf / n) * LN2;
-    let k = ((kf + 0.5) as u32).clamp(1, 30);
+    let k = ((kf + 0.5) as u32).clamp(1, MAX_K as u32);
     (m, k)
-}
-
-/// 64-bit FNV-1a hash; stable across processes and platforms.
-fn hash_key(key: &[u8]) -> u64 {
-    const OFFSET: u64 = 1469598103934665603;
-    const PRIME: u64 = 1099511628211;
-    let mut h = OFFSET;
-    for &c in key {
-        h ^= u64::from(c);
-        h = h.wrapping_mul(PRIME);
-    }
-    h
 }
 
 /// The hash a filter built by [`Bloom::new`] will use.
@@ -99,8 +98,9 @@ impl Bloom {
     #[inline]
     pub fn hash_of(&self, key: &[u8]) -> u64 {
         match self.hash {
-            HashKind::Fnv09 => hash_key(key),
             HashKind::Xxh3 => xxhash_rust::xxh3::xxh3_64(key),
+            #[cfg(feature = "legacy-onda")]
+            HashKind::Fnv09 => crate::legacy_onda::fnv1a64_09(key),
         }
     }
 
@@ -147,113 +147,58 @@ impl Bloom {
         self.m
     }
 
-    /// Dense serialization: `m(uvarint) | k(uvarint) | words(LE u64...) |
-    /// hash_id(u8)`. The trailing hash tag is absent in legacy encodings, which
-    /// implies FNV; decoders that predate it ignore trailing bytes.
+    /// The epoch-1 encoding: `hash u8 | m uvarint | k uvarint | words u64 LE`.
     pub fn encode(&self) -> Vec<u8> {
+        debug_assert_eq!(
+            self.hash,
+            HashKind::Xxh3,
+            "epoch 1 writes xxh3 filters only"
+        );
         let mut dst = Vec::with_capacity(17 + self.bits.len() * 8);
+        dst.push(BLOOM_HASH_XXH3);
         append_uvarint(&mut dst, self.m);
         append_uvarint(&mut dst, u64::from(self.k));
         for &w in &self.bits {
             append_u64(&mut dst, w);
         }
-        dst.push(hash_id(self.hash));
         dst
     }
 
-    /// Decode a dense-encoded filter.
-    pub fn decode(mut p: &[u8]) -> Result<Bloom> {
-        let corrupt = || OndaError::Corruption("bloom: truncated".into());
-        let (m, n) = uvarint(p).ok_or_else(corrupt)?;
+    /// Decode an epoch-1 filter.
+    ///
+    /// Strict: a hash id other than xxh3 is `UnsupportedFormat` (0.9's FNV id
+    /// included — such a filter belongs to a 0.9 table), and `m` outside
+    /// `[1, 2^32)`, `k` outside `[1, 30]`, missing words or trailing bytes are
+    /// `Corruption`.
+    pub fn decode(p: &[u8]) -> Result<Bloom> {
+        let corrupt = |what: &str| OndaError::Corruption(format!("bloom: {what}"));
+        let (&hash, mut p) = p.split_first().ok_or_else(|| corrupt("empty block"))?;
+        if hash != BLOOM_HASH_XXH3 {
+            return Err(OndaError::UnsupportedFormat(format!(
+                "bloom hash id {hash} is not implemented by this binary"
+            )));
+        }
+        let (m, n) = uvarint(p).ok_or_else(|| corrupt("truncated m"))?;
         p = &p[n..];
-        let (k, n) = uvarint(p).ok_or_else(corrupt)?;
+        let (k, n) = uvarint(p).ok_or_else(|| corrupt("truncated k"))?;
         p = &p[n..];
+        if m == 0 || m > u64::from(u32::MAX) {
+            return Err(corrupt("bit count outside [1, 2^32)"));
+        }
+        if k == 0 || k > MAX_K {
+            return Err(corrupt("hash count outside [1, 30]"));
+        }
         let words = m.div_ceil(64) as usize;
-        if p.len() < words * 8 {
-            return Err(corrupt());
+        if p.len() != words * 8 {
+            return Err(corrupt("word array length disagrees with m"));
         }
-        let mut bits = vec![0u64; words];
-        for (i, slot) in bits.iter_mut().enumerate() {
-            *slot = read_u64(&p[i * 8..]);
-        }
-        let hash = hash_kind(p.get(words * 8).copied())?;
+        let bits = (0..words).map(|i| read_u64(&p[i * 8..])).collect();
         Ok(Bloom {
             bits,
             m,
             k: k as u32,
-            hash,
+            hash: HashKind::Xxh3,
         })
-    }
-
-    /// Sparse serialization: only non-zero words are written,
-    /// each preceded by its index.  Far smaller for mostly-empty filters.
-    ///
-    /// Format: `m(uvarint) | k(uvarint) | total_words(uvarint) |
-    /// nonzero_count(uvarint) | [idx(uvarint) word(LE u64)]... | hash_id(u8)`
-    /// (the trailing hash tag is absent in legacy encodings, implying FNV).
-    pub fn encode_sparse(&self) -> Vec<u8> {
-        let nonzero: Vec<(usize, u64)> = self
-            .bits
-            .iter()
-            .enumerate()
-            .filter(|(_, &w)| w != 0)
-            .map(|(i, &w)| (i, w))
-            .collect();
-        let mut dst = Vec::with_capacity(24 + nonzero.len() * 10);
-        append_uvarint(&mut dst, self.m);
-        append_uvarint(&mut dst, u64::from(self.k));
-        append_uvarint(&mut dst, self.bits.len() as u64);
-        append_uvarint(&mut dst, nonzero.len() as u64);
-        for (i, w) in nonzero {
-            append_uvarint(&mut dst, i as u64);
-            append_u64(&mut dst, w);
-        }
-        dst.push(hash_id(self.hash));
-        dst
-    }
-
-    /// Decode a sparse-encoded filter.
-    pub fn decode_sparse(mut p: &[u8]) -> Result<Bloom> {
-        let corrupt = || OndaError::Corruption("bloom: truncated (sparse)".into());
-        let take = |p: &mut &[u8]| -> Result<u64> {
-            let (v, n) = uvarint(p).ok_or_else(corrupt)?;
-            *p = &p[n..];
-            Ok(v)
-        };
-        let m = take(&mut p)?;
-        let k = take(&mut p)? as u32;
-        let total_words = take(&mut p)? as usize;
-        let nonzero = take(&mut p)? as usize;
-        let mut bits = vec![0u64; total_words];
-        for _ in 0..nonzero {
-            let idx = take(&mut p)? as usize;
-            if p.len() < 8 || idx >= total_words {
-                return Err(corrupt());
-            }
-            bits[idx] = read_u64(p);
-            p = &p[8..];
-        }
-        let hash = hash_kind(p.first().copied())?;
-        Ok(Bloom { bits, m, k, hash })
-    }
-}
-
-fn hash_id(h: HashKind) -> u8 {
-    match h {
-        HashKind::Fnv09 => 0,
-        HashKind::Xxh3 => 1,
-    }
-}
-
-/// Map an encoded hash tag back to a [`HashKind`]; `None` (no trailing byte)
-/// is the legacy FNV encoding.
-fn hash_kind(id: Option<u8>) -> Result<HashKind> {
-    match id {
-        None | Some(0) => Ok(HashKind::Fnv09),
-        Some(1) => Ok(HashKind::Xxh3),
-        Some(other) => Err(OndaError::Corruption(format!(
-            "bloom: unknown hash id {other}"
-        ))),
     }
 }
 
@@ -293,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_round_trip() {
+    fn round_trip() {
         let mut b = Bloom::new(500, 0.01);
         for i in 0..500u32 {
             b.add(&i.to_le_bytes());
@@ -307,50 +252,72 @@ mod tests {
         }
     }
 
+    /// The encoding, byte for byte: the hash id leads.
     #[test]
-    fn sparse_round_trip() {
-        let mut b = Bloom::new(100_000, 0.01); // big filter, few entries => sparse wins
-        for i in 0..50u32 {
+    fn golden_bytes() {
+        let mut b = Bloom::new(1, 0.01);
+        b.add(b"k");
+        let enc = b.encode();
+        assert_eq!(enc[0], 1, "xxh3 id leads");
+        assert_eq!(enc[1], 64, "m = 64 (one word)");
+        assert_eq!(enc[2], 7, "k");
+        assert_eq!(enc.len(), 3 + 8);
+        let mut word = 0u64;
+        let h = xxhash_rust::xxh3::xxh3_64(b"k");
+        let (h1, h2) = (h as u32, (h >> 32) as u32);
+        for i in 0..7u32 {
+            word |= 1 << (h1.wrapping_add(i.wrapping_mul(h2)) % 64);
+        }
+        assert_eq!(enc[3..11], word.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_rows_fail_closed() {
+        let mut b = Bloom::new(64, 0.01);
+        b.add(b"x");
+        let enc = b.encode();
+        // Truncated anywhere.
+        for n in 0..enc.len() {
+            assert!(Bloom::decode(&enc[..n]).is_err(), "truncated to {n}");
+        }
+        // Trailing bytes — including 0.9's trailing tag.
+        let mut t = enc.clone();
+        t.push(1);
+        assert_eq!(Bloom::decode(&t).unwrap_err().kind(), "corruption");
+        // Hash id 0 (0.9 FNV) and an unknown id: a format this binary lacks.
+        for id in [0u8, 2, 255] {
+            let mut t = enc.clone();
+            t[0] = id;
+            assert_eq!(Bloom::decode(&t).unwrap_err().kind(), "unsupported_format");
+        }
+        // k = 0 and k = 31.
+        for k in [0u8, 31] {
+            let mut t = enc.clone();
+            t[2] = k;
+            assert_eq!(Bloom::decode(&t).unwrap_err().kind(), "corruption");
+        }
+        // m = 0.
+        let mut t = vec![1u8, 0, 1];
+        t.extend_from_slice(&[0; 8]);
+        assert_eq!(Bloom::decode(&t).unwrap_err().kind(), "corruption");
+        // m = 2^32.
+        let mut t = vec![1u8];
+        append_uvarint(&mut t, 1 << 32);
+        append_uvarint(&mut t, 3);
+        assert_eq!(Bloom::decode(&t).unwrap_err().kind(), "corruption");
+    }
+
+    #[test]
+    fn fuzz_decode_never_panics() {
+        let mut b = Bloom::new(200, 0.01);
+        for i in 0..200u32 {
             b.add(&i.to_le_bytes());
         }
-        let sparse = b.encode_sparse();
-        let dense = b.encode();
-        assert!(sparse.len() < dense.len(), "sparse should be smaller");
-        let d = Bloom::decode_sparse(&sparse).unwrap();
-        assert_eq!(d.m, b.m);
-        assert_eq!(d.k, b.k);
-        for i in 0..50u32 {
-            assert!(d.may_contain(&i.to_le_bytes()));
-        }
-    }
-
-    #[test]
-    fn decode_rejects_truncation() {
-        let b = Bloom::new(64, 0.01);
-        let enc = b.encode();
-        // Truncating into the bit words is corruption...
-        assert!(Bloom::decode(&enc[..enc.len() - 9]).is_err());
-        // ...but stripping only the trailing hash tag is a valid LEGACY (FNV)
-        // encoding, by construction.
-        let legacy = Bloom::decode(&enc[..enc.len() - 1]).unwrap();
-        assert_eq!(legacy.hash, HashKind::Fnv09);
-    }
-
-    #[test]
-    fn legacy_decode_uses_fnv() {
-        // Build under FNV (as a pre-tag writer would have), encode WITHOUT the
-        // tag byte, and verify decode finds every key — no false negatives.
-        let mut b = Bloom::new(1000, 0.01);
-        b.hash = HashKind::Fnv09;
-        for i in 0..1000u32 {
-            b.add(&i.to_be_bytes());
-        }
-        let mut enc = b.encode();
-        enc.pop(); // strip the hash tag -> legacy format
-        let d = Bloom::decode(&enc).unwrap();
-        assert_eq!(d.hash, HashKind::Fnv09);
-        for i in 0..1000u32 {
-            assert!(d.may_contain(&i.to_be_bytes()), "missing {i}");
+        let seed = b.encode();
+        let mut rng = crate::util::FuzzRng::new(0xB100_F1E7_0000_0001);
+        for _ in 0..5000 {
+            let case = crate::util::fuzz_mutate(&mut rng, &seed);
+            let _ = Bloom::decode(&case);
         }
     }
 
@@ -364,19 +331,6 @@ mod tests {
             let key = i.to_be_bytes();
             let h = b.hash_of(&key);
             assert_eq!(b.may_contain_hash(h), b.may_contain(&key));
-        }
-    }
-
-    #[test]
-    fn sparse_tag_round_trip() {
-        let mut b = Bloom::new(100_000, 0.01);
-        for i in 0..50u32 {
-            b.add(&i.to_le_bytes());
-        }
-        let d = Bloom::decode_sparse(&b.encode_sparse()).unwrap();
-        assert_eq!(d.hash, HashKind::Xxh3);
-        for i in 0..50u32 {
-            assert!(d.may_contain(&i.to_le_bytes()));
         }
     }
 
@@ -410,7 +364,8 @@ mod tests {
             .count();
         assert!(
             admitted < 500,
-            "{admitted}/10000 absent keys admitted at fpr 0.01 — the filter is              saturated, which is what sizing from a guess produces"
+            "{admitted}/10000 absent keys admitted at fpr 0.01 — the filter is \
+             saturated, which is what sizing from a guess produces"
         );
     }
 
@@ -428,7 +383,9 @@ mod tests {
             .count();
         assert_eq!(
             admitted, 10_000,
-            "a 49x-overloaded filter should admit everything; if this ever              fails the sizing math changed and the regression test above is              measuring something else"
+            "a 49x-overloaded filter should admit everything; if this ever \
+             fails the sizing math changed and the regression test above is \
+             measuring something else"
         );
     }
 }

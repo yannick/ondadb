@@ -11,9 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ondadb::{
-    ColumnFamily, ColumnFamilyConfig, Compression, MergeOperator, Options, SyncMode, DB,
-};
+use ondadb::{ColumnFamily, ColumnFamilyConfig, Compression, MergeOperator, Options, SyncMode, DB};
 
 #[derive(Debug)]
 struct Concat;
@@ -91,11 +89,16 @@ fn base_opts(dir: &std::path::Path) -> Options {
 fn fill_points(db: &DB, cf: &Arc<ColumnFamily>, from: usize, to: usize, large_every: usize) {
     for i in from..to {
         let k = format!("key{i:05}");
-        let len = if large_every > 0 && i % large_every == 0 { 600 } else { 24 };
+        let len = if large_every > 0 && i % large_every == 0 {
+            600
+        } else {
+            24
+        };
         if i % 7 == 0 {
             db.put(cf, k.as_bytes(), &val(i, len), TEN_YEARS).unwrap();
         } else {
-            db.put(cf, k.as_bytes(), &val(i, len), Duration::ZERO).unwrap();
+            db.put(cf, k.as_bytes(), &val(i, len), Duration::ZERO)
+                .unwrap();
         }
     }
 }
@@ -138,7 +141,8 @@ fn gen_percf(root: &std::path::Path) {
     {
         let mut t = db.begin();
         for i in (1..400).step_by(11) {
-            t.single_delete(&alpha, format!("key{i:05}").as_bytes()).unwrap();
+            t.single_delete(&alpha, format!("key{i:05}").as_bytes())
+                .unwrap();
         }
         t.commit().unwrap();
     }
@@ -195,15 +199,20 @@ fn gen_caps(root: &std::path::Path) {
         .unwrap();
     fill_points(&db, &m, 0, 200, 9);
     for i in 0..60 {
-        db.merge(&m, format!("key{i:05}").as_bytes(), format!("op{i}").as_bytes())
-            .unwrap();
+        db.merge(
+            &m,
+            format!("key{i:05}").as_bytes(),
+            format!("op{i}").as_bytes(),
+        )
+        .unwrap();
     }
     db.delete_range(&m, b"key00100", b"key00120").unwrap();
     fill_points(&db, &plain, 0, 150, 0);
     db.flush_memtable(&m).unwrap();
     db.flush_memtable(&plain).unwrap();
     for i in 50..90 {
-        db.merge(&m, format!("key{i:05}").as_bytes(), b"late").unwrap();
+        db.merge(&m, format!("key{i:05}").as_bytes(), b"late")
+            .unwrap();
     }
     db.delete_range(&plain, b"key00010", b"key00020").unwrap();
     db.flush_memtable(&m).unwrap();
@@ -211,7 +220,8 @@ fn gen_caps(root: &std::path::Path) {
     db.compact(&m).unwrap();
     // WAL-only tail: merges, a range delete and point writes in envelopes.
     for i in 80..100 {
-        db.merge(&m, format!("key{i:05}").as_bytes(), b"tail").unwrap();
+        db.merge(&m, format!("key{i:05}").as_bytes(), b"tail")
+            .unwrap();
     }
     db.delete_range(&m, b"key00150", b"key00160").unwrap();
     fill_points(&db, &plain, 140, 170, 5);

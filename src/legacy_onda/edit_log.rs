@@ -137,7 +137,9 @@ pub fn replay(m: Manifest, data: &[u8]) -> Result<Manifest> {
             continue;
         }
         replayer.apply(&rec.edit).map_err(|e| match e {
-            OndaError::Corruption(msg) => corrupt(format!("0.9 manifest edit {}: {msg}", rec.edit_id)),
+            OndaError::Corruption(msg) => {
+                corrupt(format!("0.9 manifest edit {}: {msg}", rec.edit_id))
+            }
             other => other,
         })?;
         applied_through = rec.edit_id;
@@ -207,7 +209,10 @@ mod tests {
         let data = fixture_log();
         // Truncated below the header.
         for len in [0, 4, HEADER_BYTES - 1] {
-            assert_eq!(decode_header(&data[..len]).unwrap_err().kind(), "corruption");
+            assert_eq!(
+                decode_header(&data[..len]).unwrap_err().kind(),
+                "corruption"
+            );
         }
         // A bit flip anywhere in the header fails its CRC.
         for at in 0..HEADER_BYTES {
@@ -257,7 +262,11 @@ mod tests {
         for &x in b {
             c ^= u32::from(x);
             for _ in 0..8 {
-                c = if c & 1 != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0x82F6_3B78
+                } else {
+                    c >> 1
+                };
             }
         }
         !c

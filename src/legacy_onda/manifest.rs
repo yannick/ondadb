@@ -26,7 +26,8 @@ use crate::encoding::{read_u32, read_u64, uvarint};
 use crate::error::{OndaError, Result};
 use crate::manifest::{CfManifest, Manifest, SstMeta, WalLayout};
 
-const MAGIC: u32 = 0x5756_4D46; // "WVMF"
+/// `"WVMF"`, stored as a little-endian `u32`.
+pub const MAGIC: u32 = 0x5756_4D46;
 /// Lowest manifest version, and the one still written whenever the database
 /// uses no format capability — the same lowest-version discipline the
 /// positional tails follow, so a legacy-only database stays readable by every
@@ -374,6 +375,7 @@ fn decode_manifest_column_families(
             name,
             config,
             sstables,
+            unified_id: None,
         });
     }
     Ok(cfs)
@@ -926,6 +928,7 @@ mod tests {
             name: "x".into(),
             config: Vec::new(),
             sstables: vec![SstMeta::default()],
+            unified_id: None,
         }];
         // count = 1, index = 0, range_count = 0 -> refused.
         let mut p = Vec::new();
@@ -1302,6 +1305,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                unified_id: None,
             }],
         }
     }

@@ -294,7 +294,7 @@ impl DB {
                 .iter()
                 .find(|cf| cf.name() == cfm.name)
                 .ok_or(OndaError::NotFound)?;
-            let cf_dir = dir.join(format!("cf-{}", cfm.name));
+            let cf_dir = dir.join(crate::format::cf_dir_name(&cfm.name));
             std::fs::create_dir_all(&cf_dir)?;
             for sst in &mut cfm.sstables {
                 let storage = source_cf.tiers().storage_for(sst.tier.as_deref());
@@ -359,7 +359,9 @@ impl DB {
                          fragments: Vec<crate::range_tombstone::Fragment>|
          -> Result<()> {
             let id = self.inner.next_file_id();
-            let klog = dir.join(format!("cf-{}", cf.name())).join(format!("{id}.klog"));
+            let klog = dir
+                .join(crate::format::cf_dir_name(cf.name()))
+                .join(format!("{id}.klog"));
             let klog = klog.to_str().ok_or_else(|| {
                 OndaError::InvalidArgs(format!("snapshot path {klog:?} is not UTF-8"))
             })?;

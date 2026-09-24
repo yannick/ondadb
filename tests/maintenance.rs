@@ -185,7 +185,8 @@ fn read_only_checkpoint_and_backup_keep_wal_only_data() {
             db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
                 .unwrap();
             db.delete_range(&cf, b"k00090", b"k00110").unwrap();
-            db.put(&other, b"o", b"only-in-wal", Duration::ZERO).unwrap();
+            db.put(&other, b"o", b"only-in-wal", Duration::ZERO)
+                .unwrap();
             db.sync_wal().unwrap();
             copy_tree(src.path(), crashed.path());
             db.close().unwrap();
@@ -194,7 +195,11 @@ fn read_only_checkpoint_and_backup_keep_wal_only_data() {
 
         let db = DB::open(options(crashed.path(), true)).unwrap();
         let cf = db.get_column_family("default").unwrap();
-        assert_eq!(db.get(&cf, b"k00150").unwrap(), b"value", "unified={unified}");
+        assert_eq!(
+            db.get(&cf, b"k00150").unwrap(),
+            b"value",
+            "unified={unified}"
+        );
         db.checkpoint(dest.path().join("ckpt")).unwrap();
         db.backup(dest.path().join("bk")).unwrap();
         db.close().unwrap();
@@ -2136,6 +2141,10 @@ fn close_compacts_the_log_and_reports_failure() {
         "close ran a snapshot compaction"
     );
     let bytes = std::fs::read(ondadb::manifest_edit::edit_log_path(dir.path())).unwrap();
-    assert_eq!(bytes.len(), 28, "the log restarts at its header");
+    assert_eq!(
+        bytes.len(),
+        ondadb::manifest_edit::EDIT_LOG_HEADER_BYTES,
+        "the log restarts at its header"
+    );
     assert_eq!(after.applied_through, after.next_edit_id - 1);
 }

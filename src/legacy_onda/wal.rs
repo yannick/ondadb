@@ -130,7 +130,11 @@ mod tests {
         for &x in &first[8..] {
             c ^= u32::from(x);
             for _ in 0..8 {
-                c = if c & 1 != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0x82F6_3B78
+                } else {
+                    c >> 1
+                };
             }
         }
         first[4..8].copy_from_slice(&(!c).to_le_bytes());
