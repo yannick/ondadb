@@ -131,6 +131,13 @@ pub(crate) struct CfCtx {
     pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
     /// Bounded cache of open SSTable readers — see [`crate::table_cache`].
     pub tables: Arc<crate::table_cache::TableCache>,
+    /// Whether `bc`/`tables` are views leased from a shared
+    /// [`ReadResources`](crate::read_resources::ReadResources). Another
+    /// database of the same cache namespace may be reading through the very
+    /// readers this one opened, so close must leave them to the lease (which
+    /// purges the namespace when its last database goes) instead of closing
+    /// them itself.
+    pub shared_reads: bool,
     pub flush_tx: Sender<FlushJob>,
     pub compact_tx: Sender<Arc<ColumnFamily>>,
     pub closing: Arc<AtomicBool>,
@@ -277,6 +284,182 @@ impl PointReadCandidate {
             Ok(self.value.unwrap_or_default())
         } else {
             Err(OndaError::NotFound)
+        }
+    }
+}
+
+/// Where a point read collects its winning version: the owned
+/// [`PointReadCandidate`] behind `get`, or [`BufCandidate`] behind `get_into`.
+///
+/// One generic resolution pass (`ColumnFamily::resolve_point`) drives both, so
+/// the source order, the range-delete rule and the `max_seq` early exit cannot
+/// drift apart between the two reads; monomorphization keeps `get`'s path
+/// exactly what it was.
+trait PointSink {
+    fn found(&self) -> bool;
+    fn seq(&self) -> u64;
+    fn probe_unified(
+        &mut self,
+        u: &crate::unified::UnifiedStore,
+        id: u64,
+        key: &[u8],
+        read_seq: u64,
+        now: i64,
+    );
+    fn probe_mem(&mut self, mem: &Memtable, key: &[u8], read_seq: u64, now: i64);
+    fn probe_table(&mut self, rd: &Reader, key: &[u8], read_seq: u64, now: i64) -> Result<()>;
+    fn apply_mask(&mut self, covering: Option<u64>);
+}
+
+impl PointSink for PointReadCandidate {
+    fn found(&self) -> bool {
+        self.found
+    }
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn probe_unified(
+        &mut self,
+        u: &crate::unified::UnifiedStore,
+        id: u64,
+        key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) {
+        self.consider_memtable(u.get(id, key, read_seq, now));
+    }
+    fn probe_mem(&mut self, mem: &Memtable, key: &[u8], read_seq: u64, now: i64) {
+        self.consider_memtable(mem.get(key, read_seq, now));
+    }
+    fn probe_table(&mut self, rd: &Reader, key: &[u8], read_seq: u64, now: i64) -> Result<()> {
+        let (value, seq, found, deleted, kind) = rd.get_unfiltered(key, read_seq, now)?;
+        self.consider(value, seq, found, deleted, kind);
+        Ok(())
+    }
+    fn apply_mask(&mut self, covering: Option<u64>) {
+        self.mask(covering);
+    }
+}
+
+/// [`PointReadCandidate`] for `get_into`: the winning value lives in the
+/// caller's buffer, at `out[start..start + len]`, and nothing is allocated
+/// beyond that buffer's growth.
+///
+/// Memtable versions are copied straight out of the skiplist through the
+/// borrowing `chain` walk. A table's value is appended *after* the current
+/// winner and only moved down over it if it wins, so a losing probe costs a
+/// truncate, never the winner.
+struct BufCandidate<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+    found: bool,
+    seq: u64,
+    deleted: bool,
+    kind: u64,
+    range_floor: Option<u64>,
+}
+
+impl<'a> BufCandidate<'a> {
+    fn new(out: &'a mut Vec<u8>) -> BufCandidate<'a> {
+        let start = out.len();
+        BufCandidate {
+            out,
+            start,
+            found: false,
+            seq: 0,
+            deleted: false,
+            kind: crate::format::KIND_PUT,
+            range_floor: None,
+        }
+    }
+
+    /// `consider` for a borrowed memtable version: `value` is `None` for a
+    /// tombstone or an expired entry, exactly as `Memtable::chain` reports it.
+    fn offer(&mut self, seq: u64, kind: u64, value: Option<&[u8]>) {
+        if self.found && seq <= self.seq {
+            return;
+        }
+        self.out.truncate(self.start);
+        if let Some(v) = value {
+            self.out.extend_from_slice(v);
+        }
+        self.found = true;
+        self.seq = seq;
+        self.deleted = value.is_none();
+        self.kind = kind;
+    }
+
+    /// The value's length, or `NotFound` (with the buffer restored).
+    fn finish(self) -> Result<usize> {
+        if self.found && !self.deleted {
+            Ok(self.out.len() - self.start)
+        } else {
+            self.out.truncate(self.start);
+            Err(OndaError::NotFound)
+        }
+    }
+}
+
+impl PointSink for BufCandidate<'_> {
+    fn found(&self) -> bool {
+        self.found
+    }
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn probe_unified(
+        &mut self,
+        u: &crate::unified::UnifiedStore,
+        id: u64,
+        key: &[u8],
+        read_seq: u64,
+        now: i64,
+    ) {
+        // `chain` walks the store's memtables newest first and stops when the
+        // callback says so — after the first version, which is what `get`
+        // returns.
+        u.chain(id, key, read_seq, now, |seq, kind, value| {
+            self.offer(seq, kind, value);
+            false
+        });
+    }
+    fn probe_mem(&mut self, mem: &Memtable, key: &[u8], read_seq: u64, now: i64) {
+        mem.chain(key, read_seq, now, |seq, kind, value| {
+            self.offer(seq, kind, value);
+            false
+        });
+    }
+    fn probe_table(&mut self, rd: &Reader, key: &[u8], read_seq: u64, now: i64) -> Result<()> {
+        let tail = self.out.len();
+        let (seq, found, deleted, kind) =
+            match rd.get_unfiltered_into(key, read_seq, now, self.out) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.out.truncate(tail);
+                    return Err(e);
+                }
+            };
+        if found && (!self.found || seq > self.seq) {
+            // The new winner sits after the old one; close the gap.
+            self.out.drain(self.start..tail);
+            self.found = true;
+            self.seq = seq;
+            self.deleted = deleted;
+            self.kind = kind;
+        } else {
+            self.out.truncate(tail);
+        }
+        Ok(())
+    }
+    fn apply_mask(&mut self, covering: Option<u64>) {
+        let Some(seq) = covering else { return };
+        self.range_floor = Some(seq);
+        if !self.found || seq > self.seq {
+            self.out.truncate(self.start);
+            self.found = true;
+            self.seq = seq;
+            self.deleted = true;
+            self.kind = crate::format::KIND_DELETE;
         }
     }
 }
@@ -1617,15 +1800,33 @@ impl ColumnFamily {
         Ok(best)
     }
 
-    fn consider_sstables(
+    fn consider_sstables<S: PointSink>(
         &self,
-        candidate: &mut PointReadCandidate,
+        candidate: &mut S,
         tables: &[Arc<SstHandle>],
         user_key: &[u8],
         read_seq: u64,
         now: i64,
+        early_exit: bool,
     ) -> Result<()> {
         for th in tables {
+            // EARLY EXIT (wavesdb 5ef39df): a table cannot hold a version newer
+            // than its `max_seq`, and `consider` only ever replaces the
+            // candidate with a strictly newer one — so once the candidate's
+            // sequence reaches a table's `max_seq`, probing it cannot change
+            // the answer. The gate is per table rather than a `break`, because
+            // position does not order sequences: an ingestion carries the
+            // sequence reserved at its *start*, so a table flushed later (and
+            // stored above it) can hold an older version of the same key. See
+            // `tests/read_early_exit.rs`.
+            //
+            // Range tombstones and merge chains are unaffected: coverage is
+            // collected from every source before this loop (and has already
+            // been folded into `candidate`), and a winning operand sends the
+            // read down `fold_point_chain`, which walks every table itself.
+            if early_exit && candidate.found() && th.meta.max_seq <= candidate.seq() {
+                continue;
+            }
             // One bloom hash + one check per table; the probe below skips the
             // filter (it was just consulted).
             let rd = th.reader()?;
@@ -1641,8 +1842,7 @@ impl ColumnFamily {
             }
             self.sst_probes.fetch_add(1, Ordering::Relaxed);
             crate::perf::bump(|p| p.sstable_probes += 1);
-            let (value, seq, found, deleted, kind) = rd.get_unfiltered(user_key, read_seq, now)?;
-            candidate.consider(value, seq, found, deleted, kind);
+            candidate.probe_table(&rd, user_key, read_seq, now)?;
         }
         Ok(())
     }
@@ -1761,46 +1961,124 @@ impl ColumnFamily {
     /// version across all sources is not an operand, the chain has no operand
     /// above its base and the ordinary answer *is* the folded one.
     pub(crate) fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
+        self.get_impl(user_key, read_seq, true)
+    }
+
+    /// [`get`](Self::get) with the `max_seq` early exit switched off: every
+    /// candidate table is probed. The reference the randomized oracle holds the
+    /// early exit to.
+    #[cfg(test)]
+    pub(crate) fn get_exhaustive(&self, user_key: &[u8], read_seq: u64) -> Result<Vec<u8>> {
+        self.get_impl(user_key, read_seq, false)
+    }
+
+    fn get_impl(&self, user_key: &[u8], read_seq: u64, early_exit: bool) -> Result<Vec<u8>> {
         self.point_reads.fetch_add(1, Ordering::Relaxed);
         let now = coarse_now_nanos();
         let sources = self.point_read_sources(user_key);
         let mut candidate = PointReadCandidate::default();
+        self.resolve_point(&mut candidate, &sources, user_key, read_seq, now, early_exit)?;
+        if candidate.kind == crate::format::KIND_MERGE {
+            return self.fold_winning_operand(&sources, user_key, read_seq, now, candidate.range_floor);
+        }
+        candidate.finish()
+    }
 
+    /// [`get`](Self::get), **appending** the value to `out` instead of
+    /// allocating one. Returns the value's length; on `NotFound` or any error
+    /// `out` is exactly as it was.
+    ///
+    /// No allocation on a hit beyond `out`'s own growth — except for a merge
+    /// family whose winning version is an operand, where the operator's fold
+    /// produces a fresh value by construction.
+    pub(crate) fn get_into(&self, user_key: &[u8], read_seq: u64, out: &mut Vec<u8>) -> Result<usize> {
+        self.point_reads.fetch_add(1, Ordering::Relaxed);
+        let now = coarse_now_nanos();
+        let sources = self.point_read_sources(user_key);
+        let start = out.len();
+        let mut candidate = BufCandidate::new(out);
+        if let Err(e) = self.resolve_point(&mut candidate, &sources, user_key, read_seq, now, true) {
+            candidate.out.truncate(start);
+            return Err(e);
+        }
+        if candidate.kind == crate::format::KIND_MERGE {
+            let floor = candidate.range_floor;
+            candidate.out.truncate(start);
+            let value = self.fold_winning_operand(&sources, user_key, read_seq, now, floor)?;
+            out.extend_from_slice(&value);
+            return Ok(value.len());
+        }
+        candidate.finish()
+    }
+
+    /// The candidate pass shared by `get` and `get_into`: every memtable
+    /// source newest first, then range coverage, then the tables (with the
+    /// `max_seq` early exit when `early_exit`).
+    fn resolve_point<S: PointSink>(
+        &self,
+        candidate: &mut S,
+        sources: &PointReadSources,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        early_exit: bool,
+    ) -> Result<()> {
         // Unified-memtable mode: the shared store holds this CF's hot data.
         if let Some(u) = &self.ctx.unified {
             crate::perf::bump(|p| p.memtable_probes += 1);
-            candidate.consider_memtable(u.get(self.id, user_key, read_seq, now));
+            candidate.probe_unified(u, self.id, user_key, read_seq, now);
         }
         crate::perf::bump(|p| p.memtable_probes += 1);
-        candidate.consider_memtable(sources.mem.get(user_key, read_seq, now));
+        candidate.probe_mem(&sources.mem, user_key, read_seq, now);
         for imm in sources.imms.iter().rev() {
             crate::perf::bump(|p| p.memtable_probes += 1);
-            candidate.consider_memtable(imm.mem.get(user_key, read_seq, now));
+            candidate.probe_mem(&imm.mem, user_key, read_seq, now);
         }
-        self.consider_sstables(&mut candidate, &sources.tables, user_key, read_seq, now)?;
-        candidate.mask(self.covering_range_seq(&sources, user_key, read_seq)?);
-        if candidate.kind == crate::format::KIND_MERGE {
-            if let Some(op) = self.opts.merge_operator.as_ref() {
-                return self.fold_point_chain(
-                    op,
-                    &sources.mem,
-                    &sources.imms,
-                    sources.tables.iter(),
-                    user_key,
-                    read_seq,
-                    now,
-                    candidate.range_floor,
-                );
-            }
-            // An operand with no operator can only come from a hand-edited
-            // config blob: `resolve_merge_operator` fails the open otherwise.
-            return Err(OndaError::Corruption(format!(
-                "column family {:?} holds a merge operand for key {:?} but has no merge operator",
-                self.name,
-                String::from_utf8_lossy(user_key)
-            )));
+        // Coverage before the tables, as `multi_get` does: `mask` and
+        // `consider` commute (each keeps the strictly newer of the two, and a
+        // span never shares a sequence with a point write), and applying the
+        // span first lets a range delete newer than every table end the read
+        // without a single point probe.
+        candidate.apply_mask(self.covering_range_seq(sources, user_key, read_seq)?);
+        self.consider_sstables(
+            candidate,
+            &sources.tables,
+            user_key,
+            read_seq,
+            now,
+            early_exit,
+        )
+    }
+
+    /// Resolve a key whose winning version is a merge operand: walk and fold
+    /// its whole chain (see [`get`](Self::get) for why the winner decides).
+    fn fold_winning_operand(
+        &self,
+        sources: &PointReadSources,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        range_floor: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        if let Some(op) = self.opts.merge_operator.as_ref() {
+            return self.fold_point_chain(
+                op,
+                &sources.mem,
+                &sources.imms,
+                sources.tables.iter(),
+                user_key,
+                read_seq,
+                now,
+                range_floor,
+            );
         }
-        candidate.finish()
+        // An operand with no operator can only come from a hand-edited
+        // config blob: `resolve_merge_operator` fails the open otherwise.
+        Err(OndaError::Corruption(format!(
+            "column family {:?} holds a merge operand for key {:?} but has no merge operator",
+            self.name,
+            String::from_utf8_lossy(user_key)
+        )))
     }
 
     /// [`point_read_sources`](Self::point_read_sources) for a whole batch, in
@@ -1954,6 +2232,7 @@ impl ColumnFamily {
     fn resolve_table_batch(
         &self,
         rd: &Reader,
+        max_seq: u64,
         keys: &[&[u8]],
         idxs: &[usize],
         read_seq: u64,
@@ -1964,6 +2243,11 @@ impl ColumnFamily {
     ) {
         scratch.clear();
         for &i in idxs {
+            // `get`'s early exit, per key: a version at or above this table's
+            // `max_seq` cannot be displaced by anything the table holds.
+            if Self::resolved_above(&cands[i], max_seq) {
+                continue;
+            }
             // One bloom hash + one check per (key, table), exactly as
             // `consider_sstables` does — the counters must stay comparable
             // between a batch and the N gets it replaces.
@@ -2028,6 +2312,13 @@ impl ColumnFamily {
                 }
             }
         }
+    }
+
+    /// Whether `cand` already holds a version no table with this `max_seq` can
+    /// replace — the batch form of `consider_sstables`' early exit.
+    #[inline]
+    fn resolved_above(cand: &PointReadCandidate, max_seq: u64) -> bool {
+        cand.found && max_seq <= cand.seq
     }
 
     /// Attribute one source failure to every key of `group` that still needs
@@ -2108,9 +2399,18 @@ impl ColumnFamily {
         self.batch_covering_range_seqs(&sources, keys, read_seq, &mut cands, &mut errs);
         let mut scratch: SmallVec<[(usize, usize); 16]> = SmallVec::new();
         for (th, idxs) in &sources.tables {
+            // Every key this table could answer is already resolved by a
+            // version it cannot beat: skip it without even opening the reader.
+            if idxs
+                .iter()
+                .all(|&i| Self::resolved_above(&cands[i], th.meta.max_seq))
+            {
+                continue;
+            }
             match th.reader() {
                 Ok(rd) => self.resolve_table_batch(
                     &rd,
+                    th.meta.max_seq,
                     keys,
                     idxs,
                     read_seq,
@@ -2568,6 +2868,9 @@ impl ColumnFamily {
         }
         if let Some(w) = s.wal.take() {
             let _ = w.close();
+        }
+        if self.ctx.shared_reads {
+            return;
         }
         for lvl in &s.levels {
             for th in lvl {
@@ -3473,6 +3776,169 @@ mod tests {
                 "unified={unified}: {batched:?} vs {sequential:?}"
             );
             assert_eq!(batched[0].as_deref().unwrap(), b"v2", "newest wins");
+            db.close().unwrap();
+        }
+    }
+
+    /// Concatenating merge operator for the early-exit oracle.
+    #[derive(Debug)]
+    struct Concat;
+
+    impl crate::config::MergeOperator for Concat {
+        fn name(&self) -> &str {
+            "test.early-exit.concat"
+        }
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            existing: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> std::result::Result<Vec<u8>, String> {
+            let mut out = existing.map(<[u8]>::to_vec).unwrap_or_default();
+            for op in operands {
+                out.push(b'+');
+                out.extend_from_slice(op);
+            }
+            Ok(out)
+        }
+    }
+
+    /// The early exit (wavesdb 5ef39df) is an optimization, never a semantic:
+    /// random puts, deletes, TTL writes, merge operands, range deletes,
+    /// flushes, ingestions and compactions, in both layouts, read at the head
+    /// and at pinned snapshots — `get`, `get_into` and `multi_get` must answer exactly what
+    /// the exhaustive reference (every candidate table probed) answers.
+    #[test]
+    fn point_read_early_exit_matches_exhaustive() {
+        use std::time::Duration;
+        for unified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = crate::config::Options::new(dir.path().to_str().unwrap());
+            opts.unified_memtable = unified;
+            opts.merge_fns = vec![Arc::new(Concat)];
+            let db = crate::DB::open(opts).unwrap();
+            db.enable_format_capabilities(crate::format::CAP_RANGE_DELETES)
+                .unwrap();
+            let cf = db
+                .create_column_family(
+                    "p",
+                    crate::config::ColumnFamilyConfig {
+                        l1_file_count_trigger: 6,
+                        merge_operator_name: Some("test.early-exit.concat".into()),
+                        ..crate::config::ColumnFamilyConfig::default()
+                    },
+                )
+                .unwrap();
+            // Deterministic LCG: the test must replay identically.
+            let mut state = 0x5EED_u64 ^ u64::from(unified);
+            let mut rng = move |n: u64| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % n
+            };
+            const KEYS: u64 = 48;
+            let key = |i: u64| format!("k{i:03}").into_bytes();
+            let mut snaps: Vec<crate::Txn> = Vec::new();
+            let check = |snaps: &[crate::Txn], when: &str| {
+                let mut seqs = vec![db.inner.visible_seq()];
+                seqs.extend(snaps.iter().map(|t| t.read_seq_for_tests()));
+                let owned: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+                let keys: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                for &seq in &seqs {
+                    let batch = cf.multi_get(&keys, seq);
+                    for (i, k) in keys.iter().enumerate() {
+                        let want = cf.get_exhaustive(k, seq).map_err(|e| e.to_string());
+                        let got = cf.get(k, seq).map_err(|e| e.to_string());
+                        assert_eq!(
+                            got,
+                            want,
+                            "{when}: unified={unified} key {:?} at seq {seq}: get",
+                            String::from_utf8_lossy(k)
+                        );
+                        let mut buf = b"p".to_vec();
+                        let got = cf
+                            .get_into(k, seq, &mut buf)
+                            .map(|n| {
+                                assert_eq!(n, buf.len() - 1);
+                                buf[1..].to_vec()
+                            })
+                            .map_err(|e| e.to_string());
+                        assert_eq!(
+                            got,
+                            want,
+                            "{when}: unified={unified} key {:?} at seq {seq}: get_into",
+                            String::from_utf8_lossy(k)
+                        );
+                        if got.is_err() {
+                            assert_eq!(buf, b"p", "a miss changed the caller's buffer");
+                        }
+                        let got = batch[i].as_ref().map(Vec::clone).map_err(|e| e.to_string());
+                        assert_eq!(
+                            got,
+                            want,
+                            "{when}: unified={unified} key {:?} at seq {seq}: multi_get",
+                            String::from_utf8_lossy(k)
+                        );
+                    }
+                }
+            };
+            for step in 0..600u64 {
+                match rng(100) {
+                    0..=39 => {
+                        let ttl = match rng(6) {
+                            0 => Duration::from_secs(3600),
+                            1 => Duration::from_nanos(1), // expired when read
+                            _ => Duration::ZERO,
+                        };
+                        db.put(&cf, &key(rng(KEYS)), format!("v{step}").as_bytes(), ttl)
+                            .unwrap();
+                    }
+                    40..=51 => db.merge(&cf, &key(rng(KEYS)), format!("m{step}").as_bytes()).unwrap(),
+                    52..=59 => db.delete(&cf, &key(rng(KEYS))).unwrap(),
+                    60..=63 => {
+                        let lo = rng(KEYS);
+                        let hi = (lo + 1 + rng(6)).min(KEYS);
+                        db.delete_range(&cf, &key(lo), &key(hi)).unwrap();
+                    }
+                    64..=73 => db.flush_memtable(&cf).unwrap(),
+                    74..=79 => {
+                        // Sorted batch through the ingest side door, whose
+                        // sequence predates a put committed during the load.
+                        let mut ing = db.start_ingestion(&cf).unwrap();
+                        if rng(2) == 0 {
+                            db.put(&cf, &key(rng(KEYS)), b"during-ingest", Duration::ZERO)
+                                .unwrap();
+                        }
+                        let lo = rng(KEYS);
+                        for i in lo..(lo + 8).min(KEYS) {
+                            if rng(4) == 0 {
+                                ing.write_tombstone(&key(i)).unwrap();
+                            } else {
+                                ing.write(&key(i), format!("ing{step}").as_bytes(), Duration::ZERO)
+                                    .unwrap();
+                            }
+                        }
+                        ing.finish().unwrap();
+                    }
+                    80..=85 => db.compact(&cf).unwrap(),
+                    86..=92 => {
+                        if snaps.len() < 4 {
+                            snaps.push(db.begin_with_isolation(crate::IsolationLevel::Snapshot));
+                        }
+                    }
+                    _ => {
+                        if !snaps.is_empty() {
+                            snaps.remove(0);
+                        }
+                    }
+                }
+                if step % 25 == 0 {
+                    check(&snaps, &format!("step {step}"));
+                }
+            }
+            check(&snaps, "end");
+            drop(snaps);
             db.close().unwrap();
         }
     }

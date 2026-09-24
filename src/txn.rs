@@ -91,6 +91,17 @@ struct BufferedChain {
     operands: Vec<Vec<u8>>,
 }
 
+/// Where a transaction's point read is answered from; see
+/// `Txn::plan_point_read`.
+enum PlannedRead {
+    /// This transaction's own buffered value.
+    Buffered(BufRange),
+    /// Deleted by this transaction (a buffered tombstone or range delete).
+    Missing,
+    /// The store, at this sequence.
+    Store(u64),
+}
+
 /// The range deletes this transaction has buffered, as `(cf, start, end)`
 /// borrowed from the arena.
 fn buffered_ranges<'a>(
@@ -270,9 +281,11 @@ fn ttl_to_abs(ttl: Duration) -> i64 {
 }
 
 impl DB {
-    /// Begin a transaction at the default (Snapshot) isolation level.
+    /// Begin a transaction at the database's default isolation level,
+    /// [`Options::default_isolation`](crate::Options::default_isolation)
+    /// (`Snapshot` unless configured otherwise).
     pub fn begin(&self) -> Txn {
-        self.begin_with_isolation(IsolationLevel::Snapshot)
+        self.begin_with_isolation(self.inner.opts.default_isolation)
     }
 
     /// Begin a transaction at a specific isolation level.
@@ -280,13 +293,14 @@ impl DB {
         self.begin_inner(level, false)
     }
 
-    /// Begin a **pessimistic** transaction at the default (Snapshot) isolation
-    /// level (3.3).
+    /// Begin a **pessimistic** transaction at the database's default isolation
+    /// level (3.3), [`Options::default_isolation`](crate::Options::default_isolation)
+    /// (`Snapshot` unless configured otherwise).
     ///
     /// See [`begin_pessimistic_with_isolation`](Self::begin_pessimistic_with_isolation)
     /// for what changes; everything else is [`begin`](Self::begin).
     pub fn begin_pessimistic(&self) -> Txn {
-        self.begin_pessimistic_with_isolation(IsolationLevel::Snapshot)
+        self.begin_pessimistic_with_isolation(self.inner.opts.default_isolation)
     }
 
     /// Begin a **pessimistic** transaction: one that takes a point lock on
@@ -387,6 +401,19 @@ impl DB {
         cf.get(key, self.inner.read_floor_seq())
     }
 
+    /// [`get`](Self::get), **appending** the value to `out` instead of
+    /// allocating one, so a caller can reuse one buffer across reads.
+    ///
+    /// Returns the value's length. On `NotFound` (missing, deleted, expired) or
+    /// any error, `out` is exactly as it was. A hit performs no heap allocation
+    /// beyond `out`'s own growth — the value is copied from the memtable's
+    /// skiplist or the table's (cached) block straight into it — with one
+    /// exception: a merge family's key whose newest version is an operand is
+    /// folded by the operator, which produces a fresh value.
+    pub fn get_into(&self, cf: &Arc<ColumnFamily>, key: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+        cf.get_into(key, self.inner.read_floor_seq(), out)
+    }
+
     /// [`get`](Self::get), with the read path's [`PerfContext`] for this one
     /// operation.
     ///
@@ -418,7 +445,9 @@ impl DB {
     /// * **Isolated failures.** A table that fails to open or whose block fails
     ///   its checksum errors only the keys whose resolution needed it. A key a
     ///   strictly newer source had already resolved still returns its value,
-    ///   where `get` would have propagated the error.
+    ///   where `get` propagates the error of every table it probes (it skips,
+    ///   and so never fails on, only a table whose `max_seq` is at or below the
+    ///   version it already holds).
     ///
     /// The win is deduplicated IO: candidate tables are opened and filtered
     /// once per table rather than once per key, and each distinct data block is
@@ -910,20 +939,57 @@ impl Txn {
                 return Self::fold_buffered(cf, key, committed.as_deref(), &chain.operands);
             }
         }
+        match self.plan_point_read(cf, id, key) {
+            PlannedRead::Buffered(r) => Ok(buf_slice(&self.buf, r).to_vec()),
+            PlannedRead::Missing => Err(OndaError::NotFound),
+            PlannedRead::Store(rs) => cf.get(key, rs),
+        }
+    }
+
+    /// [`get`](Self::get), **appending** the value to `out` instead of
+    /// allocating one; see [`DB::get_into`](crate::DB::get_into). Returns the
+    /// value's length; on `NotFound` or an error `out` is unchanged.
+    ///
+    /// A value this transaction buffered is copied straight out of its arena.
+    /// A merge family's key with buffered operands resolves through
+    /// [`get`](Self::get) — the fold produces a fresh value regardless.
+    pub fn get_into(&mut self, cf: &Arc<ColumnFamily>, key: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+        let id = cf_id(cf);
+        if cf.merge_op().is_some() && self.buffered_chain(id, key).is_some() {
+            let value = self.get(cf, key)?;
+            out.extend_from_slice(&value);
+            return Ok(value.len());
+        }
+        match self.plan_point_read(cf, id, key) {
+            PlannedRead::Buffered(r) => {
+                let value = buf_slice(&self.buf, r);
+                out.extend_from_slice(value);
+                Ok(value.len())
+            }
+            PlannedRead::Missing => Err(OndaError::NotFound),
+            PlannedRead::Store(rs) => cf.get_into(key, rs, out),
+        }
+    }
+
+    /// Everything a point read decides before it touches the store: the
+    /// buffer (last write wins), this transaction's own range deletes, the
+    /// `Serializable` read set, and the read sequence. Shared by `get` and
+    /// `get_into` so the two cannot disagree.
+    fn plan_point_read(&mut self, cf: &Arc<ColumnFamily>, id: usize, key: &[u8]) -> PlannedRead {
         // Read-your-writes: scan the buffer backward for the latest write.
         for w in self.writes.iter().rev() {
             if !w.is_range() && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key {
                 if w.tombstone() {
-                    return Err(OndaError::NotFound);
+                    return PlannedRead::Missing;
                 }
-                return Ok(buf_slice(&self.buf, w.value).to_vec());
+                return PlannedRead::Buffered(w.value);
             }
         }
         // Read-your-writes for range deletes. Reached only when no buffered
         // point write matched: own-write overlap is rejected at commit, so the
         // two can never both apply to one key.
         if self.own_range_covers(cf, key) {
-            return Err(OndaError::NotFound);
+            return PlannedRead::Missing;
         }
         if self.isolation == IsolationLevel::Serializable {
             let read = (id, key.to_vec());
@@ -932,12 +998,11 @@ impl Txn {
             }
             self.read_cfs.entry(id).or_insert_with(|| cf.clone());
         }
-        let rs = if self.fixed {
+        PlannedRead::Store(if self.fixed {
             self.read_seq
         } else {
             self.db.read_floor_seq()
-        };
-        cf.get(key, rs)
+        })
     }
 
     /// [`get`](Self::get), with the read path's [`PerfContext`] for this one
@@ -1948,6 +2013,12 @@ impl Txn {
             spans.push(((at, scratch.len() - at), i));
         }
         (scratch, spans)
+    }
+
+    /// The isolation level this transaction runs at — the one it was begun
+    /// with, or the one [`reset`](Self::reset) last gave it.
+    pub fn isolation(&self) -> IsolationLevel {
+        self.isolation
     }
 
     /// The sequence this transaction reads at.

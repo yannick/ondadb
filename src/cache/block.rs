@@ -1,6 +1,13 @@
 //! Sharded, byte-bounded CLOCK (second-chance) cache of decompressed SSTable
-//! bytes keyed by `(file_id, domain, offset)`.  Cached values are immutable
-//! (`Arc<[u8]>`); callers must not mutate them.
+//! bytes keyed by `(namespace, file_id, domain, offset)`.  Cached values are
+//! immutable (`Arc<[u8]>`); callers must not mutate them.
+//!
+//! A `BlockCache` is a **view**: shared storage plus a namespace id. Every
+//! private cache ([`BlockCache::new`]) is namespace 0 and owns its storage
+//! alone. [`ReadResources`](crate::read_resources::ReadResources) hands each
+//! leased database a view of one shared storage under its own namespace, so the
+//! databases share one byte budget while table `7` of one can never be served
+//! for table `7` of another.
 //!
 //! Reads are deliberately **non-serializing**: a hit takes the shard's
 //! `RwLock` in *read* mode and sets an atomic reference bit — unlike an LRU,
@@ -48,6 +55,9 @@ impl BlockDomain {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct BlockKey {
+    /// Which database's file-id space `file_id` belongs to; see the module
+    /// docs. `0` for every private cache.
+    ns: u64,
     file_id: u64,
     off: u64,
     domain: BlockDomain,
@@ -104,8 +114,9 @@ impl Shard {
     /// thousands of slots clearing bits while readers stall. After
     /// [`CLOCK_SWEEP_BUDGET`] spared entries the hand evicts regardless —
     /// put latency stays bounded and capacity always converges.
-    fn evict_to_cap(&mut self) {
+    fn evict_to_cap(&mut self) -> u64 {
         let mut spared = 0usize;
+        let mut evicted = 0u64;
         while self.used > self.cap && self.map.len() > 1 {
             let Some(k) = self.ring.pop_front() else {
                 break;
@@ -118,8 +129,19 @@ impl Shard {
                 self.ring.push_back(k); // second chance
             } else {
                 self.unlink(&k);
+                evicted += 1;
             }
         }
+        evicted
+    }
+
+    /// Drop every entry and reset the tallies.
+    fn clear(&mut self) {
+        self.map.clear();
+        self.ring.clear();
+        self.used = 0;
+        self.vlog_entries = 0;
+        self.vlog_used = 0;
     }
 }
 
@@ -144,22 +166,35 @@ pub struct CacheStats {
     pub vlog_entries: usize,
     /// The vlog share of `bytes`.
     pub vlog_bytes: i64,
+    /// Entries (either domain) the clock hand evicted to stay under capacity.
+    /// Explicit removals and namespace purges are not evictions.
+    pub evictions: u64,
 }
 
-/// A sharded CLOCK block cache (see module docs).
-pub struct BlockCache {
+/// The storage behind one or more [`BlockCache`] views.
+struct Core {
     shards: Vec<RwLock<Shard>>,
     mask: u64,
     hits: AtomicU64,
     misses: AtomicU64,
     vlog_hits: AtomicU64,
     vlog_misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// A sharded CLOCK block cache (see module docs): a namespaced view of shared
+/// storage. Counters and capacity belong to the storage, so every view of it
+/// reports the same [`stats`](Self::stats).
+pub struct BlockCache {
+    core: Arc<Core>,
+    ns: u64,
 }
 
 impl std::fmt::Debug for BlockCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockCache")
-            .field("shards", &self.shards.len())
+            .field("shards", &self.core.shards.len())
+            .field("ns", &self.ns)
             .finish()
     }
 }
@@ -171,14 +206,15 @@ impl BlockCache {
     /// (or less) yields a disabled cache (every `get` misses).
     pub fn new(capacity_bytes: i64) -> BlockCache {
         if capacity_bytes <= 0 {
-            return BlockCache {
+            return BlockCache::from_core(Core {
                 shards: Vec::new(),
                 mask: 0,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 vlog_hits: AtomicU64::new(0),
                 vlog_misses: AtomicU64::new(0),
-            };
+                evictions: AtomicU64::new(0),
+            });
         }
         let per = (capacity_bytes / NUM_SHARDS as i64).max(1);
         let shards = (0..NUM_SHARDS)
@@ -193,26 +229,55 @@ impl BlockCache {
                 })
             })
             .collect();
-        BlockCache {
+        BlockCache::from_core(Core {
             shards,
             mask: (NUM_SHARDS - 1) as u64,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             vlog_hits: AtomicU64::new(0),
             vlog_misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        })
+    }
+
+    fn from_core(core: Core) -> BlockCache {
+        BlockCache {
+            core: Arc::new(core),
+            ns: 0,
+        }
+    }
+
+    /// Another view of this cache's storage, keyed under namespace `ns`.
+    /// Entries of different namespaces never alias, whatever their file ids.
+    pub(crate) fn namespaced(&self, ns: u64) -> BlockCache {
+        BlockCache {
+            core: Arc::clone(&self.core),
+            ns,
         }
     }
 
     /// Whether the cache stores anything.
     pub fn enabled(&self) -> bool {
-        !self.shards.is_empty()
+        !self.core.shards.is_empty()
+    }
+
+    #[inline]
+    fn key(&self, file_id: u64, off: u64, domain: BlockDomain) -> BlockKey {
+        BlockKey {
+            ns: self.ns,
+            file_id,
+            off,
+            domain,
+        }
     }
 
     fn shard_for(&self, k: &BlockKey) -> &RwLock<Shard> {
         let mut h = k.file_id.wrapping_mul(1099511628211) ^ k.off;
         h = h.wrapping_add(k.domain.salt());
+        // Namespace 0 (every private cache) keeps its historical placement.
+        h ^= k.ns.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         h ^= h >> 33;
-        &self.shards[(h & self.mask) as usize]
+        &self.core.shards[(h & self.core.mask) as usize]
     }
 
     /// Look up the bytes cached at `(file_id, domain, off)`. Hits take the
@@ -221,11 +286,7 @@ impl BlockCache {
         if !self.enabled() {
             return None;
         }
-        let k = BlockKey {
-            file_id,
-            off,
-            domain,
-        };
+        let k = self.key(file_id, off, domain);
         let out = {
             let s = self.shard_for(&k).read();
             s.map.get(&k).map(|e| {
@@ -234,8 +295,8 @@ impl BlockCache {
             })
         };
         let (hit, miss) = match domain {
-            BlockDomain::Klog => (&self.hits, &self.misses),
-            BlockDomain::Vlog => (&self.vlog_hits, &self.vlog_misses),
+            BlockDomain::Klog => (&self.core.hits, &self.core.misses),
+            BlockDomain::Vlog => (&self.core.vlog_hits, &self.core.vlog_misses),
         };
         match &out {
             Some(_) => hit.fetch_add(1, Ordering::Relaxed),
@@ -250,11 +311,7 @@ impl BlockCache {
         if !self.enabled() {
             return;
         }
-        let k = BlockKey {
-            file_id,
-            off,
-            domain,
-        };
+        let k = self.key(file_id, off, domain);
         let mut s = self.shard_for(&k).write();
         if let Some(e) = s.map.get(&k) {
             // Already present: blocks are immutable, so keep the existing
@@ -279,7 +336,10 @@ impl BlockCache {
         );
         s.ring.push_back(k);
         if s.used > s.cap {
-            s.evict_to_cap();
+            let evicted = s.evict_to_cap();
+            if evicted > 0 {
+                self.core.evictions.fetch_add(evicted, Ordering::Relaxed);
+            }
         }
     }
 
@@ -293,22 +353,40 @@ impl BlockCache {
         if !self.enabled() {
             return;
         }
-        let k = BlockKey {
-            file_id,
-            off,
-            domain,
-        };
+        let k = self.key(file_id, off, domain);
         let mut s = self.shard_for(&k).write();
         s.unlink(&k);
     }
 
-    /// Aggregate hit/miss counters and approximate size.
+    /// Drop every entry of this view's namespace.
+    ///
+    /// Only map entries are unlinked; their ring slots are reaped by the clock
+    /// hand, exactly as for [`remove`](Self::remove).
+    pub(crate) fn purge_namespace(&self, ns: u64) {
+        for shard in &self.core.shards {
+            let mut s = shard.write();
+            let doomed: Vec<BlockKey> = s.map.keys().filter(|k| k.ns == ns).copied().collect();
+            for k in &doomed {
+                s.unlink(k);
+            }
+        }
+    }
+
+    /// Drop every entry of every namespace sharing this storage.
+    pub(crate) fn clear(&self) {
+        for shard in &self.core.shards {
+            shard.write().clear();
+        }
+    }
+
+    /// Aggregate hit/miss counters and approximate size — of the whole
+    /// storage, every namespace included.
     pub fn stats(&self) -> CacheStats {
         let mut entries = 0;
         let mut bytes = 0;
         let mut vlog_entries = 0;
         let mut vlog_bytes = 0;
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let s = shard.read();
             entries += s.map.len();
             bytes += s.used;
@@ -316,14 +394,15 @@ impl BlockCache {
             vlog_bytes += s.vlog_used;
         }
         CacheStats {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
+            hits: self.core.hits.load(Ordering::Relaxed),
+            misses: self.core.misses.load(Ordering::Relaxed),
             entries,
             bytes,
-            vlog_hits: self.vlog_hits.load(Ordering::Relaxed),
-            vlog_misses: self.vlog_misses.load(Ordering::Relaxed),
+            vlog_hits: self.core.vlog_hits.load(Ordering::Relaxed),
+            vlog_misses: self.core.vlog_misses.load(Ordering::Relaxed),
             vlog_entries,
             vlog_bytes,
+            evictions: self.core.evictions.load(Ordering::Relaxed),
         }
     }
 }
@@ -420,11 +499,13 @@ mod tests {
         for i in 0..total as u64 {
             let (file_id, off) = (i / 8 + 1, (i % 8) * 4096);
             let kk = BlockKey {
+                ns: 0,
                 file_id,
                 off,
                 domain: BlockDomain::Klog,
             };
             let vk = BlockKey {
+                ns: 0,
                 file_id,
                 off,
                 domain: BlockDomain::Vlog,
@@ -446,6 +527,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             for i in 0..total as u64 {
                 let k = BlockKey {
+                    ns: 0,
                     file_id: i / 8 + 1,
                     off: (i % 8) * 4096,
                     domain,
@@ -463,7 +545,8 @@ mod tests {
     /// The shard index `shard_for` picked, by pointer identity.
     fn self_shard_index(c: &BlockCache, k: &BlockKey) -> usize {
         let target = c.shard_for(k) as *const _;
-        c.shards
+        c.core
+            .shards
             .iter()
             .position(|s| std::ptr::eq(s, target))
             .expect("shard_for returns one of our shards")
@@ -527,5 +610,33 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn namespaces_never_alias_and_purge_alone() {
+        let a = BlockCache::new(1 << 20);
+        let b = a.namespaced(7);
+        a.put(1, 0, BlockDomain::Klog, blk(10, 1));
+        b.put(1, 0, BlockDomain::Klog, blk(10, 2));
+        assert_eq!(a.get(1, 0, BlockDomain::Klog).unwrap()[0], 1);
+        assert_eq!(b.get(1, 0, BlockDomain::Klog).unwrap()[0], 2);
+        assert_eq!(a.stats().entries, 2, "one storage, two namespaces");
+        a.purge_namespace(7);
+        assert!(b.get(1, 0, BlockDomain::Klog).is_none());
+        assert_eq!(a.get(1, 0, BlockDomain::Klog).unwrap()[0], 1);
+        a.clear();
+        assert_eq!(a.stats().entries, 0);
+        assert_eq!(a.stats().bytes, 0);
+    }
+
+    #[test]
+    fn evictions_are_counted() {
+        let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
+        for i in 0..200u64 {
+            c.put(i, 0, BlockDomain::Klog, blk(512, 1));
+        }
+        let st = c.stats();
+        assert!(st.evictions > 0);
+        assert_eq!(st.evictions + st.entries as u64, 200);
     }
 }

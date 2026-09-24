@@ -852,11 +852,30 @@ impl Reader {
     pub(crate) fn scan_point_entry(
         &self,
         raw: &[u8],
-        mut offset: usize,
+        offset: usize,
         user_key: &[u8],
         read_seq: u64,
         now: i64,
     ) -> Result<PointResult> {
+        let mut value = Vec::new();
+        let (seq, found, deleted, kind) =
+            self.scan_point_entry_into(raw, offset, user_key, read_seq, now, &mut value)?;
+        Ok(((found && !deleted).then_some(value), seq, found, deleted, kind))
+    }
+
+    /// [`scan_point_entry`](Self::scan_point_entry), **appending** a live
+    /// value to `out` instead of returning it — the caller-buffer read
+    /// (`DB::get_into`). Returns `(seq, found, deleted, kind)`; `out` is
+    /// untouched unless the entry is found and live.
+    pub(crate) fn scan_point_entry_into(
+        &self,
+        raw: &[u8],
+        mut offset: usize,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<(u64, bool, bool, u64)> {
         // Delta blocks need a running previous key; legacy blocks borrow each
         // key straight out of the block and allocate nothing.
         let mut scratch = Vec::new();
@@ -879,16 +898,19 @@ impl Reader {
                 break;
             }
             if entry.tombstone() || (entry.ttl != 0 && entry.ttl <= now) {
-                return Ok((None, entry.seq, true, true, u64::from(entry.kind)));
+                return Ok((entry.seq, true, true, u64::from(entry.kind)));
             }
-            let value = if entry.has_vlog() {
-                self.read_vlog(entry.vlog_off, entry.val_len as u64)?
+            if entry.has_vlog() {
+                // Exact reservation: the value's length is known, so the one
+                // growth (if any) is to precisely what it needs.
+                out.reserve(entry.val_len);
+                self.read_vlog_into(entry.vlog_off, entry.val_len as u64, out)?;
             } else {
-                entry.inline_value(raw).to_vec()
-            };
-            return Ok((Some(value), entry.seq, true, false, u64::from(entry.kind)));
+                out.extend_from_slice(entry.inline_value(raw));
+            }
+            return Ok((entry.seq, true, false, u64::from(entry.kind)));
         }
-        Ok((None, 0, false, false, crate::format::KIND_PUT))
+        Ok((0, false, false, crate::format::KIND_PUT))
     }
 
     /// [`get`](Self::get) without the bloom check, for callers that have
@@ -907,6 +929,25 @@ impl Reader {
         let (raw, restarts) = self.split_block(block.bytes())?;
         let offset = self.restart_scan_offset(raw, restarts, user_key, read_seq)?;
         self.scan_point_entry(raw, offset, user_key, read_seq, now)
+    }
+
+    /// [`get_unfiltered`](Self::get_unfiltered), appending a live value to
+    /// `out`; see [`scan_point_entry_into`](Self::scan_point_entry_into).
+    pub(crate) fn get_unfiltered_into(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+        now: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<(u64, bool, bool, u64)> {
+        let bi = self.find_block(user_key, read_seq);
+        if bi >= self.index.len() {
+            return Ok((0, false, false, crate::format::KIND_PUT));
+        }
+        let block = self.read_data_block_local(bi)?;
+        let (raw, restarts) = self.split_block(block.bytes())?;
+        let offset = self.restart_scan_offset(raw, restarts, user_key, read_seq)?;
+        self.scan_point_entry_into(raw, offset, user_key, read_seq, now, out)
     }
 
     /// The slot that can hold "the frame at `off` is verified", allocating the

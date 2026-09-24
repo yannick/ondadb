@@ -443,6 +443,13 @@ pub struct DbInner {
     /// thereby released — at the end of `close()`.
     lock_file: Mutex<Option<std::fs::File>>,
 
+    /// This database's lease on a shared
+    /// [`ReadResources`](crate::read_resources::ReadResources), or `None` for
+    /// private caches. Released at the end of `close()` (or on drop), which is
+    /// what lets the resources purge this database's namespace and, once
+    /// closing, empty the shared caches.
+    read_lease: Mutex<Option<crate::read_resources::ReadLease>>,
+
     /// Fail-stop flag: tripped by any durability failure (WAL fsync, background
     /// flush, manifest persist); checked at every write commit.
     pub(crate) poison: Arc<crate::util::Poison>,
@@ -745,6 +752,20 @@ impl DbInner {
 
     pub(crate) fn acquire_snapshot(&self, seq: u64) -> u64 {
         *self.snapshots.lock().entry(seq).or_insert(0) += 1;
+        seq
+    }
+
+    /// Pin the current published watermark and return it, **atomically**:
+    /// the watermark is read under the same `snapshots` lock that
+    /// [`oldest_snapshot`](Self::oldest_snapshot) holds while it reads, so a
+    /// compaction choosing its GC floor either sees this pin or read a
+    /// watermark no newer than it — never a newer "oldest snapshot" that could
+    /// collect a version this pin is entitled to. (Reading `visible_seq()` and
+    /// then calling `acquire_snapshot` leaves exactly that window open.)
+    pub(crate) fn acquire_visible_snapshot(&self) -> u64 {
+        let mut s = self.snapshots.lock();
+        let seq = self.visible_seq();
+        *s.entry(seq).or_insert(0) += 1;
         seq
     }
 
@@ -1656,6 +1677,8 @@ fn undo_capability_prepare(undo: CapabilityPrepareUndo) {
 struct OpenResources {
     tiers: Arc<crate::storage::TierRegistry>,
     block_cache: Arc<BlockCache>,
+    tables: Arc<crate::table_cache::TableCache>,
+    read_lease: Option<crate::read_resources::ReadLease>,
     flush_tx: Sender<FlushJob>,
     flush_rx: Receiver<FlushJob>,
     compact_tx: Sender<Arc<ColumnFamily>>,
@@ -1669,13 +1692,36 @@ struct OpenResources {
 
 impl OpenResources {
     fn new(opts: &Options, dir: &str) -> Result<Self> {
-        let file_cache = Arc::new(FileCache::new(opts.max_open_sstables.max(1)));
+        // A leased open takes all three caches from the shared resources; the
+        // per-database size options are then ignored (documented on
+        // `Options::read_resources`).
+        let read_lease = match &opts.read_resources {
+            Some(shared) => Some(shared.lease(read_cache_namespace(opts, dir)?)?),
+            None => None,
+        };
+        let (file_cache, block_cache, tables) = match &read_lease {
+            Some(lease) => (
+                lease.file_cache(),
+                Arc::new(lease.block_cache()),
+                Arc::new(lease.table_cache()),
+            ),
+            None => (
+                Arc::new(FileCache::new(opts.max_open_sstables.max(1))),
+                Arc::new(BlockCache::new(opts.block_cache_size as i64)),
+                Arc::new(crate::table_cache::TableCache::with_byte_budget(
+                    opts.max_open_readers,
+                    opts.max_open_reader_bytes,
+                )),
+            ),
+        };
         let tiers = build_tier_registry(opts, dir, file_cache)?;
         let (flush_tx, flush_rx) = unbounded::<FlushJob>();
         let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
         Ok(Self {
             tiers,
-            block_cache: Arc::new(BlockCache::new(opts.block_cache_size as i64)),
+            block_cache,
+            tables,
+            read_lease,
             flush_tx,
             flush_rx,
             compact_tx,
@@ -1687,6 +1733,16 @@ impl OpenResources {
             pending_flush: Arc::new(AtomicUsize::new(0)),
         })
     }
+}
+
+/// The cache namespace a leased open keys under: the caller's name, or the
+/// database directory's canonical path. Prefixed so a caller's name can never
+/// collide with some directory's path.
+fn read_cache_namespace(opts: &Options, dir: &str) -> Result<String> {
+    Ok(match &opts.read_cache_namespace {
+        Some(name) => format!("name:{name}"),
+        None => format!("path:{}", std::fs::canonicalize(dir)?.display()),
+    })
 }
 
 struct WorkerReceivers {
@@ -1754,6 +1810,8 @@ fn build_db_inner(
     let OpenResources {
         tiers,
         block_cache,
+        tables,
+        read_lease,
         flush_tx,
         flush_rx,
         compact_tx,
@@ -1790,10 +1848,6 @@ fn build_db_inner(
         &poison,
         &wal_syncs,
     )?;
-    let tables = Arc::new(crate::table_cache::TableCache::with_byte_budget(
-        opts.max_open_readers,
-        opts.max_open_reader_bytes,
-    ));
     // Built once and shared: `None` unless background IO is limited, so the
     // default configuration costs one nil check at each charge point.
     let io_limiter = crate::ioctrl::limiter_for(
@@ -1814,6 +1868,7 @@ fn build_db_inner(
         range_fragment_registry: Arc::new(crate::range_tombstone::FragmentRegistry::default()),
         io_limiter: io_limiter.clone(),
         tables,
+        shared_reads: read_lease.is_some(),
         flush_tx,
         compact_tx,
         closing: closing.clone(),
@@ -1884,6 +1939,7 @@ fn build_db_inner(
         file_deletion: FileDeletionState::new(opts),
         workers: Mutex::new(Vec::new()),
         lock_file: Mutex::new(Some(lock_file)),
+        read_lease: Mutex::new(read_lease),
         handles: Arc::new(AtomicUsize::new(1)),
         poison,
         clock,
@@ -2224,6 +2280,13 @@ impl DB {
             return Err(OndaError::InvalidArgs("empty path".into()));
         }
         check_merge_fn_names(&opts)?;
+        // Shared read resources assume immutable tables: a writer would flush,
+        // compact and delete files other databases' cached readers may hold.
+        if opts.read_resources.is_some() && !opts.read_only {
+            return Err(OndaError::InvalidArgs(
+                "Options::read_resources requires Options::read_only".into(),
+            ));
+        }
         if opts.migrate_to_unified {
             if !opts.unified_memtable {
                 return Err(OndaError::InvalidArgs(
@@ -3186,6 +3249,9 @@ impl DB {
         // now closed, and pacing was cancelled at the top of `close`, so this
         // drains at full speed rather than at the configured rate.
         self.inner.drain_deletions();
+        // The shared-cache lease goes after every reader of this database is
+        // done with: releasing it may purge this namespace's readers and blocks.
+        drop(self.inner.read_lease.lock().take());
         // Release the directory lock last, once all state is durable, so a
         // concurrent open never sees a half-closed database.
         *self.inner.lock_file.lock() = None;

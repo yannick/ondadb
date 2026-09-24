@@ -22,6 +22,8 @@ type/function names — grep for them; line numbers rot.
 | `memtable_arena.rs` | *(unsafe-fastpath only)* arena skip-list shard: single-allocation nodes with inline key prefix + seq; `ShardCursor` for zero-copy flush |
 | `wal.rs` | Striped write-ahead log: batch frames, group commit (Full mode), replay |
 | `sst/` | SSTable `writer.rs` (klog/vlog/bloom/index/footer), `reader.rs` (point get, block reads, CRC-once bitmap, mmap fastpath), `iter.rs` (bidirectional iterator, cached key prefix), `mod.rs` (formats, `Block`) |
+| `read_resources.rs` | `ReadResources`: one block cache, file-handle cache and reader cache that many **read-only** opens lease (`Options::read_resources`), keyed per lease namespace so equal file ids of different databases never alias |
+| `snapshot.rs` | `SnapshotHandle` (`DB::snapshot`): a refcounted read snapshot outside a transaction, pinned in the same `snapshots` registry |
 | `table_cache.rs` | `TableCache`: sharded (CLOCK) LRU of open SSTable readers, bounding resident index+bloom memory by reader count (`max_open_readers`) and byte budget (`max_open_reader_bytes`); the `max_open_files` equivalent |
 | `iterator.rs` | `ChildIter` enum (Mem/Sst), heap `MergingIter`, public `Iterator` with MVCC collapse, pinned-block borrowed keys/values and the merge-operand arena (1.1) |
 | `tailing.rs` | `TailingIterator`: forward-only keyspace tail that refreshes past its own end (not a change feed) |
@@ -177,6 +179,23 @@ unified store (if enabled) → active memtable → immutable memtables (newest
 first) → L0 tables whose [min,max] covers the key (all of them; L0 overlaps) →
 one binary-searched table per level ≥ 1.
 
+**Early exit by `max_seq` (wavesdb `5ef39df`).** Once the read holds a
+version — a point hit, a tombstone, or a covering range delete (coverage is
+folded in *before* the table walk) — a candidate table is skipped when its
+`SstMeta::max_seq` is at or below that version's sequence: nothing it holds
+could displace the candidate, because `consider` keeps only a strictly newer
+version. The gate is per table, not a `break`, because position does not order
+sequences — an ingestion carries the sequence reserved at its *start*, so a
+table flushed after it (and stored above it in L0) can hold an older version of
+the same key. In the ordinary flow it degenerates to "a memtable hit reads no
+table, an L0 hit reads nothing older". A winning merge operand still walks every
+table in `fold_point_chain`, and a miss still probes every candidate.
+`multi_get` applies the same gate per key and skips a table outright when every
+key it could answer is already resolved. A skipped table is never opened, so a
+corrupt table older than the answer no longer fails a `get`. Equivalence to the
+exhaustive walk is pinned by `point_read_early_exit_matches_exhaustive`
+(randomized oracle); the probe counts by `tests/read_early_exit.rs`.
+
 **Range-delete masking (1.2)** runs beside that walk and is resolved against it
 at the end: the maximum *covering* sequence at or below `read_seq` is taken
 across the memtable sets, the unified set, every L0 table whose **span**
@@ -188,6 +207,19 @@ At most two tables per level, one binary search, and one `range_count == 0`
 branch for every legacy or point-only table; a column family that never issues a
 range delete allocates nothing (pinned by
 `no_range_cf_allocates_nothing_on_read`).
+
+**Caller-buffer reads (`get_into`).** `DB::get_into` / `Txn::get_into` /
+`SnapshotHandle::get_into` run the *same* candidate pass as `get` —
+`ColumnFamily::resolve_point` is generic over a `PointSink`, with the owned
+`PointReadCandidate` behind `get` and `BufCandidate` behind `get_into`, so
+source order, range masking and the early exit cannot drift apart. The buffer
+sink copies a memtable version out of the skiplist through the borrowing
+`Memtable::chain` walk (stopping after the first version) and a table's value
+through `Reader::get_unfiltered_into`, appended after the current winner and
+moved down over it only if it wins. The value is appended to the caller's
+buffer; a miss or an error leaves the buffer as it was. A winning merge operand
+still folds into a fresh value. The default (crossbeam) memtable allocates an
+owned probe key per lookup for both reads; the arena memtable does not.
 
 Iterators apply the same rule per surfaced group, through a monotonic cursor per
 source that walks with the scan in either direction. SSTable get: bloom filter →
@@ -292,7 +324,7 @@ through the same `PointReadCandidate::consider`/`consider_memtable` entry points
 as `get`, so newest-wins (and equal-seq ties) resolve identically. One
 divergence from N `get`s, deliberate: a failing source errors only the keys
 whose resolution needed it — a key a strictly newer source already resolved
-keeps its value, where `get` propagates the error.
+keeps its value, where `get` propagates the error of any table it probes.
 
 A table's filter strength is chosen when it is **written**, from its output
 level: `ColumnFamilyConfig::bloom_fpr_for_level(level, bottom)` returns the

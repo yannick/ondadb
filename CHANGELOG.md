@@ -62,6 +62,49 @@
 - Fixed the `--features s3` test build (a stale 4-tuple destructure of
   `Reader::get`).
 
+### Added
+
+- **Shared read resources** (wavesdb `ReadResources`, `23648c8`,
+  `f6b3def`): `ReadResources::new(ReadResourceOptions { block_cache_bytes,
+  max_open_files, max_open_readers, max_reader_bytes })` builds one block
+  cache, file-handle cache and reader cache that any number of **read-only**
+  opens lease through `Options::read_resources`, so N immutable databases
+  share one budget instead of N. Cache keys are namespaced per lease
+  (`Options::read_cache_namespace`, default the directory's canonical path),
+  so identical table ids in different databases never alias. A writable open
+  with resources is `InvalidArgs`; `close()` refuses new leases and the caches
+  are emptied when the last leased database closes. `stats()` reports block
+  hits/misses/evictions/entries/bytes, reader-cache stats, open files,
+  leases and closing. `CacheStats` gains `evictions`.
+- **`get_into`** caller-buffer point reads on `DB`, `Txn` and
+  `SnapshotHandle`: the value is appended to a caller-owned `Vec<u8>` (its
+  length is returned; a miss leaves the buffer unchanged), so a reused buffer
+  makes a hit allocation-free for the value — from the memtable and from a
+  cached table block alike. Same candidate pass as `get`, so results are
+  identical (checked by the randomized read oracle).
+- **Standalone read snapshots** (wavesdb `SnapshotHandle`): `DB::snapshot()`
+  returns a refcounted `SnapshotHandle` that pins its sequence exactly as a
+  `Snapshot` transaction does, so compaction retains every version it can
+  see until the last clone drops. Read through `SnapshotHandle::{get,
+  multi_get, new_iterator, new_iterator_bounded}` or `DB::get_at` /
+  `DB::new_iterator_at`; a handle from another database is `InvalidArgs`.
+  The pin is registered atomically with reading the watermark.
+- **`Options::default_isolation`** (wavesdb `d789912`): the isolation level
+  `DB::begin` and `DB::begin_pessimistic` use. Defaults to `Snapshot`, so
+  nothing changes unless it is set; not persisted. `Txn::isolation()` reports
+  a transaction's level. The per-family `default_isolation_level` stays
+  reserved (a transaction spans families, so no family's setting could decide).
+
+### Performance
+
+- **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
+  and `multi_get` skip a candidate table whose `max_seq` is at or below the
+  version already in hand (point hit, tombstone, or covering range delete),
+  so a memtable hit reads no table and an L0 hit reads nothing older.
+  Results are unchanged (randomized oracle against the exhaustive walk); a
+  corrupt table older than the answer is no longer probed, so it no longer
+  fails the read.
+
 ## 0.9.1
 
 **Shared-bug corrective release.** Five defects that wavesdb fixed after

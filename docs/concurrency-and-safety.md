@@ -31,7 +31,29 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   Repeatable-Read/Snapshot/Serializable txns pin their `read_seq` via
   `acquire_snapshot`/`release_snapshot`. Compaction's version GC keeps every
   version newer than `oldest_snapshot()`.
-- Isolation (`txn.rs`): ReadUncommitted/ReadCommitted read live `visible_seq`;
+  A standalone `SnapshotHandle` (`DB::snapshot`, `snapshot.rs`) is one more
+  entry in the same map: it pins through `acquire_visible_snapshot`, which reads
+  `visible_seq()` **under** the `snapshots` lock (the lock `oldest_snapshot()`
+  holds while it reads the watermark), so no compaction can pick a GC floor
+  above the pin in the window between reading the watermark and registering
+  it. Clones share one pin (`Arc`); the last drop releases it. Excise and
+  span-index pruning key off `oldest_snapshot()` too, so a handle holds them
+  back exactly as a transaction does. Transactions still use the two-step
+  `visible_seq()` + `acquire_snapshot` and keep that (narrow) window; closing
+  it there is a separate change.
+- Shared read resources (`read_resources.rs`): `BlockCache` and `TableCache`
+  are *views* — `Arc` storage plus a namespace id — and both key on
+  `(namespace, file id)`, so leased databases share one budget without ever
+  aliasing two databases' table ids. `ReadResources::state` (a leaf mutex)
+  counts leases per namespace. A leased database's `close` skips closing its
+  readers (`CfCtx::shared_reads`: another open of the same namespace may be
+  reading through them) and drops the lease last; the last lease of a
+  namespace purges that namespace's readers (closing their file handles) and
+  blocks, and after `ReadResources::close` the last lease empties all three
+  caches. Only read-only opens may lease — a writer's compaction would delete
+  files a shared reader holds.
+- Isolation (`txn.rs`): `DB::begin` uses `Options::default_isolation`
+  (default `Snapshot`, not persisted); ReadUncommitted/ReadCommitted read live `visible_seq`;
   the pinned levels read their snapshot. Snapshot+Serializable serialize
   commit-time validation under `commit_mu` and abort with `Conflict` on
   write-write conflicts (first-committer-wins). **Serializable validates point
