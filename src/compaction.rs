@@ -129,6 +129,158 @@ pub(crate) fn run_manual(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()
     res
 }
 
+/// Manual compaction of a key span (`DB::compact_range`, plan C F3, wavesdb
+/// `CompactRange`): push every table whose span reaches into `[lower, upper]`
+/// down level by level to the bottom, then rewrite the bottom tables in the
+/// span that no push produced, and return once all of it is installed.
+///
+/// **Level by level, not one multi-level merge.** A single merge of every
+/// in-span table into the deepest level (wavesdb's shape) is only correct when
+/// the input set is closed under overlap: a table taken from L0 may extend far
+/// past the span, and any table in an intermediate level that overlaps that
+/// overhang — but not the span — would be left *above* output holding versions
+/// newer than its own, and shadow them. Each push here is an ordinary
+/// `level -> level + 1` job whose target set `gather_target` closes over the
+/// source's whole key span, so no level ever holds a version older than one
+/// below it; the pushes then chain down because every output lands in the span
+/// again.
+///
+/// **What "in the span" means.** Whole tables are selected, never parts of
+/// them: a table is taken when its *span* (point keys plus range-tombstone
+/// fragments, `SstMeta::span_min/max`) intersects the bounds under the family's
+/// comparator — `Included`/`Excluded` exactly as for `new_iterator_bounded`.
+/// Keys outside the bounds that share a table with keys inside are rewritten
+/// too. L0 is the exception to "only in-span tables": its files overlap, so it
+/// is taken as the oldest-first window up to and including the newest in-span
+/// file, which is the only L0 subset that can move without reordering versions.
+///
+/// **Exclusion.** Like [`run_manual`], it takes `compact_mu` and the whole
+/// keyspace's range lock for the duration: the tables a push rewrites extend
+/// arbitrarily far past the span, so a lock on the span alone would
+/// under-claim, and the chain of pushes would have to re-pick after every
+/// re-lock. Background jobs and parts/tiers operations wait; flushes do not
+/// (they only add L0 files, newer than anything this moves).
+///
+/// Retention is the ordinary job's: a push into the bottom level, and the
+/// final in-place rewrite, drop tombstones and expired TTL entries not pinned
+/// by a live snapshot; bottom output is cut at partition boundaries. FIFO
+/// families never merge, so for them this runs the FIFO eviction pass and
+/// nothing else.
+pub(crate) fn run_range(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    lower: Bound<&[u8]>,
+    upper: Bound<&[u8]>,
+) -> Result<()> {
+    let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Compaction);
+    if cf.opts.compaction_style == crate::config::CompactionStyle::Fifo {
+        return run_fifo(db, cf);
+    }
+    let _mu = cf.compact_mu.lock();
+    let _range = cf
+        .range_locks
+        .acquire_blocking(crate::range_lock::KeyRange::all());
+    cf.compacting
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let res = compact_range_locked(db, cf, (lower, upper));
+    cf.compacting
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    refresh_compaction_debt(db, cf);
+    res
+}
+
+/// [`run_range`]'s body, with the whole keyspace already held.
+fn compact_range_locked(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    bounds: (Bound<&[u8]>, Bound<&[u8]>),
+) -> Result<()> {
+    // Every table written from here on is output of this call; the final
+    // bottom rewrite skips those, since they are already fresh bottom output.
+    let floor = db.file_id_watermark();
+    let count = || {
+        cf.compaction_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    // At least one push, out of L0: a one-level family's L0 window goes to a
+    // new L1 rather than being rewritten in place, which would have to take
+    // the whole of L0 (its files overlap), span or not.
+    let n = cf.with_levels(|levels| levels.len()).max(2);
+    for level in 0..n - 1 {
+        let Some(inputs) = range_inputs(db, cf, level, &bounds) else {
+            continue;
+        };
+        let (min_key, max_key) = key_span(&inputs, &cf.cmp());
+        // `None`: a foreign mount overlaps the target span. Merging around a
+        // read-only mount would leave overlapping tables in one level, so this
+        // step is skipped, as `DB::compact`'s sweep skips it; the data stays
+        // where it is, which is always correct.
+        let Some(inputs) = gather_target(db, cf, level + 1, &min_key, &max_key, inputs) else {
+            continue;
+        };
+        compact_inputs(db, cf, level, level + 1, inputs)?;
+        count();
+    }
+    // The bottom: rewrite in place what no push above produced, so every
+    // in-span bottom table sees the bottom drop rules once — including one no
+    // incoming data overlapped.
+    let last = cf.with_levels(|levels| levels.len()).saturating_sub(1);
+    if last == 0 {
+        // Still one level: nothing in L0 was in the span, so nothing to do.
+        return Ok(());
+    }
+    let inputs = cf.with_levels(|levels| {
+        let picked: Vec<Arc<SstHandle>> = levels[last]
+            .iter()
+            .filter(|t| t.meta.id < floor)
+            .filter(|t| !is_foreign_mount(db, &t.meta))
+            .filter(|t| cf.span_in_bounds(&t.meta, &bounds))
+            .cloned()
+            .collect();
+        (!picked.is_empty()).then_some(picked)
+    });
+    if let Some(inputs) = inputs {
+        compact_inputs(db, cf, last, last, inputs)?;
+        count();
+    }
+    Ok(())
+}
+
+/// The tables of `level` a range compaction takes: those whose span reaches
+/// into `bounds` (foreign mounts never), or for L0 the oldest-first window up
+/// to and including the newest such file. `None` when there are none.
+fn range_inputs(
+    db: &DbInner,
+    cf: &Arc<ColumnFamily>,
+    level: usize,
+    bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+) -> Option<Vec<Arc<SstHandle>>> {
+    cf.with_levels(|levels| {
+        let tables = levels.get(level)?;
+        let picked: Vec<Arc<SstHandle>> = if level == 0 {
+            // Newest-first: everything from the newest in-span file to the end
+            // (older) moves together. Leaving an older overlapping file behind
+            // while a newer one moves down would let the older version shadow
+            // the newer one.
+            let newest = tables
+                .iter()
+                .position(|t| !is_foreign_mount(db, &t.meta) && cf.span_in_bounds(&t.meta, bounds))?;
+            tables[newest..]
+                .iter()
+                .filter(|t| !is_foreign_mount(db, &t.meta))
+                .cloned()
+                .collect()
+        } else {
+            tables
+                .iter()
+                .filter(|t| !is_foreign_mount(db, &t.meta) && cf.span_in_bounds(&t.meta, bounds))
+                .cloned()
+                .collect()
+        };
+        (!picked.is_empty()).then_some(picked)
+    })
+}
+
 /// Background compaction: run bounded jobs until nothing is triggered.
 ///
 /// Unlike [`run_manual`] this takes no CF-wide lock. Each job holds only the

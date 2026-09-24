@@ -268,6 +268,33 @@ Two consequences worth knowing operationally:
 `DB::compact` (the manual sweep) still takes the column family whole — it
 rewrites every level by design.
 
+## Compacting a key span: `DB::compact_range` (plan C F3)
+
+`db.compact_range(&cf, lower, upper)` compacts the tables whose key span
+reaches into `[lower, upper]` down to the bottom level and returns when the
+result is installed. Bounds are `std::ops::Bound<&[u8]>` under the family's
+comparator, exactly as for `new_iterator_bounded`; `(Unbounded, Unbounded)`
+is the whole family.
+
+- **Whole tables.** A table is taken when its span (point keys plus range
+  fragments) intersects the bounds, so neighbouring keys that share a table
+  are rewritten too. In L0 the oldest-first window up to and including the
+  newest in-span file moves — an older overlapping file may never stay above a
+  newer one that moved down.
+- **Level by level.** `L -> L+1` pushes (each an ordinary job whose target set
+  covers the source's whole key span), then an in-place rewrite of the in-span
+  bottom tables no push produced. A one-level family pushes its window into a
+  new L1. One multi-level merge into the deepest level would be cheaper but is
+  only correct if the input set is closed under overlap at every intermediate
+  level; the chain of ordinary pushes is correct by construction.
+- **Retention and partitions** are the ordinary job's: tombstones and expired
+  TTL entries that reach the bottom are dropped unless a live snapshot still
+  reads what they shadow; bottom output is cut at partition boundaries.
+- **Exclusion**, as for `DB::compact`: the family's whole key range for the
+  duration (the pushed tables extend past the span). Writes and flushes go on.
+  A foreign mount skips only the push that would merge around it. FIFO
+  families run their eviction pass instead.
+
 ## Splitting one job across threads
 
 `Options::num_compaction_threads` limits how many *jobs* run at once, and jobs

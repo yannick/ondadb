@@ -2754,7 +2754,11 @@ impl ColumnFamily {
     }
 
     /// Does this table's **span** (points plus fragments) reach into `bounds`?
-    fn span_in_bounds(&self, meta: &SstMeta, bounds: &(Bound<&[u8]>, Bound<&[u8]>)) -> bool {
+    pub(crate) fn span_in_bounds(
+        &self,
+        meta: &SstMeta,
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> bool {
         let cmp = &self.cmp;
         let (lo, hi) = (meta.span_min(cmp), meta.span_max(cmp));
         let above_lower = match bounds.0 {

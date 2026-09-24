@@ -2838,6 +2838,48 @@ impl DB {
         result
     }
 
+    /// Compact the tables of `cf` whose key span reaches into
+    /// `[lower, upper]` down to the bottom level, and wait for it (plan C F3,
+    /// wavesdb `CompactRange`).
+    ///
+    /// Bounds follow [`Txn::new_iterator_bounded`](crate::Txn::new_iterator_bounded):
+    /// `Included`/`Excluded`/`Unbounded` user keys under the family's
+    /// comparator; `(Unbounded, Unbounded)` is the whole family. Selection is
+    /// by **whole table** — a table is taken when its span (point keys plus
+    /// range-tombstone fragments) intersects the bounds, so keys outside the
+    /// bounds that share a table with keys inside are rewritten too, and in L0
+    /// every file older than the newest in-span one moves with it (L0 files
+    /// overlap, and only an oldest-first window can move without reordering
+    /// versions).
+    ///
+    /// The work is ordinary compaction, level by level (`L -> L+1` jobs,
+    /// then an in-place rewrite of in-span bottom tables that no push
+    /// produced), through the normal catalog transaction and retention rules:
+    /// tombstones and expired TTL entries reaching the bottom are dropped
+    /// unless a live snapshot still sees what they shadow, and bottom output is
+    /// cut at partition boundaries. It runs on the caller's thread and holds
+    /// the family's whole key range while it does, like
+    /// [`compact`](Self::compact), so background compaction and parts/tiers
+    /// operations on the family wait; writes and flushes do not. A foreign
+    /// mount blocks only the push that would merge around it. A FIFO family
+    /// never merges: this runs its eviction pass and nothing else.
+    pub fn compact_range(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.inner.poison.check()?;
+        let result = compaction::run_range(&self.inner, cf, lower, upper);
+        if let Err(error) = &result {
+            cf.record_compaction_failure(error);
+        }
+        result
+    }
+
     /// Force an fsync of every write-ahead log (all column families plus the
     /// unified store, when enabled).
     ///

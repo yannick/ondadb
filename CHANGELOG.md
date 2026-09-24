@@ -182,6 +182,13 @@ directory written by this release is not readable by 0.9.x. The crate is still
 
 #### Compaction
 
+- **`DB::compact_range(cf, lower, upper)`** (plan C F3, wavesdb
+  `CompactRange`): manual compaction of the tables whose span reaches into
+  `Bound`-style bounds, level by level to the bottom, through the ordinary job
+  path (catalog transaction, retention, partition cuts), holding the family's
+  range lock like `DB::compact`; returns when done. `ReadOnly` on a read-only
+  handle. See `docs/compaction-and-write-pacing.md`.
+
 - **Tombstone-density trigger wired** (plan C P4). `ColumnFamilyConfig::
   tombstone_density_trigger` / `tombstone_density_min_entries`, declared but
   read by nothing until now, compact a table whose tombstone fraction reaches
