@@ -1,8 +1,83 @@
 # Changelog
 
-## Unreleased
+## Unreleased — Breaking: yoloDB format epoch 1
 
-### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
+**ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB
+and wavesdb converge on (plan C step 1). Every persisted identifier changes,
+so **a 0.9.x database is not readable by this release's engine**, and a
+directory written by this release is not readable by 0.9.x. The crate is still
+`ondadb`; only the format changed. See `docs/formats.md` and the registry in
+`docs/format-registry.md`.
+
+### Breaking: the format epoch
+
+- **CRC32-C everywhere.** `encoding::checksum` now computes CRC32-C (the `crc32c`
+  crate: hardware CRC on aarch64 and x86-64). 0.9 documented CRC32-C but computed
+  CRC-32/IEEE; every artifact's checksum changes.
+- **SSTable footer** — 96 bytes, magic `YOLOST01`, `format_version` 1, a CRC32-C
+  over the footer (0.9's was unchecksummed), a table **capability word**, and the
+  aux-block handle inside the footer. Footer flags are only `0x01` bloom and
+  `0x02` btree: restart trailers are on **every** data block
+  (`WriterOptions::restart_interval = 0` is refused), vlog frames have one
+  format, and extended/prefix-delta/range meaning moved into the capability word.
+- **Value logs** start with a 32-byte `YOLODBVL` header; frame offsets are
+  absolute (the first frame is at 32).
+- **Codec ids**: LZ4 (and `Lz4Fast`) is stored as **6** — the same raw LZ4 block
+  bytes 0.9 stored as 2. Ids **2 and 4 are burned** (0.9 LZ4 / wavesdb zstd) and
+  refused as `UnsupportedFormat`; 7 (zstd-dict) and 8 (brotli) are reserved.
+  `Compression::from_u8` is replaced by `Compression::codec_id` /
+  `Compression::from_codec_id`.
+- **Bloom blocks**: the hash id leads (`1 | m | k | words`); only xxh3 filters
+  exist in epoch 1.
+- **MANIFEST** — magic `YOLODBMF`, version 1, the capability word as a fixed
+  `u64` header field, and every optional field (WAL layout, nonce, edit cursor,
+  partition/tier/object/max-entry-time, age stamps, range summaries) as a
+  **flagged section** under a strict mask, replacing the positional tails and
+  `ONDA*` tagged tails. A new per-CF **unified id** section (`CfManifest::unified_id`)
+  is stored only when the id diverges from FNV-1a-64 of the name.
+- **MANIFEST-EDITS** — a 32-byte `YOLODBED` header; record framing unchanged
+  (under CRC32-C).
+- **WAL segments** — every stripe file starts with a 32-byte `YOLODBWL` header
+  (version, layout, generation), written and fsynced before the first frame.
+  Replay refuses a segment without one as `UnsupportedFormat` at byte 0; a
+  zero-length file or a torn header is an empty segment. `Wal::open` and
+  `Wal::replay` take a `wal::SegmentId`.
+- **CF config blob** — a `YOLODBCF` TLV (`tag | len | value`, ascending tags,
+  defaults elided, durations in **nanoseconds**). Unknown tags are **preserved**
+  on a decode→encode round trip (`ColumnFamilyConfig::unknown_config_tags`).
+  Decoding is strict: `ColumnFamilyConfig::decode` now returns `Result`.
+- **Unified CF ids** use the correct FNV-1a-64 offset basis
+  (`14695981039346656037`, as wavesdb); 0.9 dropped a digit.
+- Error taxonomy, everywhere: malformed bytes are `Corruption`; an unknown
+  version, flag, capability bit, codec, kind or config enum value is
+  `UnsupportedFormat`.
+
+### Reading 0.9.x databases
+
+- The 0.9 decoders are frozen, decode-only, in `ondadb::legacy_onda`, behind the
+  new **default-on** cargo feature `legacy-onda`. `legacy_onda::open_read_only`
+  opens a 0.9 directory read-only through the engine — tables, WAL tails
+  (per-CF or unified), merge operands, range tombstones and the edit log — which
+  is the source side of the planned automatic upgrade. Without the feature a 0.9
+  directory is a hard `UnsupportedFormat` refusal.
+- **Migration today:** open the 0.9 database with `legacy_onda::open_read_only`
+  and copy every column family into a new database (iterate and write, or
+  `Ingestion`). Automatic in-place upgrade on open (plan C §1.3) is the next step
+  and is not in this release.
+
+### Other
+
+- `docs/format-registry.md` is now the yoloDB registry; `src/format.rs` pins every
+  epoch-1 number with a `const` assertion and a golden test, and
+  `tests/fixtures/epoch1/` is the frozen corpus. The 0.9 corpus moved to
+  `tests/fixtures/legacy-onda/`, with three whole 0.9.1 database directories.
+- The unified WAL rotation opens its next segment before draining writers, as
+  the per-CF rotation already did, so the segment-header fsync does not extend
+  the write gate.
+
+### Ported from wavesdb (plan C step 1, §1.4)
+
+#### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
 
 - `DB::checkpoint_to_object_store(store, prefix, &ObjectCheckpointOptions)`
   uploads `<prefix>/cf-<name>/<id>.{klog,vlog}` then `<prefix>/MANIFEST`
@@ -19,7 +94,7 @@
   and object checkpoints copy the identical file set. No on-disk format
   change: the MANIFEST bytes are the ones a local checkpoint writes.
 
-### Demote a part to the default tier (wavesdb `4fa392c`)
+#### Demote a part to the default tier (wavesdb `4fa392c`)
 
 - `DB::move_part_to_default_tier(cf, partition)`; `move_part_to_tier` and
   `move_part_to_tier_observed` accept the reserved name `"ssd"` for the
@@ -32,7 +107,7 @@
 - `tests/s3_tier.rs`: prefixes are now unique per test (pid + counter), so
   parallel S3 tests no longer collide on macOS's microsecond clock.
 
-### Incremental-backup diff (wavesdb `SSTablesSince`)
+#### Incremental-backup diff (wavesdb `SSTablesSince`)
 
 - `DB::live_sstables()`, `DB::sstables_since(seq)` and
   `DB::sstables_diff(&prior)` (new module `checkpoint`, types
@@ -41,7 +116,7 @@
   data, so `sstables_diff` — by `(cf, id)` identity, reporting `added` and
   `removed` — is the one an incremental backup should use.
 
-### S3 parity with wavesdb v0.8.2–v0.8.6 (feature `s3`)
+#### S3 parity with wavesdb v0.8.2–v0.8.6 (feature `s3`)
 
 - `S3Config` gains `session_token`, `anonymous`, `profile` and `read_only`,
   and derives `Default`. Credential precedence: explicit keys (+ token) >
@@ -62,7 +137,7 @@
 - Fixed the `--features s3` test build (a stale 4-tuple destructure of
   `Reader::get`).
 
-### Added
+#### Added
 
 - **Shared read resources** (wavesdb `ReadResources`, `23648c8`,
   `f6b3def`): `ReadResources::new(ReadResourceOptions { block_cache_bytes,
@@ -95,7 +170,7 @@
   a transaction's level. The per-family `default_isolation_level` stays
   reserved (a transaction spans families, so no family's setting could decide).
 
-### Performance
+#### Performance
 
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
   and `multi_get` skip a candidate table whose `max_seq` is at or below the

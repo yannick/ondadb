@@ -296,10 +296,10 @@ impl DB {
 
         std::fs::create_dir_all(dir)?;
         for cfm in &plan.manifest.cfs {
-            std::fs::create_dir_all(dir.join(format!("cf-{}", cfm.name)))?;
+            std::fs::create_dir_all(dir.join(crate::format::cf_dir_name(&cfm.name)))?;
         }
         for f in &plan.files {
-            let dst = dir.join(format!("cf-{}/{}.{}", f.cf, f.id, f.ext));
+            let dst = dir.join(crate::format::cf_dir_name(&f.cf)).join(format!("{}.{}", f.id, f.ext));
             place_storage_file(f.storage.as_ref(), &f.src, &dst, hard_link)?;
         }
         if self.inner.opts.read_only {
@@ -415,7 +415,9 @@ impl DB {
                          fragments: Vec<crate::range_tombstone::Fragment>|
          -> Result<()> {
             let id = self.inner.next_file_id();
-            let klog = dir.join(format!("cf-{}", cf.name())).join(format!("{id}.klog"));
+            let klog = dir
+                .join(crate::format::cf_dir_name(cf.name()))
+                .join(format!("{id}.klog"));
             let klog = klog.to_str().ok_or_else(|| {
                 OndaError::InvalidArgs(format!("snapshot path {klog:?} is not UTF-8"))
             })?;

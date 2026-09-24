@@ -1,10 +1,22 @@
-# On-disk formats
+# On-disk formats — yoloDB format epoch 1
 
 Every persisted byte, exactly. All fixed-width integers are **little-endian**;
 varints are unsigned LEB128 (`uvarint`) or zig-zag LEB128 (`varint`) — see
-`encoding.rs`. The framing checksum everywhere is **CRC32-C** (`checksum()`,
-crc32fast). Format changes require updating this file, the round-trip tests,
-and a release note (no cross-version compat machinery exists yet — v0).
+`encoding.rs`. The integrity checksum everywhere is **CRC32-C** (Castagnoli;
+`encoding::checksum`, the `crc32c` crate, check value `"123456789"` →
+`0xE3069283`).
+
+This is **format epoch 1** of the yoloDB family (plan C,
+`docs/plans/phase-c-yolodb-convergence/plan.md`), which ondaDB writes from
+0.10. Every magic, version, flag, capability bit, kind, codec id and config
+tag named here is registered in [`format-registry.md`](format-registry.md) and
+pinned in `src/format.rs` by a `const` assertion and a golden test; the byte
+corpus is `tests/fixtures/epoch1/` (`tests/epoch1_golden.rs`). The ondaDB 0.9
+formats this epoch replaced are summarized in the appendix; they are read only
+by `src/legacy_onda/`.
+
+A format change requires updating this file, the registry, the golden corpus
+and a release note.
 
 ## Internal keys (`format.rs`)
 
@@ -48,8 +60,8 @@ refuse to read would turn a caller's mistake into an unopenable database.
 
 | Error | Meaning | Examples |
 |---|---|---|
-| `Corruption` (code `-5`) | the bytes contradict a format this binary *does* implement | unknown entry-flag bit, `SINGLE_DELETE` without `TOMBSTONE`, unknown or duplicated manifest tail tag, a record that fails to decode inside a CRC-valid WAL frame |
-| `UnsupportedFormat` (code `-16`) | the bytes are well-formed but name a feature this binary does not implement | a footer flag bit outside `KNOWN_FOOTER_FLAGS`, a manifest capability bit outside `KNOWN_CAPS`, an assigned-but-unimplemented record kind (`< 64`), an unknown WAL envelope schema, an unknown SST aux-section tag |
+| `Corruption` (code `-5`) | the bytes contradict a format this binary *does* implement | unknown entry-flag bit, `SINGLE_DELETE` without `TOMBSTONE`, a manifest section a writer cannot produce, a record that fails to decode inside a CRC-valid WAL frame, any checksum mismatch outside a torn tail |
+| `UnsupportedFormat` (code `-16`) | the bytes are well-formed but name a feature this binary does not implement | an unknown artifact version, a footer flag outside `0x03`, a capability bit outside `KNOWN_CAPS`, an unknown manifest section flag, a burned or unimplemented codec id, an assigned-but-unimplemented record kind (`< 64`), an unknown WAL envelope schema or segment layout, an unknown SST aux-section tag, an unknown config enum value, and any 0.9 artifact (read through `legacy_onda`) |
 
 A record kind **≥ 64 is `Corruption`, not `UnsupportedFormat`**: that range is
 never assigned to anything, so those bytes cannot have come from a newer writer.
@@ -62,8 +74,9 @@ cleanly (`Ok`).
 
 A capability is the durable *permission* to write a newer artifact, taken once —
 before the first byte using it exists — through
-`DB::enable_format_capabilities`. The word lives in the manifest's `ONDACAP1`
-tail and bumps the manifest to VERSION 2, which pre-1.0 binaries refuse outright.
+`DB::enable_format_capabilities`. The database's word is the fixed `caps u64`
+field of the manifest header; each SSTable additionally declares the subset its
+own bytes use in its footer's capability word (§ Footer).
 
 | Bit | Symbol | Owner feature |
 |---:|---|---|
@@ -76,9 +89,8 @@ tail and bumps the manifest to VERSION 2, which pre-1.0 binaries refuse outright
 | `1 << 6` | `CAP_TXN_DECISIONS` | 3.2 — prepare/decision records; implies `CAP_EXTENDED_RECORDS` |
 
 `KNOWN_CAPS = 0x7F`. The values are an interoperability contract with wavesdb:
-a bit is never renumbered, only retired. Enabling is **one-way and idempotent**;
-a database that enables nothing keeps writing VERSION-1 manifests and legacy
-artifacts forever.
+a bit is never renumbered, only retired. Enabling is **one-way and idempotent**.
+A bit outside `KNOWN_CAPS` in a manifest or a footer is `UnsupportedFormat`.
 
 The enable protocol (`DbInner::enable_capability`) is persist-before-use:
 refuse a poisoned or read-only database → return `Ok` if the bits are already
@@ -115,15 +127,16 @@ describe the same thing with the same numbers: `HAS_TTL = 0x02`,
 modifier bit is `Corruption`: modifiers are not capability-gated, so no writer
 of any vintage may set one.
 
-Every legacy byte pattern these rules must keep accepting is pinned by the
-frozen corpus in `tests/fixtures/phase1/` (see
-`tests/fixtures_phase1.rs::legacy_corpus_decodes_unchanged`). Those files were
-produced by the 0.8.2 encoders and are regenerated only by an explicit,
-reviewed format change — the `#[ignore]`d `regenerate_phase1_fixtures` test.
+The byte patterns these rules accept are pinned by the epoch-1 golden corpus in
+`tests/fixtures/epoch1/` (`tests/epoch1_golden.rs`), which the live encoders
+must reproduce byte for byte and which the tests decode by hand. Those files
+change only by an explicit, reviewed regeneration (the `#[ignore]`d
+`regenerate_epoch1_fixtures`).
 
 ## WAL (`wal.rs`)
 
-File set per generation (a generation = one memtable lifetime):
+File set per generation (a generation = one memtable lifetime; its files are a
+*segment*):
 
 ```
 wal-<gen>.log            stripe 0 — its presence marks the generation
@@ -134,6 +147,38 @@ wal-<gen>.log.s1 .. .s3  stripes 1..3   (only for SyncMode::None/Interval)
 Committing threads own a sticky stripe (`my_stripe`), eliminating file-mutex
 convoys. Replay reads all stripes; cross-stripe order is immaterial (seq
 decides visibility). Deletion must use `wal::remove_wal_files(base)`.
+
+### Segment header (32 bytes, offset 0 of every stripe file)
+
+```
+off len field
+  0   8 magic "YOLODBWL"
+  8   4 version u32 = 1
+ 12   1 layout u8          1 = per column family (envelope schema 1)
+                           2 = unified            (envelope schema 2)
+ 13   3 reserved = 0
+ 16   8 generation u64     must equal the <gen> in the file name
+ 24   4 reserved = 0
+ 28   4 crc32c u32 over bytes 0..28
+```
+
+Frames start at offset 32. `Wal::open(path, mode, interval, SegmentId)` writes
+the header into every new stripe and **fsyncs it before the open returns**, so
+no frame is ever appended ahead of a durable header. That ordering is what makes
+the torn-header rule safe:
+
+| First bytes of a stripe | Replay | Reopen for append |
+|---|---|---|
+| zero-length file (created, never written) | empty | header written |
+| a short prefix of the magic, or all zero, shorter than 32 bytes | empty (torn header) | truncated, header rewritten |
+| exactly 32 bytes, CRC mismatch or all zero | empty (torn header) | truncated, header rewritten |
+| anything else without the magic — a 0.9 WAL is frames from byte 0 | `UnsupportedFormat` at byte 0 | `UnsupportedFormat` |
+| unknown version, unknown layout byte | `UnsupportedFormat` | same |
+| CRC mismatch with frames behind it; reserved bytes set; a layout or generation other than the file's name and place say | `Corruption` | same |
+
+A torn header can only sit on a file holding no frame, because the header was
+durable before the first frame was written — so treating it as empty loses
+nothing, exactly as a torn tail loses nothing.
 
 Frame — **one frame per committed batch** (atomic replay unit):
 
@@ -318,25 +363,43 @@ value with `len >= klog_value_threshold`, default 512 — WiscKey separation).
 ### klog layout
 
 ```
-[data block 0] … [data block N-1] [bloom block?] [index block(s)] [footer 64B]
+[data block 0] … [data block N-1] [bloom block?] [aux block?] [index block(s)] [footer 96B]
 ```
 
-Every block (data/bloom/index) is framed by `block.rs`:
+Every block (data/bloom/aux/index) is framed by `block.rs`:
 
 ```
-[alg u8][comp_len u32][raw_len u32][crc32c(payload) u32][payload]
+[codec u8][comp_len u32][raw_len u32][crc32c(payload) u32][payload]
 ```
 
-`alg` is the `Compression` enum; if compression does not shrink a block it is
-stored with `alg = None`. The CRC covers the compressed payload. Data blocks
-target `ColumnFamilyConfig::data_block_size` raw bytes (default 4 KiB), counting
-the restart trailer the block will carry — it rides inside the framed payload,
-so a block cut on its entries alone overshoots the target by `4 * R + 4`. (Before
-2.1 the cut ignored the trailer; existing files are unaffected, because block
-boundaries are self-describing.) Block handles make each file self-describing, so
+`codec` is an epoch-1 codec id (§ Codec ids); if compression does not shrink a
+block it is stored with codec `0`. The CRC covers the stored payload, and it is
+checked **before** the codec byte is interpreted, so a flipped codec byte is
+`Corruption` and only an intact frame naming an unimplemented codec is
+`UnsupportedFormat`. Data blocks target `ColumnFamilyConfig::data_block_size` raw
+bytes (default 4 KiB), counting the restart trailer the block will carry — it
+rides inside the framed payload, so a block cut on its entries alone overshoots
+the target by `4 * R + 4`. Block handles make each file self-describing, so
 changing the policy does not affect reads of existing tables.
 
-Data-block entry (`sst::encode_entry` / `decode_entry`):
+**Every data block carries a restart trailer** (0.9 made it optional behind a
+footer flag):
+
+```
+entries … | restart_off u32 × R | R u32
+```
+
+one anchor per `restart_interval` entries (`ColumnFamilyConfig::
+block_restart_interval`, default 8, in `[1, 1024]`; `WriterOptions::
+restart_interval = 0` — 0.9's "no trailer" — is refused). The first anchor is
+at offset 0, anchors strictly increase, and point reads and seeks binary-search
+them.
+
+The entry layout is table-level and read from the footer's **capability word**:
+without `CAP_EXTENDED_RECORDS` the *base* layout below; with it the extended
+layout; with `CAP_PREFIX_DELTA` as well, the prefix-delta layout.
+
+Base data-block entry (`sst::encode_entry` / `decode_entry`):
 
 ```
 flags u8 | key_len uvarint | val_len uvarint | seq uvarint
@@ -346,12 +409,12 @@ flags u8 | key_len uvarint | val_len uvarint | seq uvarint
 ```
 
 Entries are appended in internal order; each block's index separator is the
-block's **last** `(user_key, seq)`.
+block's **last** `(user_key, seq)` (shortened under a bytewise comparator).
 
-#### Extended entry layout (`FOOTER_EXTENDED_BLOCK = 0x10`)
+#### Extended entry layout (`CAP_EXTENDED_RECORDS` in the footer word)
 
-When the footer sets `FOOTER_EXTENDED_BLOCK`, **every** data-block entry in the
-table uses the kind-bearing layout instead:
+When the footer declares `CAP_EXTENDED_RECORDS`, **every** data-block entry in
+the table uses the kind-bearing layout instead:
 
 ```
 kind uvarint | modifiers uvarint | key_len uvarint | val_len uvarint
@@ -359,13 +422,12 @@ kind uvarint | modifiers uvarint | key_len uvarint | val_len uvarint
 | value bytes | vlog_off u64   (as above, on modifiers & HAS_VLOG)
 ```
 
-The flag is **table-level**, not per-block: a block carries no flag byte of its
-own, so a per-block decision would be its own format change. `Reader::open`
-resolves the layout once from `footer[48]` and threads it to every
-`decode_entry`. Block framing, compression, the restart trailer and the index
-are untouched — entry boundaries still come from `decode_entry`'s returned
-`next`, so restart binary search, the B+tree index and the block CRC all keep
-working unchanged.
+The choice is **table-level**, not per-block: a block carries no header byte of
+its own, so a per-block decision would be its own format change (plan C step 2,
+row B). `Reader::open` resolves the layout once from the footer and threads it
+to every `decode_entry`. Block framing, compression, the restart trailer and the
+index are untouched — entry boundaries still come from `decode_entry`'s returned
+`next`.
 
 #### Merge operands (kind 4, `CAP_MERGE_OPERANDS`)
 
@@ -378,10 +440,11 @@ it was folded into.
 Writer rule, the same shape as prefix-delta's: a family emits kind 4 only when
 it has a merge operator **and** the database durably holds
 `CAPS_MERGE_WRITE = CAP_EXTENDED_RECORDS | CAP_MERGE_OPERANDS`. Because the kind
-exists only inside the extended entry, a family with an operator writes
-`FOOTER_EXTENDED_BLOCK` tables from flush, ingestion and compaction alike;
-`Writer::add` refuses a non-point kind on a legacy-layout table rather than
-emitting bytes that say something else.
+exists only inside the extended entry, a family with an operator writes extended
+tables from flush, ingestion and compaction alike; `Writer::add` refuses a
+non-point kind on a base-layout table rather than emitting bytes that say
+something else. A table that holds an operand declares `CAP_MERGE_OPERANDS` in
+its footer word.
 
 **The fold rule.** For key `k` at `read_seq`, over the versions of `k`
 newest-first, considering only `seq <= read_seq`:
@@ -400,7 +463,7 @@ newest-first, considering only `seq <= read_seq`:
 point-read path already carries as found/deleted.
 
 The operator is identified by *name*, persisted in the column family's config
-blob (tag `ONDAMRG1`, `name_len uvarint | name`) and re-resolved from
+blob (TLV tag 32, `merge_operator_name`) and re-resolved from
 `Options::merge_fns` at every open. A stored name with no registered
 implementation fails the open — never a silent fallback, which would read every
 stored operand back as its own raw bytes. The stored name always wins, and
@@ -432,34 +495,9 @@ live chain is not reclaimed, the bottom TTL drop never applies to an operand,
 and an operand is not bloom-filter-eligible. Everything *older* than a chain's
 base is still dropped exactly as before.
 
-**Extended footer prefix.** The 64-byte footer is full, so the aux-block handle
-lives in the 16 bytes immediately preceding it:
+#### Prefix-delta entry layout (`CAP_PREFIX_DELTA` in the footer word)
 
-```
-[size-80 .. size-72)  aux_off u64   (0 when absent)
-[size-72 .. size-64)  aux_len u64   (0 when absent)
-[size-64 .. size)     the fixed 64-byte footer
-```
-
-Read at open and bounds-checked against the file before any allocation. The aux
-block is `block.rs`-framed like every other block (so it is CRC-covered) and its
-payload is a tagged section list:
-
-```
-aux payload := section_count uvarint | section × count
-section     := tag u8 | len uvarint | payload[len]
-tag 1 = range-delete fragments (defined by 1.2)
-tag 2..  reserved
-```
-
-An unknown section tag is `UnsupportedFormat`, raised at `Reader::open` rather
-than surfacing later as a silently missing section. 1.0 defines the container
-and writes `aux_off = aux_len = 0`; 1.2 is the first producer. A legacy table
-has no prefix at all (`Reader::aux_block_handle()` returns `None`).
-
-#### Prefix-delta entry layout (`FOOTER_PREFIX_DELTA = 0x20`)
-
-When the footer sets `FOOTER_PREFIX_DELTA`, **every** data-block entry stores
+When the footer declares `CAP_PREFIX_DELTA`, **every** data-block entry stores
 only the key bytes it does not share with its predecessor
 (`sst::encode_entry_delta` / `decode_entry_delta`):
 
@@ -483,12 +521,12 @@ anchor, so **every offset the restart array names decodes with
 search free of materialization, and what makes bidirectional iteration
 possible at all. Sharing never crosses a block boundary or an anchor.
 
-The flag requires both `FOOTER_EXTENDED_BLOCK` (the layout is defined only over
-the extended entry) and `FOOTER_RESTARTS` (without anchors a delta block is
-decodable only from offset 0). `Reader::open` rejects either combination as
-`Corruption` — no writer can produce it. Nothing else changes: the restart
-trailer, the index block, the B+tree index, the bloom block, block framing and
-the vlog are untouched.
+The bit requires `CAP_EXTENDED_RECORDS` (the layout is defined only over the
+extended entry); a footer declaring one without the other is `Corruption` — no
+writer can produce it. Every block has anchors in epoch 1, so the 0.9 rule
+"prefix-delta requires the restart flag" is now structural. Nothing else
+changes: the restart trailer, the index block, the B+tree index, the bloom
+block, block framing and the vlog are untouched.
 
 Decoder validation rules, each with its own corruption test
 (`tests/prefix_delta.rs`):
@@ -501,8 +539,7 @@ Decoder validation rules, each with its own corruption test
 5. A restart run's walk lands exactly on the next anchor — and the last run's
    on the end of the entries region, so nothing sits between the last entry and
    the trailer.
-6. `FOOTER_PREFIX_DELTA` without `FOOTER_EXTENDED_BLOCK` or without
-   `FOOTER_RESTARTS`.
+6. `CAP_PREFIX_DELTA` without `CAP_EXTENDED_RECORDS` in the footer word.
 7. Reconstructed keys are non-decreasing within a block. Exact under byte-wise
    ordering, which is where it is enforced; a custom comparator defines its own
    order, and threading a `ComparatorRef` vtable call into the per-entry decode
@@ -520,36 +557,43 @@ it away by itself.
 Writing is gated on **both** `CAP_EXTENDED_RECORDS` and `CAP_PREFIX_DELTA` plus
 `ColumnFamilyConfig::enable_prefix_delta_keys`. Turning the option off stops new
 delta blocks; tables already written stay readable, in any level, part,
-checkpoint or attach — a footer flag is read from the artifact, never from the
-manifest.
+checkpoint or attach — the footer's capability word is read from the artifact,
+never from the manifest.
 
 ### vlog layout
 
-Concatenated per-value frames, addressed by `vlog_off` (frame start). Two frame
-layouts exist; which one a table uses is a footer flag (`FOOTER_VLOG_V2`), not a
-per-frame tag:
+A 32-byte header, then concatenated per-value frames addressed by `vlog_off`
+(the frame's absolute file offset, so every offset is ≥ 32):
 
 ```
-v1: [crc32c(value) u32][value bytes]                        (VLOG_CRC_LEN = 4)
-v2: [crc32c(stored) u32][alg u8][stored_len u32][stored]    (VLOG_V2_HDR_LEN = 9)
+header:  0 magic "YOLODBVL" | 8 version u32 = 1 | 12 flags u32 = 0
+        | 16 reserved [12] = 0 | 28 crc32c u32 over bytes 0..28
+frame:   [crc32c(stored) u32][codec u8][stored_len u32][stored]     (9-byte header)
 ```
 
-In v2 the payload is the value compressed with `alg`, or the raw value with
-`alg = None` when compression would not shrink it — so **the stored length never
-exceeds the logical value length** (`val_len` in the klog entry), and a frame
-claiming otherwise is corrupt. `stored_len` is a `u32`: the writer refuses a
-value whose stored form reaches 4 GiB (`OndaError::TooLarge`) rather than
-truncate the field, which would leave the CRC covering bytes no reader reads and
-the next frame's offset pointing inside this one.
+The header is written when the writer creates the file (on its first large
+value) and validated by the reader on its first vlog access — magic and CRC
+`Corruption`, version and flags `UnsupportedFormat`, reserved bytes `Corruption`
+— once per open reader, like the block and frame checksums. A frame offset below
+32 is `Corruption`. The `flags` word is reserved for per-file dictionaries and
+compression groups (plan C step 2); no bit is assigned in epoch 1.
 
-The CRC covers the stored bytes and is verified **once per frame per open
+The payload is the value compressed with `codec`, or the raw value with codec
+`0` when compression would not shrink it — so **the stored length never exceeds
+the logical value length** (`val_len` in the klog entry), and a frame claiming
+otherwise is corrupt. `stored_len` is a `u32`: the writer refuses a value whose
+stored form reaches 4 GiB (`OndaError::TooLarge`) rather than truncate the
+field, which would leave the CRC covering bytes no reader reads and the next
+frame's offset pointing inside this one.
+
+The frame CRC covers the stored bytes and is verified **once per frame per open
 reader** (`Reader::verify_vlog_frame`), on both the file and mmap paths — the
 same "immutable file, check it once" rule the klog's per-block `verified` bitmap
 uses, and the same limit: a frame is re-verified when the table is re-opened, not
 when it is re-read. A frame that fails is never marked, so corruption keeps being
 reported on every subsequent read.
 
-Older builds wrote unframed vlogs — no migration exists.
+Epoch 1 has exactly one frame format (0.9 had two, selected by a footer flag).
 
 ### Index
 
@@ -567,40 +611,49 @@ fanout 256 (`BTREE_FANOUT`). Node: `node_type u8 (1=leaf, 0=internal)` |
 The reader walks the tree at open and rebuilds the flat in-memory index —
 `use_btree` changes the on-disk index layout only, not the engine.
 
-### Footer (fixed 64 bytes at EOF)
+### Footer (fixed 96 bytes at EOF)
 
 ```
 offset  field
-0..8    index handle offset      (u64)
-8..16   index handle length
-16..24  bloom handle offset      (0 if none)
-24..32  bloom handle length
-32..40  num_entries
-40..48  max_seq
-48      flags: FOOTER_HAS_BLOOM=0x01, FOOTER_BTREE=0x02,
-               FOOTER_RESTARTS=0x04, FOOTER_VLOG_V2=0x08,
-               FOOTER_EXTENDED_BLOCK=0x10, FOOTER_PREFIX_DELTA=0x20
-49..56  unused
-56..64  FOOTER_MAGIC = 0x5741_5645_5353_5431
+ 0..16  index handle        off u64 | len u64
+16..32  bloom handle        off u64 | len u64     (0, 0 iff no FLAG_BLOOM)
+32..40  num_entries u64
+40..48  max_seq u64
+48..52  flags u32           FLAG_BLOOM = 0x01, FLAG_BTREE = 0x02
+52..56  format_version u32 = 1
+56..64  capability word u64 (the table's subset of TABLE_CAPS)
+64..80  aux handle          off u64 | len u64     (0, 0 when no aux block)
+80..84  crc32c u32 over bytes 0..80
+84..88  reserved u32 = 0
+88..96  magic "YOLOST01"
 ```
 
-`KNOWN_FOOTER_FLAGS = 0x3F`. A bit outside that mask was written by a newer
-binary and names a feature this one does not implement, so `Reader::open`
-refuses the file with `OndaError::UnsupportedFormat` (code `-16`) rather than
-`Corruption` — the file is intact, this binary is simply too old.
+`sst::decode_footer` checks, in order, and fails closed:
+
+| Check | Error |
+|---|---|
+| magic is 0.9's `WAVESST1` | `UnsupportedFormat` (read it through `legacy_onda`) |
+| magic is anything else | `Corruption` |
+| `format_version != 1` | `UnsupportedFormat` — the CRC position is the version's to define |
+| CRC32-C over bytes 0..80 | `Corruption` |
+| reserved word non-zero | `Corruption` |
+| a flag outside `0x03` | `UnsupportedFormat` |
+| a capability bit outside `KNOWN_CAPS` | `UnsupportedFormat` |
+| a database-level bit (`CAP_MANIFEST_EDITS`, `CAP_PERIODIC_AGE`, `CAP_TXN_DECISIONS`), or a table bit without `CAP_EXTENDED_RECORDS` | `Corruption` |
+| any handle past the footer, `FLAG_BLOOM` disagreeing with the bloom handle, an empty aux handle with an offset | `Corruption` |
+| `CAP_RANGE_DELETES` disagreeing with the aux block's range section (checked at open) | `Corruption` |
+
+The flags carry no format meaning (plan C §1.1.3): restarts became
+unconditional, one vlog frame format remains, and the extended/prefix-delta/
+range meaning moved into the capability word. The footer is checksummed — 0.9's
+was not.
 
 ### Aux block and the range-fragment section (tag 1, 1.2)
 
-An **extended** table (`FOOTER_EXTENDED_BLOCK`) carries a 16-byte handle in the
-bytes immediately preceding the footer:
-
-```
-aux_off u64 LE | aux_len u64 LE      (both 0 when the table has no aux block)
-```
-
-It lives outside the footer because the fixed 64 bytes are full. The block it
-addresses is `block.rs`-framed like every other block, so its bytes are
-CRC-covered (invariant 4), and its payload is a tagged section list:
+Every table's footer carries the aux-block handle (0.9 put it in 16 bytes ahead
+of the footer, and only for extended tables). The block it addresses is
+`block.rs`-framed like every other block, so its bytes are CRC-covered
+(invariant 4), and its payload is a tagged section list:
 
 ```
 aux payload := section_count uvarint | section × count
@@ -611,7 +664,9 @@ tag 2.. reserved
 
 An unknown section tag fails the **open** with `UnsupportedFormat`: the block is
 intact and names a feature this binary does not implement, and a silently
-skipped section would be a silently missing range delete.
+skipped section would be a silently missing range delete. A table carrying a
+range section declares `CAP_RANGE_DELETES` in its footer word, and only such a
+table does.
 
 Section 1's payload:
 
@@ -624,8 +679,8 @@ fragment := slen uvarint | start | elen uvarint | end
 Fragments of one table are **disjoint, sorted by `start`, and non-empty**, with
 strictly descending sequence stacks — a file claiming otherwise is `Corruption`,
 because the read path's binary search and its monotonic scan cursor both depend
-on those properties. Legacy tables, and extended tables with no fragments, carry
-no aux block at all (`aux_off = aux_len = 0`).
+on those properties. Tables with no fragments carry no aux block at all
+(`aux_off = aux_len = 0` in the footer).
 
 **Where fragments come from.** A flush emits its memtable's range tombstones
 fragmented over the whole keyspace — one L0 file, one owned interval. A
@@ -653,281 +708,110 @@ output. Both stay inside the job span.
 
 ### Bloom filter (`bloom.rs`)
 
-Classic k-hash (double hashing from one FNV-1a), sized from expected entries ×
-`bloom_fpr` (default 0.01). Serialized dense or sparse (non-zero words only);
-stored as a meta block, referenced by the footer.
+Classic k-hash (double hashing from one xxh3-64 of the user key, seed 0), sized
+from the keys a table actually holds × the level's false-positive rate. Stored
+as a meta block, referenced by the footer:
+
+```
+hash u8 = 1 (xxh3-64) | m uvarint | k uvarint | words u64 LE × ceil(m / 64)
+```
+
+The hash id **leads** (wavesdb's layout; 0.9 trailed it). Probing is
+`bit_i = (h1 + i·h2) mod m` with `h1 = h as u32`, `h2 = (h >> 32) as u32`, bits
+LSB-first in u64 words — identical in both engines. `Bloom::decode` refuses a
+hash id other than 1 as `UnsupportedFormat` (0 is 0.9's FNV) and `m` outside
+`[1, 2^32)`, `k` outside `[1, 30]`, a short word array or trailing bytes as
+`Corruption`.
+
+### Codec ids
+
+| Id | Codec |
+|---:|---|
+| 0 | none |
+| 1 | snappy |
+| 2 | **burned** (0.9 LZ4 / wavesdb zstd) — `UnsupportedFormat` |
+| 3 | zstd |
+| 4 | **burned** (0.9 LZ4-fast / wavesdb zstd) — `UnsupportedFormat` |
+| 5 | raw deflate |
+| 6 | raw LZ4 block — `Compression::Lz4` and `Lz4Fast` both write it |
+| 7 | zstd with a per-file dictionary — reserved (step 2) |
+| 8 | brotli — reserved |
+
+`Compression` is an API enum; `Compression::codec_id` / `from_codec_id` are the
+only mapping to and from the byte.
 
 ## MANIFEST (`manifest.rs`)
 
 Whole file, CRC32-C over everything before the trailing 4-byte CRC:
 
 ```
-magic u32 = 0x5756_4D46 ("WVMF") | version u32 ∈ {1, 2}
-| next_file_id u64 | global_seq u64 | cf_count uvarint
-| per CF: name bytes* | config blob bytes* | sst_count uvarint
-  | per SST: id, level, num_entries, num_tombstones, max_seq,
-             klog_size, vlog_size (all uvarint) | min_key* | max_key*
-| append-tolerant tail (0–4 sections, see below)
-| crc32c u32
+off  field
+  0  magic "YOLODBMF"
+  8  version u32 = 1
+ 12  caps u64                       the database's capability word
+ 20  db_flags u32                   sections present (strict mask)
+ 24  next_file_id u64
+ 32  global_seq u64
+ 40  [0x2 DB_INSTANCE_NONCE]  nonce u64
+     [0x4 DB_EDIT_LOG]        generation u64 | applied_through u64 | next_edit_id u64
+     cf_count uvarint
+     per CF:  cf_flags uvarint | name* | config* | [0x1 CF_UNIFIED_ID] id u64
+              | sst_count uvarint
+       per SST: id, level, num_entries, num_tombstones, max_seq, klog_size,
+                vlog_size (all uvarint) | min_key* | max_key*
+                | sst_flags uvarint
+                | [0x01 SST_PARTITION]            name*
+                | [0x02 SST_TIER]                 name*
+                | [0x04 SST_OBJECT]               stem*
+                | [0x08 SST_MAX_ENTRY_TIME]       uvarint (i64 as u64)
+                | [0x10 SST_LAST_COMPACTION_TIME] uvarint (i64 as u64)
+                | [0x20 SST_RANGE]                range_count | range_min_seq
+                                                  | range_max_seq | min_key* | max_key*
+     crc32c u32
 ```
 
-(`*` = uvarint length prefix + bytes.) The config blob is the
-`ColumnFamilyConfig::encode` durable subset (comparator name, use_btree,
-compression, sync mode, per-level/per-prefix compression, FIFO settings,
-partition rules, tier rules — see § Config blob below). `Manifest::save` is
-crash-atomic: write `MANIFEST.tmp` → `sync_all` → rename over `MANIFEST` →
-parent-dir fsync. The temp path is fixed, so all saves MUST be serialized by
-`DbInner::manifest_mu` (a past data-loss bug). A CRC-invalid manifest fails
-`DB::open` (no partial recovery); a missing one is an empty database.
+(`*` = uvarint length + bytes.) `DB_UNIFIED_WAL` (`0x1`) has no payload: its
+presence is the unified WAL layout. Every optional field is a **flagged
+section**, present in ascending bit order exactly when its value differs from
+the empty default — the discipline wavesdb's v3/v4 manifest proved out,
+replacing 0.9's positional tails and `ONDA*` 8-byte tagged tails (whose
+"tagged sections force the positional ones" rule was load-bearing and a
+silent-corruption hazard). `Manifest::save` is crash-atomic: write
+`MANIFEST.tmp` → `sync_all` → rename over `MANIFEST` → parent-dir fsync. The
+temp path is fixed, so all saves MUST be serialized by `DbInner::manifest_mu`
+(a past data-loss bug). A missing manifest is an empty database.
 
-### Append-tolerant tail (SST metadata and WAL layout)
+**Decoding** checks the whole-file CRC first — any flipped bit is `Corruption`
+— then fails closed:
 
-The per-SST record list above is a flat sequential encoding with no framing,
-so optional per-record fields cannot be added in place without breaking older
-readers. Instead they live in a tail between the last CF's records and the
-CRC (the CRC covers the tail). Its four original sections are always in this
-order; later tagged A2 sections are described below:
-
-```
-1. partition section   per CF, in manifest CF order:
-                         count uvarint
-                         { table_index uvarint | name* } × count
-2. tier section        same shape as 1 (payload = tier name)
-3. max-entry-time section
-                         count uvarint
-                         { table_index uvarint | value uvarint } × count
-4. unified WAL layout    "ONDAWAL1" | layout u8 (1 = unified)
-```
-
-`table_index` is the table's position in that CF's `sst_count` list.
-`value` in section 3 is `SstMeta::max_entry_time` cast to `u64` (nanoseconds
-since the Unix epoch); tables not listed in a section decode that field as
-`None`.
-
-**Emission rules** (`Manifest::encode`) keep every earlier on-disk format
-byte-identical — a later section is emitted only when all earlier ones
-precede it, even if those are all-empty counts:
-
-| Fields set anywhere in the manifest | Tail emitted |
+| Condition | Error |
 |---|---|
-| none                                | no tail at all (legacy layout, byte-identical to pre-0.3.0) |
-| only `partition`                    | section 1 only (P1 layout) |
-| any `tier`, no `max_entry_time`     | sections 1 + 2 (P3 layout) |
-| any `max_entry_time`                | sections 1 + 2 + 3 |
-| unified WAL layout                  | sections 1 + 2 + 3 + tagged section 4 |
-| any tagged section (`ONDAOBJ1`, `ONDAINS1`, `ONDACAP1`, `ONDAAGE1`) | sections 1 + 2 + 3 (possibly all-empty) + the tags |
+| 0.9 magic `WVMF` | `UnsupportedFormat` (read through `legacy_onda`) |
+| any other foreign magic, CRC mismatch, truncation, trailing bytes after the last CF | `Corruption` |
+| version ≠ 1; a capability bit outside `KNOWN_CAPS`; an unknown db / cf / sst flag bit | `UnsupportedFormat` |
+| `DB_EDIT_LOG` at the empty default `(0, 0, 1)`, or with `next_edit_id ≠ applied_through + 1` | `Corruption` |
+| `SST_LAST_COMPACTION_TIME` without `CAP_PERIODIC_AGE`; `SST_RANGE` without `CAP_RANGE_DELETES` | `Corruption` — nothing stamps a table before the bit is durable |
+| a range summary naming zero fragments, an empty bound, or `min_seq > max_seq` | `Corruption` |
+| `CF_UNIFIED_ID` equal to FNV-1a-64 of the name | `Corruption` — the derived id is never written |
+| a table level above `u32`, invalid UTF-8 in a name | `Corruption` |
 
-**Decoding** is positional for sections 1–3: after the CF loop, if bytes remain
-before the CRC the first section is the partition section, the next (if bytes
-remain) the tier section, the next the time section. Everything after that is
-**tagged**, and is decoded by a dispatch loop (`decode_tagged_tails`) that reads
-an 8-byte tag, hands the remainder to that tag's decoder, and repeats:
+The config blob is the `ColumnFamilyConfig::encode` TLV (§ Config blob);
+partition and tier rules travel inside it.
 
-- a tag this binary does not know ⇒ `Corruption` (the loop's default arm);
-- a residual shorter than 8 bytes, or a tag payload shorter than the tag
-  requires ⇒ `Corruption`;
-- a repeated tag ⇒ `Corruption` (the encoder emits each at most once, and a
-  second copy would silently overwrite the first);
-- `ONDAWAL1` accepts only layout byte `1`.
+### Per-table fields
 
-This rejects exactly what the previous fixed sequence rejected — an unknown
-trailing tag was already `Corruption`, because the old `decode_wal_layout`
-demanded an exact 9-byte residual. The loop shape is what lets a future tail
-section be one more arm instead of another positional hazard.
+`partition` is set for bottom-level files compaction cut on a partition
+boundary; `tier` names the storage tier holding a part (`None` = the database
+directory); `object` is the tier-root-relative stem of a table on a **shared**
+tier (`cf-{cf}/{instance:016x}-{id}`, or adopted verbatim by
+`attach_part_by_ref`); `max_entry_time` is the approximate wall-clock age the
+part mover's `TierRule::min_age` gate reads (carried as the maximum over a
+compaction's inputs).
 
-A manifest that stops before the layout tag decodes as `PerColumnFamily`; every
-legacy layout therefore decodes cleanly. Unified manifests emit the preceding
-three sections even when empty so the tag is unambiguous.
-
-**Compatibility rules:**
-
-- *Old reader, new manifest*: pre-tail decoders ignored trailing body bytes
-  (the CRC still validates — it covers the whole body), so a pre-0.3.0
-  binary opens a 0.3.0 manifest without error. **But** it reconstructs every
-  `SstMeta` without `partition`/`tier`/`max_entry_time`, and its next
-  manifest rewrite (any flush/compaction) re-encodes without the tail —
-  the metadata is silently and permanently stripped. For an untiered
-  database that only loses partition stamps (re-derivable by the next
-  bottom compaction); for a database with parts on a **named tier** it is
-  fatal-on-reopen: the stripped `tier` makes the engine resolve those
-  tables at the default-tier path, where the files do not exist. Do not
-  downgrade a tiered database (see `docs/parts-and-tiers.md` § Downgrade).
-- *New reader, old manifest*: a legacy (no-tail) manifest decodes with all
-  three fields `None` on every table — the pre-partitioning semantics.
-
-### Config blob (`ColumnFamilyConfig::encode`)
-
-The per-CF config blob uses the same append-tolerant idea *inside* the blob:
-a fixed prefix (comparator name`*`, compression u8, write_buffer_size u64,
-level_size_ratio u64, klog_value_threshold u64, enable_bloom u8, bloom_fpr
-f64-bits, l1_file_count_trigger u32, l0_queue_stall_threshold u32, use_btree
-u8 — all little-endian fixed width unless marked) followed by appended tails
-in this order: sync_mode u8 + sync_interval u64 (µs); compression_per_level
-(count u8 + algs); compaction_style u8 + fifo_max_bytes u64 + fifo_ttl u64
-(µs); compression_rules (count u8 + `{prefix* | alg u8}`); **partition_rules**
-(count u8 + `{prefix* | name*}`); **tier_rules** (count u8 + `{prefix* |
-tier_name* | min_age u64 (µs)}`). `decode_into` stops early on a short blob
-via `?`, so a blob from any older version reconstructs the missing trailing
-fields as struct defaults (empty rule lists).
-
-Version 0.3.1 retains those four `u8` counts and their first 255 entries
-byte-for-byte. If any list is longer, the normal config blob is followed by
-`ONDAOVF1`, then four overflow lists in the same order. Each overflow list is
-`extra_count uvarint` followed by the entries beyond index 254, using the same
-entry encoding shown above. A 0.3.0 reader ignores this tagged tail and keeps
-the first 255 entries; a 0.3.1 reader appends every overflow entry. The tag is
-inside the manifest body and is therefore covered by the manifest CRC32-C.
-
-Later tagged config tails follow in this fixed order:
-
-```
-ONDAPFN1 | scheme_name*                         derived partition function
-ONDACMP1 | target_file_size u64 | l1_base_bytes u64
-          | soft_pending_compaction_bytes u64
-          | hard_pending_compaction_bytes u64   compaction geometry
-ONDABLK1 | data_block_size u64                  per-CF block target
-ONDAVVC1 | max_cached_vlog_value_bytes u64      per-CF vlog value cache limit
-ONDABLM1 | count u64 | fpr f64-bits x count
-          | optimize_filters_for_hits u8        per-level bloom policy
-ONDAPRD1 | periodic_compaction_interval u64     microseconds; 0 = disabled (0.3)
-ONDAPFX1 | enable_prefix_delta_keys u8
-          | block_restart_interval u64           prefix-delta key encoding (2.1)
-ONDAMRG1 | merge_operator_name*                  merge operator name (1.1)
-```
-
-`ONDAPFX1` is elided when both fields are at their defaults (`false` and 8), and
-is all-or-nothing on read: a truncated tail, or an interval outside `[1, 1024]`,
-leaves both at their defaults. `0` is deliberately **not** a legal config
-interval even though `WriterOptions::restart_interval` takes it — there it means
-"emit no restart trailer at all", which stays reachable only by constructing
-`WriterOptions` directly.
-
-`ONDAMRG1` is elided entirely for a family with no merge operator, so such a
-family encodes byte-for-byte as pre-1.1 releases wrote it; a truncated tail
-leaves the name at `None`, which is also how a pre-1.1 blob decodes and is the
-only safe default — the resolver then has nothing to look up. The name is the
-*durable* half of the feature: the implementation is re-supplied through
-`Options::merge_fns` at every open, and a stored name that resolves to nothing
-fails the open.
-
-`ONDAPRD1` is elided at the default (zero, disabled), so a family that never
-sets it encodes byte-for-byte as earlier releases wrote it; it is refused by
-`ColumnFamilyConfig::validate` on a `CompactionStyle::Fifo` family, which evicts
-by age through `fifo_ttl` instead.
-
-`ONDABLM1` is all-or-nothing: a truncated tail, or one holding a rate outside
-`(0, 1)`, leaves both fields at their defaults (empty vector, `false`) rather
-than applying half a policy. `ONDABLM2` is **reserved** for a future geometric
-(Monkey-style) auto-allocation policy, which would be mutually exclusive with
-the explicit vector; nothing writes or reads it yet.
-
-Each tag is omitted when its setting is absent or equal to the release default.
-Decoders consume only tags they recognize and leave missing or truncated tails
-at defaults; all bytes remain covered by the enclosing manifest checksum.
-
-## Unified-memtable WAL (`unified.rs`)
-
-Same WAL format; file names `unified-wal-<gen>.log[.sN]`; record keys carry an
-8-byte big-endian CF-id prefix (`cf_id = fnv64(cf_name)`). Split flush strips
-the prefix and re-sorts each CF's slice with that CF's comparator. The manifest
-tag above prevents reopening a non-empty database under a different WAL layout.
-
-## A2 tail tags (0.7.8)
-
-Two tagged manifest-tail sections follow the positional
-(partition/tier/max-entry-time) sections, in fixed order, each self-identifying
-by an 8-byte magic (the `ONDAWAL1` precedent):
-
-- `ONDAOBJ1` — per-CF `(count, (table_index, object)...)` name section: the
-  tier-root-relative object path of each shared-tier table
-  (`SstMeta::object`). Emitted only when some table carries one.
-- `ONDAINS1` — 8-byte per-database instance nonce naming this database's
-  objects on shared tiers. Emitted once minted.
-
-When any tagged section is present the encoder emits ALL positional sections
-first (possibly all-empty), which is what lets the positional decoder consume
-greedily without misreading a tag. Manifests carrying neither tag are
-byte-identical to pre-A2 encodings.
-
-## Capability tail tag (1.0)
-
-```
-ONDACAP1 | caps u64        (16 bytes total)
-```
-
-Decoded **after `ONDAINS1`, before `ONDAWAL1`** — the full emitted tail order is
-
-```
-[positional: partition | tier | max_entry_time]
-[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDAWAL1 layout]
-[crc32c u32]
-```
-
-`ManifestTailPresence::tagged()` includes `caps`, and this wiring is
-**load-bearing**: the positional decoder is gated only on non-emptiness, so a
-caps tag emitted without the three positional sections ahead of it would be read
-as a partition name section — silent corruption rather than rejection.
-
-Version coupling, both directions:
-
-- the header carries `2` **iff** `caps != 0`, and `1` otherwise (the same
-  lowest-version discipline the positional tails follow), so a legacy-only
-  database keeps writing bytes every previous binary can read;
-- `ONDACAP1` in a VERSION-1 manifest is `Corruption` (the encoder bumps the
-  version exactly when it emits the tag, so those bytes contradict themselves);
-- `caps & !KNOWN_CAPS != 0` is `UnsupportedFormat`;
-- a duplicate `ONDACAP1` is `Corruption`, like every other repeated tag.
-
-A pre-1.0 binary checks the version by exact equality against `1` and therefore
-refuses a v2 manifest outright. That refusal is proven by
-`tests/frozen_decoder.rs`, which vendors a copy of the 0.8.2 header decode path
-rather than trusting a constant this repository still owns.
-
-## Periodic-age tail tag (0.3)
-
-```
-ONDAAGE1 | per CF, in manifest CF order:
-             count uvarint
-             { table_index uvarint | value uvarint } × count
-```
-
-The same `(table_index, u64)` section shape as the positional max-entry-time
-section, carrying `SstMeta::last_compaction_time` — the wall-clock nanoseconds
-at which a table was last *written by a compaction*. Tables not listed decode
-that field as `None`, which the picker reads as **unknown, therefore never
-eligible**.
-
-Deliberately a **new** field rather than a reuse of `max_entry_time`. That field
-carries the maximum forward over a compaction's inputs so re-compacting cold
-data does not make it look freshly written — which is exactly what the part
-mover's `TierRule::min_age` gate needs, and exactly what a periodic trigger must
-not have: carrying it forward would leave a just-rewritten table instantly
-re-eligible (a loop), and resetting it would break tier placement.
-
-Decoded **after `ONDACAP1`, before `ONDAWAL1`**; the full emitted tail order is
-
-```
-[positional: partition | tier | max_entry_time]
-[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDARNG1 …] [ONDAAGE1 …]
-[ONDAMED1 …] [ONDAWAL1 layout]
-[crc32c u32]
-```
-
-Order in the byte stream is a convention, not a requirement: the tag dispatch
-loop is order-independent. `ManifestTailPresence::tagged()` includes this
-section, for the same load-bearing reason `ONDACAP1` does.
-
-Capability coupling, both directions:
-
-- the section is emitted **iff** `caps & CAP_PERIODIC_AGE != 0` *and* some table
-  carries a stamp, so a database that has not taken the capability writes the
-  same bytes it always did (and, transitively, still writes VERSION 1);
-- `ONDAAGE1` without `CAP_PERIODIC_AGE` in the same manifest is `Corruption`:
-  nothing stamps a table before the bit is durable, so those bytes were
-  truncated, hand-edited, or written by something that skipped the enable;
-- a duplicate `ONDAAGE1` is `Corruption`, like every other repeated tag.
-
-Who sets the field:
+`last_compaction_time` is the wall-clock time a table was last *written by a
+compaction* — deliberately not `max_entry_time`, which carries forward and would
+leave a just-rewritten table instantly re-eligible for periodic compaction. It
+is persisted only under `CAP_PERIODIC_AGE`; unknown (`None`) is never eligible.
 
 | Site | Stamp |
 |---|---|
@@ -937,115 +821,103 @@ Who sets the field:
 | `DB::attach_part` / `attach_part_by_ref` | left `None`, and therefore never eligible |
 | the `CAP_PERIODIC_AGE` enable transition | `None` → the enable time, for local non-mounted tables, **in the same manifest write** that persists the capability |
 
-The enable-time stamping is what makes the trigger restart-safe. "Eligible one
-interval after open" is not: open time is not durable, so a database restarted
-more often than its interval would never become eligible at all.
-## Range-summary tail tag (1.2)
+The **range summary** is the catalog's view of a table's aux range section: how
+many fragments it holds, the lowest and highest sequence in any stack, and the
+lowest `start` / highest `end` it owns. The read path's gap-owner rule needs
+`range_count` and `range_max_key` before any reader is opened, `gather_target`
+needs the span bounds to size a compaction job, and delete-only excise reads
+`range_count`; `attach_part` and `attach_part_by_ref` re-derive all five fields
+from the incoming table's decoded aux section rather than trusting a foreign
+catalog. `range_min_key` may sort **below** `min_key` and `range_max_key`
+**above** `max_key` — fragments are clipped to the output *interval*, which
+reaches past a table's first and last point key.
+
+### The unified column-family id (`CF_UNIFIED_ID`)
+
+Under the unified WAL layout every key in the shared WAL and memtable carries an
+8-byte big-endian column-family id. It defaults to **FNV-1a-64 of the name**
+(the standard offset basis `14695981039346656037`, as wavesdb computes it); a
+family whose id diverges from that stores it here. Epoch-1 writers never produce
+a divergent id yet — the section is the ground plan C F5′ (clearing a family
+under the unified layout by giving it a fresh id) builds on, and it is how a
+0.9 directory opened through `legacy_onda` keeps the truncated-basis ids its WAL
+keys carry.
+
+### Config blob (`ColumnFamilyConfig::encode`, `config_blob.rs`)
 
 ```
-ONDARNG1 | per CF, in manifest CF order:
-             count uvarint
-             { table_index uvarint | range_count uvarint
-               | range_min_seq uvarint | range_max_seq uvarint
-               | min_key bytes | max_key bytes } × count
+blob  := magic "YOLODBCF" | version u32 = 1 | entry*
+entry := tag uvarint | len uvarint | value[len]
 ```
 
-The catalog's summary of each table's aux range section: how many fragments it
-holds, the lowest and highest sequence in any of its stacks, and the lowest
-`start` / highest `end` it owns. Tables not listed decode to `range_count = 0`
-and `None` bounds — which is every legacy table, and every table written before
-the capability was taken.
+One tag per durable `ColumnFamilyConfig` field (the table is in
+[`format-registry.md`](format-registry.md#cf-config-tlv-tags)). Entries are in
+**strictly ascending** tag order; a field at its default is **elided**, so a
+default family's blob is the 12-byte header; durations are **nanoseconds**.
+Scalars are exactly one minimal uvarint, booleans one byte `0`/`1`, codec
+fields epoch-1 codec ids, lists `count uvarint | item*` with no bytes left over.
 
-A **tagged** tail, never appended to the positional `SstMeta` body:
-`decode_sstable` initializes optional fields to `None` and relies on tails to
-fill them, so appending to the body would break both VERSION-1 readers and the
-append-tolerant decode.
+A tag this binary does not know is **preserved**: `decode` keeps it on
+`ColumnFamilyConfig::unknown_config_tags` and the next `encode` writes it back
+verbatim, so rewriting a family's config never strips an option a newer binary
+— or another yoloDB engine — stored there (plan C step 2 row G). Everything else
+is strict, because the blob sits inside a CRC-verified manifest or edit record:
+a wrong magic, a short entry, a tag out of order or repeated, tag 0, or a known
+tag whose value does not parse is `Corruption`; an unknown version or a known
+tag naming an enum value this binary lacks (a codec, a sync mode, a compaction
+style) is `UnsupportedFormat`. This replaces 0.9's lenient positional decoder,
+which fell back to defaults on anything it did not understand — and read
+wavesdb's JSON config as a 123-byte comparator name.
 
-The bounds are unconditional rather than optional because a table with
-`range_count > 0` has both by construction (a fragment has two bounds); a record
-naming zero fragments, an empty bound, or `min_seq > max_seq` is `Corruption` —
-bytes the encoder cannot produce.
+The merge operator and the derived partition scheme are persisted by **name**
+(tags 32 and 20) and re-resolved from `Options::merge_fns` /
+`Options::partition_fns` at every open. A stored name with no registered
+implementation fails the open — never a silent fallback, which would read every
+stored operand back as its own raw bytes. The stored name always wins.
 
-Decoded **after `ONDACAP1`, before `ONDAWAL1`**; order in the byte stream is a
-convention, since the tag dispatch loop is order-independent.
-`ManifestTailPresence::tagged()` includes this section, for the same
-load-bearing reason `ONDACAP1` does: a tag emitted without the three positional
-sections ahead of it would be read as a partition name section.
+## Unified-memtable WAL (`unified.rs`)
 
-Capability coupling, both directions, exactly as `ONDAAGE1`:
+Same WAL format with layout byte 2; file names `unified-wal-<gen>.log[.sN]`;
+record keys carry the 8-byte big-endian CF-id prefix (§ The unified column-family
+id). Split flush strips the prefix and re-sorts each CF's slice with that CF's
+comparator. The manifest's `DB_UNIFIED_WAL` flag prevents reopening a non-empty
+database under a different WAL layout.
 
-- emitted **iff** `caps & CAP_RANGE_DELETES != 0` *and* some table carries a
-  fragment, so a database that has not taken the capability writes the bytes it
-  always did (and still writes VERSION 1);
-- `ONDARNG1` without `CAP_RANGE_DELETES` is `Corruption`;
-- a duplicate `ONDARNG1` is `Corruption`, like every other repeated tag.
-
-Why the summary is in the catalog at all: the read path's **gap-owner rule**
-needs `range_count` and `range_max_key` to decide whether to consult a table,
-`gather_target` needs the span bounds to size a compaction job, and delete-only
-excise (1.2) reads `range_count` to tell a covered candidate from a fragment
-owner — all before any reader is opened. (Excise then opens the owners' readers,
-and only theirs: the fragment *intervals* it needs live in the aux section, not
-in this summary, which carries only the enclosing min/max.) `attach_part` and
-`attach_part_by_ref` re-derive all five fields from the incoming table's decoded
-aux section rather than trusting a foreign catalog — a summary that disagreed
-with the section would leave fragments installed but invisible, and the read
-path's `range_count == 0` gate would silently stop masking. Keeping them in the manifest is what makes "one extra
-`range_count == 0` branch per point-only table" the whole cost of the feature
-for a database that does not use it.
-
-## Edit-log tail tag and `MANIFEST-EDITS` (2.2)
+## `MANIFEST-EDITS` (2.2)
 
 A full `MANIFEST` rewrite costs O(catalog) bytes and one fsync per structural
 change — 12.4 MiB per persist at 100k parts, paid by every flush. With
 `CAP_MANIFEST_EDITS` the durable catalog becomes a **periodic snapshot**
-(`MANIFEST`, unchanged in shape) plus an **append-only log of numbered edits**
-(`MANIFEST-EDITS`). Without the capability nothing changes: no log file is
-created and the manifest is still rewritten in full, byte-for-byte as before.
+(`MANIFEST`) plus an **append-only log of numbered edits** (`MANIFEST-EDITS`).
+Without the capability no log file is created and the manifest is rewritten in
+full.
 
-### Snapshot tail tag
+### Snapshot cursor (`DB_EDIT_LOG`)
 
-```
-ONDAMED1 | generation u64 | applied_through u64 | next_edit_id u64   (32 bytes)
-```
+The snapshot's `DB_EDIT_LOG` section — `generation | applied_through |
+next_edit_id` — is present only when the triple differs from `(0, 0, 1)` (a
+checkpoint or backup destination is stamped generation 1 with nothing applied). `applied_through` is the highest edit id the
+snapshot already contains; `generation` is **informational only** (see
+Recovery). `next_edit_id != applied_through + 1` is `Corruption`.
 
-Decoded **after `ONDACAP1`, before `ONDAWAL1`**, so the full emitted tail order is
-
-```
-[positional: partition | tier | max_entry_time]
-[ONDAOBJ1 …] [ONDAINS1 nonce] [ONDACAP1 caps] [ONDAMED1 …] [ONDAWAL1 layout]
-[crc32c u32]
-```
-
-`ManifestTailPresence::tagged()` includes `edits`, for the same load-bearing
-reason `caps` is in it. The tag is emitted only when the triple differs from
-`(0, 0, 1)` — a database that has never had a log writes exactly the bytes it
-wrote before 2.2 — and, like `ONDACAP1`, it forces header version 2 and is
-`Corruption` inside a VERSION-1 manifest. `next_edit_id != applied_through + 1`
-is `Corruption`: no writer produces that pairing. The whole-file CRC already
-covers the tail, so no new checksum is introduced on the snapshot side.
-
-`applied_through` is the highest edit id the snapshot already contains;
-`generation` is **informational only** (see Recovery below).
-
-### `MANIFEST-EDITS` header (fixed 28 bytes, at offset 0)
+### `MANIFEST-EDITS` header (fixed 32 bytes, at offset 0)
 
 ```
 off  len  field
-  0    4  magic  u32 LE = 0x4F4E_4445 ("ONDE"; on disk: 45 44 4E 4F)
-  4    4  schema u32 LE = 1
-  8    8  base_applied_through u64   — no record in this file has id <= this
- 16    8  snapshot_generation  u64   — informational only
- 24    4  crc32c u32 over bytes [0, 24)
+  0    8  magic "YOLODBED"
+  8    4  schema u32 = 1
+ 12    8  base_applied_through u64   — no record in this file has id <= this
+ 20    8  snapshot_generation  u64   — informational only
+ 28    4  crc32c u32 over bytes [0, 28)
 ```
 
-The magic is ondaDB-namespaced on purpose: `"WD…"` is the wavesdb namespace and
-the two engines are expected to share tiers, so a wavesdb-looking magic here
-would invite cross-engine mount confusion. A file shorter than 28 bytes, a bad
-header CRC, or an unknown magic/schema is `Corruption` — never a torn tail. The
-header is written once, by snapshot compaction, and fsynced before any record.
+A file shorter than 32 bytes, a foreign magic or a bad header CRC is
+`Corruption`; an unknown schema, and 0.9's `ONDE` log, are `UnsupportedFormat` —
+never a torn tail. The header is written once, by snapshot compaction, and
+fsynced before any record.
 
-### Record framing (records begin at offset 28, contiguous)
+### Record framing (records begin at offset 32, contiguous)
+
 
 ```
 off  len   field
@@ -1156,3 +1028,26 @@ section: `edit_bytes > max(4 MiB, snapshot_bytes)` or `edit_count > 4096`.
 7. reconcile `next_file_id >= max table id + 1` and `global_seq >= max max_seq`;
 8. read-only opens replay the log but never compact it and never write to it —
    not even the temp-file sweep.
+
+## Appendix: the ondaDB 0.9 formats (read only by `legacy_onda`)
+
+Epoch 1 replaced every 0.9 container; the 0.9 decoders live, frozen and
+decode-only, in `src/legacy_onda/` behind the default-on `legacy-onda` cargo
+feature, pinned against `tests/fixtures/legacy-onda/` (byte corpus plus three
+database directories written by 0.9.1). `legacy_onda::open_read_only` opens a
+0.9 directory read-only through the engine; building without the feature makes
+every 0.9 artifact a hard `UnsupportedFormat`.
+
+| Artifact | 0.9 | Epoch 1 |
+|---|---|---|
+| checksum | CRC-32/**IEEE** (documented as CRC32-C) | CRC32-C |
+| SST footer | 64 B, magic `WAVESST1` u64, unchecksummed, flag byte `0x01` bloom `0x02` btree `0x04` restarts `0x08` vlog-v2 `0x10` extended `0x20` prefix-delta; aux handle in the 16 bytes before it (extended tables only) | 96 B, `YOLOST01`, CRC32-C, flags bloom/btree only, capability word, aux handle inside |
+| restart trailer | optional (flag `0x04`) | every block |
+| vlog | no header; v1 `crc \| value` or v2 frames | 32-byte header; v2 frames only |
+| bloom | `m \| k \| words \| [tag]`, absent tag = FNV (basis `1469598103934665603`) | `tag \| m \| k \| words`, xxh3 only |
+| codec ids | 0–5, `2`/`4` = LZ4 | 0, 1, 3, 5, `6` = LZ4; 2/4 burned |
+| MANIFEST | `WVMF` u32, v1/v2 by capability, positional body + positional tails + `ONDA*` tagged tails | `YOLODBMF`, one version, flagged sections |
+| MANIFEST-EDITS | 28-byte `ONDE` u32 header | 32-byte `YOLODBED` header, same record framing |
+| WAL | no header | 32-byte `YOLODBWL` segment header |
+| config blob | positional fields + `ONDA*` tails, µs durations, lenient | `YOLODBCF` TLV, ns durations, strict, unknown tags preserved |
+| unified CF id | FNV-1a with the truncated basis | FNV-1a-64 (correct basis), overridable per CF |

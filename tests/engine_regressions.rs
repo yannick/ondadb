@@ -334,19 +334,27 @@ fn wal_corruption_variants_never_panic_and_keep_batches_atomic() {
         frame.extend_from_slice(&[0xab; 16]);
         f.write_all(&frame).unwrap();
     }
-    // (b) A parseable WAL name holding pure garbage.
-    std::fs::write(
-        dir.path().join("cf-default").join("wal-99.log"),
-        val(99, 3000),
-    )
-    .unwrap();
+    // (b) A parseable WAL name holding pure garbage. Epoch-1 segments start
+    // with a `YOLODBWL` header, so this is refused at byte 0 — never replayed
+    // as frames, and never silently skipped as an empty generation.
+    let garbage = dir.path().join("cf-default").join("wal-99.log");
+    std::fs::write(&garbage, val(99, 3000)).unwrap();
+    match DB::open(Options::new(dir.path().to_str().unwrap())) {
+        Err(e) => assert_eq!(e.kind(), "unsupported_format", "{e}"),
+        Ok(_) => panic!("a WAL segment without a header must be refused"),
+    }
+    std::fs::remove_file(&garbage).unwrap();
     // (c) Flip bytes a third of the way into the largest WAL file.
     let biggest = wal_files(dir.path(), "default")
         .into_iter()
         .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .unwrap();
     let mut bytes = std::fs::read(&biggest).unwrap();
-    let at = bytes.len() / 3;
+    // Past the 32-byte segment header: this row is about damaged *frames*. A
+    // damaged header with frames behind it is not crash residue (the header is
+    // fsynced before the first frame) and fails the open as `Corruption` — the
+    // WAL unit tests pin that row.
+    let at = (bytes.len() / 3).max(32);
     let end = (at + 8).min(bytes.len());
     for b in &mut bytes[at..end] {
         *b ^= 0xff;

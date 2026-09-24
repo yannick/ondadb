@@ -193,7 +193,7 @@ pub struct ObjectCheckpoint {
 /// ondaDB's `cf-<name>` directory naming, so a restored checkpoint is an
 /// ordinary database directory.
 fn table_key(prefix: &str, cf: &str, id: u64, ext: &str) -> String {
-    join_key(prefix, &format!("cf-{cf}/{id}.{ext}"))
+    join_key(prefix, &format!("{}/{id}.{ext}", crate::format::cf_dir_name(cf)))
 }
 
 fn join_key(prefix: &str, rest: &str) -> String {
@@ -342,7 +342,7 @@ fn receipt_order(prefix: &str, key: &str) -> (bool, String, u8, u64) {
     let (stem, ext) = file.rsplit_once('.').unwrap_or((file, ""));
     (
         true,
-        dir.trim_start_matches("cf-").to_string(),
+        dir.trim_start_matches(crate::format::CF_DIR_PREFIX).to_string(),
         u8::from(ext == "vlog"),
         stem.parse().unwrap_or(0),
     )
@@ -429,7 +429,7 @@ impl DB {
             .collect();
         if self.inner.opts.read_only {
             for cfm in &plan.manifest.cfs {
-                std::fs::create_dir_all(scratch.0.join(format!("cf-{}", cfm.name)))?;
+                std::fs::create_dir_all(scratch.0.join(crate::format::cf_dir_name(&cfm.name)))?;
             }
             self.write_sealed_memtables(&scratch.0, &plan.cfs, &mut plan.manifest)?;
         }
@@ -463,7 +463,7 @@ impl DB {
                     if ext == "vlog" && size == 0 {
                         continue;
                     }
-                    let src = scratch.0.join(format!("cf-{}/{}.{ext}", cfm.name, m.id));
+                    let src = scratch.0.join(crate::format::cf_dir_name(&cfm.name)).join(format!("{}.{ext}", m.id));
                     uploads.push(Upload {
                         key: table_key(prefix, &cfm.name, m.id, ext),
                         storage: local.clone(),
@@ -575,7 +575,7 @@ pub fn restore_from_object_store(
         let mut manifest = fetch_checkpoint_manifest(store, prefix, &staged)?;
         let mut rewrite = false;
         for cfm in &mut manifest.cfs {
-            let cf_dir = dir.join(format!("cf-{}", cfm.name));
+            let cf_dir = dir.join(crate::format::cf_dir_name(&cfm.name));
             std::fs::create_dir_all(&cf_dir)?;
             for m in &mut cfm.sstables {
                 for (ext, size) in [("klog", m.klog_size), ("vlog", m.vlog_size)] {
@@ -741,13 +741,13 @@ pub fn open_remote_checkpoint(
         let mut manifest = fetch_checkpoint_manifest(store.as_ref(), prefix, &staged)?;
         let mut sizes = HashMap::new();
         for cfm in &mut manifest.cfs {
-            let cf_dir = dir.join(format!("cf-{}", cfm.name));
+            let cf_dir = dir.join(crate::format::cf_dir_name(&cfm.name));
             if !cf_dir.exists() {
                 std::fs::create_dir_all(&cf_dir)?;
                 created_dirs.push(cf_dir);
             }
             for m in &mut cfm.sstables {
-                let stem = format!("cf-{}/{}", cfm.name, m.id);
+                let stem = format!("{}/{}", crate::format::cf_dir_name(&cfm.name), m.id);
                 sizes.insert(format!("{prefix}/{stem}.klog"), m.klog_size);
                 if m.vlog_size > 0 {
                     sizes.insert(format!("{prefix}/{stem}.vlog"), m.vlog_size);

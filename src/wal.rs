@@ -1,5 +1,12 @@
 //! Write-ahead log.
 //!
+//! Every stripe file of a WAL generation (a *segment*) starts with a 32-byte
+//! header ([`crate::format::wal_segment`]): the magic `YOLODBWL`, a version,
+//! the layout (per-CF or unified) and the generation, under a CRC32-C. It is
+//! written and fsynced before the first frame, so replay can refuse a foreign
+//! or 0.9 file at byte 0 instead of mid-frame, and a torn header can only ever
+//! sit on a file that holds no frame.
+//!
 //! Each committed batch is appended as ONE length-and-checksum framed unit, so
 //! a crash leaves at most a torn frame at the tail, which replay detects and
 //! discards — and a multi-record commit replays either whole or not at all
@@ -40,6 +47,149 @@ use crate::error::{OndaError, Result};
 use crate::format::flags;
 
 const HEADER_SIZE: usize = 8; // payload_len(4) + crc(4)
+
+/// Which WAL a segment belongs to, as its header records it: the layout and the
+/// generation. Replay checks both against what the file's name and place say,
+/// so a segment moved between databases or layouts is refused rather than
+/// replayed into the wrong memtable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentId {
+    pub layout: crate::manifest::WalLayout,
+    pub generation: u64,
+}
+
+impl SegmentId {
+    /// A per-column-family WAL's generation `generation`.
+    pub fn per_cf(generation: u64) -> SegmentId {
+        SegmentId {
+            layout: crate::manifest::WalLayout::PerColumnFamily,
+            generation,
+        }
+    }
+
+    /// The unified WAL's generation `generation`.
+    pub fn unified(generation: u64) -> SegmentId {
+        SegmentId {
+            layout: crate::manifest::WalLayout::Unified,
+            generation,
+        }
+    }
+
+    fn layout_byte(self) -> u8 {
+        match self.layout {
+            crate::manifest::WalLayout::PerColumnFamily => {
+                crate::format::wal_segment::LAYOUT_PER_CF
+            }
+            crate::manifest::WalLayout::Unified => crate::format::wal_segment::LAYOUT_UNIFIED,
+        }
+    }
+}
+
+/// Encode the 32-byte segment header for `id`.
+pub(crate) fn encode_segment_header(id: SegmentId) -> [u8; SEGMENT_HEADER_LEN] {
+    use crate::format::wal_segment::*;
+    let mut b = [0u8; HEADER_LEN];
+    b[..8].copy_from_slice(&MAGIC);
+    put_u32(&mut b[8..], VERSION);
+    b[12] = id.layout_byte();
+    // 13..16 reserved (zero)
+    b[16..24].copy_from_slice(&id.generation.to_le_bytes());
+    // 24..28 reserved (zero)
+    let crc = checksum(&b[..28]);
+    put_u32(&mut b[28..], crc);
+    b
+}
+
+/// Width of the segment header, and the offset of the first frame.
+pub(crate) const SEGMENT_HEADER_LEN: usize = crate::format::wal_segment::HEADER_LEN;
+
+/// What a segment's first bytes say.
+#[derive(Debug, PartialEq, Eq)]
+enum SegmentHead {
+    /// A valid header for the expected segment: frames follow.
+    Valid,
+    /// No frame can follow: a zero-length file (created, never written) or a
+    /// header torn by a crash. The header is fsynced before the first frame is
+    /// appended, so a torn one can only sit on a file that holds no frame —
+    /// the same crash residue a torn tail is, and just as clean.
+    Empty,
+}
+
+/// Classify a segment from its first `min(file_len, 32)` bytes.
+///
+/// A torn header is recognized narrowly — a short prefix of the magic (or of
+/// zeros), or a full-width header that fails its CRC or reads all-zero on a
+/// file holding nothing past it — so that a 0.9 WAL (frames from byte 0) or a
+/// foreign file is refused as `UnsupportedFormat` at byte 0, never mistaken for
+/// an empty segment. Past those checks: an unknown version or layout byte is
+/// `UnsupportedFormat`; a header naming a different layout or generation than
+/// the file's name and place, or a non-zero reserved byte, is `Corruption`.
+fn check_segment_head(head: &[u8], file_len: u64, expect: SegmentId) -> Result<SegmentHead> {
+    use crate::format::wal_segment::*;
+    let foreign = || {
+        OndaError::UnsupportedFormat(
+            "wal: segment has no yoloDB header (YOLODBWL) — a foreign file, or an ondaDB 0.9 \
+             WAL, which is readable only through legacy_onda"
+                .into(),
+        )
+    };
+    if file_len == 0 {
+        return Ok(SegmentHead::Empty);
+    }
+    if head.len() < HEADER_LEN {
+        let n = head.len().min(8);
+        if head[..n] == MAGIC[..n] || head.iter().all(|&b| b == 0) {
+            return Ok(SegmentHead::Empty); // torn while the header was written
+        }
+        return Err(foreign());
+    }
+    let only_header = file_len == HEADER_LEN as u64;
+    if head[..8] != MAGIC {
+        if only_header && head.iter().all(|&b| b == 0) {
+            return Ok(SegmentHead::Empty); // size persisted, data not
+        }
+        return Err(foreign());
+    }
+    let version = read_u32(&head[8..]);
+    if version != VERSION {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "wal segment version {version} is not implemented by this binary"
+        )));
+    }
+    if read_u32(&head[28..]) != checksum(&head[..28]) {
+        if only_header {
+            return Ok(SegmentHead::Empty);
+        }
+        return Err(OndaError::Corruption(
+            "wal segment header: checksum mismatch".into(),
+        ));
+    }
+    if head[13..16].iter().any(|&b| b != 0) || head[24..28].iter().any(|&b| b != 0) {
+        return Err(OndaError::Corruption(
+            "wal segment header: reserved bytes are not zero".into(),
+        ));
+    }
+    let layout = head[12];
+    if layout != LAYOUT_PER_CF && layout != LAYOUT_UNIFIED {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "wal segment layout {layout} is not implemented by this binary"
+        )));
+    }
+    if layout != expect.layout_byte() {
+        return Err(OndaError::Corruption(format!(
+            "wal segment header: layout {layout} where {} was expected",
+            expect.layout_byte()
+        )));
+    }
+    let generation = u64::from_le_bytes(head[16..24].try_into().unwrap());
+    if generation != expect.generation {
+        return Err(OndaError::Corruption(format!(
+            "wal segment header: generation {generation} where {} was expected",
+            expect.generation
+        )));
+    }
+    Ok(SegmentHead::Valid)
+}
 
 /// One logical WAL entry (owned; produced by replay).
 #[derive(Debug, Clone)]
@@ -690,10 +840,7 @@ fn decode_record(p: &[u8]) -> Result<(Record, usize)> {
     crate::format::check_entry_flags(fl)?;
     let mut off = 1usize;
     let mut r = Record {
-        kind: crate::format::point_kind(
-            fl & flags::TOMBSTONE != 0,
-            fl & flags::SINGLE_DELETE != 0,
-        ),
+        kind: crate::format::point_kind(fl & flags::TOMBSTONE != 0, fl & flags::SINGLE_DELETE != 0),
         ..Default::default()
     };
     let (klen, n) = uvarint(&p[off..]).ok_or_else(corrupt)?;
@@ -862,16 +1009,34 @@ impl std::fmt::Debug for Wal {
 }
 
 impl Wal {
-    /// Open (creating if needed) the WAL at `path` for appending.  Under
-    /// [`SyncMode::Interval`] a background thread fsyncs every `interval`.
-    pub fn open(path: impl AsRef<Path>, mode: SyncMode, interval: Duration) -> Result<Wal> {
-        Self::open_inner(path.as_ref(), mode, interval, crate::util::sync_parent_dir)
+    /// Open (creating if needed) the WAL segment `id` at `path` for
+    /// appending. Under [`SyncMode::Interval`] a background thread fsyncs every
+    /// `interval`.
+    ///
+    /// Every stripe file gets its segment header before anything else: a new
+    /// (or empty, or torn-header) file is given one and **fsynced** before the
+    /// open returns, so no frame can ever be appended ahead of a durable
+    /// header. An existing file must carry `id`'s header.
+    pub fn open(
+        path: impl AsRef<Path>,
+        mode: SyncMode,
+        interval: Duration,
+        id: SegmentId,
+    ) -> Result<Wal> {
+        Self::open_inner(
+            path.as_ref(),
+            mode,
+            interval,
+            id,
+            crate::util::sync_parent_dir,
+        )
     }
 
     fn open_inner(
         path: &Path,
         mode: SyncMode,
         interval: Duration,
+        id: SegmentId,
         sync_parent: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<Wal> {
         let nstripes = if mode == SyncMode::Full {
@@ -885,7 +1050,25 @@ impl Wal {
         for k in 0..nstripes {
             let stripe = stripe_path(path, k);
             created |= !stripe.exists();
-            let f = OpenOptions::new().create(true).append(true).open(stripe)?;
+            let mut f = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(stripe)?;
+            let len = f.metadata()?.len();
+            let mut head = vec![0u8; (len as usize).min(SEGMENT_HEADER_LEN)];
+            if !head.is_empty() {
+                std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(0))?;
+                f.read_exact(&mut head)?;
+            }
+            if check_segment_head(&head, len, id)? == SegmentHead::Empty {
+                // Nothing can follow a missing or torn header, so rewriting it
+                // loses nothing. Durable before the first frame — the ordering
+                // the torn-header rule above depends on.
+                f.set_len(0)?;
+                f.write_all(&encode_segment_header(id))?;
+                f.sync_data()?;
+            }
             size += f.metadata()?.len() as i64;
             files.push(Mutex::new(Some(f)));
         }
@@ -1182,27 +1365,32 @@ impl Wal {
         Ok(())
     }
 
-    /// Replay records from the WAL based at `path`, invoking `f` for each.
-    /// Every stripe file is replayed; record order across stripes is not
-    /// meaningful — sequence numbers define visibility.  A torn or
-    /// checksum-failed frame at a stripe's tail ends that stripe cleanly (the
-    /// expected result of a crash mid-write); each frame — one committed batch —
-    /// replays atomically.  A record that fails to decode *inside* a CRC-valid
-    /// frame is not crash residue and fails with [`OndaError::Corruption`].
-    /// Returns the highest sequence number seen.  Missing files replay as empty.
-    pub fn replay<F>(path: impl AsRef<Path>, mut f: F) -> Result<u64>
+    /// Replay records from the WAL segment `id` based at `path`, invoking `f`
+    /// for each. Every stripe file is replayed; record order across stripes is
+    /// not meaningful — sequence numbers define visibility.
+    ///
+    /// Each stripe must start with `id`'s segment header (see
+    /// `check_segment_head`): a missing or foreign one is `UnsupportedFormat`
+    /// at byte 0, a zero-length file or a torn header is an empty stripe. After
+    /// it, a torn or checksum-failed frame at a stripe's tail ends that stripe
+    /// cleanly (the expected result of a crash mid-write); each frame — one
+    /// committed batch — replays atomically. A record that fails to decode
+    /// *inside* a CRC-valid frame is not crash residue and fails with
+    /// [`OndaError::Corruption`]. Returns the highest sequence number seen.
+    /// Missing files replay as empty.
+    pub fn replay<F>(path: impl AsRef<Path>, id: SegmentId, mut f: F) -> Result<u64>
     where
         F: FnMut(ReplayRecord) -> Result<()>,
     {
         let mut last_seq = 0u64;
         for k in 0..WAL_STRIPES {
-            let seq = Self::replay_file(stripe_path(path.as_ref(), k), &mut f)?;
+            let seq = Self::replay_file(stripe_path(path.as_ref(), k), id, &mut f)?;
             last_seq = last_seq.max(seq);
         }
         Ok(last_seq)
     }
 
-    fn replay_file<F>(path: std::path::PathBuf, f: &mut F) -> Result<u64>
+    fn replay_file<F>(path: std::path::PathBuf, id: SegmentId, f: &mut F) -> Result<u64>
     where
         F: FnMut(ReplayRecord) -> Result<()>,
     {
@@ -1211,54 +1399,89 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
+        let len = file.metadata()?.len();
         let mut r = BufReader::with_capacity(64 << 10, file);
-        let mut last_seq = 0u64;
-        let mut header = [0u8; HEADER_SIZE];
-        loop {
-            if read_full(&mut r, &mut header)?.is_none() {
-                return Ok(last_seq); // clean EOF or partial header
+        let mut head = vec![0u8; (len as usize).min(SEGMENT_HEADER_LEN)];
+        r.read_exact(&mut head)?;
+        let state = check_segment_head(&head, len, id).map_err(|e| match e {
+            OndaError::Corruption(m) => OndaError::Corruption(format!("{}: {m}", path.display())),
+            OndaError::UnsupportedFormat(m) => {
+                OndaError::UnsupportedFormat(format!("{}: {m}", path.display()))
             }
-            let plen = read_u32(&header[0..4]) as usize;
-            let want = read_u32(&header[4..8]);
-            let mut payload = vec![0u8; plen];
-            if read_full(&mut r, &mut payload)?.is_none() {
-                return Ok(last_seq); // torn payload at tail
-            }
-            if checksum(&payload) != want {
-                return Ok(last_seq); // corrupted tail
-            }
-            // Decode every record in the (verified) frame.
-            // Past this point the bytes are known-intact: any decode failure
-            // is corruption, not a torn tail, and must not be swallowed.
-            //
-            // The first payload byte selects the form: an envelope frame
-            // (0xFF) or the legacy record stream. Both forms may appear in one
-            // file — enabling the capability changes what is written next, not
-            // what is already there.
-            if payload.first() == Some(&ENVELOPE_TAG) {
-                let seq = decode_envelope(&payload, |rec| {
-                    // `last_seq` accounting covers range records too: a WAL
-                    // whose newest record is a range delete must still restore
-                    // the sequence it committed at. Control records (3.2)
-                    // contribute nothing — see `ReplayRecord::replay_seq`.
-                    let seq = rec.replay_seq();
-                    f(rec)?;
-                    Ok(seq)
-                })?;
-                last_seq = last_seq.max(seq);
-                continue;
-            }
-            let mut p = &payload[..];
-            while !p.is_empty() {
-                let (rec, used) = decode_record(p)?;
-                p = &p[used..];
-                if rec.seq > last_seq {
-                    last_seq = rec.seq;
-                }
-                f(ReplayRecord::Point(rec))?;
-            }
+            other => other,
+        })?;
+        if state == SegmentHead::Empty {
+            return Ok(0);
         }
+        replay_frames(&mut r, checksum, f)
     }
+}
+
+/// Replay every frame from `r` until a clean end or a torn tail, checking each
+/// payload with `crc`. Returns the highest record sequence seen.
+///
+/// Shared with the 0.9 decoder (`legacy_onda::wal`), whose frames are the same
+/// shape under a different checksum. The split between the two tail cases is
+/// the contract of [`Wal::replay`]: a short header, a short payload or a CRC
+/// mismatch ends the stripe cleanly; anything that fails to decode *inside* a
+/// verified frame is `Corruption`.
+pub(crate) fn replay_frames<R, F>(r: &mut R, crc: fn(&[u8]) -> u32, f: &mut F) -> Result<u64>
+where
+    R: Read,
+    F: FnMut(ReplayRecord) -> Result<()>,
+{
+    let mut last_seq = 0u64;
+    let mut header = [0u8; HEADER_SIZE];
+    loop {
+        if read_full(r, &mut header)?.is_none() {
+            return Ok(last_seq); // clean EOF or partial header
+        }
+        let plen = read_u32(&header[0..4]) as usize;
+        let want = read_u32(&header[4..8]);
+        let mut payload = vec![0u8; plen];
+        if read_full(r, &mut payload)?.is_none() {
+            return Ok(last_seq); // torn payload at tail
+        }
+        if crc(&payload) != want {
+            return Ok(last_seq); // corrupted tail
+        }
+        let seq = decode_frame_payload(&payload, f)?;
+        last_seq = last_seq.max(seq);
+    }
+}
+
+/// Decode one CRC-verified frame payload, handing each record to `f`, and
+/// return the highest sequence it carried.
+///
+/// Past the CRC the bytes are known-intact: any decode failure is corruption,
+/// not a torn tail, and must not be swallowed. The first payload byte selects
+/// the form — an envelope frame (0xFF) or the flags-byte record stream — and
+/// both may appear in one file: enabling the capability changes what is
+/// written next, not what is already there.
+pub(crate) fn decode_frame_payload<F>(payload: &[u8], f: &mut F) -> Result<u64>
+where
+    F: FnMut(ReplayRecord) -> Result<()>,
+{
+    if payload.first() == Some(&ENVELOPE_TAG) {
+        return decode_envelope(payload, |rec| {
+            // `last_seq` accounting covers range records too: a WAL whose
+            // newest record is a range delete must still restore the sequence
+            // it committed at. Control records (3.2) contribute nothing — see
+            // `ReplayRecord::replay_seq`.
+            let seq = rec.replay_seq();
+            f(rec)?;
+            Ok(seq)
+        });
+    }
+    let mut last_seq = 0u64;
+    let mut p = payload;
+    while !p.is_empty() {
+        let (rec, used) = decode_record(p)?;
+        p = &p[used..];
+        last_seq = last_seq.max(rec.seq);
+        f(ReplayRecord::Point(rec))?;
+    }
+    Ok(last_seq)
 }
 
 impl Drop for Wal {
@@ -1352,7 +1575,7 @@ mod tests {
             "wal_legacy_torn_tail.bin",
             "wal_legacy_crc_valid_undecodable.bin",
         ] {
-            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
+            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
             // Frame headers included and excluded: the record decoder must
             // survive both a payload and the raw file it came from.
             seeds.push(bytes[HEADER_SIZE.min(bytes.len())..].to_vec());
@@ -1414,13 +1637,36 @@ mod tests {
         assert_eq!(err.kind(), "corruption");
     }
 
-    /// Replay a frozen corpus fixture from a private directory.
-    fn replay_fixture(name: &str) -> (tempfile::TempDir, Result<(Vec<Record>, u64)>) {
+    /// One point record as a framed batch, exactly as `append_batch` writes it.
+    fn point_frame(key: &[u8], value: &[u8], seq: u64) -> Vec<u8> {
+        let r = Record {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            seq,
+            ..Default::default()
+        };
+        encode_frame(None, &point_envelope(&[r.as_ref()]))
+    }
+
+    /// Frame an arbitrary payload under a valid CRC.
+    fn raw_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; HEADER_SIZE];
+        put_u32(&mut out[0..], payload.len() as u32);
+        put_u32(&mut out[4..], checksum(payload));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Replay `bytes` — frames — as a whole stripe behind a valid segment
+    /// header, from a private directory.
+    fn replay_bytes(bytes: &[u8]) -> (tempfile::TempDir, Result<(Vec<Record>, u64)>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        std::fs::copy(crate::util::phase1_fixture(name), &path).unwrap();
+        let mut file = encode_segment_header(SegmentId::per_cf(0)).to_vec();
+        file.extend_from_slice(bytes);
+        std::fs::write(&path, file).unwrap();
         let mut got = Vec::new();
-        let res = Wal::replay(&path, |r| {
+        let res = Wal::replay(&path, SegmentId::per_cf(0), |r| {
             got.push(point(r));
             Ok(())
         })
@@ -1432,7 +1678,10 @@ mod tests {
     /// ends cleanly and every record before the tear is delivered.
     #[test]
     fn torn_payload_stops_replay_cleanly() {
-        let (_dir, res) = replay_fixture("wal_legacy_torn_tail.bin");
+        // A header claiming 32 payload bytes followed by only 3.
+        let mut bytes = point_frame(b"good", b"v", 1);
+        bytes.extend_from_slice(&[32, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
+        let (_dir, res) = replay_bytes(&bytes);
         let (got, last) = res.expect("a torn tail must not fail replay");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].key, b"good");
@@ -1443,7 +1692,10 @@ mod tests {
     /// real corruption: the bytes were written intact and still lie.
     #[test]
     fn crc_valid_undecodable_record_is_corruption() {
-        let (_dir, res) = replay_fixture("wal_legacy_crc_valid_undecodable.bin");
+        // flags 0, klen 5, vlen 0, seq 7 — but only two key bytes follow.
+        let mut bytes = point_frame(b"good", b"v", 1);
+        bytes.extend_from_slice(&raw_frame(&[0x00, 0x05, 0x00, 0x07, b'a', b'b']));
+        let (_dir, res) = replay_bytes(&bytes);
         let err = res.expect_err("a CRC-valid undecodable record must fail replay");
         assert_eq!(err.kind(), "corruption");
     }
@@ -1452,7 +1704,9 @@ mod tests {
     /// replay skips it and keeps reading.
     #[test]
     fn empty_frame_is_skipped_and_replay_continues() {
-        let (_dir, res) = replay_fixture("wal_legacy_empty_frame.bin");
+        let mut bytes = encode_frame(None, &[]);
+        bytes.extend_from_slice(&point_frame(b"after", b"v", 9));
+        let (_dir, res) = replay_bytes(&bytes);
         let (got, last) = res.expect("an empty frame must not fail replay");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].key, b"after");
@@ -1641,7 +1895,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(rec("legacy", "a", 1)).unwrap();
             let recs = envelope_point_records();
             let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
@@ -1650,7 +1905,7 @@ mod tests {
             wal.append(rec("legacy2", "b", 9)).unwrap();
         }
         let mut keys = Vec::new();
-        let last = Wal::replay(&path, |r| {
+        let last = Wal::replay(&path, SegmentId::per_cf(0), |r| {
             keys.push(String::from_utf8(point(r).key).unwrap());
             Ok(())
         })
@@ -1763,15 +2018,17 @@ mod tests {
         ));
     }
 
-    /// The committed schema-1 range fixture pins the wire bytes.
+    /// The committed schema-1 range fixture pins the **payload** wire bytes.
+    /// The frame header differs from the 0.9 fixture by its checksum only
+    /// (IEEE there, CRC32-C here); the envelope inside is unchanged.
     #[test]
     fn range_record_golden_bytes() {
-        let bytes = std::fs::read(crate::util::phase1_fixture("wal_v2_range_schema1.bin")).unwrap();
+        let bytes = std::fs::read(crate::util::legacy_fixture("wal_v2_range_schema1.bin")).unwrap();
         let recs = range_records();
-        assert_eq!(
-            encode_frame(ENVELOPE_SCHEMA_PER_CF.into(), &range_envelope(&recs)),
-            bytes
-        );
+        let frame = encode_frame(ENVELOPE_SCHEMA_PER_CF.into(), &range_envelope(&recs));
+        assert_eq!(frame[HEADER_SIZE..], bytes[HEADER_SIZE..]);
+        assert_eq!(frame[..4], bytes[..4], "payload length");
+        assert_eq!(read_u32(&frame[4..8]), checksum(&frame[HEADER_SIZE..]));
         let got = decode_envelope_any(&bytes[HEADER_SIZE..]).unwrap();
         assert_eq!(got.len(), recs.len());
     }
@@ -1799,7 +2056,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(rec("kept", "v", 1)).unwrap();
             let ranges = range_records();
             wal.append_batch_envelope(ENVELOPE_SCHEMA_PER_CF, &range_envelope(&ranges))
@@ -1810,7 +2068,7 @@ mod tests {
         // that actually holds them.
         let stripe = (0..WAL_STRIPES)
             .map(|k| stripe_path(&path, k))
-            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+            .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > SEGMENT_HEADER_LEN as u64))
             .expect("one stripe holds the appends");
         let full = std::fs::metadata(&stripe).unwrap().len();
         let f = std::fs::OpenOptions::new()
@@ -1822,7 +2080,7 @@ mod tests {
 
         let mut points = Vec::new();
         let mut ranges = 0usize;
-        let last = Wal::replay(&path, |rec| {
+        let last = Wal::replay(&path, SegmentId::per_cf(0), |rec| {
             match rec {
                 ReplayRecord::Point(r) => points.push(r.seq),
                 ReplayRecord::RangeDelete { .. } => ranges += 1,
@@ -1937,8 +2195,12 @@ mod tests {
                 ]
             }),
         ] {
-            let bytes = std::fs::read(crate::util::phase1_fixture(name)).unwrap();
-            assert_eq!(encode_frame(Some(schema), &env(&recs)), bytes, "{name}");
+            let bytes = std::fs::read(crate::util::legacy_fixture(name)).unwrap();
+            // The payload is what is pinned; the frame CRC is IEEE in the 0.9
+            // fixture and CRC32-C here.
+            let frame = encode_frame(Some(schema), &env(&recs));
+            assert_eq!(frame[HEADER_SIZE..], bytes[HEADER_SIZE..], "{name}");
+            assert_eq!(frame[..4], bytes[..4], "{name}: payload length");
             // And the committed bytes decode back to the same records.
             let got = decode_envelope_payload(&bytes[HEADER_SIZE..]).unwrap();
             assert_eq!(got.len(), recs.len(), "{name}");
@@ -2283,13 +2545,7 @@ mod tests {
     #[test]
     fn decision_frame_shape_is_enforced() {
         // Two records under a decision head.
-        let mut body = control_body(
-            crate::format::KIND_ABORT_DECISION,
-            0,
-            &TXN_ID,
-            &[],
-            0,
-        );
+        let mut body = control_body(crate::format::KIND_ABORT_DECISION, 0, &TXN_ID, &[], 0);
         body.extend_from_slice(&control_body(crate::format::KIND_PUT, 0, b"k", b"v", 0));
         assert_eq!(
             decode_envelope_any(&control_payload(2, &body))
@@ -2344,7 +2600,8 @@ mod tests {
         let path = dir.path().join("wal");
         let (cf_ids, recs) = prepare_fixture();
         {
-            let wal = Wal::open(&path, SyncMode::Full, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(rec("committed", "v", 12)).unwrap();
             let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
             wal.append_prepare(ENVELOPE_SCHEMA_UNIFIED, &TXN_ID, &cf_ids, &refs)
@@ -2356,10 +2613,14 @@ mod tests {
         let mut prepares = 0;
         let mut decisions = Vec::new();
         let mut points = 0;
-        let last = Wal::replay(&path, |r| {
+        let last = Wal::replay(&path, SegmentId::per_cf(0), |r| {
             match r {
                 ReplayRecord::Point(_) => points += 1,
-                ReplayRecord::Prepare { id, cf_ids: c, records } => {
+                ReplayRecord::Prepare {
+                    id,
+                    cf_ids: c,
+                    records,
+                } => {
                     assert_eq!(id, TXN_ID);
                     assert_eq!(c, cf_ids);
                     assert_eq!(records.len(), 2);
@@ -2410,10 +2671,16 @@ mod tests {
         let path = dir.path().join("wal");
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
-        let err = Wal::open_inner(&path, SyncMode::Full, Duration::ZERO, |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            Err(std::io::Error::other("injected parent sync failure").into())
-        })
+        let err = Wal::open_inner(
+            &path,
+            SyncMode::Full,
+            Duration::ZERO,
+            SegmentId::per_cf(0),
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::other("injected parent sync failure").into())
+            },
+        )
         .expect_err("a new WAL must not open when its directory sync fails");
 
         assert!(matches!(err, OndaError::Io(_)));
@@ -2424,14 +2691,20 @@ mod tests {
     fn existing_wal_does_not_require_creation_sync() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        drop(Wal::open(&path, SyncMode::Full, Duration::ZERO).unwrap());
+        drop(Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(0)).unwrap());
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
         drop(
-            Wal::open_inner(&path, SyncMode::Full, Duration::ZERO, |_| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+            Wal::open_inner(
+                &path,
+                SyncMode::Full,
+                Duration::ZERO,
+                SegmentId::per_cf(0),
+                |_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
             .unwrap(),
         );
 
@@ -2442,7 +2715,9 @@ mod tests {
     fn concurrent_append_replay_complete() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = std::sync::Arc::new(Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap());
+        let wal = std::sync::Arc::new(
+            Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(0)).unwrap(),
+        );
         let threads = 8;
         let batches = 500;
         let per_batch = 10;
@@ -2477,7 +2752,7 @@ mod tests {
         let total = threads * batches * per_batch;
         let mut seen = vec![false; total + 1];
         let mut count = 0usize;
-        let last = Wal::replay(&path, |rec| {
+        let last = Wal::replay(&path, SegmentId::per_cf(0), |rec| {
             let r = point(rec);
             assert!(!seen[r.seq as usize], "duplicate seq {}", r.seq);
             seen[r.seq as usize] = true;
@@ -2503,13 +2778,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(rec("a", "1", 1)).unwrap();
             let (b, c) = (rec("b", "2", 2), rec("c", "3", 3));
             wal.append_batch(&[b.as_ref(), c.as_ref()]).unwrap();
         }
         let mut got = Vec::new();
-        let last = Wal::replay(&path, |rec| {
+        let last = Wal::replay(&path, SegmentId::per_cf(0), |rec| {
             let r = point(rec);
             got.push((String::from_utf8(r.key).unwrap(), r.seq));
             Ok(())
@@ -2524,7 +2800,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::Full, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(Record {
                 key: b"k".to_vec(),
                 value: b"v".to_vec(),
@@ -2543,7 +2820,7 @@ mod tests {
             .unwrap();
         }
         let mut recs = Vec::new();
-        Wal::replay(&path, |rec| {
+        Wal::replay(&path, SegmentId::per_cf(0), |rec| {
             let r = point(rec);
             recs.push(r);
             Ok(())
@@ -2558,7 +2835,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(rec("good", "v", 1)).unwrap();
         }
         // Append garbage (a partial frame) to simulate a crash mid-write.
@@ -2568,7 +2846,7 @@ mod tests {
             f.write_all(&[9, 0, 0, 0, 1, 2, 3]).unwrap(); // claims 9 bytes, gives 3
         }
         let mut n = 0;
-        let last = Wal::replay(&path, |_| {
+        let last = Wal::replay(&path, SegmentId::per_cf(0), |_| {
             n += 1;
             Ok(())
         })
@@ -2582,7 +2860,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::None, Duration::ZERO).unwrap();
+            let wal =
+                Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
             wal.append(rec("a", "1", 1)).unwrap();
             wal.append(rec("b", "2", 2)).unwrap();
         }
@@ -2592,7 +2871,11 @@ mod tests {
             use std::io::{Seek, SeekFrom, Write};
             let data_file = (0..WAL_STRIPES)
                 .map(|k| stripe_path(&path, k))
-                .find(|p| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
+                .find(|p| {
+                    std::fs::metadata(p)
+                        .map(|m| m.len() > SEGMENT_HEADER_LEN as u64)
+                        .unwrap_or(false)
+                })
                 .expect("one stripe holds the records");
             let mut f = OpenOptions::new().write(true).open(&data_file).unwrap();
             let len = f.metadata().unwrap().len();
@@ -2600,7 +2883,7 @@ mod tests {
             f.write_all(&[0xFF]).unwrap();
         }
         let mut keys = Vec::new();
-        Wal::replay(&path, |rec| {
+        Wal::replay(&path, SegmentId::per_cf(0), |rec| {
             let r = point(rec);
             keys.push(r.key);
             Ok(())
@@ -2614,7 +2897,9 @@ mod tests {
         use std::sync::Arc as StdArc;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = StdArc::new(Wal::open(&path, SyncMode::Full, Duration::ZERO).unwrap());
+        let wal = StdArc::new(
+            Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(0)).unwrap(),
+        );
         let mut handles = Vec::new();
         for t in 0..8u64 {
             let wal = wal.clone();
@@ -2630,7 +2915,7 @@ mod tests {
         }
         drop(wal);
         let mut count = 0;
-        Wal::replay(&path, |_| {
+        Wal::replay(&path, SegmentId::per_cf(0), |_| {
             count += 1;
             Ok(())
         })
@@ -2643,12 +2928,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
         {
-            let wal = Wal::open(&path, SyncMode::Interval, Duration::from_millis(10)).unwrap();
+            let wal = Wal::open(
+                &path,
+                SyncMode::Interval,
+                Duration::from_millis(10),
+                SegmentId::per_cf(0),
+            )
+            .unwrap();
             wal.append(rec("a", "1", 1)).unwrap();
             std::thread::sleep(Duration::from_millis(30));
         }
         let mut count = 0;
-        Wal::replay(&path, |_| {
+        Wal::replay(&path, SegmentId::per_cf(0), |_| {
             count += 1;
             Ok(())
         })
@@ -2660,7 +2951,13 @@ mod tests {
     fn interval_sync_flushes_each_dirty_generation_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal");
-        let wal = Wal::open(&path, SyncMode::Interval, Duration::from_secs(60)).unwrap();
+        let wal = Wal::open(
+            &path,
+            SyncMode::Interval,
+            Duration::from_secs(60),
+            SegmentId::per_cf(0),
+        )
+        .unwrap();
         let syncs = Arc::new(AtomicU64::new(0));
         wal.set_sync_counter(syncs.clone());
 
@@ -2674,5 +2971,190 @@ mod tests {
             WAL_STRIPES as u64,
             "an idle interval must not repeat the previous generation's sync"
         );
+    }
+
+    // ---- segment header (epoch 1) --------------------------------------------
+
+    /// The header, byte for byte.
+    #[test]
+    fn segment_header_golden_bytes() {
+        let h = encode_segment_header(SegmentId::unified(0x0102_0304_0506_0708));
+        assert_eq!(&h[..8], b"YOLODBWL");
+        assert_eq!(read_u32(&h[8..]), 1, "version");
+        assert_eq!(h[12], 2, "unified layout");
+        assert_eq!(&h[13..16], &[0, 0, 0]);
+        assert_eq!(&h[16..24], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&h[24..28], &[0, 0, 0, 0]);
+        assert_eq!(read_u32(&h[28..]), checksum(&h[..28]));
+        assert_eq!(encode_segment_header(SegmentId::per_cf(3))[12], 1);
+    }
+
+    /// A new WAL writes the header, and it is on disk before any frame: the
+    /// file of a WAL opened and closed with no append is exactly the header.
+    #[test]
+    fn open_writes_the_header_before_any_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-7.log");
+        drop(Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(7)).unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            encode_segment_header(SegmentId::per_cf(7)).to_vec()
+        );
+        // Reopening an existing segment appends behind its header.
+        let wal = Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(7)).unwrap();
+        wal.append(rec("k", "v", 1)).unwrap();
+        drop(wal);
+        let mut n = 0;
+        Wal::replay(&path, SegmentId::per_cf(7), |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+        // The wrong segment id is refused, on replay and on reopen.
+        for id in [SegmentId::per_cf(8), SegmentId::unified(7)] {
+            assert_eq!(
+                Wal::replay(&path, id, |_| Ok(())).unwrap_err().kind(),
+                "corruption"
+            );
+            assert_eq!(
+                Wal::open(&path, SyncMode::Full, Duration::ZERO, id)
+                    .unwrap_err()
+                    .kind(),
+                "corruption"
+            );
+        }
+    }
+
+    fn replay_file_bytes(bytes: &[u8]) -> Result<usize> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        std::fs::write(&path, bytes).unwrap();
+        let mut n = 0;
+        Wal::replay(&path, SegmentId::per_cf(0), |_| {
+            n += 1;
+            Ok(())
+        })?;
+        Ok(n)
+    }
+
+    /// Every shape a crash can leave at the head of a segment replays as empty:
+    /// a created-but-unwritten file, a partial header, a header-sized file whose
+    /// bytes never landed, a full header whose CRC fails with nothing behind it.
+    #[test]
+    fn torn_headers_are_empty_segments() {
+        let h = encode_segment_header(SegmentId::per_cf(0));
+        assert_eq!(replay_file_bytes(&[]).unwrap(), 0);
+        for n in [1usize, 7, 8, 20, 31] {
+            assert_eq!(replay_file_bytes(&h[..n]).unwrap(), 0, "prefix {n}");
+        }
+        assert_eq!(replay_file_bytes(&[0u8; 32]).unwrap(), 0);
+        assert_eq!(replay_file_bytes(&[0u8; 5]).unwrap(), 0);
+        let mut torn = h;
+        torn[20] ^= 0x01;
+        assert_eq!(replay_file_bytes(&torn).unwrap(), 0);
+        // And a reopen repairs a torn header in place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        std::fs::write(&path, &h[..11]).unwrap();
+        let wal = Wal::open(&path, SyncMode::Full, Duration::ZERO, SegmentId::per_cf(0)).unwrap();
+        wal.append(rec("after", "v", 3)).unwrap();
+        drop(wal);
+        let mut got = Vec::new();
+        Wal::replay(&path, SegmentId::per_cf(0), |r| {
+            got.push(point(r).key);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, vec![b"after".to_vec()]);
+    }
+
+    /// A segment without a yoloDB header — a 0.9 WAL is frames from byte 0 —
+    /// is refused at byte 0, never read as an empty stripe or mid-frame.
+    #[test]
+    fn a_missing_or_foreign_header_is_unsupported_format() {
+        let frames = point_frame(b"k", b"v", 1);
+        for bytes in [
+            frames.clone(),       // a 0.9 WAL
+            frames[..6].to_vec(), // a short 0.9 WAL
+            b"WAVESST1-and-more-bytes-after-it".to_vec(),
+        ] {
+            assert_eq!(
+                replay_file_bytes(&bytes).unwrap_err().kind(),
+                "unsupported_format",
+                "{bytes:?}"
+            );
+        }
+        // An all-zero header with frames behind it cannot be torn: the header
+        // is fsynced before the first frame.
+        let mut zeros = vec![0u8; 32];
+        zeros.extend_from_slice(&frames);
+        assert_eq!(
+            replay_file_bytes(&zeros).unwrap_err().kind(),
+            "unsupported_format"
+        );
+    }
+
+    #[test]
+    fn segment_header_corruption_rows() {
+        let h = encode_segment_header(SegmentId::per_cf(0));
+        let frames = point_frame(b"k", b"v", 1);
+        let with = |head: &[u8]| {
+            let mut b = head.to_vec();
+            b.extend_from_slice(&frames);
+            b
+        };
+        let reseal = |mut b: [u8; 32]| {
+            let crc = checksum(&b[..28]);
+            b[28..].copy_from_slice(&crc.to_le_bytes());
+            b
+        };
+        assert_eq!(replay_file_bytes(&with(&h)).unwrap(), 1);
+        // A CRC failure with frames behind it is corruption, not a torn tail.
+        let mut bad = h;
+        bad[17] ^= 0x01;
+        assert_eq!(
+            replay_file_bytes(&with(&bad)).unwrap_err().kind(),
+            "corruption"
+        );
+        // Unknown version or layout byte: a newer format.
+        let mut v = h;
+        v[8] = 2;
+        assert_eq!(
+            replay_file_bytes(&with(&reseal(v))).unwrap_err().kind(),
+            "unsupported_format"
+        );
+        let mut l = h;
+        l[12] = 9;
+        assert_eq!(
+            replay_file_bytes(&with(&reseal(l))).unwrap_err().kind(),
+            "unsupported_format"
+        );
+        // Reserved bytes set.
+        for at in [13usize, 15, 24, 27] {
+            let mut r = h;
+            r[at] = 1;
+            assert_eq!(
+                replay_file_bytes(&with(&reseal(r))).unwrap_err().kind(),
+                "corruption",
+                "reserved byte {at}"
+            );
+        }
+    }
+
+    /// Every stripe carries the header; a stripe file that was never written
+    /// to still replays as empty.
+    #[test]
+    fn every_stripe_gets_a_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-2.log");
+        drop(Wal::open(&path, SyncMode::None, Duration::ZERO, SegmentId::per_cf(2)).unwrap());
+        for k in 0..WAL_STRIPES {
+            assert_eq!(
+                std::fs::read(stripe_path(&path, k)).unwrap(),
+                encode_segment_header(SegmentId::per_cf(2)).to_vec(),
+                "stripe {k}"
+            );
+        }
     }
 }

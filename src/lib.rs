@@ -23,11 +23,13 @@
 //!   append-only keyspace without rebuilding a cursor per poll.
 //! * [`PerfContext`] attributes one operation's cost to a mechanism.
 //!
-//! **Formats are capability-gated.** Every stored byte that is not 0.8.2's sits
-//! behind a `CAP_*` bit in [`mod@format`], enabled explicitly and one-way by
+//! **The on-disk format is yoloDB epoch 1** — the format family ondaDB and
+//! wavesdb converge on — with every magic, version, flag, capability bit, codec
+//! id and config tag in [`mod@format`]. Optional artifacts sit behind `CAP_*`
+//! bits, enabled explicitly and one-way by
 //! [`DB::enable_format_capabilities`](crate::DB::enable_format_capabilities).
-//! Nothing is on by default, so an upgraded database keeps writing bytes an
-//! older binary can read until an operator decides otherwise.
+//! ondaDB 0.9.x directories are read (read-only) only through `legacy_onda`,
+//! behind the default-on `legacy-onda` feature.
 
 // The default build is safe Rust.  The optional `mmap-reads` and
 // `arena-memtable` features each lift this to allow the localized `unsafe` in,
@@ -65,6 +67,7 @@ pub mod compaction;
 pub mod comparator;
 pub mod compress;
 pub mod config;
+pub(crate) mod config_blob;
 pub mod db;
 pub mod encoding;
 pub mod error;
@@ -73,6 +76,8 @@ pub mod format;
 pub mod ingest;
 pub mod ioctrl;
 pub mod iterator;
+#[cfg(feature = "legacy-onda")]
+pub mod legacy_onda;
 pub mod maintenance;
 pub mod manifest;
 pub mod manifest_edit;

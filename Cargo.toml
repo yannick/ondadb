@@ -1,6 +1,6 @@
 [package]
 name = "ondadb"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.89" # std::fs::File advisory locking (DB LOCK file)
 license = "MPL-2.0"
@@ -16,7 +16,12 @@ name = "onda_bench"
 path = "src/bin/onda_bench.rs"
 
 [features]
-default = []
+default = ["legacy-onda"]
+# Read-only decoders for the ondaDB 0.9.x on-disk formats (`src/legacy_onda/`):
+# what opens a pre-epoch-1 directory read-only, and what the epoch-1 auto-upgrade
+# reads its source through. Default-on; building without it makes a 0.9
+# directory a hard `UnsupportedFormat` refusal.
+legacy-onda = ["dep:crc32fast"]
 # Object-store (S3) support pulls in network deps; gated so the core build stays lean.
 s3 = ["dep:rust-s3", "dep:tokio"]
 # Opt-in performance fast paths that use localized `unsafe`. The default build
@@ -40,7 +45,12 @@ crossbeam-channel = "0.5"
 self_cell = "1"
 parking_lot = "0.12"
 lru = "0.12"
-crc32fast = "1.4"
+# CRC32-C (Castagnoli): the checksum of every epoch-1 artifact. Hardware CRC on
+# aarch64 and SSE4.2 on x86-64; the crate's `unsafe` stays in the crate.
+crc32c = "0.6"
+# CRC-32/IEEE, which every ondaDB 0.9.x artifact carries. Needed only to read
+# those, so it comes with `legacy-onda`.
+crc32fast = { version = "1.4", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh3"] }
 lz4_flex = "0.11"
 zstd = "0.13"

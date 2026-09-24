@@ -6,16 +6,15 @@ use std::sync::{Arc, OnceLock};
 use super::{
     cmp_internal, decode_aux_sections, decode_delta_anchor, decode_entry, decode_entry_delta,
     restart_lower_bound, validate_delta_restarts, vlog_path_for, Block, BlockHandle, EntryLayout,
-    IndexEntry, SstIterator, AUX_HANDLE_LEN, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK, FOOTER_HAS_BLOOM,
-    FOOTER_MAGIC, FOOTER_PREFIX_DELTA, FOOTER_RESTARTS, FOOTER_SIZE, FOOTER_VLOG_V2,
-    KNOWN_FOOTER_FLAGS, VLOG_CRC_LEN, VLOG_V2_HDR_LEN,
+    IndexEntry, SstIterator, VlogFrames, FOOTER_SIZE, VLOG_FRAME_HDR_LEN, VLOG_HEADER_LEN,
 };
 use crate::bloom::Bloom;
 use crate::cache::{BlockCache, BlockDomain};
 use crate::comparator::ComparatorRef;
 use crate::config::Compression;
-use crate::encoding::{checksum, read_u32, read_u64, uvarint};
+use crate::encoding::{read_u32, uvarint};
 use crate::error::{OndaError, Result};
+use crate::format::FormatProfile;
 use crate::storage::{ReadHandle, Storage};
 
 /// Reads a finished SSTable.  The footer, index and bloom filter are loaded on
@@ -35,24 +34,33 @@ pub struct Reader {
     num_entries: u64,
     max_seq: u64,
     bloom: Option<Bloom>,
-    /// Data blocks carry the restart-offset trailer ([`FOOTER_RESTARTS`]).
+    /// Data blocks carry the restart-offset trailer. Always true for an
+    /// epoch-1 table; a 0.9 table could omit it.
     has_restarts: bool,
-    /// Vlog frames use the v2 (possibly compressed) layout
-    /// ([`FOOTER_VLOG_V2`]).
-    vlog_v2: bool,
-    /// Data-block entry layout, resolved once from the footer flags. Table-level
-    /// by construction ([`FOOTER_EXTENDED_BLOCK`]), so every block of this file
-    /// decodes the same way.
+    /// The value-log frame layout: epoch 1's (a 32-byte file header, then
+    /// possibly compressed frames), or one of 0.9's two.
+    vlog: VlogFrames,
+    /// The epoch-1 vlog header has been validated (once per open reader, like
+    /// the block and frame checksums). Set only after a check passes.
+    vlog_header_ok: OnceLock<()>,
+    /// Data-block entry layout, resolved once from the footer's capability
+    /// word. Table-level by construction, so every block of this file decodes
+    /// the same way.
     entry_layout: EntryLayout,
-    /// Data-block entries are prefix-delta encoded ([`FOOTER_PREFIX_DELTA`]).
-    /// Table-level, like [`Self::entry_layout`], and validated at open against
-    /// the two flags it requires.
+    /// Data-block entries are prefix-delta encoded (`CAP_PREFIX_DELTA` in the
+    /// footer word). Table-level, like [`Self::entry_layout`].
     prefix_delta: bool,
+    /// The table's footer capability word.
+    table_caps: u64,
     /// `cmp.is_bytewise()`, resolved once: the delta decoder's in-block order
     /// check is exact only under byte-wise ordering (AGENTS.md invariant 7).
     bytewise: bool,
-    /// Aux-block handle of an extended table (`(0, 0)` when absent), `None` for
-    /// a legacy table that has no such prefix at all.
+    /// The format family this table is decoded as — checksums, codec ids and
+    /// footer layout. Always [`FormatProfile::Epoch1`] except for a 0.9 table
+    /// opened through `legacy_onda`.
+    profile: FormatProfile,
+    /// Aux-block handle (`(0, 0)` when the table has none). `None` only for a
+    /// 0.9 table without the extended layout, which had nowhere to put one.
     aux_handle: Option<BlockHandle>,
     /// Range-tombstone fragments from aux section 1 (1.2), decoded once at
     /// open: sorted by `start`, disjoint, each with its covering sequences
@@ -248,6 +256,31 @@ impl Reader {
         vlog_cache_limit: usize,
         limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
     ) -> Result<Arc<Reader>> {
+        Reader::open_profiled(
+            klog_path,
+            storage,
+            bc,
+            file_id,
+            cmp,
+            vlog_cache_limit,
+            limiter,
+            FormatProfile::Epoch1,
+        )
+    }
+
+    /// Like [`open_with_limiter`](Self::open_with_limiter), decoding the table
+    /// as format family `profile`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_profiled(
+        klog_path: &str,
+        storage: Arc<dyn Storage>,
+        bc: Arc<BlockCache>,
+        file_id: u64,
+        cmp: ComparatorRef,
+        vlog_cache_limit: usize,
+        limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+        profile: FormatProfile,
+    ) -> Result<Arc<Reader>> {
         let mut r = Reader {
             klog_path: klog_path.to_string(),
             vlog_path: vlog_path_for(klog_path),
@@ -262,11 +295,14 @@ impl Reader {
             num_entries: 0,
             max_seq: 0,
             bloom: None,
-            has_restarts: false,
-            vlog_v2: false,
-            entry_layout: EntryLayout::Legacy,
+            has_restarts: true,
+            vlog: VlogFrames::Epoch1,
+            vlog_header_ok: OnceLock::new(),
+            entry_layout: EntryLayout::Base,
             prefix_delta: false,
+            table_caps: 0,
             bytewise: false,
+            profile,
             aux_handle: None,
             fragments: Arc::from([]),
             vlog_verified: OnceLock::new(),
@@ -281,106 +317,72 @@ impl Reader {
         r.bytewise = r.cmp.is_bytewise();
         let f = r.storage.open_read(klog_path)?;
         let size = f.size()?;
-        if size < FOOTER_SIZE as u64 {
-            return Err(corrupt());
-        }
-        let mut footer = [0u8; FOOTER_SIZE];
-        f.read_exact_at(&mut footer, size - FOOTER_SIZE as u64)?;
-        if read_u64(&footer[56..64]) != FOOTER_MAGIC {
-            return Err(corrupt());
-        }
-        let index_off = read_u64(&footer[0..8]);
-        let index_len = read_u64(&footer[8..16]);
-        let bloom_off = read_u64(&footer[16..24]);
-        let bloom_len = read_u64(&footer[24..32]);
-        r.num_entries = read_u64(&footer[32..40]);
-        r.max_seq = read_u64(&footer[40..48]);
-        let flags = footer[48];
-        if flags & !KNOWN_FOOTER_FLAGS != 0 {
-            return Err(OndaError::UnsupportedFormat(format!(
-                "sst footer flags {flags:#04x} outside known mask {KNOWN_FOOTER_FLAGS:#04x}"
-            )));
-        }
-        r.has_restarts = flags & FOOTER_RESTARTS != 0;
-        r.vlog_v2 = flags & FOOTER_VLOG_V2 != 0;
-        r.prefix_delta = flags & FOOTER_PREFIX_DELTA != 0;
-        if r.prefix_delta {
-            // Both are `Corruption`, not `UnsupportedFormat`: the bits name
-            // formats this binary DOES implement, in a combination no writer
-            // can produce. The delta layout is defined only over the extended
-            // entry, and without a restart trailer a delta block is decodable
-            // only from offset 0 — no seek, no reverse iteration.
-            if flags & FOOTER_EXTENDED_BLOCK == 0 {
-                return Err(OndaError::Corruption(
-                    "sst: FOOTER_PREFIX_DELTA without FOOTER_EXTENDED_BLOCK".into(),
-                ));
-            }
-            if flags & FOOTER_RESTARTS == 0 {
-                return Err(OndaError::Corruption(
-                    "sst: FOOTER_PREFIX_DELTA without FOOTER_RESTARTS".into(),
-                ));
-            }
-        }
-        if flags & FOOTER_EXTENDED_BLOCK != 0 {
-            r.entry_layout = EntryLayout::Extended;
-            // The 16 bytes ahead of the footer are the aux-block handle.
-            if size < (FOOTER_SIZE + AUX_HANDLE_LEN) as u64 {
-                return Err(corrupt());
-            }
-            let mut aux = [0u8; AUX_HANDLE_LEN];
-            f.read_exact_at(&mut aux, size - (FOOTER_SIZE + AUX_HANDLE_LEN) as u64)?;
-            let handle = BlockHandle {
-                offset: read_u64(&aux[0..8]),
-                length: read_u64(&aux[8..16]),
-            };
-            // The handle must address bytes that exist, and specifically bytes
-            // ahead of the prefix it was read from. Checking before the read
-            // keeps a garbage length from being turned into an allocation.
-            let limit = size - (FOOTER_SIZE + AUX_HANDLE_LEN) as u64;
-            if handle.offset > limit || handle.length > limit - handle.offset {
-                return Err(corrupt());
-            }
-            r.aux_handle = Some(handle);
-            if handle.length > 0 {
-                // Decoded at open, not lazily: an aux block naming a section
-                // this binary does not implement must fail the open, not
-                // surface later as a silently missing range delete.
-                let (payload, _) = read_block_at(&*f, handle.offset, handle.length)?;
-                for (tag, section) in decode_aux_sections(&payload)? {
-                    if tag == crate::sst::AUX_SECTION_RANGE {
-                        r.fragments = crate::range_tombstone::decode_fragments(section)?.into();
-                    }
-                }
-                // Fragments are written sorted and disjoint; the read path's
-                // binary search and its monotonic cursor both depend on it, so
-                // a file that claims otherwise is corrupt.
-                if r.fragments.windows(2).any(|w| {
-                    r.cmp.compare(&w[0].end, &w[1].start).is_gt()
-                        || r.cmp.compare(&w[1].start, &w[1].end).is_ge()
-                }) {
-                    return Err(OndaError::Corruption(
-                        "sst: range fragments are unsorted, overlapping or empty".into(),
-                    ));
+        // The last FOOTER_SIZE bytes hold either family's footer: epoch 1's is
+        // 96 bytes, 0.9's is 64 plus a 16-byte aux handle ahead of it.
+        let tail_len = size.min(FOOTER_SIZE as u64) as usize;
+        let mut tail = vec![0u8; tail_len];
+        f.read_exact_at(&mut tail, size - tail_len as u64)?;
+        let footer = match profile {
+            FormatProfile::Epoch1 => super::decode_footer(&tail, size)?,
+            #[cfg(feature = "legacy-onda")]
+            FormatProfile::Onda09 => crate::legacy_onda::sst::table_footer(&tail, size)?,
+        };
+        r.num_entries = footer.num_entries;
+        r.max_seq = footer.max_seq;
+        r.has_restarts = footer.restarts;
+        r.vlog = footer.vlog;
+        r.entry_layout = footer.entry_layout();
+        r.prefix_delta = footer.prefix_delta();
+        r.table_caps = footer.caps;
+        r.aux_handle = footer.aux;
+        if let Some(handle) = footer.aux.filter(|h| h.length > 0) {
+            // Decoded at open, not lazily: an aux block naming a section this
+            // binary does not implement must fail the open, not surface later
+            // as a silently missing range delete.
+            let (payload, _) = read_block_at(&*f, handle.offset, handle.length, profile)?;
+            for (tag, section) in decode_aux_sections(&payload)? {
+                if tag == crate::sst::AUX_SECTION_RANGE {
+                    r.fragments = crate::range_tombstone::decode_fragments(section)?.into();
                 }
             }
+            // Fragments are written sorted and disjoint; the read path's
+            // binary search and its monotonic cursor both depend on it, so a
+            // file that claims otherwise is corrupt.
+            if r.fragments.windows(2).any(|w| {
+                r.cmp.compare(&w[0].end, &w[1].start).is_gt()
+                    || r.cmp.compare(&w[1].start, &w[1].end).is_ge()
+            }) {
+                return Err(OndaError::Corruption(
+                    "sst: range fragments are unsorted, overlapping or empty".into(),
+                ));
+            }
+        }
+        // An epoch-1 table declares its range fragments in its capability word,
+        // in both directions: fragments without the bit, or the bit without
+        // fragments, is bytes no writer produces.
+        if profile == FormatProfile::Epoch1
+            && (footer.caps & crate::format::CAP_RANGE_DELETES != 0) != !r.fragments.is_empty()
+        {
+            return Err(OndaError::Corruption(
+                "sst: range fragments disagree with the footer's CAP_RANGE_DELETES".into(),
+            ));
         }
 
-        if flags & FOOTER_HAS_BLOOM != 0 && bloom_len > 0 {
-            let (raw, _) = read_block_at(&*f, bloom_off, bloom_len)?;
-            r.bloom = Some(Bloom::decode(&raw)?);
+        if let Some(bloom) = footer.bloom {
+            let (raw, _) = read_block_at(&*f, bloom.offset, bloom.length, profile)?;
+            r.bloom = Some(match profile {
+                FormatProfile::Epoch1 => Bloom::decode(&raw)?,
+                #[cfg(feature = "legacy-onda")]
+                FormatProfile::Onda09 => crate::legacy_onda::sst::decode_bloom(&raw)?,
+            });
         }
-        if flags & FOOTER_BTREE != 0 {
+        if footer.btree {
             // Hybrid klog: the index handle points at the B+tree root. Walk the
             // tree (root → ... → leaves) to rebuild the in-memory flat index.
-            r.load_btree(
-                &*f,
-                BlockHandle {
-                    offset: index_off,
-                    length: index_len,
-                },
-            )?;
+            r.load_btree(&*f, footer.index)?;
         } else {
-            let (idx_raw, _) = read_block_at(&*f, index_off, index_len)?;
+            let (idx_raw, _) =
+                read_block_at(&*f, footer.index.offset, footer.index.length, profile)?;
             r.decode_index(&idx_raw)?;
         }
 
@@ -468,7 +470,7 @@ impl Reader {
     }
 
     fn walk_btree_node(&mut self, f: &dyn ReadHandle, h: BlockHandle, is_root: bool) -> Result<()> {
-        let (block, _) = read_block_at(f, h.offset, h.length)?;
+        let (block, _) = read_block_at(f, h.offset, h.length, self.profile)?;
         let mut p = &block[..];
         if p.is_empty() {
             return Err(corrupt());
@@ -551,7 +553,7 @@ impl Reader {
     }
 
     /// Whether this table's data-block entries are prefix-delta encoded
-    /// ([`FOOTER_PREFIX_DELTA`]).
+    /// (`CAP_PREFIX_DELTA` in the footer word).
     #[inline]
     pub(crate) fn prefix_delta(&self) -> bool {
         self.prefix_delta
@@ -564,11 +566,8 @@ impl Reader {
         self.bytewise
     }
 
-    /// This table's aux-block handle as `(offset, length)`, or `None` for a
-    /// legacy table (one without [`FOOTER_EXTENDED_BLOCK`], which has no such
-    /// prefix at all). `Some((0, 0))` means an extended table with no aux block.
-    /// This table's range-tombstone fragments (1.2); empty for a point-only or
-    /// legacy table.
+    /// This table's range-tombstone fragments (1.2); empty for a point-only
+    /// table.
     pub fn range_fragments(&self) -> &[crate::range_tombstone::Fragment] {
         &self.fragments
     }
@@ -589,6 +588,9 @@ impl Reader {
         crate::range_tombstone::covering_seq_in(&self.cmp, &self.fragments, key, read_seq)
     }
 
+    /// This table's aux-block handle as `(offset, length)`: `Some((0, 0))`
+    /// when it has no aux block. `None` only for a 0.9 table without the
+    /// extended layout, which had no handle at all.
     pub fn aux_block_handle(&self) -> Option<(u64, u64)> {
         self.aux_handle.map(|h| (h.offset, h.length))
     }
@@ -611,14 +613,14 @@ impl Reader {
             let (word, bit) = (i / 64, 1u64 << (i % 64));
             let seen = self.verified[word].load(AtOrd::Acquire) & bit != 0;
             let parsed = if seen {
-                crate::block::block_payload_preverified(&mmap[start..end])?
+                crate::block::block_payload_for(self.profile, &mmap[start..end], false)?
             } else {
                 // First touch of this block in this reader: the same point at
                 // which the CRC is paid is the point at which the pages are
                 // actually faulted in, so it is the mmap analogue of a cache
                 // miss and the only place worth charging.
                 crate::ioctrl::charge(&self.limiter, h.length);
-                let p = crate::block::block_payload(&mmap[start..end])?;
+                let p = crate::block::block_payload_for(self.profile, &mmap[start..end], true)?;
                 self.verified[word].fetch_or(bit, AtOrd::AcqRel);
                 p
             };
@@ -667,7 +669,7 @@ impl Reader {
         // never consumes the bandwidth it queued for.
         crate::ioctrl::charge(&self.limiter, h.length);
         let f = self.storage.open_read(&self.klog_path)?;
-        let (raw, alg) = read_block_at(&*f, h.offset, h.length)?;
+        let (raw, alg) = read_block_at(&*f, h.offset, h.length, self.profile)?;
         if alg != Compression::None {
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
         }
@@ -690,10 +692,10 @@ impl Reader {
             let (word, bit) = (i / 64, 1u64 << (i % 64));
             let seen = self.verified[word].load(AtOrd::Acquire) & bit != 0;
             let parsed = if seen {
-                crate::block::block_payload_preverified(&mmap[start..end])?
+                crate::block::block_payload_for(self.profile, &mmap[start..end], false)?
             } else {
                 crate::ioctrl::charge(&self.limiter, h.length);
-                let p = crate::block::block_payload(&mmap[start..end])?;
+                let p = crate::block::block_payload_for(self.profile, &mmap[start..end], true)?;
                 self.verified[word].fetch_or(bit, AtOrd::AcqRel);
                 p
             };
@@ -756,6 +758,12 @@ impl Reader {
     /// involved, and an operator inspecting a loose klog should be able to ask.
     pub fn is_prefix_delta(&self) -> bool {
         self.prefix_delta
+    }
+
+    /// The table's capability word (epoch 1: from its footer), which says
+    /// which entry layout and aux sections a reader must implement.
+    pub fn table_caps(&self) -> u64 {
+        self.table_caps
     }
 
     /// Index of the first data block whose last key is `>= (user_key, seq)`.
@@ -979,10 +987,47 @@ impl Reader {
         if slot.load(AtOrd::Acquire) == off {
             return Ok(());
         }
-        if checksum(payload) != want {
+        if self.profile.checksum(payload) != want {
             return Err(corrupt());
         }
         slot.store(off, AtOrd::Release);
+        Ok(())
+    }
+
+    /// Whether this table's vlog frames carry a codec byte and a stored length
+    /// (epoch 1, and 0.9's "v2").
+    #[inline]
+    fn framed_vlog(&self) -> bool {
+        match self.vlog {
+            VlogFrames::Epoch1 => true,
+            #[cfg(feature = "legacy-onda")]
+            VlogFrames::Onda09V2 => true,
+            #[cfg(feature = "legacy-onda")]
+            VlogFrames::Onda09V1 => false,
+        }
+    }
+
+    /// Validate the epoch-1 vlog header once per open reader, and refuse a
+    /// frame offset that points into it. `header` reads the file's first
+    /// [`VLOG_HEADER_LEN`] bytes; it runs only until a check passes.
+    #[inline]
+    fn check_vlog_frame_offset(
+        &self,
+        off: u64,
+        header: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        if self.vlog != VlogFrames::Epoch1 {
+            return Ok(());
+        }
+        if off < VLOG_HEADER_LEN as u64 {
+            return Err(OndaError::Corruption(format!(
+                "sst: vlog offset {off} points into the vlog header"
+            )));
+        }
+        if self.vlog_header_ok.get().is_none() {
+            super::check_vlog_header(&header()?)?;
+            let _ = self.vlog_header_ok.set(());
+        }
         Ok(())
     }
 
@@ -992,18 +1037,19 @@ impl Reader {
             return Ok(false);
         }
         let mmap = self.vlog_mmap_handle()?;
+        self.check_vlog_frame_offset(off, || Ok(mmap[..VLOG_HEADER_LEN.min(mmap.len())].to_vec()))?;
         let Ok(start) = usize::try_from(off) else {
             return Ok(false);
         };
-        if self.vlog_v2 {
-            let Some(header_end) = start.checked_add(VLOG_V2_HDR_LEN) else {
+        if self.framed_vlog() {
+            let Some(header_end) = start.checked_add(VLOG_FRAME_HDR_LEN) else {
                 return Ok(false);
             };
             let Some(header) = mmap.get(start..header_end) else {
                 return Ok(false);
             };
             let want = read_u32(&header[0..4]);
-            let compression = Compression::from_u8(header[4]).ok_or_else(corrupt)?;
+            let compression = self.profile.codec(header[4])?;
             let payload_len = read_u32(&header[5..9]) as usize;
             if payload_len > len {
                 return Err(corrupt());
@@ -1018,8 +1064,9 @@ impl Reader {
             append_vlog_payload(compression, payload, len, out)?;
             return Ok(true);
         }
+        // 0.9 "v1": `crc | raw value`, no codec byte.
         let Some(value_end) = start
-            .checked_add(VLOG_CRC_LEN)
+            .checked_add(4)
             .and_then(|value_start| value_start.checked_add(len))
         else {
             return Ok(false);
@@ -1027,8 +1074,8 @@ impl Reader {
         let Some(frame) = mmap.get(start..value_end) else {
             return Ok(false);
         };
-        let want = read_u32(&frame[..VLOG_CRC_LEN]);
-        let value = &frame[VLOG_CRC_LEN..];
+        let want = read_u32(&frame[..4]);
+        let value = &frame[4..];
         self.verify_vlog_frame(off, value, want)?;
         out.extend_from_slice(value);
         Ok(true)
@@ -1036,11 +1083,16 @@ impl Reader {
 
     fn read_vlog_from_file(&self, off: u64, len: usize, out: &mut Vec<u8>) -> Result<()> {
         let file = self.storage.open_read(&self.vlog_path)?;
-        if self.vlog_v2 {
-            let mut header = [0u8; VLOG_V2_HDR_LEN];
+        self.check_vlog_frame_offset(off, || {
+            let mut h = vec![0u8; VLOG_HEADER_LEN];
+            file.read_exact_at(&mut h, 0)?;
+            Ok(h)
+        })?;
+        if self.framed_vlog() {
+            let mut header = [0u8; VLOG_FRAME_HDR_LEN];
             file.read_exact_at(&mut header, off)?;
             let want = read_u32(&header[0..4]);
-            let compression = Compression::from_u8(header[4]).ok_or_else(corrupt)?;
+            let compression = self.profile.codec(header[4])?;
             let payload_len = read_u32(&header[5..9]) as usize;
             // Bound allocation before a corrupt header can request up to 4 GiB.
             // Writers store compressed bytes only when shorter than the raw
@@ -1049,16 +1101,17 @@ impl Reader {
                 return Err(corrupt());
             }
             let mut payload = vec![0u8; payload_len];
-            file.read_exact_at(&mut payload, off + VLOG_V2_HDR_LEN as u64)?;
+            file.read_exact_at(&mut payload, off + VLOG_FRAME_HDR_LEN as u64)?;
             self.verify_vlog_frame(off, &payload, want)?;
             return append_vlog_payload(compression, &payload, len, out);
         }
-        let mut crc = [0u8; VLOG_CRC_LEN];
+        // 0.9 "v1": `crc | raw value`, no codec byte.
+        let mut crc = [0u8; 4];
         file.read_exact_at(&mut crc, off)?;
         let want = read_u32(&crc);
         let start = out.len();
         out.resize(start + len, 0);
-        file.read_exact_at(&mut out[start..], off + VLOG_CRC_LEN as u64)?;
+        file.read_exact_at(&mut out[start..], off + 4)?;
         if let Err(error) = self.verify_vlog_frame(off, &out[start..], want) {
             out.truncate(start);
             return Err(error);
@@ -1105,7 +1158,7 @@ impl Reader {
         // vlog read unpaced under `mmap-reads`, the configuration that reads the
         // most. The header is included because the frame is what leaves the
         // device, not the value.
-        crate::ioctrl::charge(&self.limiter, length + VLOG_V2_HDR_LEN as u64);
+        crate::ioctrl::charge(&self.limiter, length + VLOG_FRAME_HDR_LEN as u64);
         #[cfg(feature = "mmap-reads")]
         let served = self.read_vlog_from_mmap(off, len, out)?;
         #[cfg(not(feature = "mmap-reads"))]
@@ -1189,10 +1242,15 @@ impl Reader {
 /// algorithm the frame was stored with** — a caller cannot otherwise tell a
 /// decompression from a raw copy, and `perf::bytes_decompressed` must count only
 /// the former.
-fn read_block_at(f: &dyn ReadHandle, off: u64, length: u64) -> Result<(Vec<u8>, Compression)> {
+fn read_block_at(
+    f: &dyn ReadHandle,
+    off: u64,
+    length: u64,
+    profile: FormatProfile,
+) -> Result<(Vec<u8>, Compression)> {
     let mut buf = vec![0u8; length as usize];
     f.read_exact_at(&mut buf, off)?;
-    let (alg, payload, raw_len, _total) = crate::block::block_payload(&buf)?;
+    let (alg, payload, raw_len, _total) = crate::block::block_payload_for(profile, &buf, true)?;
     let raw = crate::compress::decompress(alg, payload, raw_len)?;
     if raw.len() != raw_len {
         return Err(OndaError::Corruption("block: raw length mismatch".into()));
@@ -1236,8 +1294,14 @@ mod tests {
         .unwrap();
         for i in 0..n {
             let k = format!("key{i:06}");
-            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
-                .unwrap();
+            w.add(
+                k.as_bytes(),
+                b"value",
+                (i + 1) as u64,
+                0,
+                crate::format::KIND_PUT,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
         Reader::open(
@@ -1269,60 +1333,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_block_without_trailer_still_reads() {
-        let dir = tempfile::tempdir().unwrap();
-        let klog = dir.path().join("legacy.klog");
-        let klog = klog.to_str().unwrap();
-        let mut w = Writer::new(
-            klog,
-            WriterOptions {
-                compression: Compression::None,
-                compression_rules: Vec::new(),
-                cmp: default_comparator(),
-                enable_bloom: true,
-                bloom_fpr: Some(0.01),
-                klog_value_threshold: 512,
-                block_size: 512,
-                expected_entries: 300,
-                use_btree: false,
-                restart_interval: 0, // legacy: no trailer, no footer flag
-                extended_entries: false,
-                prefix_delta: false,
-            },
-        )
-        .unwrap();
-        for i in 0..300 {
-            let k = format!("key{i:06}");
-            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
-                .unwrap();
-        }
-        w.finish().unwrap();
-        let r = Reader::open(
-            klog,
-            local(),
-            Arc::new(BlockCache::new(1 << 20)),
-            2,
-            default_comparator(),
-            0,
-        )
-        .unwrap();
-        assert!(!r.has_restarts);
-        for i in 0..300 {
-            let k = format!("key{i:06}");
-            let (_, _, found, ..) = r.get(k.as_bytes(), u64::MAX, 0).unwrap();
-            assert!(found, "missing {k}");
-        }
-        let mut it = r.iter();
-        it.seek_to_first();
-        let mut n = 0;
-        while it.valid() {
-            n += 1;
-            it.next();
-        }
-        assert_eq!(n, 300);
-    }
-
-    #[test]
     fn get_after_bloom_equivalent() {
         let dir = tempfile::tempdir().unwrap();
         let r = small_reader(dir.path(), 500);
@@ -1350,8 +1360,14 @@ mod tests {
         let mut w = Writer::new(path, opts).unwrap();
         for i in 0..n {
             let k = format!("tenant/alpha/cluster/{:04}/segment", i);
-            w.add(k.as_bytes(), b"value", (i + 1) as u64, 0, crate::format::KIND_PUT)
-                .unwrap();
+            w.add(
+                k.as_bytes(),
+                b"value",
+                (i + 1) as u64,
+                0,
+                crate::format::KIND_PUT,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
     }
@@ -1373,11 +1389,18 @@ mod tests {
         }
     }
 
-    /// Flip the footer flag byte of the klog at `path`.
-    fn patch_footer_flags(path: &str, f: impl Fn(u8) -> u8) {
+    /// Rewrite the 96-byte footer of the klog at `path` through `f`, then
+    /// re-seal its CRC32-C unless `keep_crc` — so a test can reach the checks
+    /// behind the checksum.
+    fn patch_footer(path: &str, keep_crc: bool, f: impl Fn(&mut [u8])) {
+        use crate::format::sst_footer::CRC;
         let mut bytes = std::fs::read(path).unwrap();
-        let at = bytes.len() - FOOTER_SIZE + 48;
-        bytes[at] = f(bytes[at]);
+        let at = bytes.len() - FOOTER_SIZE;
+        f(&mut bytes[at..]);
+        if !keep_crc {
+            let crc = crate::encoding::checksum(&bytes[at..at + CRC]);
+            bytes[at + CRC..at + CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        }
         std::fs::write(path, bytes).unwrap();
     }
 
@@ -1392,85 +1415,156 @@ mod tests {
         )
     }
 
-    /// The delta layout is defined only over the extended entry, so the two
-    /// flags may not be separated — and the combination cannot come from any
-    /// writer, which is why it is `Corruption` and not `UnsupportedFormat`.
+    /// The epoch-1 footer, byte for byte, decoded by hand from the layout in
+    /// `format::sst_footer` rather than through `decode_footer`.
     #[test]
-    fn prefix_delta_without_extended_is_corruption() {
+    fn footer_bytes_are_the_documented_layout() {
+        use crate::format::sst_footer as f;
         let dir = tempfile::tempdir().unwrap();
-        let klog = dir.path().join("d.klog");
+        let klog = dir.path().join("f.klog");
         let klog = klog.to_str().unwrap();
         write_table(klog, delta_opts(8), 64);
-        open_at(klog).expect("the unpatched delta table must open");
-        patch_footer_flags(klog, |f| f & !FOOTER_EXTENDED_BLOCK);
-        let err = open_at(klog).expect_err("delta without extended must be refused");
-        assert_eq!(err.kind(), "corruption", "{err}");
-        assert!(err.to_string().contains("FOOTER_EXTENDED_BLOCK"), "{err}");
+        let bytes = std::fs::read(klog).unwrap();
+        let ft = &bytes[bytes.len() - 96..];
+        let u32_at = |o: usize| u32::from_le_bytes(ft[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(ft[o..o + 8].try_into().unwrap());
+        assert_eq!(&ft[88..96], b"YOLOST01");
+        assert_eq!(u32_at(52), 1, "format_version");
+        assert_eq!(u32_at(48), 0, "no bloom, no btree");
+        assert_eq!(u64_at(56), 0x09, "CAP_EXTENDED_RECORDS | CAP_PREFIX_DELTA");
+        assert_eq!(u64_at(32), 64, "num_entries");
+        assert_eq!(u64_at(40), 64, "max_seq");
+        assert_eq!((u64_at(64), u64_at(72)), (0, 0), "no aux block");
+        assert_eq!(u32_at(84), 0, "reserved");
+        assert_eq!(u32_at(80), crate::encoding::checksum(&ft[..80]));
+        // The index handle addresses the block right ahead of the footer.
+        assert_eq!(u64_at(0) + u64_at(8), bytes.len() as u64 - 96);
+        let r = open_at(klog).unwrap();
+        assert_eq!(r.table_caps(), 0x09);
+        assert!(r.is_prefix_delta());
+        let _ = (f::SIZE, f::MAGIC);
     }
 
-    /// Without a restart trailer a delta block is decodable only from offset 0
-    /// — no seek, no reverse iteration.
+    /// Every epoch-1 footer corruption row fails closed with the right kind.
     #[test]
-    fn prefix_delta_without_restarts_is_corruption() {
+    fn footer_corruption_rows_fail_closed() {
+        use crate::format::sst_footer::*;
         let dir = tempfile::tempdir().unwrap();
-        let klog = dir.path().join("d.klog");
+        let base = dir.path().join("base.klog");
+        let base = base.to_str().unwrap();
+        write_table(base, delta_opts(8), 64);
+        let original = std::fs::read(base).unwrap();
+        let klog = dir.path().join("t.klog");
         let klog = klog.to_str().unwrap();
-        write_table(klog, delta_opts(8), 64);
-        patch_footer_flags(klog, |f| f & !FOOTER_RESTARTS);
-        let err = open_at(klog).expect_err("delta without restarts must be refused");
-        assert_eq!(err.kind(), "corruption", "{err}");
-        assert!(err.to_string().contains("FOOTER_RESTARTS"), "{err}");
-    }
-
-    /// Task-5 refactor guard: `restart_scan_offset` now runs through the shared
-    /// `restart_lower_bound`, and must return byte-for-byte the offsets the
-    /// open-coded binary search returned over a frozen legacy fixture.
-    #[test]
-    fn restart_lower_bound_matches_legacy_scan_offset() {
-        let path = crate::util::phase1_fixture("klog_legacy_flat_restarts_bloom.klog");
-        let path = path.to_str().unwrap();
-        let r = open_at(path).unwrap();
-        assert!(r.has_restarts && !r.prefix_delta);
-        // The pre-refactor body, verbatim.
-        let legacy = |raw: &[u8], restarts: &[u8], key: &[u8], seq: u64| -> usize {
-            if restarts.len() < 8 {
-                return 0;
-            }
-            let restart_off = |i: usize| read_u32(&restarts[i * 4..]) as usize;
-            let (mut lo, mut hi) = (0usize, restarts.len() / 4);
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let (entry, _) = decode_entry(raw, r.entry_layout, restart_off(mid)).unwrap();
-                if cmp_internal(&r.cmp, entry.user_key(raw), entry.seq, key, seq).is_lt() {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if lo > 0 {
-                restart_off(lo - 1)
-            } else {
-                0
-            }
+        let case = |keep_crc: bool, f: &dyn Fn(&mut [u8])| -> String {
+            std::fs::write(klog, &original).unwrap();
+            patch_footer(klog, keep_crc, f);
+            open_at(klog)
+                .expect_err("must be refused")
+                .kind()
+                .to_string()
         };
-        let mut probes: Vec<String> = (1..45u64).map(|i| format!("k{i:02}")).collect();
-        probes.extend(["a".into(), "k00".into(), "k99".into(), "zzz".into()]);
-        let mut checked = 0;
-        for bi in 0..r.data_block_count() {
-            let block = r.read_data_block_local(bi).unwrap();
-            let (raw, restarts) = r.split_block(block.bytes()).unwrap();
-            for probe in &probes {
-                for seq in [0u64, 25, u64::MAX] {
-                    let want = legacy(raw, restarts, probe.as_bytes(), seq);
-                    let got = r
-                        .restart_scan_offset(raw, restarts, probe.as_bytes(), seq)
-                        .unwrap();
-                    assert_eq!(got, want, "block {bi}, probe {probe}, seq {seq}");
-                    checked += 1;
-                }
-            }
+        // A bit flip anywhere the CRC covers.
+        for at in [0usize, 20, 33, 44, 49, 57, 70] {
+            assert_eq!(case(true, &|b| b[at] ^= 0x04), "corruption", "flip at {at}");
         }
-        assert!(checked > 100, "the fixture must exercise the search");
+        // Magic: a foreign one is corruption; 0.9's is a named refusal.
+        assert_eq!(case(true, &|b| b[MAGIC_AT] = b'X'), "corruption");
+        assert_eq!(
+            case(true, &|b| b[MAGIC_AT..]
+                .copy_from_slice(&0x5741_5645_5353_5431u64.to_le_bytes())),
+            "unsupported_format"
+        );
+        // Unknown format version.
+        assert_eq!(case(false, &|b| b[VERSION] = 2), "unsupported_format");
+        // Reserved word.
+        assert_eq!(case(false, &|b| b[RESERVED] = 1), "corruption");
+        // Unknown flag bit.
+        assert_eq!(case(false, &|b| b[FLAGS] |= 0x04), "unsupported_format");
+        // Unknown capability bit / a database-level bit / a bit without its
+        // prerequisite.
+        assert_eq!(case(false, &|b| b[CAPS + 1] |= 0x01), "unsupported_format");
+        assert_eq!(case(false, &|b| b[CAPS] |= 0x10), "corruption");
+        assert_eq!(case(false, &|b| b[CAPS] = 0x08), "corruption");
+        // Declaring range fragments the aux block does not hold.
+        assert_eq!(case(false, &|b| b[CAPS] |= 0x04), "corruption");
+        // Bloom flag without a bloom handle.
+        assert_eq!(case(false, &|b| b[FLAGS] |= 0x01), "corruption");
+        // A handle past the end of the file.
+        assert_eq!(case(false, &|b| b[AUX + 15] = 0x7F), "corruption");
+        assert_eq!(case(false, &|b| b[INDEX + 7] = 0x7F), "corruption");
+        // Truncation: shorter than a footer, and a footer cut in half.
+        std::fs::write(klog, &original[..40]).unwrap();
+        assert_eq!(open_at(klog).unwrap_err().kind(), "corruption");
+        std::fs::write(klog, &original[..original.len() - 48]).unwrap();
+        assert_eq!(open_at(klog).unwrap_err().kind(), "corruption");
+    }
+
+    /// The footer decoder is total over arbitrary bytes.
+    #[test]
+    fn fuzz_footer_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("f.klog");
+        let klog = klog.to_str().unwrap();
+        write_table(klog, delta_opts(8), 32);
+        let bytes = std::fs::read(klog).unwrap();
+        let tail = bytes[bytes.len() - FOOTER_SIZE..].to_vec();
+        let mut rng = crate::util::FuzzRng::new(0xF007_E4F0_07E4_0001);
+        for _ in 0..20_000 {
+            let t = crate::util::fuzz_mutate(&mut rng, &tail);
+            let _ = super::super::decode_footer(&t, bytes.len() as u64);
+            let _ = super::super::decode_footer(&t, t.len() as u64);
+        }
+    }
+
+    /// The vlog header is validated before the first frame is trusted, and a
+    /// frame offset pointing into it is refused.
+    #[test]
+    fn vlog_header_is_checked_once_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let klog = dir.path().join("v.klog");
+        let klog_s = klog.to_str().unwrap();
+        let mut w = Writer::new(
+            klog_s,
+            WriterOptions {
+                klog_value_threshold: 16,
+                ..delta_opts(8)
+            },
+        )
+        .unwrap();
+        w.add(b"a", &[b'x'; 100], 1, 0, crate::format::KIND_PUT)
+            .unwrap();
+        w.finish().unwrap();
+        let vlog = klog.with_extension("vlog");
+        let vbytes = std::fs::read(&vlog).unwrap();
+        assert_eq!(&vbytes[..8], b"YOLODBVL");
+        assert_eq!(u32::from_le_bytes(vbytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(vbytes[28..32].try_into().unwrap()),
+            crate::encoding::checksum(&vbytes[..28])
+        );
+        let (v, ..) = open_at(klog_s).unwrap().get(b"a", u64::MAX, 0).unwrap();
+        assert_eq!(v.unwrap(), vec![b'x'; 100]);
+        for (at, kind) in [
+            (0usize, "corruption"),
+            (8, "unsupported_format"),
+            (12, "unsupported_format"),
+            (20, "corruption"),
+            (29, "corruption"),
+        ] {
+            let mut bad = vbytes.clone();
+            bad[at] ^= 0x01;
+            if at != 29 && at != 0 {
+                let crc = crate::encoding::checksum(&bad[..28]);
+                bad[28..32].copy_from_slice(&crc.to_le_bytes());
+            }
+            std::fs::write(&vlog, &bad).unwrap();
+            let err = open_at(klog_s)
+                .unwrap()
+                .get(b"a", u64::MAX, 0)
+                .expect_err("a bad vlog header must fail the read");
+            assert_eq!(err.kind(), kind, "flip at {at}");
+        }
     }
 
     /// The batch point-read planner in `column_family.rs` drives the reader's
@@ -1507,7 +1601,13 @@ mod tests {
             match i % 4 {
                 // A tombstone, an expired-TTL entry, and two live values.
                 1 => w.add(k.as_bytes(), b"", seq, 0, crate::format::KIND_DELETE),
-                2 => w.add(k.as_bytes(), b"expired", seq, NOW - 1, crate::format::KIND_PUT),
+                2 => w.add(
+                    k.as_bytes(),
+                    b"expired",
+                    seq,
+                    NOW - 1,
+                    crate::format::KIND_PUT,
+                ),
                 _ => w.add(k.as_bytes(), b"live", seq, 0, crate::format::KIND_PUT),
             }
             .unwrap();

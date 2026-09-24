@@ -6,17 +6,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{
-    data_block_alg, encode_entry, encode_entry_delta, vlog_path_for, BlockHandle, EntryLayout,
-    FileMeta, IndexEntry, AUX_HANDLE_LEN, DEFAULT_BLOCK_SIZE, FOOTER_BTREE, FOOTER_EXTENDED_BLOCK,
-    FOOTER_HAS_BLOOM, FOOTER_MAGIC, FOOTER_PREFIX_DELTA, FOOTER_RESTARTS, FOOTER_SIZE,
-    FOOTER_VLOG_V2, VLOG_V2_HDR_LEN,
+    data_block_alg, encode_entry, encode_entry_delta, encode_footer, encode_vlog_header,
+    vlog_path_for, BlockHandle, EntryLayout, FileMeta, FooterFields, IndexEntry,
+    DEFAULT_BLOCK_SIZE, VLOG_FRAME_HDR_LEN, VLOG_HEADER_LEN,
 };
 use crate::block::write_block;
 use crate::bloom::Bloom;
 use crate::comparator::ComparatorRef;
 use crate::compress::compress as do_compress;
 use crate::config::{compression_for_key, Compression, CompressionRule};
-use crate::encoding::{append_uvarint, checksum, put_u32, put_u64};
+use crate::encoding::{append_uvarint, checksum, put_u32};
 use crate::error::{OndaError, Result};
 
 /// Configuration for SSTable construction.
@@ -42,23 +41,19 @@ pub struct WriterOptions {
     pub expected_entries: usize,
     /// Write a B+tree (hybrid klog) index instead of a flat single-level index.
     pub use_btree: bool,
-    /// Entries per in-block restart point (`0` disables the restart trailer,
-    /// producing legacy blocks). See [`super::RESTART_INTERVAL`].
+    /// Entries per in-block restart point; at least 1. Epoch 1 writes a
+    /// restart trailer on **every** data block, so `0` — 0.9's "no trailer" —
+    /// is refused by [`Writer::new`]. See [`super::RESTART_INTERVAL`].
     pub restart_interval: usize,
     /// Write every data-block entry in the extended (kind-bearing) layout and
-    /// set [`FOOTER_EXTENDED_BLOCK`]. Table-level: the flag describes the whole
-    /// file, so this is fixed for the writer's lifetime. Off by default —
-    /// nothing in the engine enables it yet, and a table written this way is
-    /// unreadable by binaries older than 1.0.
+    /// declare `CAP_EXTENDED_RECORDS` in the footer's capability word.
+    /// Table-level: the word describes the whole file, so this is fixed for
+    /// the writer's lifetime.
     pub extended_entries: bool,
     /// Store each user key as `shared_len | suffix` against its predecessor
-    /// ([`FOOTER_PREFIX_DELTA`]). Table-level, like `extended_entries`, which
-    /// it implies — the delta layout is defined only over the extended entry,
-    /// so `finish` sets both footer flags.
-    ///
-    /// Requires `restart_interval > 0`: sharing is reset at every anchor, and
-    /// without a restart trailer a delta block would be decodable only from
-    /// offset 0. [`Writer::new`] refuses the combination.
+    /// (`CAP_PREFIX_DELTA` in the footer word). Table-level, like
+    /// `extended_entries`, which it implies — the delta layout is defined only
+    /// over the extended entry, so `finish` declares both.
     pub prefix_delta: bool,
 }
 
@@ -68,7 +63,7 @@ const BTREE_FANOUT: usize = 256;
 /// The stored (post-compression) payload length as it goes into a vlog frame
 /// header, or [`OndaError::TooLarge`] when it does not fit.
 ///
-/// The header field is a `u32` (see [`VLOG_V2_HDR_LEN`] and `docs/formats.md`),
+/// The header field is a `u32` (see [`VLOG_FRAME_HDR_LEN`] and `docs/formats.md`),
 /// so a 4 GiB payload written with an `as u32` cast would wrap to a small
 /// length: the frame's CRC would then cover bytes the reader never reads, the
 /// next frame's offset would point into this one's payload, and the table would
@@ -159,6 +154,10 @@ pub struct Writer {
     /// Range-tombstone fragments to write into this table's aux section (1.2),
     /// sorted by `start` and disjoint. Set once, before [`finish`](Self::finish).
     range_fragments: Vec<crate::range_tombstone::Fragment>,
+    /// Whether any merge operand (kind 4) was written, so the footer's
+    /// capability word can declare `CAP_MERGE_OPERANDS` for exactly the tables
+    /// that carry one.
+    wrote_merge: bool,
 }
 
 impl std::fmt::Debug for Writer {
@@ -191,7 +190,7 @@ impl Writer {
     /// only the flush or compaction job knows the output boundaries, and it is
     /// what keeps level->=1 span disjointness true (see `docs/formats.md`).
     ///
-    /// The aux block only exists on an extended table, so
+    /// Range fragments are defined over the kind-bearing entry, so
     /// [`WriterOptions::extended_entries`] (or the prefix-delta layout, which
     /// implies it) must be set; [`finish`](Self::finish) refuses the
     /// combination otherwise rather than silently dropping the fragments.
@@ -209,10 +208,10 @@ impl Writer {
     }
 
     pub fn new(klog_path: &str, mut opts: WriterOptions) -> Result<Writer> {
-        if opts.prefix_delta && opts.restart_interval == 0 {
+        if opts.restart_interval == 0 {
             return Err(OndaError::InvalidArgs(
-                "prefix_delta requires restart_interval > 0: a delta block \
-                 without restart anchors is decodable only from offset 0"
+                "restart_interval must be at least 1: every epoch-1 data block \
+                 carries a restart trailer"
                     .into(),
             ));
         }
@@ -266,6 +265,7 @@ impl Writer {
             last_seq: 0,
             pending_block: false,
             range_fragments: Vec::new(),
+            wrote_merge: false,
             finished: false,
         })
     }
@@ -301,7 +301,7 @@ impl Writer {
         if self.extended() {
             EntryLayout::Extended
         } else {
-            EntryLayout::Legacy
+            EntryLayout::Base
         }
     }
 
@@ -320,11 +320,7 @@ impl Writer {
     /// the overshoot grows exactly where blocks are meant to get denser.
     #[inline]
     fn pending_trailer_len(&self) -> usize {
-        if self.opts.restart_interval == 0 {
-            0
-        } else {
-            4 * self.cur_restarts.len() + 4
-        }
+        4 * self.cur_restarts.len() + 4
     }
 
     /// Append one entry. `value` is ignored for tombstones.
@@ -349,8 +345,9 @@ impl Writer {
                  was opened with extended_entries = false"
             )));
         }
-        let tombstone = kind == crate::format::KIND_DELETE
-            || kind == crate::format::KIND_SINGLE_DELETE;
+        let tombstone =
+            kind == crate::format::KIND_DELETE || kind == crate::format::KIND_SINGLE_DELETE;
+        self.wrote_merge |= kind == crate::format::KIND_MERGE;
         self.settle_pending_index(user_key);
         // Per-key compression rule; also decides whether this key may share
         // the block being built.
@@ -380,8 +377,7 @@ impl Writer {
             has_vlog = true;
         }
 
-        let anchor = self.opts.restart_interval > 0
-            && self.cur_entries.is_multiple_of(self.opts.restart_interval);
+        let anchor = self.cur_entries.is_multiple_of(self.opts.restart_interval);
         if anchor {
             self.cur_restarts.push(self.cur_block.len() as u32);
             // An anchor is self-contained: reset the predecessor so its
@@ -435,12 +431,17 @@ impl Writer {
         Ok(())
     }
 
-    /// Append a value to the vlog as a v2 frame
-    /// `[crc32c u32 LE][alg u8][comp_len u32 LE][payload]` and return the
+    /// Append a value to the vlog as a frame
+    /// `[crc32c u32 LE][codec u8][stored_len u32 LE][stored]` and return the
     /// frame's start offset. The payload is `value` compressed with `alg`,
     /// stored raw (`alg = None`) when compression would not shrink it. The
     /// crc covers the stored payload, matching the checksum coverage klog
     /// blocks already have.
+    ///
+    /// The file is created on the first large value with its 32-byte header
+    /// ([`crate::format::vlog_header`]) ahead of the first frame; frame offsets
+    /// are absolute, so every offset this returns is at least
+    /// [`VLOG_HEADER_LEN`].
     fn write_vlog(&mut self, value: &[u8], alg: Compression) -> Result<u64> {
         if self.vlog.is_none() {
             let f = OpenOptions::new()
@@ -448,7 +449,12 @@ impl Writer {
                 .truncate(true)
                 .write(true)
                 .open(&self.vlog_path)?;
-            self.vlog = Some(BufWriter::with_capacity(256 << 10, f));
+            let mut w = BufWriter::with_capacity(256 << 10, f);
+            let header = encode_vlog_header();
+            crate::ioctrl::charge(&self.limiter, header.len() as u64);
+            w.write_all(&header)?;
+            self.vlog = Some(w);
+            self.vlog_off = VLOG_HEADER_LEN as u64;
         }
         let (used_alg, payload) = if alg == Compression::None {
             (Compression::None, None)
@@ -465,16 +471,19 @@ impl Writer {
         // corrupt this frame and every frame after it (see `vlog_stored_len`).
         let stored_len = vlog_stored_len(stored.len())?;
         let off = self.vlog_off;
-        let mut hdr = [0u8; VLOG_V2_HDR_LEN];
+        let mut hdr = [0u8; VLOG_FRAME_HDR_LEN];
         put_u32(&mut hdr[0..4], checksum(stored));
-        hdr[4] = used_alg as u8;
+        hdr[4] = used_alg.codec_id();
         put_u32(&mut hdr[5..9], stored_len);
         // The frame, header included, is what reaches the device.
-        crate::ioctrl::charge(&self.limiter, VLOG_V2_HDR_LEN as u64 + stored.len() as u64);
+        crate::ioctrl::charge(
+            &self.limiter,
+            VLOG_FRAME_HDR_LEN as u64 + stored.len() as u64,
+        );
         let w = self.vlog.as_mut().unwrap();
         w.write_all(&hdr)?;
         w.write_all(stored)?;
-        self.vlog_off += VLOG_V2_HDR_LEN as u64 + stored.len() as u64;
+        self.vlog_off += VLOG_FRAME_HDR_LEN as u64 + stored.len() as u64;
         Ok(off)
     }
 
@@ -482,18 +491,16 @@ impl Writer {
         if self.cur_block.is_empty() {
             return Ok(());
         }
-        if self.opts.restart_interval > 0 {
-            // Trailer: restart offsets then their count, all u32 LE. Readers
-            // find it from the count in the block's last 4 bytes.
-            for i in 0..self.cur_restarts.len() {
-                let mut b = [0u8; 4];
-                put_u32(&mut b, self.cur_restarts[i]);
-                self.cur_block.extend_from_slice(&b);
-            }
+        // Trailer, on every block: restart offsets then their count, all
+        // u32 LE. Readers find it from the count in the block's last 4 bytes.
+        for i in 0..self.cur_restarts.len() {
             let mut b = [0u8; 4];
-            put_u32(&mut b, self.cur_restarts.len() as u32);
+            put_u32(&mut b, self.cur_restarts[i]);
             self.cur_block.extend_from_slice(&b);
         }
+        let mut b = [0u8; 4];
+        put_u32(&mut b, self.cur_restarts.len() as u32);
+        self.cur_block.extend_from_slice(&b);
         self.cur_restarts.clear();
         self.cur_entries = 0;
         // Sharing never crosses a block boundary: the next block's first entry
@@ -628,17 +635,19 @@ impl Writer {
             });
         }
 
-        let mut footer_flags = FOOTER_VLOG_V2;
-        if self.opts.restart_interval > 0 {
-            footer_flags |= FOOTER_RESTARTS;
-        }
+        // The table's capability subset: what a reader must implement to
+        // decode these bytes, declared in the footer rather than in flags.
+        let mut caps = 0u64;
         if self.extended() {
-            footer_flags |= FOOTER_EXTENDED_BLOCK;
+            caps |= crate::format::CAP_EXTENDED_RECORDS;
         }
         if self.opts.prefix_delta {
-            footer_flags |= FOOTER_PREFIX_DELTA;
+            caps |= crate::format::CAP_PREFIX_DELTA;
         }
-        let mut bloom_handle = BlockHandle::default();
+        if self.wrote_merge {
+            caps |= crate::format::CAP_MERGE_OPERANDS;
+        }
+        let mut bloom_handle = None;
         // Size the filter from the keys actually written, not from a hint. Both
         // halves are matched together so there is no default rate to fall back
         // on: the buffer only exists when a rate was configured.
@@ -648,56 +657,45 @@ impl Writer {
                 b.add_hash(h);
             }
             let enc = b.encode();
-            bloom_handle = self.write_meta_block(&enc)?;
-            footer_flags |= FOOTER_HAS_BLOOM;
+            bloom_handle = Some(self.write_meta_block(&enc)?);
         }
 
-        // The aux block goes out before the index so the handle written just
-        // ahead of the footer addresses bytes that already exist.
-        let mut aux_handle = BlockHandle::default();
+        let mut aux_handle = None;
         if !self.range_fragments.is_empty() {
             if !self.extended() {
                 return Err(OndaError::InvalidArgs(
-                    "range fragments require an extended table: the aux-block                      handle only exists when FOOTER_EXTENDED_BLOCK is set"
+                    "range fragments require an extended table: a range delete is a \
+                     kind-bearing record"
                         .into(),
                 ));
             }
+            caps |= crate::format::CAP_RANGE_DELETES;
             let payload = crate::sst::encode_aux_sections(&[(
                 crate::sst::AUX_SECTION_RANGE,
                 crate::range_tombstone::encode_fragments(&self.range_fragments),
             )]);
-            aux_handle = self.write_meta_block(&payload)?;
+            aux_handle = Some(self.write_meta_block(&payload)?);
         }
 
         let index_handle = if self.opts.use_btree {
-            footer_flags |= FOOTER_BTREE;
             self.write_btree_index()?
         } else {
             let index_bytes = self.encode_index();
             self.write_meta_block(&index_bytes)?
         };
 
-        let mut footer = [0u8; FOOTER_SIZE];
-        put_u64(&mut footer[0..8], index_handle.offset);
-        put_u64(&mut footer[8..16], index_handle.length);
-        put_u64(&mut footer[16..24], bloom_handle.offset);
-        put_u64(&mut footer[24..32], bloom_handle.length);
-        put_u64(&mut footer[32..40], self.num_entries);
-        put_u64(&mut footer[40..48], self.max_seq);
-        footer[48] = footer_flags;
-        put_u64(&mut footer[56..64], FOOTER_MAGIC);
+        let footer = encode_footer(&FooterFields {
+            index: index_handle,
+            bloom: bloom_handle,
+            num_entries: self.num_entries,
+            max_seq: self.max_seq,
+            btree: self.opts.use_btree,
+            caps,
+            aux: aux_handle,
+        });
+        crate::ioctrl::charge(&self.limiter, footer.len() as u64);
 
         let mut klog = self.klog.take().unwrap();
-        if self.extended() {
-            // Aux-block handle, immediately before the footer. 1.0 defines the
-            // container and produces no sections, so both fields are zero,
-            // which is every table of a database that has not enabled
-            // CAP_RANGE_DELETES; 1.2 is the first writer to fill them in.
-            let mut aux = [0u8; AUX_HANDLE_LEN];
-            put_u64(&mut aux[0..8], aux_handle.offset);
-            put_u64(&mut aux[8..16], aux_handle.length);
-            klog.write_all(&aux)?;
-        }
         klog.write_all(&footer)?;
         klog.flush()?;
         let mut klog = klog.into_inner().map_err(|e| e.into_error())?;
@@ -832,7 +830,8 @@ mod tests {
         for i in 0..200u64 {
             // Long shared prefix, so a non-anchor entry always shares bytes.
             let k = format!("tenant/alpha/cluster/{i:04}");
-            w.add(k.as_bytes(), b"v", i + 1, 0, crate::format::KIND_PUT).unwrap();
+            w.add(k.as_bytes(), b"v", i + 1, 0, crate::format::KIND_PUT)
+                .unwrap();
         }
         w.finish().unwrap();
         let r = Reader::open(
@@ -876,16 +875,18 @@ mod tests {
         );
     }
 
-    /// Sharing is reset at every anchor, so a delta table without a restart
-    /// trailer would be decodable only from offset 0.
+    /// Every epoch-1 data block carries a restart trailer, so the 0.9 "no
+    /// trailer" interval is refused for every layout.
     #[test]
-    fn delta_writer_refuses_zero_restart_interval() {
+    fn writer_refuses_zero_restart_interval() {
         let dir = tempfile::tempdir().unwrap();
-        let klog = dir.path().join("no.klog");
-        let err = Writer::new(klog.to_str().unwrap(), opts(0, true, 512))
-            .expect_err("prefix_delta with no restart trailer must be refused");
-        assert_eq!(err.kind(), "invalid_args", "{err}");
-        assert!(err.to_string().contains("restart_interval"), "{err}");
+        for delta in [false, true] {
+            let klog = dir.path().join("no.klog");
+            let err = Writer::new(klog.to_str().unwrap(), opts(0, delta, 512))
+                .expect_err("a zero restart interval must be refused");
+            assert_eq!(err.kind(), "invalid_args", "{err}");
+            assert!(err.to_string().contains("restart_interval"), "{err}");
+        }
     }
 
     /// The restart trailer rides inside the framed payload, so a block cut on
@@ -899,8 +900,14 @@ mod tests {
             let mut w = Writer::new(klog, opts(4, delta, 1024)).unwrap();
             for i in 0..400u64 {
                 let k = format!("tenant/alpha/{i:04}");
-                w.add(k.as_bytes(), b"payload-payload", i + 1, 0, crate::format::KIND_PUT)
-                    .unwrap();
+                w.add(
+                    k.as_bytes(),
+                    b"payload-payload",
+                    i + 1,
+                    0,
+                    crate::format::KIND_PUT,
+                )
+                .unwrap();
             }
             w.finish().unwrap();
             let r = Reader::open(
@@ -1003,7 +1010,8 @@ mod tests {
             // 2 KiB keys: 16-byte ordered prefix + 2032 bytes of padding.
             let mut k = format!("{i:016}").into_bytes();
             k.resize(2048, b'x');
-            w.add(&k, &val, (i + 1) as u64, 0, crate::format::KIND_PUT).unwrap();
+            w.add(&k, &val, (i + 1) as u64, 0, crate::format::KIND_PUT)
+                .unwrap();
         }
         w.finish().unwrap();
         let r = Reader::open(

@@ -116,6 +116,9 @@ pub(crate) struct TableRef {
     /// Background-IO admission for reads served by this table's reader, or
     /// `None` when unlimited.
     pub io_limiter: Option<Arc<dyn crate::ioctrl::IoLimiter>>,
+    /// The format family the table is decoded as (epoch 1, or a 0.9 table
+    /// read through `legacy_onda`).
+    pub format: crate::format::FormatProfile,
 }
 
 /// One cached reader with its second-chance bit.
@@ -322,7 +325,7 @@ impl TableCache {
         }
 
         // `Reader::open` already yields an `Arc`.
-        let reader = Reader::open_with_limiter(
+        let reader = Reader::open_profiled(
             &t.klog,
             Arc::clone(&t.storage),
             Arc::clone(&t.bc),
@@ -330,6 +333,7 @@ impl TableCache {
             t.cmp.clone(),
             t.vlog_cache_limit,
             t.io_limiter.clone(),
+            t.format,
         )?;
         self.core.opens.fetch_add(1, Ordering::Relaxed);
 

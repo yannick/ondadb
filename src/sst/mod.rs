@@ -2,23 +2,27 @@
 //! compaction.
 //!
 //! An SSTable is a klog file (keys + small values + metadata) and an optional
-//! vlog file (large values — WiscKey key/value separation).  klog layout:
+//! vlog file (large values — WiscKey key/value separation). yoloDB epoch-1
+//! klog layout:
 //!
 //! ```text
-//! [data block 0] .. [data block N-1] [bloom block?] [index block] [footer(64)]
+//! [data block 0] .. [data block N-1] [bloom?] [aux?] [index] [footer 96B]
 //! ```
 //!
-//! Blocks are framed by [`crate::block`].  Data-block entries are in internal
-//! order (user key ascending, sequence descending):
+//! Blocks are framed by [`crate::block`]. Every data block carries a restart
+//! trailer. Data-block entries are in internal order (user key ascending,
+//! sequence descending), in one of three table-level layouts the footer's
+//! capability word selects:
 //!
 //! ```text
-//! flags(1) | key_len uvarint | val_len uvarint | seq uvarint |
-//! ttl varint(if HAS_TTL) | key | (value | vlog_off u64 LE if HAS_VLOG)
+//! base      flags(1) | key_len | val_len | seq | ttl? | key | value|vlog_off
+//! extended  kind | modifiers | key_len | val_len | seq | ttl? | key | value|vlog_off
+//! delta     kind | modifiers | shared | suffix_len | val_len | seq | ttl? | suffix | …
 //! ```
 //!
-//! Tables written with [`FOOTER_PREFIX_DELTA`] replace `key_len | key` with
-//! `shared_len | suffix_len | ... | suffix`, storing only the bytes a key does
-//! not share with its predecessor (see [`encode_entry_delta`]).
+//! The footer layout is [`crate::format::sst_footer`]; it is CRC32-C
+//! checksummed and names its format version and the table's capability
+//! subset. A 0.9 table (`WAVESST1`) is decoded only through `legacy_onda`.
 
 mod iter;
 mod reader;
@@ -33,71 +37,15 @@ pub use reader::Reader;
 pub use writer::{Writer, WriterOptions};
 
 use crate::config::Compression;
-use crate::encoding::{append_u64, append_uvarint, append_varint, uvarint, varint};
+use crate::encoding::{
+    append_u64, append_uvarint, append_varint, put_u32, put_u64, read_u32, read_u64, uvarint,
+    varint,
+};
 use crate::error::{OndaError, Result};
-use crate::format::flags;
+use crate::format::{flags, sst_footer};
 
-/// Fixed footer size in bytes.
-pub(crate) const FOOTER_SIZE: usize = 64;
-/// Footer magic: "WAVESST1"-derived value reused for ondaDB klogs.
-pub(crate) const FOOTER_MAGIC: u64 = 0x5741_5645_5353_5431;
-/// Footer flag: a bloom block is present.
-pub(crate) const FOOTER_HAS_BLOOM: u8 = 0x01;
-/// Footer flag: the index block is a B+tree root (hybrid klog) rather than a
-/// flat single-level index.
-pub(crate) const FOOTER_BTREE: u8 = 0x02;
-/// Footer flag: data blocks carry a restart-offset trailer
-/// (`entries... | restart_off u32 LE x R | R u32 LE`) enabling in-block binary
-/// search. Absent on legacy files, whose blocks are entries only.
-pub(crate) const FOOTER_RESTARTS: u8 = 0x04;
-/// Footer flag: vlog frames use the v2 layout
-/// `[crc32c u32 LE][alg u8][comp_len u32 LE][payload]` (payload may be
-/// compressed; `alg = None` stores it raw). Absent on legacy files, whose
-/// frames are `[crc32c u32 LE][raw value]`.
-pub(crate) const FOOTER_VLOG_V2: u8 = 0x08;
-/// Footer flag: **every** data-block entry in this table uses the extended
-/// (kind-bearing) layout, and the 16 bytes immediately preceding the footer are
-/// the aux-block handle.
-///
-/// Table-level, not per-block: a block carries no flag byte of its own
-/// (`block.rs` frames it as `[alg][comp_len][raw_len][crc32c][payload]`), so a
-/// per-block decision would be its own format change. Entry boundaries still
-/// come from `decode_entry`'s returned `next`, which is why the restart
-/// trailer, the B+tree index and the block CRC all keep working unchanged.
-pub(crate) const FOOTER_EXTENDED_BLOCK: u8 = 0x10;
-/// Footer flag: **every** data-block entry in this table is prefix-delta
-/// encoded — `key_len | key` is replaced by `shared_len | suffix_len | suffix`
-/// and the user key is `prev_key[..shared_len] ++ suffix` (2.1).
-///
-/// Table-level for the same reason [`FOOTER_EXTENDED_BLOCK`] is: the block
-/// cache is keyed `(file_id, offset)` and stores bytes only, so a cache hit
-/// returns a payload with no envelope to re-parse. Reading the encoding off the
-/// footer also keeps a detached/frozen/mounted table self-describing without
-/// its source manifest.
-///
-/// Requires both [`FOOTER_EXTENDED_BLOCK`] (the delta layout is defined only
-/// over the extended entry) and [`FOOTER_RESTARTS`] (without anchors a delta
-/// block is decodable only from offset 0 — no seek, no reverse iteration).
-/// `Reader::open` rejects either combination as `Corruption`.
-pub(crate) const FOOTER_PREFIX_DELTA: u8 = 0x20;
-/// Mask of every footer flag bit this binary implements (`0x3F`).
-///
-/// A file setting a bit outside this mask was written by a newer binary and
-/// names a feature we do not implement — [`OndaError::UnsupportedFormat`], not
-/// `Corruption`.
-pub(crate) const KNOWN_FOOTER_FLAGS: u8 = FOOTER_HAS_BLOOM
-    | FOOTER_BTREE
-    | FOOTER_RESTARTS
-    | FOOTER_VLOG_V2
-    | FOOTER_EXTENDED_BLOCK
-    | FOOTER_PREFIX_DELTA;
-/// Width of the aux-block handle written immediately before the footer of an
-/// extended table: `aux_off u64 LE | aux_len u64 LE`, both `0` when absent.
-///
-/// It lives outside the footer because the fixed 64 bytes are full — `0..48`
-/// fields, `48` flags, `49..56` unused, `56..64` magic — and seven spare bytes
-/// cannot hold a block handle.
-pub(crate) const AUX_HANDLE_LEN: usize = 16;
+/// Fixed footer size in bytes (epoch 1).
+pub(crate) const FOOTER_SIZE: usize = sst_footer::SIZE;
 /// Entries per restart interval written by default.
 pub(crate) const RESTART_INTERVAL: usize = 8;
 /// Default target data-block size used by low-level writers when their option
@@ -105,10 +53,251 @@ pub(crate) const RESTART_INTERVAL: usize = 8;
 /// explicitly; its default is the same 4 KiB value. Existing files are
 /// unaffected because block boundaries are self-describing.
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 4 << 10;
-/// Length of the per-value CRC32-C prefix in the vlog frame.
-pub(crate) const VLOG_CRC_LEN: usize = 4;
-/// Length of the v2 vlog frame header: crc32c(4) + alg(1) + comp_len(4).
-pub(crate) const VLOG_V2_HDR_LEN: usize = 9;
+/// Length of the value-log frame header: crc32c(4) + alg(1) + stored_len(4).
+/// Epoch 1 has one frame format — 0.9's "v2" frame.
+pub(crate) const VLOG_FRAME_HDR_LEN: usize = 9;
+/// Length of the value-log file header ([`crate::format::vlog_header`]); the
+/// first frame starts here.
+pub(crate) const VLOG_HEADER_LEN: usize = crate::format::vlog_header::HEADER_LEN;
+
+/// How a table's value-log frames are laid out. Epoch 1 has exactly one
+/// shape; the other two exist only to read 0.9 tables through `legacy_onda`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VlogFrames {
+    /// A 32-byte file header, then `crc32c | alg | stored_len | stored`.
+    Epoch1,
+    /// 0.9 "v2": no file header, `crc | alg | stored_len | stored` (IEEE).
+    #[cfg(feature = "legacy-onda")]
+    Onda09V2,
+    /// 0.9 "v1": no file header, `crc | raw value` (IEEE).
+    #[cfg(feature = "legacy-onda")]
+    Onda09V1,
+}
+
+/// A decoded footer, normalized over both format families. [`Reader::open`]
+/// works from this alone, so the family-specific parsing stays in
+/// [`decode_footer`] and `legacy_onda::sst`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TableFooter {
+    pub index: BlockHandle,
+    /// `None` when the table has no filter.
+    pub bloom: Option<BlockHandle>,
+    pub num_entries: u64,
+    pub max_seq: u64,
+    pub btree: bool,
+    /// The table's capability subset: which entry layout its blocks use and
+    /// which aux sections it may carry.
+    pub caps: u64,
+    /// Data blocks carry a restart trailer. Always true in epoch 1.
+    pub restarts: bool,
+    pub vlog: VlogFrames,
+    /// The aux-block handle; `Some((0, 0))`-shaped when the table has none.
+    /// `None` only for a 0.9 table without the extended layout, which had no
+    /// place to put one.
+    pub aux: Option<BlockHandle>,
+}
+
+impl TableFooter {
+    /// The entry layout the capability word selects.
+    pub(crate) fn entry_layout(&self) -> EntryLayout {
+        if self.caps & crate::format::CAP_EXTENDED_RECORDS != 0 {
+            EntryLayout::Extended
+        } else {
+            EntryLayout::Base
+        }
+    }
+
+    pub(crate) fn prefix_delta(&self) -> bool {
+        self.caps & crate::format::CAP_PREFIX_DELTA != 0
+    }
+}
+
+/// The fields a writer puts in an epoch-1 footer.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FooterFields {
+    pub index: BlockHandle,
+    pub bloom: Option<BlockHandle>,
+    pub num_entries: u64,
+    pub max_seq: u64,
+    pub btree: bool,
+    pub caps: u64,
+    pub aux: Option<BlockHandle>,
+}
+
+/// Encode the 96-byte epoch-1 footer ([`crate::format::sst_footer`]).
+pub(crate) fn encode_footer(f: &FooterFields) -> [u8; FOOTER_SIZE] {
+    use sst_footer::*;
+    let mut b = [0u8; FOOTER_SIZE];
+    put_u64(&mut b[INDEX..], f.index.offset);
+    put_u64(&mut b[INDEX + 8..], f.index.length);
+    let bloom = f.bloom.unwrap_or_default();
+    put_u64(&mut b[BLOOM..], bloom.offset);
+    put_u64(&mut b[BLOOM + 8..], bloom.length);
+    put_u64(&mut b[NUM_ENTRIES..], f.num_entries);
+    put_u64(&mut b[MAX_SEQ..], f.max_seq);
+    let mut flags = 0u32;
+    if f.bloom.is_some() {
+        flags |= FLAG_BLOOM;
+    }
+    if f.btree {
+        flags |= FLAG_BTREE;
+    }
+    put_u32(&mut b[FLAGS..], flags);
+    put_u32(&mut b[VERSION..], FORMAT_VERSION);
+    put_u64(&mut b[CAPS..], f.caps);
+    let aux = f.aux.unwrap_or_default();
+    put_u64(&mut b[AUX..], aux.offset);
+    put_u64(&mut b[AUX + 8..], aux.length);
+    let crc = crate::encoding::checksum(&b[..CRC]);
+    put_u32(&mut b[CRC..], crc);
+    // RESERVED stays zero.
+    b[MAGIC_AT..].copy_from_slice(&MAGIC);
+    b
+}
+
+/// The last eight bytes of a 0.9 klog, as that binary stored its footer magic.
+const ONDA09_FOOTER_MAGIC: u64 = 0x5741_5645_5353_5431;
+
+/// Decode the epoch-1 footer from `tail`, the last [`FOOTER_SIZE`] bytes of a
+/// klog of `file_len` bytes.
+///
+/// Fail-closed, in this order: a foreign magic is `Corruption` (a 0.9
+/// `WAVESST1` magic is `UnsupportedFormat` naming the upgrade path); a format
+/// version other than 1 is `UnsupportedFormat` — its CRC position is not ours
+/// to know; then the CRC32-C over bytes 0..80, the reserved word, the flag
+/// mask (`UnsupportedFormat`), the capability word (unknown bit:
+/// `UnsupportedFormat`; a database-level or dependency-violating bit:
+/// `Corruption`) and every handle's bounds (`Corruption`).
+pub(crate) fn decode_footer(tail: &[u8], file_len: u64) -> Result<TableFooter> {
+    use sst_footer::*;
+    let corrupt = |what: &str| OndaError::Corruption(format!("sst footer: {what}"));
+    if tail.len() < 8 || file_len < tail.len() as u64 {
+        return Err(corrupt("file shorter than a footer"));
+    }
+    let last8 = &tail[tail.len() - 8..];
+    if last8 != MAGIC {
+        if read_u64(last8) == ONDA09_FOOTER_MAGIC {
+            return Err(OndaError::UnsupportedFormat(
+                "sst: an ondaDB 0.9 table (WAVESST1 footer); it is readable only through \
+                 legacy_onda, and the database must be upgraded to yoloDB epoch 1"
+                    .into(),
+            ));
+        }
+        return Err(corrupt("magic is not YOLOST01"));
+    }
+    if tail.len() < SIZE {
+        return Err(corrupt("file shorter than a footer"));
+    }
+    let b = &tail[tail.len() - SIZE..];
+    let version = read_u32(&b[VERSION..]);
+    if version != FORMAT_VERSION {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "sst footer format version {version} is not implemented by this binary"
+        )));
+    }
+    if read_u32(&b[CRC..]) != crate::encoding::checksum(&b[..CRC]) {
+        return Err(corrupt("checksum mismatch"));
+    }
+    if read_u32(&b[RESERVED..]) != 0 {
+        return Err(corrupt("reserved word is not zero"));
+    }
+    let flags = read_u32(&b[FLAGS..]);
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "sst footer flags {flags:#x} outside known mask {KNOWN_FLAGS:#x}"
+        )));
+    }
+    let caps = read_u64(&b[CAPS..]);
+    crate::format::check_caps(caps)?;
+    if caps & !TABLE_CAPS != 0 {
+        return Err(corrupt("capability word names a database-level bit"));
+    }
+    if caps & !crate::format::CAP_EXTENDED_RECORDS != 0
+        && caps & crate::format::CAP_EXTENDED_RECORDS == 0
+    {
+        // Merge operands, range fragments and prefix-delta blocks are all
+        // defined over the kind-bearing entry; no writer declares one without it.
+        return Err(corrupt("capability without CAP_EXTENDED_RECORDS"));
+    }
+    // Every handle must address bytes ahead of the footer; checking here keeps
+    // a garbage length from ever becoming an allocation.
+    let limit = file_len - SIZE as u64;
+    let handle = |at: usize| -> Result<BlockHandle> {
+        let h = BlockHandle {
+            offset: read_u64(&b[at..]),
+            length: read_u64(&b[at + 8..]),
+        };
+        if h.offset > limit || h.length > limit - h.offset {
+            return Err(corrupt("handle past the end of the file"));
+        }
+        Ok(h)
+    };
+    let index = handle(INDEX)?;
+    let bloom = handle(BLOOM)?;
+    let aux = handle(AUX)?;
+    let has_bloom = flags & FLAG_BLOOM != 0;
+    if has_bloom != (bloom.length > 0) || (!has_bloom && bloom.offset != 0) {
+        return Err(corrupt("bloom flag disagrees with the bloom handle"));
+    }
+    if aux.length == 0 && aux.offset != 0 {
+        return Err(corrupt("empty aux handle with an offset"));
+    }
+    Ok(TableFooter {
+        index,
+        bloom: has_bloom.then_some(bloom),
+        num_entries: read_u64(&b[NUM_ENTRIES..]),
+        max_seq: read_u64(&b[MAX_SEQ..]),
+        btree: flags & FLAG_BTREE != 0,
+        caps,
+        restarts: true,
+        vlog: VlogFrames::Epoch1,
+        aux: Some(aux),
+    })
+}
+
+/// Encode the 32-byte epoch-1 value-log header ([`crate::format::vlog_header`]).
+pub(crate) fn encode_vlog_header() -> [u8; VLOG_HEADER_LEN] {
+    use crate::format::vlog_header::*;
+    let mut b = [0u8; HEADER_LEN];
+    b[..8].copy_from_slice(&MAGIC);
+    put_u32(&mut b[8..], VERSION);
+    // flags (12..16) and reserved (16..28) are zero in epoch 1.
+    let crc = crate::encoding::checksum(&b[..28]);
+    put_u32(&mut b[28..], crc);
+    b
+}
+
+/// Validate an epoch-1 value-log header: magic and CRC32-C (`Corruption`),
+/// version and flags (`UnsupportedFormat`), reserved bytes (`Corruption`).
+pub(crate) fn check_vlog_header(b: &[u8]) -> Result<()> {
+    use crate::format::vlog_header::*;
+    let corrupt = |what: &str| OndaError::Corruption(format!("vlog header: {what}"));
+    if b.len() < HEADER_LEN {
+        return Err(corrupt("file shorter than its header"));
+    }
+    if b[..8] != MAGIC {
+        return Err(corrupt("magic is not YOLODBVL"));
+    }
+    let version = read_u32(&b[8..]);
+    if version != VERSION {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "vlog header version {version} is not implemented by this binary"
+        )));
+    }
+    if read_u32(&b[28..]) != crate::encoding::checksum(&b[..28]) {
+        return Err(corrupt("checksum mismatch"));
+    }
+    let flags = read_u32(&b[12..]);
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "vlog header flags {flags:#x} are not implemented by this binary"
+        )));
+    }
+    if b[16..28].iter().any(|&x| x != 0) {
+        return Err(corrupt("reserved bytes are not zero"));
+    }
+    Ok(())
+}
 
 /// Metadata describing a finished SSTable. `id` and paths are assigned by the
 /// caller (the column family).
@@ -305,14 +494,16 @@ impl DecEntry {
 }
 
 /// Which entry layout a table's data blocks use — a table-level property read
-/// once from the footer at [`Reader::open`] and threaded to every decode.
+/// once from the footer's capability word at [`Reader::open`] and threaded to
+/// every decode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum EntryLayout {
-    /// `flags(1) | klen | vlen | seq | ttl? | key | value|vlog_off`.
+    /// `flags(1) | klen | vlen | seq | ttl? | key | value|vlog_off` — a table
+    /// without `CAP_EXTENDED_RECORDS`: only the three point kinds.
     #[default]
-    Legacy,
+    Base,
     /// `kind uv | modifiers uv | klen | vlen | seq | ttl? | key | value|vlog_off`
-    /// ([`FOOTER_EXTENDED_BLOCK`]).
+    /// (`CAP_EXTENDED_RECORDS` in the footer's capability word).
     Extended,
 }
 
@@ -336,8 +527,8 @@ pub(crate) fn encode_entry(
     // value); the layout below must follow the byte that was actually written.
     let has_vlog = fl & flags::HAS_VLOG != 0;
     match layout {
-        EntryLayout::Legacy => {
-            // A legacy entry has nowhere to put a kind, so only the three point
+        EntryLayout::Base => {
+            // A base entry has nowhere to put a kind, so only the three point
             // kinds are representable. `Writer::add` refuses the rest before
             // reaching here; this is the last line of defence.
             debug_assert!(
@@ -381,7 +572,7 @@ pub(crate) fn decode_entry(
         return Err(corrupt());
     }
     let (fl, kind, mut p) = match layout {
-        EntryLayout::Legacy => {
+        EntryLayout::Base => {
             let fl = raw[off];
             crate::format::check_entry_flags(fl)?;
             let kind = crate::format::point_kind(
@@ -851,13 +1042,33 @@ mod tests {
             "klog_legacy_flat_restarts_bloom.klog",
             "klog_legacy_btree_norestarts_nobloom.klog",
         ] {
-            seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
+            seeds.push(std::fs::read(crate::util::legacy_fixture(name)).unwrap());
         }
         // A well-formed entry stream, so mutations start from valid framing.
         let mut buf = Vec::new();
-        let lay = EntryLayout::Legacy;
-        encode_entry(&mut buf, lay, b"k1", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
-        encode_entry(&mut buf, lay, b"k2", b"", 2, 0, crate::format::KIND_SINGLE_DELETE, false, 0);
+        let lay = EntryLayout::Base;
+        encode_entry(
+            &mut buf,
+            lay,
+            b"k1",
+            b"v",
+            1,
+            0,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
+        encode_entry(
+            &mut buf,
+            lay,
+            b"k2",
+            b"",
+            2,
+            0,
+            crate::format::KIND_SINGLE_DELETE,
+            false,
+            0,
+        );
         encode_entry(
             &mut buf,
             lay,
@@ -876,7 +1087,7 @@ mod tests {
             for _ in 0..2000 {
                 let case = crate::util::fuzz_mutate(&mut rng, seed);
                 let at = rng.below(case.len().max(1));
-                for layout in [EntryLayout::Legacy, EntryLayout::Extended] {
+                for layout in [EntryLayout::Base, EntryLayout::Extended] {
                     let _ = decode_entry(&case, layout, at);
                     let _ = decode_entry(&case, layout, 0);
                 }
@@ -900,7 +1111,7 @@ mod tests {
     #[test]
     fn decode_entry_rejects_unknown_flag_bit() {
         let raw = raw_entry(0x08, b"k", b"v");
-        let err = decode_entry(&raw, EntryLayout::Legacy, 0)
+        let err = decode_entry(&raw, EntryLayout::Base, 0)
             .expect_err("unknown flag bit must be rejected");
         assert_eq!(err.kind(), "corruption");
     }
@@ -911,7 +1122,7 @@ mod tests {
     fn decode_entry_rejects_tombstone_with_vlog() {
         let mut raw = raw_entry(flags::TOMBSTONE | flags::HAS_VLOG, b"k", b"");
         append_u64(&mut raw, 0x1234);
-        let err = decode_entry(&raw, EntryLayout::Legacy, 0)
+        let err = decode_entry(&raw, EntryLayout::Base, 0)
             .expect_err("TOMBSTONE with HAS_VLOG must be rejected");
         assert_eq!(err.kind(), "corruption");
     }
@@ -928,7 +1139,7 @@ mod tests {
         let mut buf = Vec::new();
         encode_entry(
             &mut buf,
-            EntryLayout::Legacy,
+            EntryLayout::Base,
             b"k",
             b"v",
             1,
@@ -943,7 +1154,7 @@ mod tests {
         let mut buf = Vec::new();
         encode_entry(
             &mut buf,
-            EntryLayout::Legacy,
+            EntryLayout::Base,
             b"k",
             b"",
             1,
@@ -953,7 +1164,7 @@ mod tests {
             0,
         );
         assert_eq!(buf[0], flags::TOMBSTONE | flags::SINGLE_DELETE);
-        let (dec, next) = decode_entry(&buf, EntryLayout::Legacy, 0).unwrap();
+        let (dec, next) = decode_entry(&buf, EntryLayout::Base, 0).unwrap();
         assert!(dec.tombstone() && dec.single_delete() && !dec.has_vlog());
         assert_eq!(next, buf.len());
     }
@@ -961,7 +1172,17 @@ mod tests {
     /// Encode one delta entry against `prev` and decode it back.
     fn delta_round_trip(prev: &[u8], key: &[u8], value: &[u8], ttl: i64) -> (Vec<u8>, usize) {
         let mut buf = Vec::new();
-        let shared = encode_entry_delta(&mut buf, prev, key, value, 7, ttl, crate::format::KIND_PUT, false, 0);
+        let shared = encode_entry_delta(
+            &mut buf,
+            prev,
+            key,
+            value,
+            7,
+            ttl,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
         let mut out = prev.to_vec();
         let (dec, next) = decode_entry_delta(&buf, 0, &mut out, true).unwrap();
         assert_eq!(next, buf.len(), "decode must consume the entry exactly");
@@ -1000,7 +1221,17 @@ mod tests {
     #[test]
     fn delta_entry_rejects_shared_longer_than_prev() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"abcdef", b"abcdefgh", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"abcdef",
+            b"abcdefgh",
+            b"v",
+            1,
+            0,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
         // The predecessor is shorter than the recorded shared_len (6).
         let mut out = b"abc".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true)
@@ -1015,7 +1246,17 @@ mod tests {
     #[test]
     fn delta_entry_rejects_truncated_suffix() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"ab", b"abcdefgh", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"ab",
+            b"abcdefgh",
+            b"v",
+            1,
+            0,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
         // Drop the value and part of the suffix.
         buf.truncate(buf.len() - 4);
         let mut out = b"ab".to_vec();
@@ -1026,7 +1267,17 @@ mod tests {
     #[test]
     fn delta_entry_rejects_truncated_value() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"ab", b"abc", b"a-long-value", 1, 0, crate::format::KIND_PUT, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"ab",
+            b"abc",
+            b"a-long-value",
+            1,
+            0,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
         buf.truncate(buf.len() - 3);
         let mut out = b"ab".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("truncated value");
@@ -1062,7 +1313,17 @@ mod tests {
     #[test]
     fn delta_entry_rejects_out_of_order_keys_under_bytewise_order() {
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"", b"aaa", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"",
+            b"aaa",
+            b"v",
+            1,
+            0,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
         let mut out = b"zzz".to_vec();
         let err = decode_entry_delta(&buf, 0, &mut out, true).expect_err("descending keys");
         assert_eq!(err.kind(), "corruption");
@@ -1071,7 +1332,17 @@ mod tests {
         assert!(decode_entry_delta(&buf, 0, &mut out, false).is_ok());
         // Equal keys are legal: the same user key at a lower sequence.
         let mut buf = Vec::new();
-        encode_entry_delta(&mut buf, b"aaa", b"aaa", b"v", 1, 0, crate::format::KIND_PUT, false, 0);
+        encode_entry_delta(
+            &mut buf,
+            b"aaa",
+            b"aaa",
+            b"v",
+            1,
+            0,
+            crate::format::KIND_PUT,
+            false,
+            0,
+        );
         let mut out = b"aaa".to_vec();
         assert!(decode_entry_delta(&buf, 0, &mut out, true).is_ok());
     }
@@ -1120,7 +1391,7 @@ mod tests {
         }
         let mut seeds = vec![buf];
         for name in ["klog_legacy_flat_restarts_bloom.klog", "klog_extended.klog"] {
-            seeds.push(std::fs::read(crate::util::phase1_fixture(name)).unwrap());
+            seeds.push(std::fs::read(crate::util::legacy_fixture(name)).unwrap());
         }
 
         let mut rng = crate::util::FuzzRng::new(0x51E7_9C42_0AB3_1DD7);
@@ -1157,7 +1428,7 @@ mod tests {
     fn sst_encode_debug_asserts_tombstone_has_no_vlog() {
         encode_entry(
             &mut Vec::new(),
-            EntryLayout::Legacy,
+            EntryLayout::Base,
             b"k",
             b"v",
             1,

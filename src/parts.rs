@@ -858,7 +858,7 @@ impl DB {
             )));
         }
         let dir = dir.as_ref();
-        let cf_dir = dir.join(format!("cf-{}", cf.name()));
+        let cf_dir = dir.join(crate::format::cf_dir_name(cf.name()));
         std::fs::create_dir_all(&cf_dir)?;
 
         let mut metas: Vec<SstMeta> = Vec::new();
@@ -909,6 +909,7 @@ impl DB {
                 name: cf.name().to_string(),
                 config: cf.effective_config().encode(),
                 sstables: metas,
+                unified_id: None,
             }],
         };
         manifest.save(manifest_path(dir))?;
@@ -1079,7 +1080,7 @@ impl crate::db::DbInner {
             None
         };
         let object_for = |id: u64| -> Option<String> {
-            nonce.map(|n| format!("cf-{}/{n:016x}-{id}", cf.name()))
+            nonce.map(|n| format!("{}/{n:016x}-{id}", crate::format::cf_dir_name(cf.name())))
         };
 
         // Copy every file to the target tier and open new handles there, before

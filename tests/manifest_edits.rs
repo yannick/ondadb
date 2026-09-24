@@ -48,6 +48,7 @@ fn distinguishable_manifest() -> Manifest {
             name: "photos".into(),
             config: vec![9, 8, 7, 6, 5],
             sstables: vec![distinguishable_table()],
+            unified_id: None,
         }],
         wal_layout: WalLayout::Unified,
         instance_nonce: Some(0xDEAD_BEEF_CAFE_F00D),
@@ -273,7 +274,7 @@ fn partition_rules_and_tier_defs_travel_in_the_config_blob() {
         }]),
     )
     .unwrap();
-    let back = ColumnFamilyConfig::decode(&m.cfs[0].config);
+    let back = ColumnFamilyConfig::decode(&m.cfs[0].config).unwrap();
     assert_eq!(back.partition_rules, cfg.partition_rules);
     assert_eq!(back.tier_rules.len(), 1);
     assert_eq!(back.tier_rules[0].tier, "cold");
@@ -290,7 +291,9 @@ fn partition_rules_and_tier_defs_travel_in_the_config_blob() {
     )
     .unwrap();
     assert_eq!(
-        ColumnFamilyConfig::decode(&m.cfs[0].config).partition_rules,
+        ColumnFamilyConfig::decode(&m.cfs[0].config)
+            .unwrap()
+            .partition_rules,
         cfg2.partition_rules
     );
 }
@@ -464,7 +467,7 @@ fn crash_after_new_log_rename_starts_clean() {
     assert_eq!(log.header().snapshot_generation, live.generation + 1);
     assert_eq!(
         log_bytes(dir.path()).len(),
-        28,
+        ondadb::manifest_edit::EDIT_LOG_HEADER_BYTES,
         "a fresh log is its header and nothing else"
     );
     let back = recover_catalog(dir.path()).unwrap();
@@ -479,7 +482,7 @@ fn crash_after_new_log_rename_starts_clean() {
 fn compaction_never_truncates_the_live_log() {
     let (dir, live) = seeded_dir(2);
     let before = log_bytes(dir.path());
-    assert!(before.len() > 28);
+    assert!(before.len() > ondadb::manifest_edit::EDIT_LOG_HEADER_BYTES);
     let mut m = live.clone();
     for (call, nth) in [
         (fault::Call::Write, 1),
@@ -500,7 +503,10 @@ fn compaction_never_truncates_the_live_log() {
         );
     }
     compact_snapshot(dir.path(), &mut m, 2).unwrap();
-    assert_eq!(log_bytes(dir.path()).len(), 28);
+    assert_eq!(
+        log_bytes(dir.path()).len(),
+        ondadb::manifest_edit::EDIT_LOG_HEADER_BYTES
+    );
 }
 
 #[test]
@@ -627,7 +633,7 @@ fn recovery_accepts_a_stale_generation_in_the_log_header() {
 fn recovery_rejects_a_bad_log_header() {
     let (dir, _live) = seeded_dir(2);
     let mut bytes = log_bytes(dir.path());
-    bytes[10] ^= 0xFF; // inside base_applied_through, so the header CRC fails
+    bytes[14] ^= 0xFF; // inside base_applied_through, so the header CRC fails
     std::fs::write(edit_log_path(dir.path()), &bytes).unwrap();
     let err = recover_catalog(dir.path()).expect_err("a bad header CRC is corruption");
     assert_eq!(err.kind(), "corruption");
@@ -970,45 +976,70 @@ fn manifest_edit_scale_probe() {
     );
 }
 
-/// R6 (release fence) — a decoder frozen at VERSION 1, compiled into this test
-/// rather than expressed as a constant, must refuse a v2 snapshot. That is what
-/// makes "an older binary fails closed" a tested claim rather than an assertion
-/// about a number this change could have edited.
+/// R6 (release fence) — a decoder frozen as 0.9 compiled it must refuse every
+/// epoch-1 snapshot, capability or not: the magic changed (`WVMF` →
+/// `YOLODBMF`) and so did the checksum (IEEE → CRC32-C). That is what makes "an
+/// older binary fails closed" a tested claim rather than an assertion about a
+/// number this change could have edited.
 #[test]
-fn a_frozen_version_one_decoder_refuses_a_v2_snapshot() {
-    /// The version gate exactly as every pre-1.0 release compiled it.
-    fn version_one_decoder(bytes: &[u8]) -> Result<(), String> {
+fn a_frozen_0_9_decoder_refuses_every_epoch1_snapshot() {
+    /// CRC-32/IEEE, bit by bit — what 0.9's `encoding::checksum` computed.
+    fn crc32_ieee(b: &[u8]) -> u32 {
+        let mut c = !0u32;
+        for &x in b {
+            c ^= u32::from(x);
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0xEDB8_8320
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    }
+    /// The header gate exactly as 0.9 compiled it: whole-file CRC, magic,
+    /// then a version of 1 or 2.
+    fn onda09_decoder(bytes: &[u8]) -> Result<(), String> {
         if bytes.len() < 12 {
             return Err("short".into());
         }
         let crc_at = bytes.len() - 4;
         let stored = u32::from_le_bytes(bytes[crc_at..].try_into().unwrap());
-        if stored != ondadb::encoding::checksum(&bytes[..crc_at]) {
+        if stored != crc32_ieee(&bytes[..crc_at]) {
             return Err("crc".into());
         }
         if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != 0x5756_4D46 {
             return Err("magic".into());
         }
         match u32::from_le_bytes(bytes[4..8].try_into().unwrap()) {
-            1 => Ok(()),
+            1 | 2 => Ok(()),
             v => Err(format!("version {v}")),
         }
     }
 
     let (dir, _live) = seeded_dir(1);
-    let v2 = std::fs::read(manifest_path(dir.path())).unwrap();
-    assert_eq!(
-        version_one_decoder(&v2),
-        Err("version 2".into()),
-        "a v2 snapshot must fail closed on a frozen v1 decoder"
+    let with_caps = std::fs::read(manifest_path(dir.path())).unwrap();
+    assert!(
+        onda09_decoder(&with_caps).is_err(),
+        "an epoch-1 snapshot must fail closed on 0.9"
     );
-    // ...while a database that never enabled a capability still writes v1.
-    let legacy_dir = tempfile::tempdir().unwrap();
+    let empty_dir = tempfile::tempdir().unwrap();
     Manifest::default()
-        .save(manifest_path(legacy_dir.path()))
+        .save(manifest_path(empty_dir.path()))
         .unwrap();
-    let bytes = std::fs::read(manifest_path(legacy_dir.path())).unwrap();
-    assert_eq!(version_one_decoder(&bytes), Ok(()));
+    let bytes = std::fs::read(manifest_path(empty_dir.path())).unwrap();
+    assert!(
+        onda09_decoder(&bytes).is_err(),
+        "even with no capability at all"
+    );
+    // And not merely by accident of the checksum: under a re-sealed IEEE CRC
+    // the magic still refuses it.
+    let mut resealed = bytes.clone();
+    let n = resealed.len() - 4;
+    let crc = crc32_ieee(&resealed[..n]);
+    resealed[n..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(onda09_decoder(&resealed), Err("magic".into()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,11 +1913,13 @@ fn structural_op_latency_probe() {
                     name: "bulk".into(),
                     config: ballast_cfg().encode(),
                     sstables: ssts,
+                    unified_id: None,
                 },
                 CfManifest {
                     name: "hot".into(),
                     config: hot_cfg().encode(),
                     sstables: Vec::new(),
+                    unified_id: None,
                 },
             ],
             ..Manifest::default()
