@@ -473,7 +473,29 @@ impl Manifest {
 }
 
 /// `"WVMF"`, the 0.9 manifest magic, as that binary stored it (a LE `u32`).
-const ONDA09_MAGIC: u32 = 0x5756_4D46;
+pub(crate) const ONDA09_MAGIC: u32 = 0x5756_4D46;
+
+/// Whether `dir` holds an ondaDB 0.9 database: a `MANIFEST` whose first four
+/// bytes are 0.9's `WVMF` magic. `false` for a missing or empty manifest (an
+/// empty directory is nobody's format) and for an epoch-1 one.
+///
+/// Compiled in every build, unlike the decoders: a binary without
+/// `legacy-onda` still has to *recognize* a 0.9 directory to refuse it with a
+/// message that names the missing feature.
+pub fn is_onda09_dir(dir: impl AsRef<Path>) -> Result<bool> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(manifest_path(dir)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut magic = [0u8; 4];
+    match f.read_exact(&mut magic) {
+        Ok(()) => Ok(read_u32(&magic) == ONDA09_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 
 fn corrupt(what: &str) -> OndaError {
     OndaError::Corruption(format!("manifest: {what}"))

@@ -443,6 +443,11 @@ pub struct DbInner {
     /// thereby released — at the end of `close()`.
     lock_file: Mutex<Option<std::fs::File>>,
 
+    /// What the open that produced this handle did to upgrade a 0.9 directory
+    /// (plan C §1.3), for [`DB::last_format_upgrade`]. `None` for every open
+    /// that found an epoch-1 directory.
+    pub(crate) format_upgrade: Mutex<Option<crate::upgrade::UpgradeReport>>,
+
     /// This database's lease on a shared
     /// [`ReadResources`](crate::read_resources::ReadResources), or `None` for
     /// private caches. Released at the end of `close()` (or on drop), which is
@@ -1944,6 +1949,7 @@ fn build_db_inner(
         file_deletion: FileDeletionState::new(opts),
         workers: Mutex::new(Vec::new()),
         lock_file: Mutex::new(Some(lock_file)),
+        format_upgrade: Mutex::new(None),
         read_lease: Mutex::new(read_lease),
         handles: Arc::new(AtomicUsize::new(1)),
         poison,
@@ -2284,7 +2290,25 @@ fn ensure_instance_nonce(inner: &Arc<DbInner>) -> Result<()> {
 
 impl DB {
     /// Open (creating if needed) the database at `opts.path`.
+    ///
+    /// An ondaDB **0.9.x** directory is upgraded to yoloDB format epoch 1
+    /// first, unless [`Options::format_upgrade`] says otherwise; see
+    /// [`crate::upgrade`]. A format upgrade interrupted by a crash is completed
+    /// or rolled back here before anything else is read.
     pub fn open(opts: Options) -> Result<DB> {
+        crate::upgrade::open_observed(opts, &crate::upgrade::NoObserver)
+    }
+
+    /// What the open that produced this handle did to upgrade an ondaDB 0.9
+    /// directory to yoloDB format epoch 1 — sizes, duration, the backup's path
+    /// — or `None` if the directory was already in epoch 1.
+    pub fn last_format_upgrade(&self) -> Option<crate::upgrade::UpgradeReport> {
+        self.inner.format_upgrade.lock().clone()
+    }
+
+    /// The epoch-1 open: everything [`open`](Self::open) does once the
+    /// directory is known not to be a 0.9 one.
+    pub(crate) fn open_epoch1(opts: Options) -> Result<DB> {
         if opts.path.is_empty() {
             return Err(OndaError::InvalidArgs("empty path".into()));
         }
@@ -2315,7 +2339,7 @@ impl DB {
     /// Open without running layout migration. Kept separate so migration can
     /// recover and flush the legacy layout under the ordinary DB invariants.
     fn open_impl(opts: Options) -> Result<DB> {
-        Self::open_with_format(opts, crate::format::FormatProfile::Epoch1)
+        Self::open_with_format(opts, crate::format::FormatProfile::Epoch1, None)
     }
 
     /// Open a database whose files are in format family `format`.
@@ -2324,9 +2348,14 @@ impl DB {
     /// is a 0.9 directory read through `legacy_onda`, and only ever read-only:
     /// this binary cannot write a 0.9 byte, so a writable open of one would
     /// produce a directory that is neither.
+    ///
+    /// `lock` is a `<dir>/LOCK` handle the caller already holds (the format
+    /// upgrade, which must not drop its exclusive lock between building a
+    /// directory and opening it); `None` acquires it here as usual.
     pub(crate) fn open_with_format(
         opts: Options,
         format: crate::format::FormatProfile,
+        lock: Option<std::fs::File>,
     ) -> Result<DB> {
         if format != crate::format::FormatProfile::Epoch1 && !opts.read_only {
             return Err(OndaError::InvalidArgs(
@@ -2341,7 +2370,10 @@ impl DB {
         // opens take it shared so concurrent readers coexist but a writer is
         // excluded. The lock dies with the fd, so a crashed process never
         // leaves a stale lock behind.
-        let lock_file = acquire_dir_lock(&dir, opts.read_only)?;
+        let lock_file = match lock {
+            Some(f) => f,
+            None => acquire_dir_lock(&dir, opts.read_only)?,
+        };
         let resources = OpenResources::new(&opts, &dir)?;
 
         // A leftover MANIFEST.tmp / MANIFEST-EDITS.tmp is a crash artifact, not
@@ -3307,7 +3339,7 @@ impl DB {
 /// a collision needs two databases minting in the same nanosecond with the
 /// same path and pid — but unique enough that object names never collide
 /// under a shared tier root, which is all it exists for.
-fn mint_instance_nonce(dir: &str) -> u64 {
+pub(crate) fn mint_instance_nonce(dir: &str) -> u64 {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(dir.as_bytes());
@@ -3399,7 +3431,7 @@ fn parse_sst_file_id(name: &str) -> Option<u64> {
 }
 
 /// Acquire the advisory lock on `<dir>/LOCK` (exclusive unless `read_only`).
-fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
+pub(crate) fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
     use std::fs::TryLockError;
     let path = std::path::Path::new(dir).join("LOCK");
     let f = std::fs::OpenOptions::new()

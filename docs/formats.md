@@ -1029,6 +1029,92 @@ section: `edit_bytes > max(4 MiB, snapshot_bytes)` or `edit_count > 4096`.
 8. read-only opens replay the log but never compact it and never write to it —
    not even the temp-file sweep.
 
+## Upgrading a 0.9 directory (`upgrade.rs`, plan C §1.3)
+
+`DB::open` recognizes a 0.9 directory by its `MANIFEST`'s first four bytes
+(`WVMF`, `manifest::is_onda09_dir` — compiled in every build, so a binary
+without `legacy-onda` refuses it as `UnsupportedFormat` naming the feature).
+`Options::format_upgrade` then decides: `Auto` (default) rebuilds, `Forbid`
+refuses, `ReadOnlyLegacy` — and every read-only open — reads it through
+`legacy_onda` as it is. `yolodb upgrade <path>` (`src/bin/yolodb.rs`) runs the
+same protocol offline.
+
+**The rebuild writes no new format.** Every table is transcoded one-for-one
+into an ordinary epoch-1 table with the **same id and level**, its
+`partition`, `max_entry_time` and `last_compaction_time` carried from the 0.9
+catalog; the raw internal entries are copied (sequence, TTL, kind — so
+tombstones, single deletes and unfolded merge operands — and value) together
+with the table's range fragments. The WAL tail replayed into memtables is
+written as the L0 tables a flush would have produced (newest first in L0, fresh
+ids). The epoch-1 catalog keeps the `CAP_*` word, WAL layout, nonce, edit
+cursor and each family's config (converted to TLV); every family's unified id
+reverts to the derived FNV of its name, since no WAL survives the rebuild. Its
+`MANIFEST` is written last. Top-level entries the engine does not own are
+copied across; `LOCK`, `MANIFEST*`, `unified-wal-*` and `cf-*` are re-derived.
+
+**Siblings of `<parent>/<name>`**, all on the database's own filesystem:
+
+| Name | What |
+|---|---|
+| `.<name>.yolo-upgrade-<nonce16>/` | the rebuild; holds an empty `UPGRADE-IN-PROGRESS` marker from creation until the swap is `done` |
+| `.<name>.pre-yolo-<nonce16>/` | the untouched 0.9 directory after the swap (the backup), kept unless `format_upgrade_keep_backup = false` |
+| `.<name>.yolo-upgrade.journal` | the swap journal (below); `.journal.tmp` is its atomic-replace temp |
+
+**Swap journal** (`format::upgrade_journal`), replaced atomically (temp, fsync,
+rename, parent fsync) on every state change:
+
+```
+0  magic "YOLODBUJ"   8 bytes
+8  version u32 = 1
+12 state u8           1 = swapping, 2 = done
+13 (len u32, utf8) x3 database name, upgrade-dir name, backup-dir name
+.. crc32c u32         over every preceding byte
+```
+
+Names only, never paths; a decoded journal is `Corruption` unless the database
+name is its own and the other two are plain file names carrying the protocol's
+prefixes, so a damaged journal cannot direct a rename or delete elsewhere.
+
+**Protocol** — the source is never modified before step 6:
+
+1. `P/LOCK` exclusive for the whole run (`Locked` if a 0.9 process or another
+   handle holds it).
+2. Preflight, in order: requested WAL layout vs the catalog's (`InvalidArgs`);
+   any table with a `tier` or `object` (`FormatUpgradeUnsupported`); the source
+   opened read-only under the held lock, and any unresolved prepared
+   transaction (`FormatUpgradeUnsupported` — never aborted automatically);
+   free space on the parent filesystem ≥ the source's bytes + max(10 %,
+   16 MiB) (`Io(StorageFull)`).
+3. Create `U`, write + fsync the marker, take `U/LOCK` exclusive, fsync `U` and
+   the parent.
+4. Transcode, write the replayed memtables, copy foreign entries, write the
+   `MANIFEST` (temp + fsync + rename + fsync of `U`).
+5. Verify: reopen `U` read-only (epoch 1) and require the same table set per
+   family, equal entry and fragment counts, equal maximum sequence, a read
+   sequence ≥ the catalog's `global_seq`, and — under `Scan` — every rebuilt
+   table equal, entry by entry and fragment by fragment, to the table or
+   memtable it came from. Any failure in 2–5 removes `U` and returns the error;
+   the source is byte-identical (only a missing `LOCK` may have been created).
+6. Journal `swapping` → rename `P` → backup, fsync parent → rename `U` → `P`,
+   fsync parent → journal `done`, marker removed, fsync `P`. After the open:
+   the backup (if not kept) and then the journal are removed.
+
+**Crash recovery** runs first in every `DB::open` (and `yolodb upgrade`). With
+a journal present, a read-write open takes the lock of whichever of backup,
+`P`, `U` exists (the live upgrader holds both the source's and `U`'s — a live
+swap is `Locked`), re-reads the journal and:
+
+| Journal | Found | Action |
+|---|---|---|
+| `done` | anything | drop the marker from `P`; cleanup after the open |
+| `swapping` | `U` complete (`MANIFEST` recovers, every listed table present at its size) | roll forward: rename `P` → backup if not yet, `U` → `P`, mark `done` |
+| `swapping` | no `U`, `P` and backup both present, `P` a complete epoch-1 database | mark `done` (both renames happened) |
+| `swapping` | otherwise | roll back: backup → `P` if `P` is missing, delete `U`, delete the journal — the open then upgrades afresh |
+
+A read-only open never writes: it ignores a `done` journal and refuses a
+`swapping` one. Without a journal, an upgrade sweeps stale `U` directories (the
+marker is the proof they are the protocol's) before it starts.
+
 ## Appendix: the ondaDB 0.9 formats (read only by `legacy_onda`)
 
 Epoch 1 replaced every 0.9 container; the 0.9 decoders live, frozen and

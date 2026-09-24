@@ -119,6 +119,15 @@ ratios between engines, not absolute numbers across sessions. See
    `apply_commit`; rotation waits for drain before swapping the memtable. A
    sealed (imm) memtable is immutable — the zero-materialization flush cursors
    depend on it.
+10. **Format-upgrade swap** (`upgrade.rs`): the 0.9 source directory is
+   **never written before the swap** (only its `LOCK` is taken, exclusively,
+   for the whole run); the rebuild's `MANIFEST` is written last; the swap
+   journal is written only **after** verification passed, and it is the only
+   thing that may authorize renaming the source. Every crash-recovery branch
+   either rolls a *complete* rebuild forward or renames the untouched source
+   back — none deletes the source or the backup (only `format_upgrade_keep_backup
+   = false` does, after the upgraded database opened). A read-only open writes
+   neither a journal nor a 0.9 directory.
 
 ## Conventions
 
@@ -152,8 +161,12 @@ A 0.9.x directory is **not** readable by the epoch-1 engine. The frozen 0.9
 decoders live in `src/legacy_onda/` (default-on feature `legacy-onda`,
 decode-only, pinned by `tests/fixtures/legacy-onda/`), and
 `legacy_onda::open_read_only` opens a 0.9 database read-only through the
-engine — the source side of the planned auto-upgrade (plan C §1.3). Never add a
-0.9 *encoder* outside a `#[cfg(test)]` fixture builder.
+engine. `DB::open` **upgrades a 0.9 directory automatically** (plan C §1.3,
+`upgrade.rs`, `Options::format_upgrade` = `Auto` | `Forbid` |
+`ReadOnlyLegacy`): a one-for-one transcode into a sibling directory, verified,
+then swapped in under a journal that the next open resolves after a crash;
+`yolodb upgrade <path>` runs it offline. Never add a 0.9 *encoder* outside a
+`#[cfg(test)]` fixture builder.
 
 ## Optional format capabilities
 
@@ -195,6 +208,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | PerfContext (0.10) | `perf.rs` | |
 | IO classes / rate limiter (0.6) | `ioctrl.rs` | |
 | Tailing iterators (0.9) | `tailing.rs` | |
+| 0.9 → epoch-1 upgrade (plan C §1.3) | `upgrade.rs`, `legacy_onda/`, `src/bin/yolodb.rs` | See invariant 10; crash matrix in `tests/format_upgrade.rs` (fault hook: `UpgradeObserver`) |
 
 **Cross-feature rules live in `tests/composition.rs`**, not in either feature's
 own file: a range delete is, for one key, a *deleted base at its sequence* (so a

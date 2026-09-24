@@ -191,6 +191,40 @@ pub enum IsolationLevel {
     Serializable,
 }
 
+/// What [`DB::open`](crate::DB::open) does with an ondaDB **0.9.x** directory
+/// (plan C §1.3). A directory already in yoloDB format epoch 1 is unaffected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormatUpgrade {
+    /// Rebuild the 0.9 directory into epoch 1 in a sibling directory, verify
+    /// it, swap it into place, then open it normally (the default). Any
+    /// failure before the swap leaves the 0.9 directory byte-identical. A
+    /// read-only open never upgrades; it behaves as
+    /// [`ReadOnlyLegacy`](Self::ReadOnlyLegacy).
+    #[default]
+    Auto,
+    /// Refuse a 0.9 directory with
+    /// [`UnsupportedFormat`](crate::OndaError::UnsupportedFormat). Nothing is
+    /// written.
+    Forbid,
+    /// Open a 0.9 directory read-only through the legacy decoders, with no
+    /// rebuild — to inspect or export without committing to the upgrade. The
+    /// returned handle is read-only even when `Options::read_only` is not set.
+    ReadOnlyLegacy,
+}
+
+/// How much the format upgrade checks the rebuilt directory before the swap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormatUpgradeVerify {
+    /// Per-family entry counts and maximum sequence, **plus** a streaming
+    /// entry-by-entry comparison of every rebuilt table against its source
+    /// (the default).
+    #[default]
+    Scan,
+    /// Per-family entry counts and maximum sequence only — for a database too
+    /// large to read twice.
+    Counts,
+}
+
 /// Logging verbosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -512,6 +546,18 @@ pub struct Options {
     /// same ids (copies of one published checkpoint, say). Two databases with
     /// different contents must never share a name.
     pub read_cache_namespace: Option<String>,
+    /// What an open does with an ondaDB 0.9.x directory: upgrade it to yoloDB
+    /// format epoch 1 ([`FormatUpgrade::Auto`], the default), refuse it, or
+    /// open it read-only as it is. See `docs/formats.md` § Upgrading 0.9.x.
+    pub format_upgrade: FormatUpgrade,
+    /// How thoroughly the upgrade verifies the rebuilt directory before the
+    /// swap. Default [`FormatUpgradeVerify::Scan`].
+    pub format_upgrade_verify: FormatUpgradeVerify,
+    /// Keep the replaced 0.9 directory as `.<name>.pre-yolo-<nonce>` next to
+    /// the database after an upgrade (default `true`), which keeps the upgrade
+    /// reversible until the operator deletes it. `false` deletes it once the
+    /// upgraded database has opened.
+    pub format_upgrade_keep_backup: bool,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -809,6 +855,9 @@ impl Default for Options {
             default_isolation: IsolationLevel::Snapshot,
             read_resources: None,
             read_cache_namespace: None,
+            format_upgrade: FormatUpgrade::Auto,
+            format_upgrade_verify: FormatUpgradeVerify::Scan,
+            format_upgrade_keep_backup: true,
         }
     }
 }

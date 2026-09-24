@@ -35,6 +35,8 @@ type/function names — grep for them; line numbers rot.
 | `storage_s3.rs` | *(feature `s3`)* `S3Storage`: object-store backend — range-GET reads, single-PUT writes, own tokio runtime |
 | `parts.rs` | Part lifecycle: `detach_part`/`attach_part`/`freeze_part`, `move_part_to_tier`, the policy-driven part mover, live partition-rule add/remove |
 | `unified.rs` | Optional shared memtable+WAL across CFs (8-byte CF-id key prefix); split flush |
+| `upgrade.rs` | Automatic 0.9.x → epoch-1 upgrade (plan C §1.3): `FormatUpgrade` dispatch in `DB::open`, the rebuild (one-for-one table transcode + replayed memtables), verification, the journaled two-rename swap and its crash recovery; `yolodb upgrade` runs it offline |
+| `legacy_onda/` | *(feature `legacy-onda`)* frozen, decode-only 0.9 decoders and `open_read_only` — the upgrade's source side |
 | `ioctrl.rs` | Background IO classes (`IoClass` in a thread-local, `scoped` guards) and the `IoLimiter` trait with a work-conserving `TokenBucket` on an injectable `Clock`; bounds flush/compaction bandwidth so it cannot inflate foreground p99 |
 | `block.rs` | Block framing: `[alg][comp_len][raw_len][crc]payload`, compress-if-shrinks |
 | `bloom.rs`, `cache/`, `compress.rs`, `comparator.rs`, `encoding.rs`, `format.rs`, `error.rs`, `maintenance.rs` | Support: bloom filters, block/file LRU caches, codecs, key ordering, varints/CRC, flag bits + internal keys, error codes, checkpoint/backup/clone/stats |
@@ -940,6 +942,13 @@ final snapshot compaction whose failure is the caller's — a silently dropped o
 would make the next open replay more than it should).
 
 ## Recovery (`DB::open`)
+
+Before any of the steps below, `upgrade::open_observed` resolves a format
+upgrade a crash interrupted mid-swap (the journal beside the directory; see
+`docs/formats.md` § Upgrading a 0.9 directory), and a directory whose
+`MANIFEST` is a 0.9 one is dispatched on `Options::format_upgrade` — rebuilt
+into epoch 1 and swapped into place, refused, or opened read-only through
+`legacy_onda`. Only then does the epoch-1 open below run.
 
 0. Read-write opens only: `sweep_manifest_temp_files` unlinks any leftover
    `MANIFEST.tmp` / `MANIFEST-EDITS.tmp` before anything is loaded. They are

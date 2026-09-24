@@ -907,6 +907,7 @@ dependencies = [
  "rand",
  "rust-ini",
  "rust-s3",
+ "rustix",
  "self_cell",
  "sha2",
  "smallvec",

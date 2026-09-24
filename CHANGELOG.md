@@ -60,10 +60,35 @@ directory written by this release is not readable by 0.9.x. The crate is still
   (per-CF or unified), merge operands, range tombstones and the edit log — which
   is the source side of the planned automatic upgrade. Without the feature a 0.9
   directory is a hard `UnsupportedFormat` refusal.
-- **Migration today:** open the 0.9 database with `legacy_onda::open_read_only`
-  and copy every column family into a new database (iterate and write, or
-  `Ingestion`). Automatic in-place upgrade on open (plan C §1.3) is the next step
-  and is not in this release.
+
+### Automatic upgrade of 0.9.x databases (plan C §1.3)
+
+- `DB::open` on a 0.9 directory **upgrades it to epoch 1** by default:
+  `Options::format_upgrade` = `FormatUpgrade::Auto` (default) | `Forbid`
+  (`UnsupportedFormat`, nothing written) | `ReadOnlyLegacy` (read it as it is).
+  A read-only open never upgrades. `Options::format_upgrade_verify`
+  (`Scan` default | `Counts`) and `Options::format_upgrade_keep_backup`
+  (default `true`) tune it; `DB::last_format_upgrade()` returns an
+  `UpgradeReport` (bytes, duration, backup path, counts).
+- The rebuild runs beside the database (`.<name>.yolo-upgrade-<nonce>/`) under
+  the source's exclusive `LOCK`, transcodes every table one-for-one (same id,
+  level, partition and age stamps; raw entries incl. tombstones, single
+  deletes, merge operands, TTLs and range fragments), writes the replayed WAL
+  tail as L0 tables, writes the epoch-1 `MANIFEST` last, verifies the result
+  against the source, and swaps it in with two renames under a durable
+  `YOLODBUJ` journal. A crash at any step is completed or rolled back by the
+  next open; any failure before the swap leaves the 0.9 directory
+  byte-identical. The old directory stays as `.<name>.pre-yolo-<nonce>/`.
+- Refused with the new `OndaError::FormatUpgradeUnsupported`: tables on a
+  named tier or object store, and unresolved prepared transactions. Too little
+  free space is `Io(StorageFull)` before anything is written.
+- New binary **`yolodb upgrade <path> [--verify scan|counts] [--no-backup]`**
+  runs the same protocol offline with progress output; it needs none of the
+  application's merge operators (operands are copied, never folded).
+- `ondadb::upgrade::{upgrade, upgrade_observed, open_observed}`,
+  `UpgradeObserver` / `UpgradePhase` (the crash matrix's fault hook),
+  `manifest::is_onda09_dir`. New dependency on unix: `rustix` (`fs`, for
+  `statvfs`; already in the tree via `tempfile`).
 
 ### Other
 

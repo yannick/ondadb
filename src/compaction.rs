@@ -2435,12 +2435,12 @@ pub(crate) fn is_bottom_target(cf: &Arc<ColumnFamily>, target: usize) -> bool {
 /// original read the level set twice, where it was not implied. So a level that
 /// merely *exists* below the target, empty or not, makes the target non-bottom;
 /// the levels vector never shrinks, so that is the durable signal.
-fn target_is_bottom<T>(levels: &[Vec<T>], target: usize) -> bool {
+pub(crate) fn target_is_bottom<T>(levels: &[Vec<T>], target: usize) -> bool {
     let num_levels = levels.len().max(target + 1);
     target >= num_levels - 1 && levels.iter().skip(target + 1).all(|level| level.is_empty())
 }
 
-fn cf_writer_opts(
+pub(crate) fn cf_writer_opts(
     cf: &Arc<ColumnFamily>,
     cmp: &ComparatorRef,
     target_level: u32,

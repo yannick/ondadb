@@ -150,18 +150,8 @@ pub fn recover_catalog(dir: impl AsRef<std::path::Path>) -> Result<crate::manife
 /// bytes are 0.9's `WVMF` magic. `false` for a missing manifest (an empty
 /// directory is nobody's format) and for an epoch-1 one.
 pub fn is_legacy_dir(dir: impl AsRef<std::path::Path>) -> Result<bool> {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(crate::manifest::manifest_path(dir)) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    let mut magic = [0u8; 4];
-    match f.read_exact(&mut magic) {
-        Ok(()) => Ok(read_u32(&magic) == manifest::MAGIC),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+    const _: () = assert!(manifest::MAGIC == crate::manifest::ONDA09_MAGIC);
+    crate::manifest::is_onda09_dir(dir)
 }
 
 /// Open an ondaDB 0.9 database **read-only**, through the engine.
@@ -181,7 +171,19 @@ pub fn is_legacy_dir(dir: impl AsRef<std::path::Path>) -> Result<bool> {
 /// writer.
 ///
 /// Refuses a directory that is not a 0.9 database with `InvalidArgs`.
-pub fn open_read_only(mut opts: crate::Options) -> Result<crate::DB> {
+pub fn open_read_only(opts: crate::Options) -> Result<crate::DB> {
+    open_read_only_locked(opts, None)
+}
+
+/// [`open_read_only`] under a directory lock the caller already holds
+/// (`Some`): the format upgrade holds the source's `LOCK` **exclusively** for
+/// its whole run, and an advisory lock taken a second time by the same process
+/// through another descriptor would conflict with it. `None` takes the usual
+/// shared lock.
+pub(crate) fn open_read_only_locked(
+    mut opts: crate::Options,
+    lock: Option<std::fs::File>,
+) -> Result<crate::DB> {
     let dir = std::path::PathBuf::from(&opts.path);
     if !is_legacy_dir(&dir)? {
         return Err(OndaError::InvalidArgs(format!(
@@ -195,7 +197,7 @@ pub fn open_read_only(mut opts: crate::Options) -> Result<crate::DB> {
     opts.read_only = true;
     opts.migrate_to_unified = false;
     opts.unified_memtable = catalog.wal_layout == crate::manifest::WalLayout::Unified;
-    crate::DB::open_with_format(opts, crate::format::FormatProfile::Onda09)
+    crate::DB::open_with_format(opts, crate::format::FormatProfile::Onda09, lock)
 }
 
 #[cfg(test)]

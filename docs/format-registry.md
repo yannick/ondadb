@@ -40,6 +40,7 @@ version 2.
 | WAL segment | `YOLODBWL` | u32 = 1 | offset 0 of every stripe | *(no header)* |
 | Value log (`.vlog`) | `YOLODBVL` | u32 = 1 | offset 0 | *(no header)* |
 | CF config blob | `YOLODBCF` | u32 = 1 | offset 0 of the blob | positional + `ONDA*` tails |
+| Format-upgrade swap journal | `YOLODBUJ` | u32 = 1 | offset 0 of `<parent>/.<name>.yolo-upgrade.journal` | *(new; states `1` swapping, `2` done)* |
 
 An unknown version is `UnsupportedFormat`. A 0.9 magic in an epoch-1 position
 is `UnsupportedFormat` naming the upgrade path; any other foreign magic is
