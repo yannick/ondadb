@@ -1635,6 +1635,14 @@ impl DbInner {
         DeletionPause { inner: self }
     }
 
+    /// `(nesting depth, files queued)` of the deletion pause — what backs
+    /// [`DbStats::deletions_paused`](crate::DbStats::deletions_paused) and
+    /// [`DbStats::deletions_queued`](crate::DbStats::deletions_queued).
+    pub(crate) fn deletion_pause_state(&self) -> (u32, usize) {
+        let paused = self.file_deletion.paused.lock();
+        (paused.disabled, paused.pending.len())
+    }
+
     fn resume_deletions(&self) {
         let drained = {
             let mut paused = self.file_deletion.paused.lock();
@@ -1947,6 +1955,7 @@ fn build_db_inner(
         wal_syncs: wal_syncs.clone(),
         caps: caps.clone(),
         clock: clock.clone(),
+        read_profile: Arc::default(),
         span_index: span_index.clone(),
         format,
     });

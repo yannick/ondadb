@@ -193,6 +193,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | Prefix-delta blocks (2.1) | `sst/mod.rs` (`encode_entry_delta`) | |
 | Manifest edit log (2.2) | `manifest_edit.rs` | See invariants 1 and 2 |
 | PerfContext (0.10) | `perf.rs` | |
+| Read profiling (F13) | `read_profile.rs` | DB-wide opt-in aggregate of `PerfContext` counters; off = one relaxed load per read |
 | IO classes / rate limiter (0.6) | `ioctrl.rs` | |
 | Tailing iterators (0.9) | `tailing.rs` | |
 | Wide-column entities (F11) | `entity.rs` | Value-level frame shared with wavesdb (`WVE1`); no engine change |

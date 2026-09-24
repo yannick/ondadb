@@ -90,6 +90,7 @@ pub mod perf;
 pub mod prepared;
 pub(crate) mod range_lock;
 pub mod range_tombstone;
+pub mod read_profile;
 pub mod read_resources;
 pub(crate) mod span_index;
 pub mod snapshot;
@@ -130,6 +131,7 @@ pub use parts::{
 };
 pub use perf::PerfContext;
 pub use prepared::PreparedInfo;
+pub use read_profile::ReadStats;
 pub use read_resources::{ReadResourceOptions, ReadResourceStats, ReadResources};
 pub use snapshot::SnapshotHandle;
 pub use storage::{CreateOutcome, LocalStorage, ObjectInfo, PrefixPage, Storage};

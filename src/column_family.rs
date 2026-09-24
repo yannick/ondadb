@@ -158,6 +158,8 @@ pub(crate) struct CfCtx {
     /// The database's injectable clock (0.3) — read here only to stamp
     /// [`SstMeta::last_compaction_time`](crate::manifest::SstMeta::last_compaction_time).
     pub clock: Arc<crate::util::Clock>,
+    /// Opt-in database-wide read profiling (F13); see [`crate::read_profile`].
+    pub read_profile: Arc<crate::read_profile::ReadProfiler>,
     /// The same committed-span index `DbInner` holds (1.2), so per-family stats
     /// can report its size without reaching for the whole database.
     pub span_index: Arc<crate::span_index::SpanIndex>,
@@ -2006,6 +2008,7 @@ impl ColumnFamily {
 
     fn get_impl(&self, user_key: &[u8], read_seq: u64, early_exit: bool) -> Result<Vec<u8>> {
         self.point_reads.fetch_add(1, Ordering::Relaxed);
+        let _profiled = self.ctx.read_profile.begin(crate::read_profile::ReadOp::Point);
         let now = coarse_now_nanos();
         let sources = self.point_read_sources(user_key);
         let mut candidate = PointReadCandidate::default();
@@ -2025,6 +2028,7 @@ impl ColumnFamily {
     /// produces a fresh value by construction.
     pub(crate) fn get_into(&self, user_key: &[u8], read_seq: u64, out: &mut Vec<u8>) -> Result<usize> {
         self.point_reads.fetch_add(1, Ordering::Relaxed);
+        let _profiled = self.ctx.read_profile.begin(crate::read_profile::ReadOp::Point);
         let now = coarse_now_nanos();
         let sources = self.point_read_sources(user_key);
         let start = out.len();
@@ -2400,6 +2404,10 @@ impl ColumnFamily {
         }
         self.point_reads
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
+        let _profiled = self
+            .ctx
+            .read_profile
+            .begin(crate::read_profile::ReadOp::MultiGet(keys.len()));
         // One clock reading for the batch: two keys of one call must not
         // disagree about whether a TTL has expired.
         let now = coarse_now_nanos();
@@ -2794,6 +2802,12 @@ impl ColumnFamily {
             mask,
         )
         .with_merge_operator(self.opts.merge_operator.clone())
+        .with_read_profile(
+            self.ctx
+                .read_profile
+                .enabled()
+                .then(|| self.ctx.read_profile.clone()),
+        )
     }
 
     /// Catalogued table metadata, level by level, in the order each level

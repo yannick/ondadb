@@ -93,6 +93,21 @@ directory written by this release is not readable by 0.9.x. The crate is still
 
 ### Ported from wavesdb (plan C step 1, §1.4)
 
+#### Observability (wavesdb `DeletionsPaused`/`DeletionsQueued`, `ReadStats`, F13)
+
+- `DbStats::deletions_paused` (nesting depth of the obsolete-file deletion
+  pause; wavesdb reports a flag) and `DbStats::deletions_queued` (files held
+  behind it) make a checkpoint or backup's hold on space reclamation visible.
+- **Read profiling**: `DB::enable_read_profiling(bool)` / `read_stats()` /
+  `read_profiling_enabled()`. `ReadStats` counts profiled point reads,
+  `multi_get` calls and keys, and iterator positioning calls, and carries the
+  summed read-path mechanism counters as a `PerfContext` (bloom checks and
+  negatives, memtable/table probes, block-cache hits, block fetches, bytes,
+  vlog reads) — the same counters, gathered by running each profiled operation
+  in a private perf scope rather than by a second set of bumps. A caller's own
+  `PerfContext` scope still sees everything. Off, a point read or batch pays
+  one relaxed atomic load; an iterator decides at construction.
+
 #### Wide-column entities (wavesdb `entity.go`, F11)
 
 - `DB::put_entity` / `get_entity` / `get_columns` and the same three on `Txn`
