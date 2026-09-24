@@ -789,6 +789,12 @@ impl DbInner {
             .unwrap_or_else(|| self.visible_seq())
     }
 
+    /// The id the next allocated file will get, without allocating it: every
+    /// table written after this call has an id at or above it.
+    pub(crate) fn file_id_watermark(&self) -> u64 {
+        self.next_file_id.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn next_file_id(&self) -> u64 {
         self.next_file_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -3518,12 +3524,16 @@ fn should_schedule_compaction(
 fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
     crate::compaction::refresh_compaction_debt(db, cf);
     let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
+    // The density arm (P4) rides on `ranges`' slot: both are "work worth
+    // waking the worker for with L0 nowhere near its trigger". A delete-heavy
+    // flush produces no size pressure at all, so without it the trigger would
+    // only ever be evaluated by a pass something else happened to start.
     if should_schedule_compaction(
         db.closing.load(Ordering::Relaxed),
         fifo,
         cf.l0_len(),
         cf.opts.l1_file_count_trigger as usize,
-        cf.has_range_fragments(),
+        cf.has_range_fragments() || (!fifo && crate::compaction::density_due(db, cf)),
     ) {
         let _ = db.ctx.compact_tx.send(cf.clone());
     }

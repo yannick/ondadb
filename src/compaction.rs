@@ -149,7 +149,10 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
     // range delete.
     crate::excise::pre_pass(db, cf)?;
     let mut periodic_left = PERIODIC_BURST;
-    while let Some((job, guard)) = pick_compaction_with(db, cf, periodic_left > 0) {
+    // Tables written from here on were written by this pass; the density
+    // trigger never rewrites one of those in place (see `density_pick`).
+    let pass_floor = db.file_id_watermark();
+    while let Some((job, guard)) = pick_compaction_with(db, cf, periodic_left > 0, pass_floor) {
         cf.compacting
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let reason = job.reason;
@@ -162,6 +165,10 @@ pub(crate) fn run(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
         res?;
         cf.compaction_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if reason == CompactionReason::TombstoneDensity {
+            cf.tombstone_density_compactions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if reason == CompactionReason::Periodic {
             cf.periodic_compactions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -199,6 +206,9 @@ pub(crate) enum CompactionReason {
     /// A table has not been rewritten within
     /// [`periodic_compaction_interval`](crate::config::ColumnFamilyConfig::periodic_compaction_interval).
     Periodic,
+    /// A table's tombstone fraction reached
+    /// [`tombstone_density_trigger`](crate::config::ColumnFamilyConfig::tombstone_density_trigger).
+    TombstoneDensity,
 }
 
 /// One unit of compaction work: a bounded input set and the span it covers.
@@ -293,15 +303,17 @@ fn pick_compaction(
     db: &Arc<DbInner>,
     cf: &Arc<ColumnFamily>,
 ) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
-    pick_compaction_with(db, cf, true)
+    pick_compaction_with(db, cf, true, u64::MAX)
 }
 
-/// The next job for `cf`: capacity work first, then — when `allow_periodic`
-/// — age work.
+/// The next job for `cf`: capacity work first, then tombstone-density work,
+/// then — when `allow_periodic` — age work. `pass_floor` is the calling
+/// pass's file-id watermark ([`density_pick`]).
 fn pick_compaction_with(
     db: &Arc<DbInner>,
     cf: &Arc<ColumnFamily>,
     allow_periodic: bool,
+    pass_floor: u64,
 ) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
     let n = cf.with_levels(|levels| levels.len());
     let mut scored: Vec<(f64, usize)> = Vec::new();
@@ -337,6 +349,14 @@ fn pick_compaction_with(
         }
     }
 
+    // Density work sits between the two: a table full of tombstones costs
+    // reads a walk over dead versions and holds space, which is more than a
+    // stale table costs, but it is not a backlog that grows the way an
+    // over-capacity level is.
+    if let Some(job) = density_pick(db, cf, pass_floor) {
+        return Some(job);
+    }
+
     // Age work is the LOWEST priority: it is consulted only once every level is
     // within capacity and every triggered candidate was unusable. A level over
     // capacity is a backlog that grows; a table past its interval is stale
@@ -363,8 +383,117 @@ fn periodic_pick(
         return None;
     }
     let (level, pick) = periodic_candidate(db, cf, db.now())?;
-    build_periodic_job(db, cf, level, pick)
+    build_table_job(db, cf, level, pick, CompactionReason::Periodic)
 }
+
+/// The tombstone-density pre-pass: the densest eligible table, shaped into a
+/// job, or `None`.
+///
+/// `pass_floor` is the file-id watermark the calling [`run`] pass started at:
+/// a bottom table with an id at or above it was written by this pass, and is
+/// not rewritten in place again by it. That is the loop guard. A push-down
+/// always makes progress — its output lands a level deeper, and levels end —
+/// but an in-place bottom rewrite whose tombstones must survive (a merge
+/// chain's terminating delete, carve-out 2 of [`VersionRetention::decide`])
+/// would otherwise produce an equally dense table and pick it again forever.
+fn density_pick(
+    db: &Arc<DbInner>,
+    cf: &Arc<ColumnFamily>,
+    pass_floor: u64,
+) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
+    let trigger = cf.opts.tombstone_density_trigger;
+    if trigger <= 0.0 || trigger.is_nan() {
+        return None;
+    }
+    let oldest_snapshot = db.oldest_snapshot();
+    let candidates = cf.with_levels(|levels| {
+        dense_tables(
+            db,
+            levels,
+            trigger,
+            cf.opts.tombstone_density_min_entries,
+            oldest_snapshot,
+            pass_floor,
+        )
+    });
+    for (level, pick) in candidates {
+        if let Some(job) = build_table_job(db, cf, level, pick, CompactionReason::TombstoneDensity)
+        {
+            return Some(job);
+        }
+    }
+    None
+}
+
+/// Is density work due for `cf` — would [`density_pick`] find a candidate,
+/// before range locks and job shaping? Evaluated after every flush, so it is
+/// one relaxed branch for a family with the trigger off and a walk over the
+/// level metadata otherwise.
+pub(crate) fn density_due(db: &DbInner, cf: &Arc<ColumnFamily>) -> bool {
+    let trigger = cf.opts.tombstone_density_trigger;
+    if trigger <= 0.0 || trigger.is_nan() {
+        return false;
+    }
+    let oldest_snapshot = db.oldest_snapshot();
+    cf.with_levels(|levels| {
+        !dense_tables(
+            db,
+            levels,
+            trigger,
+            cf.opts.tombstone_density_min_entries,
+            oldest_snapshot,
+            u64::MAX,
+        )
+        .is_empty()
+    })
+}
+
+/// Every table at or past the density trigger, densest first (ties to the
+/// shallower level, then the lower id), with the level holding it.
+///
+/// Pure over the level snapshot. Excluded: foreign mounts (never rewritten),
+/// tables below `min_entries`, and — for the **bottom** level only — tables a
+/// rewrite could not thin out: one holding a version newer than the oldest
+/// live snapshot (that snapshot keeps its tombstones), or one written by the
+/// current pass (`id >= pass_floor`).
+fn dense_tables(
+    db: &DbInner,
+    levels: &[Vec<Arc<SstHandle>>],
+    trigger: f64,
+    min_entries: u64,
+    oldest_snapshot: u64,
+    pass_floor: u64,
+) -> Vec<(usize, Arc<SstHandle>)> {
+    let mut out: Vec<(usize, Arc<SstHandle>, u128, u128)> = Vec::new();
+    for (level, tables) in levels.iter().enumerate() {
+        let bottom = target_is_bottom(levels, level);
+        for t in tables {
+            let (tombs, entries) = (t.meta.num_tombstones, t.meta.num_entries);
+            if entries == 0 || entries < min_entries {
+                continue;
+            }
+            if (tombs as f64) < trigger * entries as f64 {
+                continue;
+            }
+            if is_foreign_mount(db, &t.meta) {
+                continue;
+            }
+            if bottom && (t.meta.max_seq > oldest_snapshot || t.meta.id >= pass_floor) {
+                continue;
+            }
+            out.push((level, t.clone(), tombs as u128, entries as u128));
+        }
+    }
+    // Densest first, compared exactly: a/b > c/d  <=>  a*d > c*b.
+    out.sort_by(|a, b| {
+        (b.2 * a.3)
+            .cmp(&(a.2 * b.3))
+            .then(a.0.cmp(&b.0))
+            .then(a.1.meta.id.cmp(&b.1.meta.id))
+    });
+    out.into_iter().map(|(l, t, _, _)| (l, t)).collect()
+}
+
 
 /// The oldest table past its family's periodic interval, with the level holding
 /// it, or `None` when nothing qualifies.
@@ -426,19 +555,22 @@ fn oldest_eligible_table(
     best.map(|(level, table, _)| (level, table))
 }
 
-/// Shape a job around one age-eligible table.
+/// Shape a job around one table a table-level trigger (age, tombstone
+/// density) picked, labelled `reason`.
 ///
 /// Non-bottom is an ordinary bounded push-down through
 /// [`gather_target`]/[`lock_job`], with the foreign-mount and range-lock vetoes
 /// as usual. Bottom is an **in-place rewrite** — the `compact_into(last, last)`
 /// shape [`run_manual`] uses, which is the only way a bottom table that
 /// overlaps no incoming data ever sees the compaction filter or drops its
-/// tombstones again. A deeper level is never created for age reasons alone.
-fn build_periodic_job(
+/// tombstones again. A deeper level is never created for a table-level
+/// trigger alone.
+fn build_table_job(
     db: &Arc<DbInner>,
     cf: &Arc<ColumnFamily>,
     level: usize,
     pick: Arc<SstHandle>,
+    reason: CompactionReason,
 ) -> Option<(CompactionJob, crate::range_lock::RangeGuard)> {
     if !is_bottom_target(cf, level) {
         // L0's files overlap each other, so periodic may NOT push down an
@@ -446,12 +578,12 @@ fn build_periodic_job(
         // oldest-first window `build_job` already enforces and relabel the
         // reason; the eligible table is in L0, so the window covers it.
         if level == 0 {
-            return build_job(db, cf, 0, CompactionReason::Periodic);
+            return build_job(db, cf, 0, reason);
         }
         let cmp = cf.cmp();
         let (min_key, max_key) = key_span(std::slice::from_ref(&pick), &cmp);
         let inputs = gather_target(db, cf, level + 1, &min_key, &max_key, vec![pick])?;
-        return lock_job(cf, level, level + 1, inputs, CompactionReason::Periodic);
+        return lock_job(cf, level, level + 1, inputs, reason);
     }
 
     let inputs = if level == 0 {
@@ -480,7 +612,7 @@ fn build_periodic_job(
     if inputs.is_empty() {
         return None;
     }
-    lock_job(cf, level, level, inputs, CompactionReason::Periodic)
+    lock_job(cf, level, level, inputs, reason)
 }
 
 /// Assemble a job for `level`, or `None` if every candidate there is blocked
@@ -2787,6 +2919,177 @@ mod tests {
         })
     }
 
+    // ---- P4: tombstone-density trigger ------------------------------------
+
+    /// A table with the given entry and tombstone counts; `max_seq` decides
+    /// whether a fresh database's oldest snapshot (0) has passed it.
+    #[allow(clippy::too_many_arguments)]
+    fn dense_handle(
+        cf: &Arc<crate::column_family::ColumnFamily>,
+        id: u64,
+        level: u32,
+        min: &[u8],
+        max: &[u8],
+        entries: u64,
+        tombstones: u64,
+        max_seq: u64,
+    ) -> Arc<crate::column_family::SstHandle> {
+        cf.handle_for(crate::manifest::SstMeta {
+            id,
+            level,
+            klog_size: 16,
+            min_key: min.to_vec(),
+            max_key: max.to_vec(),
+            num_entries: entries,
+            num_tombstones: tombstones,
+            max_seq,
+            ..crate::manifest::SstMeta::default()
+        })
+    }
+
+    fn density_cfg(trigger: f64, min_entries: u64) -> crate::config::ColumnFamilyConfig {
+        crate::config::ColumnFamilyConfig {
+            tombstone_density_trigger: trigger,
+            tombstone_density_min_entries: min_entries,
+            ..crate::config::ColumnFamilyConfig::default()
+        }
+    }
+
+    /// Density work ranks below capacity work and above age work, and a dense
+    /// non-bottom table is an ordinary bounded push-down.
+    #[test]
+    fn density_ranks_between_capacity_and_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(
+            &dir,
+            crate::config::ColumnFamilyConfig {
+                l1_base_bytes: 1 << 10,
+                ..density_cfg(0.5, 0)
+            },
+        );
+        // L1 over capacity AND holding a dense table: capacity wins.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![
+                handle(&cf, 1, 1, b"a", b"c", 1 << 20, 0),
+                dense_handle(&cf, 2, 1, b"d", b"f", 100, 90, 0),
+            ],
+            vec![handle(&cf, 3, 2, b"a", b"z", 16, 0)],
+        ]);
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("capacity work");
+        assert_eq!(job.reason, CompactionReason::Capacity);
+        drop(guard);
+
+        // Within capacity: the dense table is pushed down with its overlap.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![
+                handle(&cf, 1, 1, b"a", b"c", 16, 0),
+                dense_handle(&cf, 2, 1, b"d", b"f", 100, 90, 0),
+            ],
+            vec![handle(&cf, 3, 2, b"e", b"z", 16, 0)],
+        ]);
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("density work");
+        assert_eq!(job.reason, CompactionReason::TombstoneDensity);
+        assert_eq!((job.level, job.target), (1, 2));
+        let mut ids: Vec<u64> = job.inputs.iter().map(|t| t.meta.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3]);
+        drop(guard);
+    }
+
+    /// The densest table goes first; below the trigger, below `min_entries`,
+    /// or with the trigger off, nothing is picked.
+    #[test]
+    fn density_eligibility_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, density_cfg(0.5, 50));
+        let levels = || {
+            vec![
+                Vec::new(),
+                vec![
+                    dense_handle(&cf, 1, 1, b"a", b"b", 100, 60, 0), // 0.60
+                    dense_handle(&cf, 2, 1, b"c", b"d", 100, 80, 0), // 0.80
+                    dense_handle(&cf, 3, 1, b"e", b"f", 10, 10, 0),  // below min_entries
+                    dense_handle(&cf, 4, 1, b"g", b"h", 100, 49, 0), // below trigger
+                ],
+                vec![handle(&cf, 9, 2, b"x", b"z", 16, 0)],
+            ]
+        };
+        cf.replace_levels(levels());
+        let order: Vec<u64> = cf.with_levels(|l| {
+            super::dense_tables(&db.inner, l, 0.5, 50, 0, u64::MAX)
+                .iter()
+                .map(|(_, t)| t.meta.id)
+                .collect()
+        });
+        assert_eq!(order, vec![2, 1]);
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("density work");
+        assert_eq!(job.inputs[0].meta.id, 2);
+        drop(guard);
+
+        // Trigger off: no density work at all.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (db2, cf2) = picker_db(&dir2, density_cfg(0.0, 0));
+        cf2.replace_levels(vec![
+            Vec::new(),
+            vec![dense_handle(&cf2, 1, 1, b"a", b"b", 100, 100, 0)],
+            vec![handle(&cf2, 9, 2, b"x", b"z", 16, 0)],
+        ]);
+        assert!(super::pick_compaction(&db2.inner, &cf2).is_none());
+    }
+
+    /// A dense bottom table is rewritten in place — only once the oldest
+    /// snapshot has passed every version in it, and never twice in one pass.
+    #[test]
+    fn density_bottom_rewrite_needs_snapshot_clearance_and_is_once_per_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, density_cfg(0.5, 0));
+        // max_seq 5 is above a fresh database's oldest snapshot (0): a rewrite
+        // could not drop one tombstone, so it is not offered.
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![dense_handle(&cf, 7, 1, b"a", b"m", 100, 90, 5)],
+        ]);
+        assert!(super::pick_compaction(&db.inner, &cf).is_none());
+
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![dense_handle(&cf, 7, 1, b"a", b"m", 100, 90, 0)],
+        ]);
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("bottom rewrite");
+        assert_eq!(job.reason, CompactionReason::TombstoneDensity);
+        assert_eq!((job.level, job.target), (1, 1), "in place, never a new level");
+        drop(guard);
+        // Written by the current pass (id >= floor): not rewritten again.
+        assert!(super::pick_compaction_with(&db.inner, &cf, true, 7).is_none());
+        assert!(super::pick_compaction_with(&db.inner, &cf, true, 8).is_some());
+    }
+
+    /// A dense table whose span another job holds is skipped for the next
+    /// candidate, never waited on.
+    #[test]
+    fn density_respects_range_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = picker_db(&dir, density_cfg(0.5, 0));
+        cf.replace_levels(vec![
+            Vec::new(),
+            vec![
+                dense_handle(&cf, 1, 1, b"a", b"b", 100, 99, 0),
+                dense_handle(&cf, 2, 1, b"c", b"d", 100, 60, 0),
+            ],
+            vec![handle(&cf, 9, 2, b"x", b"z", 16, 0)],
+        ]);
+        let held = cf
+            .range_locks
+            .try_acquire(crate::range_lock::KeyRange::new(b"a".to_vec(), b"b".to_vec()))
+            .unwrap();
+        let (job, guard) = super::pick_compaction(&db.inner, &cf).expect("the other table");
+        assert_eq!(job.inputs[0].meta.id, 2);
+        drop(guard);
+        drop(held);
+    }
+
     // ---- 0.3: periodic-compaction eligibility -----------------------------
 
     /// One hour, the interval every eligibility test below measures against.
@@ -3099,16 +3402,16 @@ mod tests {
 
         // Only age work due.
         cf.replace_levels(fixture(16));
-        assert!(super::pick_compaction_with(&db.inner, &cf, false).is_none());
+        assert!(super::pick_compaction_with(&db.inner, &cf, false, u64::MAX).is_none());
         let (job, guard) =
-            super::pick_compaction_with(&db.inner, &cf, true).expect("the age job is due");
+            super::pick_compaction_with(&db.inner, &cf, true, u64::MAX).expect("the age job is due");
         assert_eq!(job.reason, CompactionReason::Periodic);
         drop(guard);
 
         // Capacity work is offered whatever the burst state.
         cf.replace_levels(fixture(1 << 20));
         let (job, guard) =
-            super::pick_compaction_with(&db.inner, &cf, false).expect("capacity work is due");
+            super::pick_compaction_with(&db.inner, &cf, false, u64::MAX).expect("capacity work is due");
         assert_eq!(job.reason, CompactionReason::Capacity);
         drop(guard);
     }

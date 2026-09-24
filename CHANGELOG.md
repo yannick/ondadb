@@ -180,6 +180,23 @@ directory written by this release is not readable by 0.9.x. The crate is still
   a transaction's level. The per-family `default_isolation_level` stays
   reserved (a transaction spans families, so no family's setting could decide).
 
+#### Compaction
+
+- **Tombstone-density trigger wired** (plan C P4). `ColumnFamilyConfig::
+  tombstone_density_trigger` / `tombstone_density_min_entries`, declared but
+  read by nothing until now, compact a table whose tombstone fraction reaches
+  the trigger even when no size trigger fires: below capacity work, above
+  periodic work, densest first, through the ordinary bounded job (a bottom
+  table in place, once the oldest snapshot has passed it). Default `0.0`
+  (off). Both are now **persisted** as config TLV tags 34 and 35 (registered
+  in `docs/format-registry.md`); `validate` rejects a NaN or negative
+  trigger. A delete-heavy flush now wakes the compaction worker. New
+  `CfStats::tombstone_density_compactions`.
+- The config-blob encoder now merges preserved unknown tags into tag order
+  instead of appending them — required as soon as a known tag (34, 35) sits
+  above a reserved one (33), or a blob carrying 33 would re-encode out of
+  order and be refused by its own decoder.
+
 #### Performance
 
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`

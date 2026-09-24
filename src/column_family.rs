@@ -684,6 +684,9 @@ pub struct ColumnFamily {
     /// than by a capacity trigger — see
     /// [`CfStats::periodic_compactions`](crate::maintenance::CfStats::periodic_compactions).
     pub(crate) periodic_compactions: AtomicU64,
+    /// Subset of `compaction_count` picked by the tombstone-density trigger —
+    /// [`CfStats::tombstone_density_compactions`](crate::maintenance::CfStats::tombstone_density_compactions).
+    pub(crate) tombstone_density_compactions: AtomicU64,
     pub(crate) compaction_failures: AtomicU64,
     pub(crate) last_compaction_error: Mutex<Option<String>>,
 
@@ -861,6 +864,7 @@ impl ColumnFamily {
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
             periodic_compactions: AtomicU64::new(0),
+            tombstone_density_compactions: AtomicU64::new(0),
             compaction_failures: AtomicU64::new(0),
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),
@@ -1036,6 +1040,7 @@ impl ColumnFamily {
             flush_count: AtomicU64::new(0),
             compaction_count: AtomicU64::new(0),
             periodic_compactions: AtomicU64::new(0),
+            tombstone_density_compactions: AtomicU64::new(0),
             compaction_failures: AtomicU64::new(0),
             last_compaction_error: Mutex::new(None),
             point_reads: AtomicU64::new(0),

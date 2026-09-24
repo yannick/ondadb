@@ -45,13 +45,20 @@ fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn put(out: &mut Vec<u8>, t: u64, value: &[u8]) {
+/// One `(tag, value)` entry awaiting serialization.
+type Entry = (u64, Vec<u8>);
+
+fn put(out: &mut Vec<Entry>, t: u64, value: &[u8]) {
+    out.push((t, value.to_vec()));
+}
+
+fn serialize(out: &mut Vec<u8>, t: u64, value: &[u8]) {
     append_uvarint(out, t);
     append_uvarint(out, value.len() as u64);
     out.extend_from_slice(value);
 }
 
-fn put_uvar(out: &mut Vec<u8>, t: u64, v: u64) {
+fn put_uvar(out: &mut Vec<Entry>, t: u64, v: u64) {
     let mut b = Vec::with_capacity(10);
     append_uvarint(&mut b, v);
     put(out, t, &b);
@@ -65,12 +72,11 @@ fn put_bytes_field(b: &mut Vec<u8>, v: &[u8]) {
 /// Encode `cfg` as an epoch-1 config blob.
 pub(crate) fn encode(cfg: &ColumnFamilyConfig) -> Vec<u8> {
     let d = ColumnFamilyConfig::default();
-    let mut out = Vec::with_capacity(64);
-    out.extend_from_slice(&MAGIC);
-    append_u32(&mut out, VERSION);
+    let mut out: Vec<Entry> = Vec::with_capacity(16);
 
     // Ascending tag order is the encoding's canonical form, and the decoder
-    // enforces it; every arm below is in tag order.
+    // enforces it. The arms below are in tag order, and the final sort merges
+    // the preserved unknown tags in among them.
     if cfg.comparator_name != d.comparator_name {
         put(
             &mut out,
@@ -262,13 +268,38 @@ pub(crate) fn encode(cfg: &ColumnFamilyConfig) -> Vec<u8> {
     if let Some(name) = &cfg.merge_operator_name {
         put(&mut out, tag::MERGE_OPERATOR_NAME, name.as_bytes());
     }
-    // Preserved unknown entries last: every tag this binary does not know is
-    // above every tag it does (`decode` refuses tag 0, the only other gap).
-    for (t, v) in &cfg.unknown_config_tags {
-        debug_assert!(*t > tag::MAX_KNOWN);
-        put(&mut out, *t, v);
+    if cfg.tombstone_density_trigger.to_bits() != d.tombstone_density_trigger.to_bits() {
+        put(
+            &mut out,
+            tag::TOMBSTONE_DENSITY_TRIGGER,
+            &cfg.tombstone_density_trigger.to_bits().to_le_bytes(),
+        );
     }
-    out
+    if cfg.tombstone_density_min_entries != d.tombstone_density_min_entries {
+        put_uvar(
+            &mut out,
+            tag::TOMBSTONE_DENSITY_MIN_ENTRIES,
+            cfg.tombstone_density_min_entries,
+        );
+    }
+    // Preserved unknown entries, merged into tag order. They are NOT all above
+    // the known ones: a reserved tag (33) sits below tags this binary knows, so
+    // appending would write a blob the decoder refuses as out of order. The
+    // sort is stable and no unknown tag equals a known one (`decode` routes
+    // every known tag to its field), so the order is total.
+    out.extend(cfg.unknown_config_tags.iter().cloned());
+    out.sort_by_key(|(t, _)| *t);
+    debug_assert!(
+        out.windows(2).all(|w| w[0].0 < w[1].0),
+        "config blob tags repeat"
+    );
+    let mut blob = Vec::with_capacity(64);
+    blob.extend_from_slice(&MAGIC);
+    append_u32(&mut blob, VERSION);
+    for (t, v) in &out {
+        serialize(&mut blob, *t, v);
+    }
+    blob
 }
 
 fn sync_mode_id(m: SyncMode) -> u8 {
@@ -563,6 +594,15 @@ fn apply(cfg: &mut ColumnFamilyConfig, v: Val<'_>) -> Result<()> {
             cfg.block_restart_interval = i;
         }
         tag::MERGE_OPERATOR_NAME => cfg.merge_operator_name = Some(v.string()?),
+        tag::TOMBSTONE_DENSITY_TRIGGER => {
+            let t = v.f64()?;
+            // An encoder fed a config that passed `validate` never wrote one.
+            if !t.is_finite() || t < 0.0 {
+                return Err(v.bad("tombstone density trigger not finite and >= 0"));
+            }
+            cfg.tombstone_density_trigger = t;
+        }
+        tag::TOMBSTONE_DENSITY_MIN_ENTRIES => cfg.tombstone_density_min_entries = v.uvar()?,
         // Unknown (including reserved-but-unimplemented): kept verbatim.
         t => cfg.unknown_config_tags.push((t, v.b.to_vec())),
     }
@@ -581,7 +621,7 @@ mod tests {
     }
 
     fn entry(b: &mut Vec<u8>, t: u64, v: &[u8]) {
-        put(b, t, v);
+        serialize(b, t, v);
     }
 
     /// A config with every durable field away from its default.
@@ -629,6 +669,8 @@ mod tests {
             enable_prefix_delta_keys: true,
             block_restart_interval: 16,
             merge_operator_name: Some("counter.v1".into()),
+            tombstone_density_trigger: 0.4,
+            tombstone_density_min_entries: 1000,
             ..ColumnFamilyConfig::default()
         }
     }
@@ -677,6 +719,36 @@ mod tests {
         assert!(
             matches!(d.partition_scheme, PartitionScheme::Unresolved(ref n) if n == "by-tenant")
         );
+        assert_eq!(d.tombstone_density_trigger, 0.4);
+        assert_eq!(d.tombstone_density_min_entries, 1000);
+    }
+
+    /// A preserved tag *below* a known one — the reserved 33 beside the known
+    /// 34/35 — is written back in tag order. Appending it would produce a blob
+    /// the decoder itself refuses.
+    #[test]
+    fn a_reserved_tag_below_known_ones_re_encodes_in_order() {
+        let mut b = header();
+        entry(&mut b, tag::RESERVED_BLOOM_AUTO_ALLOCATE, &[9]);
+        entry(&mut b, tag::TOMBSTONE_DENSITY_MIN_ENTRIES, &[7]);
+        let d = decode(&b).unwrap();
+        assert_eq!(d.tombstone_density_min_entries, 7);
+        assert_eq!(d.unknown_config_tags, vec![(33, vec![9])]);
+        assert_eq!(encode(&d), b);
+        let mut changed = d.clone();
+        changed.tombstone_density_trigger = 0.5;
+        let again = decode(&encode(&changed)).expect("re-encoded blob decodes");
+        assert_eq!(again.tombstone_density_trigger, 0.5);
+        assert_eq!(again.unknown_config_tags, vec![(33, vec![9])]);
+    }
+
+    #[test]
+    fn tombstone_density_trigger_must_be_finite_and_non_negative() {
+        for bad in [f64::NAN, f64::INFINITY, -0.5] {
+            let mut b = header();
+            entry(&mut b, tag::TOMBSTONE_DENSITY_TRIGGER, &bad.to_bits().to_le_bytes());
+            assert_eq!(decode(&b).unwrap_err().kind(), "corruption", "{bad}");
+        }
     }
 
     /// Byte-exact encoding of a small config, decoded by hand: the header,

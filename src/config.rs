@@ -1030,9 +1030,33 @@ pub struct ColumnFamilyConfig {
     pub min_disk_space: u64,
     pub l1_file_count_trigger: u32,
     pub l0_queue_stall_threshold: u32,
-    /// Reserved tombstone-density trigger; currently ignored.
+    /// Compact a table whose tombstone fraction (`num_tombstones /
+    /// num_entries`, from its manifest entry) is **at least** this, even when
+    /// no size trigger fires. `0.0` (the default) disables the trigger; a value
+    /// above `1.0` can never be reached and so also never fires. Must be finite
+    /// and non-negative ([`validate`](Self::validate)). Persisted (TLV tag 34).
+    ///
+    /// The point is delete-heavy workloads: a table dominated by tombstones
+    /// costs reads a walk over dead versions and holds space until a compaction
+    /// carries the tombstones to the bottom level, where they are dropped. Size
+    /// triggers alone never do that for a family whose deletes keep its levels
+    /// under capacity.
+    ///
+    /// Density work ranks **below** capacity work and **above** periodic (age)
+    /// work, and takes the densest eligible table first. A dense table above the
+    /// bottom is pushed down one level through the ordinary bounded job (an L0
+    /// table through L0's oldest-first window); a dense **bottom** table is
+    /// rewritten in place, and only once every version in it is older than the
+    /// oldest live snapshot — before that the rewrite could not drop a single
+    /// tombstone. Evaluated whenever the family's compaction runs (after every
+    /// flush and compaction). Ignored by [`CompactionStyle::Fifo`].
+    /// [`CfStats::tombstone_density_compactions`](crate::CfStats::tombstone_density_compactions)
+    /// counts the jobs it picked.
     pub tombstone_density_trigger: f64,
-    /// Reserved tombstone-density trigger; currently ignored.
+    /// Ignore tables with fewer than this many entries for
+    /// [`tombstone_density_trigger`](Self::tombstone_density_trigger) (default
+    /// `0`: any non-empty table). A small table that happens to be mostly
+    /// deletes is not worth a job of its own. Persisted (TLV tag 35).
     pub tombstone_density_min_entries: u64,
     pub use_btree: bool,
     pub compaction_style: CompactionStyle,
@@ -1634,6 +1658,15 @@ impl ColumnFamilyConfig {
                 self.soft_pending_compaction_bytes, self.hard_pending_compaction_bytes
             ));
         }
+        // A NaN would compare false against every table and silently disable
+        // the trigger; a negative one would make every table eligible. Neither
+        // is what anyone meant.
+        if !self.tombstone_density_trigger.is_finite() || self.tombstone_density_trigger < 0.0 {
+            return Err(format!(
+                "tombstone_density_trigger ({}) must be finite and >= 0 (0 disables)",
+                self.tombstone_density_trigger
+            ));
+        }
         // FIFO never merges — it evicts whole tables by size and file age
         // (`fifo_ttl`). A periodic *rewrite* has nothing to do there, and
         // accepting the option would silently do nothing, reading as a tuning
@@ -1989,6 +2022,23 @@ mod tests {
         }
         .validate()
         .expect("periodic compaction is a leveled-family option");
+    }
+
+    #[test]
+    fn validate_rejects_a_nan_or_negative_density_trigger() {
+        for bad in [f64::NAN, -0.1, f64::INFINITY] {
+            let cfg = ColumnFamilyConfig {
+                tombstone_density_trigger: bad,
+                ..ColumnFamilyConfig::default()
+            };
+            let error = cfg.validate().unwrap_err();
+            assert!(error.contains("tombstone_density_trigger"), "{error}");
+        }
+        let ok = ColumnFamilyConfig {
+            tombstone_density_trigger: 2.0, // never fires, but legal
+            ..ColumnFamilyConfig::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     /// The API variants map onto the epoch-1 codec registry; LZ4 and its

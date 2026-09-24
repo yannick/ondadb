@@ -539,14 +539,24 @@ pub mod cf_config {
         /// Reserved for a geometric (Monkey-style) bloom auto-allocation policy
         /// (plan C, P7) — the successor of 0.9's reserved `ONDABLM2` tail.
         pub const RESERVED_BLOOM_AUTO_ALLOCATE: u64 = 33;
-        /// Highest tag epoch 1 assigns a meaning to.
-        pub const MAX_KNOWN: u64 = MERGE_OPERATOR_NAME;
+        /// `tombstone_density_trigger`, f64 bits (plan C P4).
+        pub const TOMBSTONE_DENSITY_TRIGGER: u64 = 34;
+        /// `tombstone_density_min_entries`, uvarint (plan C P4).
+        pub const TOMBSTONE_DENSITY_MIN_ENTRIES: u64 = 35;
+        /// Highest tag this binary assigns a meaning to. Not every tag below
+        /// it is known — a reserved one (33) is preserved like any unknown tag,
+        /// which is why the encoder merges unknown tags into tag order rather
+        /// than appending them.
+        pub const MAX_KNOWN: u64 = TOMBSTONE_DENSITY_MIN_ENTRIES;
     }
 }
 
 const _: () = assert!(is_printable_ascii(&cf_config::MAGIC));
-const _: () = assert!(cf_config::tag::MAX_KNOWN == 32);
-const _: () = assert!(cf_config::tag::RESERVED_BLOOM_AUTO_ALLOCATE > cf_config::tag::MAX_KNOWN);
+const _: () = assert!(cf_config::tag::MAX_KNOWN == 35);
+const _: () = assert!(cf_config::tag::MERGE_OPERATOR_NAME == 32);
+const _: () = assert!(cf_config::tag::RESERVED_BLOOM_AUTO_ALLOCATE == 33);
+const _: () = assert!(cf_config::tag::TOMBSTONE_DENSITY_TRIGGER == 34);
+const _: () = assert!(cf_config::tag::TOMBSTONE_DENSITY_MIN_ENTRIES == 35);
 
 /// Compression codec ids — the `alg` byte of every block frame and vlog frame.
 ///

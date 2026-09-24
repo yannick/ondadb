@@ -244,6 +244,12 @@ minimal uvarint; booleans one byte `0`/`1`; codec values are codec ids.
 | 31 | `block_restart_interval` | uvarint in [1, 1024] |
 | 32 | `merge_operator_name` | UTF-8 |
 | 33 | *reserved*: bloom auto-allocation (plan C P7) | — |
+| 34 | `tombstone_density_trigger` | f64 bits (u64 LE), finite and ≥ 0 |
+| 35 | `tombstone_density_min_entries` | uvarint |
+
+Unknown and reserved tags are preserved **in tag order**, merged among the
+known ones on re-encode — a reserved tag (33) sits below known tags (34, 35),
+so appending it would produce a blob the decoder refuses as out of order.
 
 ## Edit-log op codes
 
