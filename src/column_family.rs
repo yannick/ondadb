@@ -211,7 +211,14 @@ struct CfState {
 
 struct RotState {
     active_writers: usize,
+    /// Commits are gated: the rotator is draining writers and swapping the
+    /// memtable/WAL pair.
     rotating: bool,
+    /// A rotator is creating the next WAL segment. Serializes rotators (the
+    /// next generation must stay stable) but does *not* gate commits: creating
+    /// a segment fsyncs one header per stripe plus the directory, and commits
+    /// keep landing in the current memtable/WAL meanwhile.
+    preparing: bool,
 }
 
 struct PointReadCandidate {
@@ -863,6 +870,7 @@ impl ColumnFamily {
             rot: Mutex::new(RotState {
                 active_writers: 0,
                 rotating: false,
+                preparing: false,
             }),
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
@@ -1040,6 +1048,7 @@ impl ColumnFamily {
             rot: Mutex::new(RotState {
                 active_writers: 0,
                 rotating: false,
+                preparing: false,
             }),
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
@@ -1247,7 +1256,7 @@ impl ColumnFamily {
     pub(crate) fn rotate_memtable(self: &Arc<Self>, force: bool) {
         let imm = {
             let mut g = self.rot.lock();
-            if g.rotating {
+            if g.rotating || g.preparing {
                 // A rotation is already in flight. Size-triggered callers can
                 // simply return (every committer past the threshold calls this;
                 // making the losers wait just serializes them behind the swap).
@@ -1255,7 +1264,7 @@ impl ColumnFamily {
                 if !force {
                     return;
                 }
-                while g.rotating {
+                while g.rotating || g.preparing {
                     self.cond.wait(&mut g);
                 }
             }
@@ -1270,12 +1279,13 @@ impl ColumnFamily {
                     return;
                 }
             }
-            g.rotating = true;
+            g.preparing = true;
 
-            // Open the next WAL before draining in-flight writers: the file
-            // creation syscall overlaps the drain instead of extending the
-            // window during which new commits are gated. Rotations are
-            // serialized by `rotating`, so the next generation is stable.
+            // Open the next WAL before gating commits: creating a segment
+            // fsyncs a header per stripe and the directory, and commits keep
+            // landing in the current memtable meanwhile instead of stalling
+            // behind those syncs. Rotations are serialized by `preparing`, so
+            // the next generation is stable.
             let (new_gen, new_path) = {
                 let s = self.state.read();
                 (s.wal_gen + 1, self.wal_path(s.wal_gen + 1))
@@ -1299,6 +1309,8 @@ impl ColumnFamily {
                 })
             };
             let mut g = self.rot.lock();
+            g.preparing = false;
+            g.rotating = true;
             while g.active_writers > 0 {
                 self.cond.wait(&mut g);
             }

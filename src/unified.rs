@@ -158,7 +158,14 @@ struct UState {
 
 struct RotState {
     active_writers: usize,
+    /// Commits are gated: the rotator is draining writers and swapping the
+    /// memtable/WAL pair.
     rotating: bool,
+    /// A rotator is creating the next WAL segment. Serializes rotators (the
+    /// next generation must stay stable) but does *not* gate commits: creating
+    /// a segment fsyncs one header per stripe plus the directory, and commits
+    /// keep landing in the current memtable/WAL meanwhile.
+    preparing: bool,
 }
 
 /// The database-wide shared memtable + WAL.
@@ -331,6 +338,7 @@ impl UnifiedStore {
             rot: Mutex::new(RotState {
                 active_writers: 0,
                 rotating: false,
+                preparing: false,
             }),
             cond: Condvar::new(),
             flush_tx,
@@ -747,7 +755,7 @@ impl UnifiedStore {
     pub(crate) fn rotate(self: &Arc<Self>, force: bool) {
         let imm = {
             let mut g = self.rot.lock();
-            while g.rotating {
+            while g.rotating || g.preparing {
                 self.cond.wait(&mut g);
             }
             {
@@ -761,12 +769,12 @@ impl UnifiedStore {
                     return;
                 }
             }
-            g.rotating = true;
-            // Open the next WAL before draining in-flight writers, as the
-            // per-CF rotation does: creating a segment writes and fsyncs its
-            // header, and that must not extend the window during which new
-            // commits are gated. Rotations are serialized by `rotating`, so the
-            // next generation is stable.
+            g.preparing = true;
+            // Open the next WAL before gating commits, as the per-CF rotation
+            // does: creating a segment fsyncs a header per stripe and the
+            // directory, and that must not extend the window during which new
+            // commits are gated. Rotations are serialized by `preparing`, so
+            // the next generation is stable.
             let new_gen = self.state.read().wal_gen + 1;
             let new_path = wal_path(&self.dir, new_gen);
             drop(g);
@@ -788,6 +796,8 @@ impl UnifiedStore {
                 })
             };
             let mut g = self.rot.lock();
+            g.preparing = false;
+            g.rotating = true;
             while g.active_writers > 0 {
                 self.cond.wait(&mut g);
             }
