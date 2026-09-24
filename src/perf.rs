@@ -114,25 +114,9 @@ impl PerfContext {
     /// Add every counter of `o` into `self` — how a worker thread's counters
     /// reach the scope of the thread that handed it the work.
     pub(crate) fn absorb(&mut self, o: &PerfContext) {
-        self.bloom_probes += o.bloom_probes;
-        self.bloom_negatives += o.bloom_negatives;
-        self.memtable_probes += o.memtable_probes;
-        self.sstable_probes += o.sstable_probes;
-        self.index_seeks += o.index_seeks;
-        self.block_cache_hits += o.block_cache_hits;
-        self.block_misses += o.block_misses;
-        self.block_read_bytes += o.block_read_bytes;
-        self.bytes_decompressed += o.bytes_decompressed;
-        self.vlog_reads += o.vlog_reads;
-        self.vlog_read_bytes += o.vlog_read_bytes;
-        self.vlog_cache_hits += o.vlog_cache_hits;
-        self.iterator_seeks += o.iterator_seeks;
-        self.iterator_steps += o.iterator_steps;
-        self.multiget_blocks_deduped += o.multiget_blocks_deduped;
-        self.range_sources += o.range_sources;
-        self.range_masked += o.range_masked;
-        self.multiget_parallel_reads += o.multiget_parallel_reads;
-        self.multiget_io_waits += o.multiget_io_waits;
+        // One implementation: `accumulate` goes through the exhaustive
+        // `fields` list, so a new counter cannot be missed here.
+        self.accumulate(o);
     }
 
     /// Every counter, in declaration order. The exhaustive destructuring makes

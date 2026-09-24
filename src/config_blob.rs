@@ -772,19 +772,26 @@ mod tests {
     /// 34/35 — is written back in tag order. Appending it would produce a blob
     /// the decoder itself refuses.
     #[test]
-    fn a_reserved_tag_below_known_ones_re_encodes_in_order() {
-        let mut b = header();
-        entry(&mut b, tag::RESERVED_BLOOM_AUTO_ALLOCATE, &[9]);
-        entry(&mut b, tag::TOMBSTONE_DENSITY_MIN_ENTRIES, &[7]);
-        let d = decode(&b).unwrap();
+    fn unknown_tags_merge_in_order_among_known_ones() {
+        // No tag below MAX_KNOWN is reserved today, but a future registry may
+        // reserve one; the encoder must not assume unknown tags sort last.
+        // Simulate it with an unknown tag carried alongside known tags on
+        // both sides of it.
+        let mut cfg = ColumnFamilyConfig {
+            bloom_auto_allocate: true,
+            tombstone_density_min_entries: 7,
+            ..ColumnFamilyConfig::default()
+        };
+        cfg.unknown_config_tags = vec![(tag::MAX_KNOWN + 1, vec![9])];
+        let d = decode(&encode(&cfg)).unwrap();
         assert_eq!(d.tombstone_density_min_entries, 7);
-        assert_eq!(d.unknown_config_tags, vec![(33, vec![9])]);
-        assert_eq!(encode(&d), b);
+        assert!(d.bloom_auto_allocate);
+        assert_eq!(d.unknown_config_tags, vec![(tag::MAX_KNOWN + 1, vec![9])]);
         let mut changed = d.clone();
         changed.tombstone_density_trigger = 0.5;
         let again = decode(&encode(&changed)).expect("re-encoded blob decodes");
         assert_eq!(again.tombstone_density_trigger, 0.5);
-        assert_eq!(again.unknown_config_tags, vec![(33, vec![9])]);
+        assert_eq!(again.unknown_config_tags, vec![(tag::MAX_KNOWN + 1, vec![9])]);
     }
 
     #[test]
@@ -828,7 +835,9 @@ mod tests {
             bloom_auto_allocate: true,
             ..ColumnFamilyConfig::default()
         };
-        let mut want = header();
+        // Tag 13 (the graduated per-level default, always written since P10)
+        // precedes it.
+        let mut want = encode(&ColumnFamilyConfig::default());
         want.extend_from_slice(&[33, 1, 1]);
         assert_eq!(encode(&on), want);
         assert!(decode(&want).unwrap().bloom_auto_allocate);
@@ -852,7 +861,10 @@ mod tests {
         assert_eq!(d.comparator_name, "reverse");
         assert_eq!(
             d.unknown_config_tags,
-            vec![(34, vec![1, 2, 3]), (900, b"wavesdb-option".to_vec())]
+            vec![
+                (tag::MAX_KNOWN + 1, vec![1, 2, 3]),
+                (900, b"wavesdb-option".to_vec())
+            ]
         );
         assert_eq!(encode(&d), b, "re-encode must preserve unknown tags");
         // And a changed known field does not disturb them.

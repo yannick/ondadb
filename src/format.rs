@@ -893,10 +893,14 @@ mod tests {
             BLOCK_RESTART_INTERVAL,
             MERGE_OPERATOR_NAME,
             BLOOM_AUTO_ALLOCATE,
+            TOMBSTONE_DENSITY_TRIGGER,
+            TOMBSTONE_DENSITY_MIN_ENTRIES,
         ];
-        assert_eq!(tags.to_vec(), (1..=33).collect::<Vec<u64>>());
+        assert_eq!(tags.to_vec(), (1..=35).collect::<Vec<u64>>());
         assert_eq!(BLOOM_AUTO_ALLOCATE, 33);
-        assert_eq!(MAX_KNOWN, 33);
+        assert_eq!(TOMBSTONE_DENSITY_TRIGGER, 34);
+        assert_eq!(TOMBSTONE_DENSITY_MIN_ENTRIES, 35);
+        assert_eq!(MAX_KNOWN, 35);
     }
 
     /// The capability word is a cross-engine contract (wavesdb is reconciled to
