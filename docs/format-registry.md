@@ -243,7 +243,7 @@ minimal uvarint; booleans one byte `0`/`1`; codec values are codec ids.
 | 30 | `enable_prefix_delta_keys` | bool |
 | 31 | `block_restart_interval` | uvarint in [1, 1024] |
 | 32 | `merge_operator_name` | UTF-8 |
-| 33 | *reserved*: bloom auto-allocation (plan C P7) | — |
+| 33 | `bloom_auto_allocate` (plan C P7, wavesdb `BloomAutoAllocate`) | bool; mutually exclusive with tag 27 (`validate`) |
 
 ## Edit-log op codes
 

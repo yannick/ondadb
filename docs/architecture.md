@@ -348,8 +348,12 @@ scopes are merged into the caller's (`multiget_parallel_reads`,
 `multiget_io_waits`). At most one window of blocks is live at a time.
 
 A table's filter strength is chosen when it is **written**, from its output
-level: `ColumnFamilyConfig::bloom_fpr_for_level(level, bottom)` returns the
-rate (`bloom_fpr_per_level`, last entry repeating, or the uniform `bloom_fpr`)
+level: `ColumnFamilyConfig::bloom_fpr_in_shape(level, bottom, bottom_level)`
+returns the rate (`bloom_fpr_per_level`, last entry repeating; else, with
+`bloom_auto_allocate` (P7), `bloom_fpr × level_size_ratio^(level −
+bottom_level)` floored at `BLOOM_AUTO_FLOOR`, where `bottom_level` is the
+family's deepest level index when the writer is created — `levels.len() − 1`,
+or the compaction target if deeper; else the uniform `bloom_fpr`)
 or `None` for "write no filter block" when `optimize_filters_for_hits` is set
 and the output lands in the bottom level (`compaction::is_bottom_target`).
 Flush and ingest always pass `bottom = false`; only compaction can omit a

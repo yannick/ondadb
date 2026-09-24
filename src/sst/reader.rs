@@ -1229,6 +1229,12 @@ impl Reader {
     pub fn max_key(&self) -> &[u8] {
         &self.max_key
     }
+    /// Size of this table's bloom filter in bits, or `None` if it was written
+    /// without one.
+    pub fn bloom_bits(&self) -> Option<u64> {
+        self.bloom.as_ref().map(|b| b.bits())
+    }
+
     pub fn num_entries(&self) -> u64 {
         self.num_entries
     }

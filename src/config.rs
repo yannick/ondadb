@@ -862,6 +862,27 @@ impl Default for Options {
     }
 }
 
+/// The smallest false-positive rate
+/// [`ColumnFamilyConfig::bloom_auto_allocate`] hands an upper level (≈19
+/// bits/key). Below it a filter grows without the miss rate moving in any way
+/// a block read could show. Same value as wavesdb's `bloomAutoFloor`.
+pub const BLOOM_AUTO_FLOOR: f64 = 1e-4;
+
+/// The geometric (Monkey) rate for `level` when the family's deepest level is
+/// `bottom_level`: `base × ratio^(level − bottom_level)`, clamped to
+/// `[min(BLOOM_AUTO_FLOOR, base), base]`. A level at or below the bottom, or a
+/// ratio that does not shrink levels, gets `base`.
+pub fn bloom_auto_fpr(base: f64, ratio: u64, level: u32, bottom_level: u32) -> f64 {
+    if level >= bottom_level || ratio <= 1 {
+        return base;
+    }
+    let depth = (bottom_level - level) as i32;
+    let fpr = base * (ratio as f64).powi(-depth);
+    // Floor, but never above the declared rate: a base below the floor is its
+    // own ceiling.
+    fpr.max(BLOOM_AUTO_FLOOR.min(base))
+}
+
 /// Per-column-family configuration.
 #[derive(Debug, Clone)]
 pub struct ColumnFamilyConfig {
@@ -1036,6 +1057,30 @@ pub struct ColumnFamilyConfig {
     /// The converse is guaranteed: any compaction whose output target is *not*
     /// bottom writes a filter, whatever its inputs carried.
     pub optimize_filters_for_hits: bool,
+    /// Derive each level's bloom false-positive rate geometrically from
+    /// [`bloom_fpr`](Self::bloom_fpr) (wavesdb `BloomAutoAllocate`, the
+    /// Monkey allocation): the deepest level gets `bloom_fpr`, and each level
+    /// above it `level_size_ratio` times less —
+    /// `fpr(L) = bloom_fpr × ratio^(L − bottom)`, floored at
+    /// [`BLOOM_AUTO_FLOOR`] (or at `bloom_fpr` itself if that is lower).
+    ///
+    /// A level above the bottom holds `1/ratio` of the keys, so the same
+    /// filter memory buys it `ratio` times fewer false positives — and a
+    /// point miss probes every level, so the upper levels' rates are where
+    /// the misses' block reads come from. "Bottom" is the deepest level the
+    /// family has when the table is written (the level vector's last index,
+    /// or the output level if that is deeper); a family with one level is all
+    /// bottom, so auto allocation changes nothing until it deepens. The floor
+    /// stops a large ratio from buying ~20+ bits/key that no block read could
+    /// notice.
+    ///
+    /// Mutually exclusive with [`bloom_fpr_per_level`](Self::bloom_fpr_per_level)
+    /// ([`validate`](Self::validate) refuses both); `optimize_filters_for_hits`
+    /// still drops the filter on bottom compaction output, and
+    /// `enable_bloom_filter = false` still wins over everything. Like the
+    /// vector it is a write-side policy: existing tables keep their filters
+    /// until rewritten. Persisted as config TLV tag 33.
+    pub bloom_auto_allocate: bool,
     /// Reserved sampled-index policy; indexes are currently exhaustive.
     pub enable_block_indexes: bool,
     /// Reserved sampled-index policy; currently ignored.
@@ -1170,6 +1215,7 @@ impl Default for ColumnFamilyConfig {
             bloom_fpr: 0.01,
             bloom_fpr_per_level: Vec::new(),
             optimize_filters_for_hits: false,
+            bloom_auto_allocate: false,
             enable_block_indexes: true,
             index_sample_ratio: 1,
             block_index_prefix_len: 16,
@@ -1547,13 +1593,39 @@ impl ColumnFamilyConfig {
     /// inherited from a compaction's inputs, which is what makes the
     /// re-filter-on-promotion guarantee hold: a filterless table compacted into
     /// a non-bottom target comes back out with a filter.
+    ///
+    /// Answers as if `level` were the deepest level, so
+    /// [`bloom_auto_allocate`](Self::bloom_auto_allocate) yields `bloom_fpr`
+    /// here; writers use [`bloom_fpr_in_shape`](Self::bloom_fpr_in_shape),
+    /// which knows the family's depth.
     pub fn bloom_fpr_for_level(&self, level: u32, bottom: bool) -> Option<f64> {
+        self.bloom_fpr_in_shape(level, bottom, level)
+    }
+
+    /// Bloom false-positive rate for a table written into `level` of a family
+    /// whose deepest level is `bottom_level`, or `None` for no filter block.
+    /// `bottom` is the compaction-output predicate of
+    /// [`bloom_fpr_for_level`](Self::bloom_fpr_for_level).
+    ///
+    /// Rules, in order (wavesdb `resolveBloomPolicy`): `optimize_filters_for_hits`
+    /// on bottom output → no filter; an explicit
+    /// [`bloom_fpr_per_level`](Self::bloom_fpr_per_level) vector; then
+    /// [`bloom_auto_allocate`](Self::bloom_auto_allocate)'s geometric rate;
+    /// else the uniform [`bloom_fpr`](Self::bloom_fpr). (`enable_bloom_filter
+    /// = false` is applied by the writer and dominates all of these.)
+    pub fn bloom_fpr_in_shape(&self, level: u32, bottom: bool, bottom_level: u32) -> Option<f64> {
         if self.optimize_filters_for_hits && bottom {
             return None; // write no filter block at all
         }
         match self.bloom_fpr_per_level.as_slice() {
             // The empty arm is what keeps `v.len() - 1` below off an empty
             // slice: that subtraction is a `usize` underflow, not a fallback.
+            [] if self.bloom_auto_allocate => Some(bloom_auto_fpr(
+                self.bloom_fpr,
+                self.level_size_ratio,
+                level,
+                bottom_level,
+            )),
             [] => Some(self.bloom_fpr),
             v => Some(v[(level as usize).min(v.len() - 1)]),
         }
@@ -1644,6 +1716,13 @@ impl ColumnFamilyConfig {
         // would derive a non-positive or zero-length bit array from it, and NaN
         // would propagate silently into the sizing arithmetic. Refuse at
         // configuration time, where the operator can still see why.
+        // Two rate policies for one family would leave a reader of the config
+        // guessing which one wrote a table; wavesdb refuses the pair too.
+        if self.bloom_auto_allocate && !self.bloom_fpr_per_level.is_empty() {
+            return Err("bloom_auto_allocate and bloom_fpr_per_level are mutually \
+                        exclusive; set one"
+                .to_string());
+        }
         for (level, fpr) in self.bloom_fpr_per_level.iter().enumerate() {
             if !fpr.is_finite() || *fpr <= 0.0 || *fpr >= 1.0 {
                 return Err(format!(
@@ -1988,6 +2067,81 @@ mod tests {
             ..ColumnFamilyConfig::default()
         };
         good.validate().expect("in-range FPRs validate");
+    }
+
+    /// wavesdb's `TestResolveBloomPolicyTable`, row for row where the two
+    /// engines share the rule (ondaDB's flush path never passes `bottom`).
+    #[test]
+    fn bloom_auto_allocation_table() {
+        let base = || ColumnFamilyConfig {
+            bloom_fpr: 0.01,
+            level_size_ratio: 10,
+            bloom_auto_allocate: true,
+            ..ColumnFamilyConfig::default()
+        };
+        let near = |got: Option<f64>, want: f64| {
+            let got = got.expect("a filter");
+            assert!((got - want).abs() / want < 1e-9, "fpr {got}, want {want}");
+        };
+        let a = base();
+        near(a.bloom_fpr_in_shape(3, false, 3), 0.01); // bottom: bloom_fpr
+        near(a.bloom_fpr_in_shape(2, false, 3), 0.001); // one above: /ratio
+        near(a.bloom_fpr_in_shape(1, false, 3), 1e-4); // two above: the floor
+        near(a.bloom_fpr_in_shape(0, false, 9), 1e-4); // far above: still floor
+        near(a.bloom_fpr_in_shape(0, false, 0), 0.01); // one level: all bottom
+        near(a.bloom_fpr_in_shape(5, false, 3), 0.01); // deeper than bottom
+
+        // The legacy entry point answers as if `level` were the bottom.
+        near(a.bloom_fpr_for_level(0, false), 0.01);
+        // A base below the floor is its own ceiling.
+        let low = ColumnFamilyConfig {
+            bloom_fpr: 5e-5,
+            ..base()
+        };
+        near(low.bloom_fpr_in_shape(1, false, 3), 5e-5);
+        // A ratio that does not shrink levels leaves the rate uniform.
+        let flat = ColumnFamilyConfig {
+            level_size_ratio: 1,
+            ..base()
+        };
+        near(flat.bloom_fpr_in_shape(0, false, 4), 0.01);
+        // A gentler ratio: 0.01 / 4^2.
+        let four = ColumnFamilyConfig {
+            level_size_ratio: 4,
+            ..base()
+        };
+        near(four.bloom_fpr_in_shape(1, false, 3), 0.01 / 16.0);
+        // optimize_filters_for_hits still drops bottom compaction output.
+        let hits = ColumnFamilyConfig {
+            optimize_filters_for_hits: true,
+            ..base()
+        };
+        assert_eq!(hits.bloom_fpr_in_shape(2, true, 2), None);
+        near(hits.bloom_fpr_in_shape(1, false, 2), 0.001);
+        // Off by default: uniform.
+        let off = ColumnFamilyConfig {
+            bloom_auto_allocate: false,
+            ..base()
+        };
+        near(off.bloom_fpr_in_shape(0, false, 3), 0.01);
+        assert_eq!(bloom_auto_fpr(0.01, 10, 1, 2), 0.001);
+    }
+
+    #[test]
+    fn bloom_auto_allocation_excludes_the_vector() {
+        let both = ColumnFamilyConfig {
+            bloom_auto_allocate: true,
+            bloom_fpr_per_level: vec![0.01],
+            ..ColumnFamilyConfig::default()
+        };
+        let error = both.validate().expect_err("both policies at once");
+        assert!(error.contains("mutually exclusive"), "{error}");
+        assert!(ColumnFamilyConfig {
+            bloom_auto_allocate: true,
+            ..ColumnFamilyConfig::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     /// FIFO evicts by age already (`fifo_ttl`); a periodic *rewrite* has no

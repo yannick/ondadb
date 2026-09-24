@@ -2460,7 +2460,14 @@ fn cf_writer_opts(
         // The filter policy is decided from the OUTPUT level and the bottom
         // predicate, never inherited from the inputs — which is what makes a
         // filterless table compacted into a non-bottom target regain a filter.
-        bloom_fpr: cf.opts.bloom_fpr_for_level(target_level, bottom),
+        // Auto allocation measures against the deepest level as the writer
+        // is created — or the target itself, when this job creates it.
+        bloom_fpr: cf.opts.bloom_fpr_in_shape(
+            target_level,
+            bottom,
+            cf.with_levels(|levels| levels.len().saturating_sub(1))
+                .max(target_level as usize) as u32,
+        ),
         klog_value_threshold: cf.opts.klog_value_threshold,
         block_size: cf.opts.data_block_size,
         // Capacity hint for the writer's bloom-hash buffer ONLY. It used to

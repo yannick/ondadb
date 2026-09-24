@@ -271,6 +271,13 @@ both **off by default**, and the measurements are the reason. Harness:
 - The degradation is **one-way**: "bottom" is dynamic, and a table written
   filterless never regains a filter until a compaction rewrites it into a
   non-bottom target. See `ColumnFamilyConfig::optimize_filters_for_hits`.
+- **`bloom_auto_allocate` (P7, wavesdb `BloomAutoAllocate`) is off by default
+  for the same reason.** It is the geometric (Monkey) form of the per-level
+  vector — `bloom_fpr × level_size_ratio^(L − bottom)`, floored at `1e-4` — so
+  the "wash" finding above applies to it unchanged: it adds filter bytes to the
+  upper levels (resident memory) and pays back only where a miss really
+  cascades through several levels' candidates. Ported for wavesdb parity and
+  for workloads that measure a cascade; no speed claim is made for it here.
 
 ## Vlog reads: CRC-once, and the opt-in value cache
 

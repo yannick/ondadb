@@ -1628,7 +1628,13 @@ impl ColumnFamily {
             // `optimize_filters_for_hits` here would strip the filter from
             // every table such a family has. That option is about compaction
             // output, not about the tables reads hit first.
-            bloom_fpr: self.opts.bloom_fpr_for_level(0, false),
+            // The family's depth now is what auto allocation measures L0
+            // against: a young, one-level family's L0 is its bottom.
+            bloom_fpr: self.opts.bloom_fpr_in_shape(
+                0,
+                false,
+                self.with_levels(|levels| levels.len().saturating_sub(1)) as u32,
+            ),
             klog_value_threshold: self.opts.klog_value_threshold,
             block_size: self.opts.data_block_size,
             expected_entries: expected,

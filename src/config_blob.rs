@@ -262,6 +262,13 @@ pub(crate) fn encode(cfg: &ColumnFamilyConfig) -> Vec<u8> {
     if let Some(name) = &cfg.merge_operator_name {
         put(&mut out, tag::MERGE_OPERATOR_NAME, name.as_bytes());
     }
+    if cfg.bloom_auto_allocate != d.bloom_auto_allocate {
+        put(
+            &mut out,
+            tag::BLOOM_AUTO_ALLOCATE,
+            &[u8::from(cfg.bloom_auto_allocate)],
+        );
+    }
     // Preserved unknown entries last: every tag this binary does not know is
     // above every tag it does (`decode` refuses tag 0, the only other gap).
     for (t, v) in &cfg.unknown_config_tags {
@@ -563,6 +570,7 @@ fn apply(cfg: &mut ColumnFamilyConfig, v: Val<'_>) -> Result<()> {
             cfg.block_restart_interval = i;
         }
         tag::MERGE_OPERATOR_NAME => cfg.merge_operator_name = Some(v.string()?),
+        tag::BLOOM_AUTO_ALLOCATE => cfg.bloom_auto_allocate = v.bool()?,
         // Unknown (including reserved-but-unimplemented): kept verbatim.
         t => cfg.unknown_config_tags.push((t, v.b.to_vec())),
     }
@@ -698,6 +706,29 @@ mod tests {
         assert_eq!(encode(&cfg), want);
     }
 
+    /// Tag 33 (`bloom_auto_allocate`, P7): elided at its default, one byte `1`
+    /// when set, and round-trips.
+    #[test]
+    fn bloom_auto_allocate_round_trips() {
+        let d = ColumnFamilyConfig::default();
+        assert!(!encode(&d)
+            .windows(3)
+            .any(|w| w == [tag::BLOOM_AUTO_ALLOCATE as u8, 1, 1]));
+        let on = ColumnFamilyConfig {
+            bloom_auto_allocate: true,
+            ..ColumnFamilyConfig::default()
+        };
+        let mut want = header();
+        want.extend_from_slice(&[33, 1, 1]);
+        assert_eq!(encode(&on), want);
+        assert!(decode(&want).unwrap().bloom_auto_allocate);
+        assert!(decode(&encode(&d)).map(|c| !c.bloom_auto_allocate).unwrap());
+        // A byte other than 0/1 is refused like every other bool.
+        let mut bad = header();
+        bad.extend_from_slice(&[33, 1, 2]);
+        assert!(decode(&bad).is_err());
+    }
+
     /// An unknown tag survives decode → encode byte for byte, beside the known
     /// ones — the property plan C step 2 relies on so one engine never strips
     /// another's options.
@@ -705,13 +736,13 @@ mod tests {
     fn unknown_tags_are_preserved() {
         let mut b = header();
         entry(&mut b, tag::COMPARATOR_NAME, b"reverse");
-        entry(&mut b, tag::RESERVED_BLOOM_AUTO_ALLOCATE, &[1, 2, 3]);
+        entry(&mut b, tag::MAX_KNOWN + 1, &[1, 2, 3]);
         entry(&mut b, 900, b"wavesdb-option");
         let d = decode(&b).unwrap();
         assert_eq!(d.comparator_name, "reverse");
         assert_eq!(
             d.unknown_config_tags,
-            vec![(33, vec![1, 2, 3]), (900, b"wavesdb-option".to_vec())]
+            vec![(34, vec![1, 2, 3]), (900, b"wavesdb-option".to_vec())]
         );
         assert_eq!(encode(&d), b, "re-encode must preserve unknown tags");
         // And a changed known field does not disturb them.

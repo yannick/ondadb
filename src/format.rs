@@ -536,17 +536,19 @@ pub mod cf_config {
         pub const ENABLE_PREFIX_DELTA_KEYS: u64 = 30;
         pub const BLOCK_RESTART_INTERVAL: u64 = 31;
         pub const MERGE_OPERATOR_NAME: u64 = 32;
-        /// Reserved for a geometric (Monkey-style) bloom auto-allocation policy
-        /// (plan C, P7) — the successor of 0.9's reserved `ONDABLM2` tail.
-        pub const RESERVED_BLOOM_AUTO_ALLOCATE: u64 = 33;
+        /// `bloom_auto_allocate` (plan C P7, wavesdb `BloomAutoAllocate`):
+        /// bool. The successor of 0.9's reserved `ONDABLM2` tail.
+        pub const BLOOM_AUTO_ALLOCATE: u64 = 33;
+        /// The name tag 33 had while it was reserved.
+        pub const RESERVED_BLOOM_AUTO_ALLOCATE: u64 = BLOOM_AUTO_ALLOCATE;
         /// Highest tag epoch 1 assigns a meaning to.
-        pub const MAX_KNOWN: u64 = MERGE_OPERATOR_NAME;
+        pub const MAX_KNOWN: u64 = BLOOM_AUTO_ALLOCATE;
     }
 }
 
 const _: () = assert!(is_printable_ascii(&cf_config::MAGIC));
-const _: () = assert!(cf_config::tag::MAX_KNOWN == 32);
-const _: () = assert!(cf_config::tag::RESERVED_BLOOM_AUTO_ALLOCATE > cf_config::tag::MAX_KNOWN);
+const _: () = assert!(cf_config::tag::MAX_KNOWN == 33);
+const _: () = assert!(cf_config::tag::BLOOM_AUTO_ALLOCATE == 33);
 
 /// Compression codec ids — the `alg` byte of every block frame and vlog frame.
 ///
@@ -857,9 +859,11 @@ mod tests {
             ENABLE_PREFIX_DELTA_KEYS,
             BLOCK_RESTART_INTERVAL,
             MERGE_OPERATOR_NAME,
+            BLOOM_AUTO_ALLOCATE,
         ];
-        assert_eq!(tags.to_vec(), (1..=32).collect::<Vec<u64>>());
-        assert_eq!(RESERVED_BLOOM_AUTO_ALLOCATE, 33);
+        assert_eq!(tags.to_vec(), (1..=33).collect::<Vec<u64>>());
+        assert_eq!(BLOOM_AUTO_ALLOCATE, 33);
+        assert_eq!(MAX_KNOWN, 33);
     }
 
     /// The capability word is a cross-engine contract (wavesdb is reconciled to

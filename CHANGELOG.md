@@ -187,6 +187,19 @@ directory written by this release is not readable by 0.9.x. The crate is still
   `onda_bench -wal_buffer <bytes>`. Provisional (loaded machine, 5 runs,
   1 thread, 1 put per commit, 200k ops, `SyncMode::None`): 8.6k–32k ops/s
   unbuffered vs 166k–387k ops/s with 256 KiB.
+- **Bloom auto-allocation** (wavesdb `BloomAutoAllocate`, plan C P7):
+  `ColumnFamilyConfig::bloom_auto_allocate` (default `false`) sizes each new
+  table's filter at `bloom_fpr × level_size_ratio^(level − bottom)`, floored
+  at `config::BLOOM_AUTO_FLOOR` (1e-4, or `bloom_fpr` if lower) — the bottom
+  level keeps `bloom_fpr`, upper levels get stronger filters. Persisted as
+  **config TLV tag 33** (the slot epoch 1 reserved for it; `format::cf_config::tag::BLOOM_AUTO_ALLOCATE`,
+  `MAX_KNOWN` is now 33; `RESERVED_BLOOM_AUTO_ALLOCATE` stays as an alias).
+  Mutually exclusive with `bloom_fpr_per_level` (`validate` refuses both).
+  New `ColumnFamilyConfig::bloom_fpr_in_shape(level, bottom, bottom_level)`,
+  `config::bloom_auto_fpr`, `Reader::bloom_bits`. No capability bit: the
+  filters are ordinary filters, and an epoch-1 binary without P7 keeps tag 33
+  as a preserved-unknown tag and writes uniform filters. Opt-in for the reason
+  `docs/performance.md` gives for per-level rates.
 - **MultiGet bounded parallel block reads** (wavesdb
   `MaxConcurrentBlockReads`, plan C P5): `Options::max_concurrent_block_reads`
   (default 8; 0/1 = sequential; not persisted) bounds, database-wide, the
