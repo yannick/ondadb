@@ -270,3 +270,31 @@ ascending bit order. Plan C step 2 row I merges this table with wavesdb's
 | ---: | --- |
 | 1 | range-delete fragments |
 | 2.. | unassigned — `UnsupportedFormat` at open |
+
+## Value-level formats (shared with wavesdb)
+
+These live **inside values**, not in any engine artifact: no capability bit,
+record kind or manifest change gates them, and the engine never inspects a
+value to decide whether it is one. They are registered here because both
+engines read and write the same bytes, so a number in them is as shared as any
+above.
+
+### Wide-column entity frame, version 1 (`src/entity.rs`, wavesdb `entity.go`)
+
+| Offset | Size | Field | Rule |
+| --- | --- | --- | --- |
+| 0 | 4 | magic | ASCII `WVE1` |
+| 4 | 1 | version | `1`; anything else ⇒ `NotEntity` |
+| 5 | 1 | flags | `0`; anything else ⇒ `NotEntity` (reserved for a future header-only checksum variant) |
+| 6 | 4 | header length `H` | `14 + directory bytes`; `14 ≤ H ≤ len − 4` |
+| 10 | 4 | column count `N` | `N ≤ 4096` and `10·N ≤ H − 14` |
+| 14 | `H − 14` | directory | `N × (nameOff u32, nameLen varint, valOff u32, valLen varint)`, ending exactly at `H` |
+| `H` | `len − H − 4` | payload | `name₀ value₀ name₁ value₁ …`, packed in directory order, no gaps |
+| `len − 4` | 4 | checksum | CRC32-C over `[0, len − 4)` |
+
+Little-endian; varints are LEB128 of at most 5 bytes and at most `u32::MAX`.
+Offsets are relative to `H`; names are 1–4096 bytes and unique; the whole frame
+is at most 64 MiB. The frame is canonical (decode → encode is the identity).
+Error classes: structure ⇒ `NotEntity`, checksum only ⇒ `Corruption` (the CRC
+is checked last). Pinned by `tests/entity.rs`, whose golden frames were
+produced by wavesdb's own `EncodeEntity`.

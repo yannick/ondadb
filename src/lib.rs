@@ -70,6 +70,7 @@ pub mod config;
 pub(crate) mod config_blob;
 pub mod db;
 pub mod encoding;
+pub mod entity;
 pub mod error;
 pub(crate) mod excise;
 pub mod format;
@@ -90,6 +91,7 @@ pub mod perf;
 pub mod prepared;
 pub(crate) mod range_lock;
 pub mod range_tombstone;
+pub mod read_profile;
 pub mod read_resources;
 pub(crate) mod span_index;
 pub mod snapshot;
@@ -121,6 +123,7 @@ pub use config::{
     TierDef, TierRule,
 };
 pub use db::{DB, DELETE_METADATA_BYTES};
+pub use entity::{EntityColumn, EntityColumnLike, EntityColumnRef};
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;
@@ -132,6 +135,7 @@ pub use parts::{
 pub use local_cache::LocalCacheStats;
 pub use perf::PerfContext;
 pub use prepared::PreparedInfo;
+pub use read_profile::ReadStats;
 pub use read_resources::{ReadResourceOptions, ReadResourceStats, ReadResources};
 pub use snapshot::SnapshotHandle;
 pub use storage::{CreateOutcome, LocalStorage, ObjectInfo, PrefixPage, Storage};

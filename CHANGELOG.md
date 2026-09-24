@@ -114,7 +114,51 @@ directory written by this release is not readable by 0.9.x. The crate is still
   the per-CF rotation already did, so the segment-header fsync does not extend
   the write gate.
 
+### Fixed
+
+- **Snapshot pins are atomic everywhere.** Transaction `begin`/`reset` read
+  the published watermark and registered it as a snapshot in two steps; a
+  compaction choosing its GC floor in between could collect the version the
+  new snapshot was entitled to, so the key read as missing. Every pin now goes through
+  `acquire_visible_snapshot`, which reads the watermark under the snapshot
+  lock. Read-committed transaction iterators and tailing-iterator segments had
+  the same window between reading their floor and pinning their sources, and
+  now hold a transient pin while they build.
+- **Pessimistic `Serializable` grant refresh** validated the read set first
+  and read the new watermark after, so a write to a read-set key landing in
+  between was adopted into the snapshot unvalidated and the transaction
+  committed a stale read. The candidate snapshot is now pinned before the
+  validation.
+
 ### Ported from wavesdb (plan C step 1, §1.4)
+
+#### Observability (wavesdb `DeletionsPaused`/`DeletionsQueued`, `ReadStats`, F13)
+
+- `DbStats::deletions_paused` (nesting depth of the obsolete-file deletion
+  pause; wavesdb reports a flag) and `DbStats::deletions_queued` (files held
+  behind it) make a checkpoint or backup's hold on space reclamation visible.
+- **Read profiling**: `DB::enable_read_profiling(bool)` / `read_stats()` /
+  `read_profiling_enabled()`. `ReadStats` counts profiled point reads,
+  `multi_get` calls and keys, and iterator positioning calls, and carries the
+  summed read-path mechanism counters as a `PerfContext` (bloom checks and
+  negatives, memtable/table probes, block-cache hits, block fetches, bytes,
+  vlog reads) — the same counters, gathered by running each profiled operation
+  in a private perf scope rather than by a second set of bumps. A caller's own
+  `PerfContext` scope still sees everything. Off, a point read or batch pays
+  one relaxed atomic load; an iterator decides at construction.
+
+#### Wide-column entities (wavesdb `entity.go`, F11)
+
+- `DB::put_entity` / `get_entity` / `get_columns` and the same three on `Txn`
+  store a set of named byte columns under one key as one ordinary value — the
+  wavesdb entity frame v1 (`WVE1`), reproduced byte for byte (golden frames in
+  `tests/entity.rs` come from wavesdb's own encoder). `ondadb::entity` has the
+  codec (`encode_entity`, `decode_entity`, `decode_entity_into`,
+  `sort_columns`) and the limits. No engine or on-disk change; the frame is
+  registered in `docs/format-registry.md` as a value-level format.
+- New error variant `OndaError::NotEntity` (code -18) for a value that is not
+  an entity frame. `get_columns` is an ondaDB convenience (wavesdb has none):
+  a projection that still reads and verifies the whole frame.
 
 #### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
 

@@ -53,6 +53,11 @@ pub enum OndaError {
     /// the message says what to change. Distinct from
     /// [`OndaError::UnsupportedFormat`], which refuses the bytes themselves.
     FormatUpgradeUnsupported(String),
+    /// The value is not a wide-column entity frame (see [`crate::entity`]): a
+    /// plain value, an unknown frame version, or a frame whose structure does
+    /// not hold. Distinct from [`OndaError::Corruption`], which an entity read
+    /// reports only for a structurally sound frame with a bad checksum.
+    NotEntity(String),
     /// Unclassified error.
     Unknown(String),
 }
@@ -78,6 +83,7 @@ impl OndaError {
             OndaError::Poisoned(_) => -15,
             OndaError::UnsupportedFormat(_) => -16,
             OndaError::FormatUpgradeUnsupported(_) => -17,
+            OndaError::NotEntity(_) => -18,
         }
     }
 
@@ -110,6 +116,7 @@ impl OndaError {
             OndaError::FormatUpgradeUnsupported(m) => {
                 OndaError::FormatUpgradeUnsupported(m.clone())
             }
+            OndaError::NotEntity(m) => OndaError::NotEntity(m.clone()),
         }
     }
 
@@ -134,6 +141,7 @@ impl OndaError {
             -15 => OndaError::Poisoned(String::new()),
             -16 => OndaError::UnsupportedFormat(String::new()),
             -17 => OndaError::FormatUpgradeUnsupported(String::new()),
+            -18 => OndaError::NotEntity(String::new()),
             _ => OndaError::Unknown(format!("code {code}")),
         }
     }
@@ -157,6 +165,7 @@ impl OndaError {
             OndaError::Poisoned(_) => "poisoned",
             OndaError::UnsupportedFormat(_) => "unsupported_format",
             OndaError::FormatUpgradeUnsupported(_) => "format_upgrade_unsupported",
+            OndaError::NotEntity(_) => "not_entity",
             OndaError::Unknown(_) => "unknown",
         }
     }
@@ -185,6 +194,7 @@ impl fmt::Display for OndaError {
             OndaError::FormatUpgradeUnsupported(m) => {
                 write!(f, "format upgrade unsupported: {m}")
             }
+            OndaError::NotEntity(m) => write!(f, "not an entity: {m}"),
             OndaError::Unknown(m) => write!(f, "unknown error: {m}"),
         }
     }
@@ -221,6 +231,8 @@ mod tests {
         assert_eq!(OndaError::from_code(-16).kind(), "unsupported_format");
         assert!(format!("{}", OndaError::UnsupportedFormat("m".into()))
             .starts_with("unsupported format"));
+        assert_eq!(OndaError::NotEntity("m".into()).code(), -18);
+        assert_eq!(OndaError::from_code(-18).kind(), "not_entity");
     }
 
     #[test]

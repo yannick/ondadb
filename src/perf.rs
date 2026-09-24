@@ -134,7 +134,113 @@ impl PerfContext {
         self.multiget_parallel_reads += o.multiget_parallel_reads;
         self.multiget_io_waits += o.multiget_io_waits;
     }
+
+    /// Every counter, in declaration order. The exhaustive destructuring makes
+    /// adding a field without extending this (and [`from_fields`]) a compile
+    /// error rather than a counter the database-wide aggregate silently drops.
+    pub(crate) fn fields(&self) -> [u64; PERF_FIELDS] {
+        let PerfContext {
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        } = *self;
+        [
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        ]
+    }
+
+    /// Inverse of [`fields`](Self::fields).
+    pub(crate) fn from_fields(f: [u64; PERF_FIELDS]) -> PerfContext {
+        let [
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        ] = f;
+        PerfContext {
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        }
+    }
+
+    /// Add `other`'s counters into this one, field by field.
+    pub fn accumulate(&mut self, other: &PerfContext) {
+        let mut sum = self.fields();
+        for (s, o) in sum.iter_mut().zip(other.fields()) {
+            *s += o;
+        }
+        *self = PerfContext::from_fields(sum);
+    }
 }
+
+/// Number of counters in a [`PerfContext`].
+pub(crate) const PERF_FIELDS: usize = 19;
 
 /// The state `bump` touches. Split from the outer frames on purpose: neither
 /// field owns anything, so this thread-local needs **no destructor** and its
@@ -223,6 +329,19 @@ impl Scope {
         let ctx = pop().unwrap_or_default();
         // The frame is already gone; let `Drop` not pop the *enclosing* one.
         std::mem::forget(self);
+        ctx
+    }
+}
+
+impl Scope {
+    /// [`finish`](Self::finish), then add the counters to the enclosing scope
+    /// (if one is open). For an *internal* scope — read profiling — that must
+    /// measure an operation without hiding its work from a caller's own
+    /// `PerfContext`, which a plain nested scope would (inner scopes do not
+    /// roll up).
+    pub(crate) fn finish_into_parent(self) -> PerfContext {
+        let ctx = self.finish();
+        bump(|p| p.accumulate(&ctx));
         ctx
     }
 }

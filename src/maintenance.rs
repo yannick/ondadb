@@ -186,6 +186,16 @@ pub struct DbStats {
     /// Bytes of the block cache currently held by decoded vlog values — the
     /// capacity vlog admission is taking from klog data blocks.
     pub vlog_cache_bytes: i64,
+    /// How many deletion pauses are currently held (nesting depth; `0` = not
+    /// paused). Checkpoint, backup, object-store checkpoints, the part mover
+    /// and demotion each hold one for their duration, during which obsolete
+    /// SSTable unlinks are queued instead of performed (wavesdb
+    /// `DeletionsPaused`, reported here as a count rather than a flag).
+    pub deletions_paused: u32,
+    /// Obsolete files queued behind the pause, unlinked when the last pause is
+    /// released. A number that climbs while `deletions_paused > 0` is the
+    /// expected shape of a long backup on a write-heavy database, not a leak.
+    pub deletions_queued: usize,
 }
 
 impl ColumnFamily {
@@ -258,6 +268,7 @@ impl DB {
             ranges += u.range_cache_stats();
         }
         let (cache_bytes, retained_bytes) = self.inner.ctx.range_fragment_registry.stats();
+        let (deletions_paused, deletions_queued) = self.inner.deletion_pause_state();
         DbStats {
             range_memtable_spans: ranges.spans,
             range_memtable_bytes: ranges.span_bytes,
@@ -273,6 +284,8 @@ impl DB {
             vlog_cache_hits: bc.vlog_hits,
             vlog_cache_misses: bc.vlog_misses,
             vlog_cache_bytes: bc.vlog_bytes,
+            deletions_paused,
+            deletions_queued,
         }
     }
 
@@ -579,5 +592,47 @@ impl DB {
             return Err(e);
         }
         Ok(dst_cf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ColumnFamilyConfig;
+    use crate::Options;
+    use std::time::Duration;
+
+    /// `deletions_paused` is the nesting depth and `deletions_queued` the
+    /// obsolete files held behind it; both drain when the last pause goes.
+    #[test]
+    fn deletion_pause_is_observable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("c", ColumnFamilyConfig::default())
+            .unwrap();
+        for v in [b"1", b"2"] {
+            db.put(&cf, b"k", v, Duration::ZERO).unwrap();
+            db.flush_memtable(&cf).unwrap();
+        }
+        let s = db.stats();
+        assert_eq!((s.deletions_paused, s.deletions_queued), (0, 0));
+
+        let outer = db.inner.pause_deletions();
+        let inner = db.inner.pause_deletions();
+        db.compact(&cf).unwrap();
+        let s = db.stats();
+        assert_eq!(s.deletions_paused, 2);
+        assert!(s.deletions_queued >= 2, "compaction inputs were not queued: {s:?}");
+
+        drop(inner);
+        let s = db.stats();
+        assert_eq!(s.deletions_paused, 1);
+        assert!(s.deletions_queued >= 2, "an inner release must not drain");
+
+        drop(outer);
+        let s = db.stats();
+        assert_eq!((s.deletions_paused, s.deletions_queued), (0, 0));
+        db.close().unwrap();
     }
 }

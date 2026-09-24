@@ -353,16 +353,16 @@ impl DB {
         // the caller's own serial write makes the conflict check refuse
         // against itself (see `wait_visible_at_own_floor`). Gaps are
         // transient, so this waits them out rather than weakening the
-        // conflict check.
+        // conflict check. The pin is taken atomically with reading the
+        // watermark (`acquire_fixed_snapshot`): reading it first and
+        // registering it after would let a compaction choose a GC floor above
+        // it in between and collect a version this snapshot must see.
         let read_seq = if fixed {
-            self.inner.wait_visible_at_own_floor();
-            self.inner.visible_seq()
+            self.inner.acquire_fixed_snapshot()
         } else {
             self.inner.read_floor_seq()
         };
-        if fixed {
-            self.inner.acquire_snapshot(read_seq);
-        }
+        crate::db::snapshot_pin_hook();
         Txn {
             db: self.inner.clone(),
             isolation: level,
@@ -600,15 +600,19 @@ impl Txn {
     ///    gap-free (invariant 5), so the wait is transient by construction and
     ///    the bound only guards a torn process — the same shape as
     ///    `wait_visible_at_own_floor`.
-    /// 2. At `Serializable`, revalidate the read set against the **old**
+    /// 2. Pin the candidate snapshot, `acquire_visible_snapshot()` — atomic
+    ///    with reading the watermark — while the old one is still held, so
+    ///    `oldest_snapshot()` never transiently jumps forward and lets
+    ///    compaction GC a version this transaction still needs.
+    /// 3. At `Serializable`, revalidate the read set against the **old**
     ///    snapshot. This is what makes the refresh sound: the reads are proven
     ///    unchanged at the new snapshot, so it is as if they had all happened
     ///    there. A changed read-set key returns `Conflict` now rather than
-    ///    silently validating under an adopted snapshot.
-    /// 3. Adopt `visible_seq()`, acquiring the new snapshot **before**
-    ///    releasing the old one, so `oldest_snapshot()` never transiently jumps
-    ///    forward and lets compaction GC a version this transaction still
-    ///    needs.
+    ///    silently validating under an adopted snapshot. Validation must come
+    ///    *after* step 2: a write validated-then-pinned could land in between,
+    ///    below the adopted `read_seq`, where the commit-time check misses it.
+    /// 4. Adopt the new snapshot and release the old one (or, if it did not
+    ///    move or validation failed, release the candidate).
     ///
     /// `RepeatableRead` does not refresh: it runs no validation, so it has no
     /// conflict to avoid, and refreshing would break the one thing its contract
@@ -626,15 +630,29 @@ impl Txn {
                 std::thread::yield_now();
             }
         }
+        // Pin the candidate snapshot *before* validating: every write at or
+        // below `new_seq` is then already in the store, where the validation
+        // against the old `read_seq` sees it, and every later write lands above
+        // the adopted `read_seq`, where commit-time validation sees it.
+        // Validating first and reading the watermark after left a window in
+        // which a write to a read-set key was folded into the new snapshot
+        // unvalidated. The pin is atomic with the watermark read, and the old
+        // snapshot stays held until the new one is adopted, so
+        // `oldest_snapshot()` never jumps past either.
+        let new_seq = self.db.acquire_visible_snapshot();
+        crate::db::snapshot_pin_hook();
         if self.isolation == IsolationLevel::Serializable {
-            self.validate_read_conflicts()?;
+            if let Err(e) = self.validate_read_conflicts() {
+                self.db.release_snapshot(new_seq);
+                return Err(e);
+            }
         }
-        let new_seq = self.db.visible_seq();
         if new_seq > self.read_seq && self.snapshot_held {
             let old = self.read_seq;
-            self.db.acquire_snapshot(new_seq);
             self.read_seq = new_seq;
             self.db.release_snapshot(old);
+        } else {
+            self.db.release_snapshot(new_seq);
         }
         Ok(())
     }
@@ -1117,11 +1135,17 @@ impl Txn {
         lower: std::ops::Bound<&[u8]>,
         upper: std::ops::Bound<&[u8]>,
     ) -> Iterator {
-        let rs = if self.fixed {
-            self.read_seq
+        // A floating (read-committed) scan holds a transient pin while the
+        // iterator is built: once built, the iterator owns its tables and
+        // memtables, but until then a compaction could collect a version its
+        // freshly read floor is entitled to.
+        let (rs, _pin) = if self.fixed {
+            (self.read_seq, None)
         } else {
-            self.db.read_floor_seq()
+            let (rs, pin) = self.db.pin_read_floor();
+            (rs, Some(pin))
         };
+        crate::db::snapshot_pin_hook();
         let id = cf_id(cf);
         // Read-only transactions (the overwhelmingly common case for scans)
         // must not construct a throwaway overlay memtable per iterator.
@@ -2064,15 +2088,13 @@ impl Txn {
                 | IsolationLevel::Snapshot
                 | IsolationLevel::Serializable
         );
+        // Pinned atomically, exactly as `begin_inner` does.
         let read_seq = if fixed {
-            self.db.wait_visible_at_own_floor();
-            self.db.visible_seq()
+            self.db.acquire_fixed_snapshot()
         } else {
             self.db.read_floor_seq()
         };
-        if fixed {
-            self.db.acquire_snapshot(read_seq);
-        }
+        crate::db::snapshot_pin_hook();
         self.isolation = level;
         self.read_seq = read_seq;
         self.fixed = fixed;
@@ -2296,5 +2318,217 @@ mod tests {
         }
         assert_eq!(t2.buf.capacity(), grown, "recycled buffer regrew");
         t2.commit().unwrap();
+    }
+
+    // ---- snapshot pin races ----------------------------------------------
+    //
+    // Every reader that picks a read sequence must make it visible to
+    // compaction's `oldest_snapshot()` before a compaction can run past it.
+    // Each test parks a reader (on its own thread) at `snapshot_pin_hook` —
+    // right after it chose its sequence — and runs put + flush + compact on
+    // this thread meanwhile. Without the pin, the compaction collects `v1`,
+    // the version the reader's sequence entitles it to, and the key vanishes.
+
+    use std::sync::mpsc;
+
+    /// A database whose `k` is `v1`, flushed to a table so a later compaction
+    /// can merge (and, unpinned, collect) it.
+    fn race_fixture(dir: &std::path::Path) -> (Arc<DB>, Arc<ColumnFamily>) {
+        let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("c", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"k", b"v1", Duration::ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        (Arc::new(db), cf)
+    }
+
+    /// Shadow `k`'s `v1` and compact, so an unpinned `v1` is collected.
+    fn shadow_and_compact(db: &DB, cf: &Arc<ColumnFamily>) {
+        db.put(cf, b"k", b"v2", Duration::ZERO).unwrap();
+        db.flush_memtable(cf).unwrap();
+        db.compact(cf).unwrap();
+    }
+
+    /// Run `reader` on its own thread. `reader` is handed `arm`, which arms
+    /// that thread's one-shot pin hook; when the hook fires, `racer` runs here
+    /// while the reader is parked, and the reader resumes afterwards.
+    fn race_pin<T: Send + 'static>(
+        reader: impl FnOnce(&dyn Fn()) -> T + Send + 'static,
+        racer: impl FnOnce(),
+    ) -> T {
+        let (paused_tx, paused_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let resume_rx = std::sync::Mutex::new(Some(resume_rx));
+            let arm = move || {
+                let paused_tx = paused_tx.clone();
+                let resume_rx = resume_rx.lock().unwrap().take().expect("armed twice");
+                crate::db::set_snapshot_pin_hook(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                });
+            };
+            reader(&arm)
+        });
+        paused_rx
+            .recv()
+            .expect("the reader never reached its snapshot pin hook");
+        racer();
+        resume_tx.send(()).unwrap();
+        handle.join().unwrap()
+    }
+
+    /// `begin` must call `arm` right before the call whose pin is under test.
+    fn fixed_begin_race(begin: fn(&DB, &dyn Fn()) -> Txn) {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = race_fixture(dir.path());
+        let (rdb, rcf) = (db.clone(), cf.clone());
+        let got = race_pin(
+            move |arm| {
+                let mut t = begin(&rdb, arm);
+                t.get(&rcf, b"k")
+            },
+            || shadow_and_compact(&db, &cf),
+        );
+        assert_eq!(
+            got.as_deref().ok(),
+            Some(&b"v1"[..]),
+            "a compaction between choosing and pinning the snapshot collected its version"
+        );
+    }
+
+    #[test]
+    fn begin_snapshot_pins_before_compaction_can_collect() {
+        fixed_begin_race(|db, arm| {
+            arm();
+            db.begin_with_isolation(IsolationLevel::Snapshot)
+        });
+    }
+
+    #[test]
+    fn begin_repeatable_read_pins_before_compaction_can_collect() {
+        fixed_begin_race(|db, arm| {
+            arm();
+            db.begin_with_isolation(IsolationLevel::RepeatableRead)
+        });
+    }
+
+    #[test]
+    fn begin_pessimistic_pins_before_compaction_can_collect() {
+        fixed_begin_race(|db, arm| {
+            arm();
+            db.begin_pessimistic_with_isolation(IsolationLevel::Serializable)
+        });
+    }
+
+    #[test]
+    fn reset_pins_before_compaction_can_collect() {
+        fixed_begin_race(|db, arm| {
+            let mut t = db.begin_with_isolation(IsolationLevel::ReadCommitted);
+            arm();
+            t.reset(IsolationLevel::Snapshot).unwrap();
+            t
+        });
+    }
+
+    #[test]
+    fn read_committed_iterator_pins_while_it_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = race_fixture(dir.path());
+        let (rdb, rcf) = (db.clone(), cf.clone());
+        let seen = race_pin(
+            move |arm| {
+                let t = rdb.begin_with_isolation(IsolationLevel::ReadCommitted);
+                arm();
+                let mut it = t.new_iterator(&rcf);
+                it.seek_to_first();
+                let mut out = Vec::new();
+                while it.valid() {
+                    out.push((it.key().to_vec(), it.value().to_vec()));
+                    it.next();
+                }
+                out
+            },
+            || shadow_and_compact(&db, &cf),
+        );
+        assert_eq!(seen, vec![(b"k".to_vec(), b"v1".to_vec())]);
+    }
+
+    #[test]
+    fn tailing_iterator_pins_while_it_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = race_fixture(dir.path());
+        let (rdb, rcf) = (db.clone(), cf.clone());
+        let seen = race_pin(
+            move |arm| {
+                arm();
+                let mut tail = rdb.new_tailing_iterator(&rcf);
+                tail.seek_to_first();
+                let mut out = Vec::new();
+                while tail.valid() {
+                    out.push((tail.key().to_vec(), tail.value().to_vec()));
+                    tail.next();
+                }
+                out
+            },
+            || shadow_and_compact(&db, &cf),
+        );
+        assert_eq!(seen, vec![(b"k".to_vec(), b"v1".to_vec())]);
+    }
+
+    #[test]
+    fn tailing_refresh_pins_while_it_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("c", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&cf, b"a", b"x", Duration::ZERO).unwrap();
+        let db = Arc::new(db);
+        let (rdb, rcf) = (db.clone(), cf.clone());
+        let seen = race_pin(
+            move |arm| {
+                let mut tail = rdb.new_tailing_iterator(&rcf);
+                tail.seek_to_first();
+                assert_eq!(tail.key(), b"a");
+                tail.next();
+                assert!(!tail.valid());
+                // Advance the floor past the segment, with `k = v1` on disk.
+                rdb.put(&rcf, b"k", b"v1", Duration::ZERO).unwrap();
+                rdb.flush_memtable(&rcf).unwrap();
+                arm();
+                assert!(tail.refresh(), "the refreshed segment lost k");
+                (tail.key().to_vec(), tail.value().to_vec())
+            },
+            || shadow_and_compact(&db, &cf),
+        );
+        assert_eq!(seen, (b"k".to_vec(), b"v1".to_vec()));
+    }
+
+    /// A lock-grant refresh at `Serializable` must not adopt a snapshot that
+    /// includes a write to a read-set key it never validated: a write landing
+    /// between the validation and the adoption would sit at or below the new
+    /// `read_seq`, where the commit-time validation cannot see it.
+    #[test]
+    fn serializable_refresh_cannot_adopt_an_unvalidated_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, cf) = race_fixture(dir.path());
+        let (rdb, rcf) = (db.clone(), cf.clone());
+        let outcome = race_pin(
+            move |arm| {
+                let mut t = rdb.begin_pessimistic_with_isolation(IsolationLevel::Serializable);
+                assert_eq!(t.get(&rcf, b"k").unwrap(), b"v1");
+                arm();
+                t.refresh_snapshot(0)?;
+                t.put(&rcf, b"z", b"derived-from-v1", Duration::ZERO)?;
+                t.commit()
+            },
+            || db.put(&cf, b"k", b"v2", Duration::ZERO).unwrap(),
+        );
+        assert!(
+            matches!(outcome, Err(OndaError::Conflict(_))),
+            "committed a Serializable txn whose read of k was overwritten: {outcome:?}"
+        );
     }
 }
