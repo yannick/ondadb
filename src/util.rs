@@ -104,6 +104,57 @@ pub mod fault {
     }
 }
 
+/// A blocking counting semaphore: the database-wide bound on data-block reads
+/// the batched point-read planner has in flight
+/// ([`Options::max_concurrent_block_reads`](crate::Options::max_concurrent_block_reads)).
+///
+/// Plain `Mutex` + `Condvar`: a permit is held across one storage read, which
+/// is milliseconds on the tiers this exists for, so the lock is never the cost.
+pub(crate) struct Semaphore {
+    free: Mutex<usize>,
+    cv: parking_lot::Condvar,
+    limit: usize,
+}
+
+/// One held permit; returned on drop, so an unwinding reader cannot leak it.
+pub(crate) struct SemaphorePermit<'a>(&'a Semaphore);
+
+impl Semaphore {
+    pub(crate) fn new(limit: usize) -> Semaphore {
+        let limit = limit.max(1);
+        Semaphore {
+            free: Mutex::new(limit),
+            cv: parking_lot::Condvar::new(),
+            limit,
+        }
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Take a permit, waiting if none is free. Returns the permit and whether
+    /// it had to wait — the signal that the bound, not the device, is what
+    /// limits the batch.
+    pub(crate) fn acquire(&self) -> (SemaphorePermit<'_>, bool) {
+        let mut free = self.free.lock();
+        let mut waited = false;
+        while *free == 0 {
+            waited = true;
+            self.cv.wait(&mut free);
+        }
+        *free -= 1;
+        (SemaphorePermit(self), waited)
+    }
+}
+
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock() += 1;
+        self.0.cv.notify_one();
+    }
+}
+
 /// Current wall-clock time in Unix nanoseconds (used for TTL evaluation).
 pub fn now_nanos() -> i64 {
     SystemTime::now()

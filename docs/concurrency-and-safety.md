@@ -141,6 +141,7 @@ the two unexamined candidates.
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
 | `commit_hook` (Mutex) | hook fn | hook invocation |
 | `DbInner::span_permits` (Mutex&lt;usize&gt;) | count of free compaction **span workers** (0.8) | one non-blocking take/release; never held across IO |
+| `CfCtx::block_reads` (`util::Semaphore`, Mutex&lt;usize&gt; + Condvar) | free permits for batched-get data-block reads on slow tiers (P5, `Options::max_concurrent_block_reads`) | the **permit** (not the mutex) is held across exactly one `read_data_block`; the mutex only for take/release. A **leaf**: a permit holder takes no engine lock — the read path below it only touches the block cache's shard locks and the storage backend. `multi_get` holds no CF lock while it waits (its source snapshot is `Arc`s taken earlier) |
 | `<dir>/LOCK` (OS advisory file lock) | whole DB directory against other processes/handles | entire open→close lifetime; exclusive for read-write, shared for read-only opens; second open fails with `OndaError::Locked` |
 
 Order among the four that meet: `cf_lifecycle_mu` → `manifest_mu` → `cfs` →

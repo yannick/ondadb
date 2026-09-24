@@ -154,6 +154,9 @@ pub(crate) struct CfCtx {
     /// [`Options::wal_write_buffer_size`](crate::Options::wal_write_buffer_size),
     /// applied to every WAL generation this database opens.
     pub wal_write_buffer_size: usize,
+    /// The database-wide bound on parallel data-block reads of batched point
+    /// reads ([`Options::max_concurrent_block_reads`](crate::Options::max_concurrent_block_reads)).
+    pub block_reads: Arc<crate::util::Semaphore>,
     /// The same `Arc` `DbInner::caps` holds, so a flush landing an L0 table can
     /// see whether `CAP_PERIODIC_AGE` is active without reaching for the whole
     /// database.
@@ -2309,9 +2312,22 @@ impl ColumnFamily {
         // stays adjacent to its twin and both ride the same fetch.
         scratch.sort_unstable();
 
+        // Bounded parallel fetch (P5) is considered only where a block read is
+        // slow enough to be worth a thread hand-off: see
+        // `Reader::block_read_is_remote`. Blocks are fetched a window at a
+        // time, so the batch never holds more than one window of blocks live
+        // however many keys it carries.
+        let limit = self.ctx.block_reads.limit();
+        let window = if limit > 1 { limit * 4 } else { usize::MAX };
+        let mut prefetched: Vec<(usize, Result<crate::sst::Block>)> = Vec::new();
+        let mut next_unplanned = 0; // first scratch position not yet windowed
         let mut pos = 0;
         while pos < scratch.len() {
             let bi = scratch[pos].0;
+            if limit > 1 && pos >= next_unplanned {
+                prefetched.clear();
+                next_unplanned = self.prefetch_window(rd, scratch, pos, window, &mut prefetched);
+            }
             let mut end = pos;
             while end < scratch.len() && scratch[end].0 == bi {
                 end += 1;
@@ -2321,7 +2337,31 @@ impl ColumnFamily {
             // The whole point of the batch: one fetch, `group.len()` lookups.
             crate::perf::bump(|p| p.multiget_blocks_deduped += (group.len() - 1) as u64);
 
-            let block = match rd.read_data_block_local(bi) {
+            // A block the window fetched is used as is (it is not re-read even
+            // if the cache is off or already evicted it); its error, if any,
+            // fails exactly this group, as a sequential read's would.
+            let fetched = prefetched
+                .iter()
+                .position(|(b, _)| *b == bi)
+                .map(|at| prefetched.swap_remove(at).1);
+            let block = match fetched {
+                Some(Ok(crate::sst::Block::Owned(a))) => Ok(crate::sst::BlockRef::Owned(a)),
+                Some(Err(e)) => Err(e),
+                // An mmap view cannot come from a slow tier; re-reading is
+                // merely the correct fallback if one ever did.
+                #[cfg(feature = "mmap-reads")]
+                Some(Ok(crate::sst::Block::Mapped { .. })) => rd.read_data_block_local(bi),
+                // A slow-tier read the window left inline (too few to fan
+                // out) still takes a permit, so the bound holds for every
+                // slow-tier read batches issue, not only the parallel ones.
+                None if limit > 1 && rd.block_read_is_remote(bi) => {
+                    let (_permit, waited) = self.ctx.block_reads.acquire();
+                    crate::perf::bump(|p| p.multiget_io_waits += u64::from(waited));
+                    rd.read_data_block_local(bi)
+                }
+                None => rd.read_data_block_local(bi),
+            };
+            let block = match block {
                 Ok(b) => b,
                 Err(e) => {
                     Self::fail_group(group, cands, errs, &e);
@@ -2350,6 +2390,96 @@ impl ColumnFamily {
                 }
             }
         }
+    }
+
+    /// Fewest slow-tier block reads in one window that are worth handing to
+    /// worker threads (wavesdb's measured threshold: below it the hand-off
+    /// costs more than the overlap buys).
+    const PARALLEL_BLOCK_MIN: usize = 4;
+
+    /// Plan the window of up to `window` distinct blocks starting at
+    /// `scratch[pos]` and, if at least [`Self::PARALLEL_BLOCK_MIN`] of them
+    /// would be slow-tier reads, fetch those with bounded parallelism into
+    /// `out` as `(block index, result)`. Returns the scratch position just past
+    /// the window.
+    ///
+    /// Workers take a permit from the database-wide semaphore per read, so
+    /// concurrent batches share one bound. The calling thread is a worker too;
+    /// a spawn failure just means fewer helpers. Each worker counts into its
+    /// own perf scope, merged into the caller's.
+    fn prefetch_window(
+        &self,
+        rd: &Reader,
+        scratch: &[(usize, usize)],
+        pos: usize,
+        window: usize,
+        out: &mut Vec<(usize, Result<crate::sst::Block>)>,
+    ) -> usize {
+        let mut cold: SmallVec<[usize; 16]> = SmallVec::new();
+        let mut distinct = 0;
+        let mut end = pos;
+        let mut last = usize::MAX;
+        while end < scratch.len() {
+            let bi = scratch[end].0;
+            if bi != last {
+                if distinct == window {
+                    break;
+                }
+                distinct += 1;
+                last = bi;
+                if rd.block_read_is_remote(bi) {
+                    cold.push(bi);
+                }
+            }
+            end += 1;
+        }
+        if cold.len() < Self::PARALLEL_BLOCK_MIN {
+            return end;
+        }
+        let sem = &*self.ctx.block_reads;
+        let workers = sem.limit().min(cold.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let want_perf = crate::perf::active();
+        let work = || {
+            let scope = want_perf.then(crate::perf::enter);
+            let mut got = Vec::new();
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&bi) = cold.get(k) else { break };
+                let (permit, waited) = sem.acquire();
+                let r = rd.read_data_block(bi);
+                drop(permit);
+                crate::perf::bump(|p| {
+                    p.multiget_parallel_reads += 1;
+                    p.multiget_io_waits += u64::from(waited);
+                });
+                got.push((bi, r));
+            }
+            (got, scope.map(|s| s.finish()))
+        };
+        std::thread::scope(|s| {
+            let helpers: Vec<_> = (1..workers)
+                .filter_map(|n| {
+                    std::thread::Builder::new()
+                        .name(format!("onda-mget-{n}"))
+                        .spawn_scoped(s, work)
+                        .ok()
+                })
+                .collect();
+            let mut results = vec![work()];
+            for h in helpers {
+                // A worker that panicked re-raises here, as the same read on
+                // the calling thread would have.
+                results.push(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+            }
+            for (got, perf) in results {
+                if let Some(perf) = perf {
+                    crate::perf::bump(|p| p.absorb(&perf));
+                }
+                out.extend(got);
+            }
+        });
+        end
     }
 
     /// Whether `cand` already holds a version no table with this `max_seq` can

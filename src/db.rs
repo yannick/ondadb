@@ -1882,6 +1882,7 @@ fn build_db_inner(
         poison: poison.clone(),
         wal_syncs: wal_syncs.clone(),
         wal_write_buffer_size: opts.wal_write_buffer_size,
+        block_reads: Arc::new(crate::util::Semaphore::new(opts.max_concurrent_block_reads)),
         caps: caps.clone(),
         clock: clock.clone(),
         span_index: span_index.clone(),

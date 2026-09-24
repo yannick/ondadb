@@ -330,6 +330,23 @@ divergence from N `get`s, deliberate: a failing source errors only the keys
 whose resolution needed it — a key a strictly newer source already resolved
 keeps its value, where `get` propagates the error of any table it probes.
 
+**Bounded parallel block reads (P5, wavesdb `MaxConcurrentBlockReads`).** The
+distinct blocks of one table's plan are walked in windows of
+`4 × Options::max_concurrent_block_reads`. If a window holds at least four
+blocks that `Reader::block_read_is_remote` (the table's storage reports
+`supports_mmap() == false` — S3, a custom tier, a `without_mmap` local tier —
+and the block is not cached), `ColumnFamily::prefetch_window` fetches exactly
+those with `read_data_block` on scoped `onda-mget-N` threads plus the calling
+thread, each read under one permit of the database-wide `CfCtx::block_reads`
+semaphore; the resolve loop then consumes the fetched blocks in block order,
+exactly as if it had read them itself. A slow-tier block the window left
+inline also takes a permit, so the bound covers every slow-tier data-block read
+batches issue. Local-tier tables, warm blocks, plans below four slow blocks,
+`get`, and a bound of 0/1 all keep the sequential loop. A fetched block's error
+fails exactly its group (same `fail_group` as the inline path). Worker perf
+scopes are merged into the caller's (`multiget_parallel_reads`,
+`multiget_io_waits`). At most one window of blocks is live at a time.
+
 A table's filter strength is chosen when it is **written**, from its output
 level: `ColumnFamilyConfig::bloom_fpr_for_level(level, bottom)` returns the
 rate (`bloom_fpr_per_level`, last entry repeating, or the uniform `bloom_fpr`)

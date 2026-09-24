@@ -536,6 +536,29 @@ pub struct Options {
     ///
     /// **Not persisted.** Host policy, taken from the options of every open.
     pub wal_write_buffer_size: usize,
+    /// Database-wide bound on data-block reads a batched point read
+    /// ([`DB::multi_get`](crate::DB::multi_get) and the `Txn` /
+    /// `SnapshotHandle` forms) keeps in flight at once (wavesdb
+    /// `MaxConcurrentBlockReads`). Default 8; `0` or `1` resolves every block
+    /// on the calling thread, one at a time.
+    ///
+    /// Only reads that would go to a **slow tier** fan out: a cold (not
+    /// block-cached) data block of a table whose storage reports
+    /// `supports_mmap() == false` — S3, a [`TierDef::custom`] backend, a local
+    /// tier marked [`without_mmap`](TierDef::without_mmap) — and only when one
+    /// table's share of the batch needs at least four such blocks. Tables on
+    /// the default local tier, warm blocks and small plans keep the sequential
+    /// path unchanged: a block read there costs microseconds, less than the
+    /// thread hand-off (wavesdb measured no gain on NVMe either). A plain
+    /// `get` never takes this path.
+    ///
+    /// Answers and errors are exactly the sequential ones: a failed block read
+    /// fails the keys that needed that block and no others (wavesdb's
+    /// per-key error contract), and a worker's reads are counted in the
+    /// caller's [`PerfContext`](crate::PerfContext).
+    ///
+    /// **Not persisted.** Host policy.
+    pub max_concurrent_block_reads: usize,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -834,6 +857,7 @@ impl Default for Options {
             read_resources: None,
             read_cache_namespace: None,
             wal_write_buffer_size: 0,
+            max_concurrent_block_reads: 8,
         }
     }
 }

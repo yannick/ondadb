@@ -187,6 +187,19 @@ directory written by this release is not readable by 0.9.x. The crate is still
   `onda_bench -wal_buffer <bytes>`. Provisional (loaded machine, 5 runs,
   1 thread, 1 put per commit, 200k ops, `SyncMode::None`): 8.6k–32k ops/s
   unbuffered vs 166k–387k ops/s with 256 KiB.
+- **MultiGet bounded parallel block reads** (wavesdb
+  `MaxConcurrentBlockReads`, plan C P5): `Options::max_concurrent_block_reads`
+  (default 8; 0/1 = sequential; not persisted) bounds, database-wide, the
+  data-block reads batched gets keep in flight on **slow tiers** (storage with
+  `supports_mmap() == false`: S3, custom, `without_mmap`). A table plan with
+  at least four cold slow-tier blocks fetches them on scoped threads, a window
+  of `4 × bound` blocks at a time; local tables and warm blocks keep the
+  sequential path unchanged, as does `get`. Answers are identical; errors
+  stay per key (a failed block fails exactly its keys — wavesdb's contract).
+  `PerfContext` gains `multiget_parallel_reads` and `multiget_io_waits`
+  (worker counters merge into the caller's scope). Provisional: a 152-key cold
+  batch against a 2 ms-per-read tier took 404 ms at bound 1 and 60 ms at 8
+  (best of 5, loaded machine).
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
   and `multi_get` skip a candidate table whose `max_seq` is at or below the
   version already in hand (point hit, tombstone, or covering range delete),
