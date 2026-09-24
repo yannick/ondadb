@@ -40,6 +40,7 @@ version 2.
 | WAL segment | `YOLODBWL` | u32 = 1 | offset 0 of every stripe | *(no header)* |
 | Value log (`.vlog`) | `YOLODBVL` | u32 = 1 | offset 0 | *(no header)* |
 | CF config blob | `YOLODBCF` | u32 = 1 | offset 0 of the blob | positional + `ONDA*` tails |
+| Format-upgrade swap journal | `YOLODBUJ` | u32 = 1 | offset 0 of `<parent>/.<name>.yolo-upgrade.journal` | *(new; states `1` swapping, `2` done)* |
 
 An unknown version is `UnsupportedFormat`. A 0.9 magic in an epoch-1 position
 is `UnsupportedFormat` naming the upgrade path; any other foreign magic is
@@ -255,8 +256,9 @@ minimal uvarint; booleans one byte `0`/`1`; codec values are codec ids.
 | 4 | `CreateCF` | 10 | `SetNonce` |
 | 5 | `DropCF` | 11 | `SetCapability` |
 | 6 | `SetCFConfig` | 12 | `RemoveTables` |
+| | | 13 | `SetCFUnifiedId` (plan C F5′) |
 
-13–63 are unassigned (`Corruption` naming the op index); ≥ 64 never assigned.
+14–63 are unassigned (`Corruption` naming the op index); ≥ 64 never assigned.
 `UpdateTable` field-mask bits: `0x01` level, `0x02` tier, `0x04` object, `0x08`
 partition, `0x10` max_entry_time, `0x20` last_compaction_time, present values in
 ascending bit order. Plan C step 2 row I merges this table with wavesdb's

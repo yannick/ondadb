@@ -47,6 +47,12 @@ pub enum OndaError {
     /// section). Distinct from [`OndaError::Corruption`], which means the bytes
     /// contradict a format this binary *does* implement.
     UnsupportedFormat(String),
+    /// The automatic upgrade of an ondaDB 0.9 directory to yoloDB format
+    /// epoch 1 cannot handle this database as it stands — tables on a
+    /// non-default tier or an object store, for instance. Nothing was written;
+    /// the message says what to change. Distinct from
+    /// [`OndaError::UnsupportedFormat`], which refuses the bytes themselves.
+    FormatUpgradeUnsupported(String),
     /// Unclassified error.
     Unknown(String),
 }
@@ -71,6 +77,7 @@ impl OndaError {
             OndaError::Busy(_) => -14,
             OndaError::Poisoned(_) => -15,
             OndaError::UnsupportedFormat(_) => -16,
+            OndaError::FormatUpgradeUnsupported(_) => -17,
         }
     }
 
@@ -100,6 +107,9 @@ impl OndaError {
             OndaError::Poisoned(m) => OndaError::Poisoned(m.clone()),
             OndaError::Unknown(m) => OndaError::Unknown(m.clone()),
             OndaError::UnsupportedFormat(m) => OndaError::UnsupportedFormat(m.clone()),
+            OndaError::FormatUpgradeUnsupported(m) => {
+                OndaError::FormatUpgradeUnsupported(m.clone())
+            }
         }
     }
 
@@ -123,6 +133,7 @@ impl OndaError {
             -14 => OndaError::Busy(String::new()),
             -15 => OndaError::Poisoned(String::new()),
             -16 => OndaError::UnsupportedFormat(String::new()),
+            -17 => OndaError::FormatUpgradeUnsupported(String::new()),
             _ => OndaError::Unknown(format!("code {code}")),
         }
     }
@@ -145,6 +156,7 @@ impl OndaError {
             OndaError::Busy(_) => "busy",
             OndaError::Poisoned(_) => "poisoned",
             OndaError::UnsupportedFormat(_) => "unsupported_format",
+            OndaError::FormatUpgradeUnsupported(_) => "format_upgrade_unsupported",
             OndaError::Unknown(_) => "unknown",
         }
     }
@@ -170,6 +182,9 @@ impl fmt::Display for OndaError {
                 write!(f, "poisoned (fail-stop after durability failure): {m}")
             }
             OndaError::UnsupportedFormat(m) => write!(f, "unsupported format: {m}"),
+            OndaError::FormatUpgradeUnsupported(m) => {
+                write!(f, "format upgrade unsupported: {m}")
+            }
             OndaError::Unknown(m) => write!(f, "unknown error: {m}"),
         }
     }

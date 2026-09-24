@@ -681,6 +681,30 @@ impl UnifiedStore {
         }
     }
 
+    /// Whether the active or any sealed shared memtable still holds a point
+    /// entry or a range tombstone under the id `id`.
+    ///
+    /// Entries of a dropped or cleared family stay in the shared memtable (and
+    /// its WAL, which replays them back into it) until the unified flush
+    /// discards them as owned by nobody. An id this reports `true` for must not
+    /// be handed to a new family: it would inherit them (plan C F5′).
+    pub(crate) fn holds_cf(&self, id: u64) -> bool {
+        let prefix = id.to_be_bytes();
+        let s = self.state.read();
+        std::iter::once(&s.mem)
+            .chain(s.imm.iter().map(|i| &i.mem))
+            .any(|mem| {
+                let mut it = UnifiedMemIter::new(mem.clone(), id);
+                it.seek_to_first();
+                it.valid()
+                    || (!mem.ranges().is_empty()
+                        && mem
+                            .ranges()
+                            .fragments(None, None)
+                            .any(|f| f.start.len() >= 8 && f.start[..8] == prefix))
+            })
+    }
+
     /// Extract a column family's entries (prefix stripped) for an iterator
     /// overlay; ordering is the caller's responsibility.
     pub(crate) fn entries_for_cf(&self, id: u64) -> Vec<Entry> {

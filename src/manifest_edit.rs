@@ -83,6 +83,7 @@ mod code {
     pub const SET_NONCE: u64 = 10;
     pub const SET_CAPABILITY: u64 = 11;
     pub const REMOVE_TABLES: u64 = 12;
+    pub const SET_CF_UNIFIED_ID: u64 = 13;
     /// Highest op code that may ever be assigned a meaning.
     pub const MAX_ASSIGNABLE: u64 = 63;
 }
@@ -102,6 +103,7 @@ const _: () = assert!(
         && code::SET_NONCE == 10
         && code::SET_CAPABILITY == 11
         && code::REMOVE_TABLES == 12
+        && code::SET_CF_UNIFIED_ID == 13
         && code::MAX_ASSIGNABLE == 63
 );
 const _: () = assert!(
@@ -238,6 +240,11 @@ pub enum Op {
     SetCapability(u64),
     /// Retire a batch of tables from one CF (compaction inputs, FIFO victims).
     RemoveTables { cf: String, ids: Vec<u64> },
+    /// Give a column family the unified-layout id its keys carry, when it is
+    /// not the one derived from its name (plan C F5′: a family cleared under
+    /// the unified layout takes a fresh id, so the old id's entries are owned
+    /// by nobody). Follows the `CreateCF` of the same edit.
+    SetCfUnifiedId { name: String, id: u64 },
 }
 
 /// One numbered, atomically applied group of ops.
@@ -412,6 +419,11 @@ pub fn encode_op(b: &mut Vec<u8>, op: &Op) {
             for id in ids {
                 append_uvarint(b, *id);
             }
+        }
+        Op::SetCfUnifiedId { name, id } => {
+            append_uvarint(b, code::SET_CF_UNIFIED_ID);
+            append_bytes(b, name.as_bytes());
+            append_u64(b, *id);
         }
     }
 }
@@ -647,6 +659,10 @@ impl<'a> Cur<'a> {
                 }
                 Ok(Op::RemoveTables { cf, ids })
             }
+            code::SET_CF_UNIFIED_ID => Ok(Op::SetCfUnifiedId {
+                name: self.string()?,
+                id: self.u64le()?,
+            }),
             other => Err(corrupt(format!(
                 "manifest edit: op index {}: op code {other} is {}",
                 self.op_index,
@@ -1046,6 +1062,14 @@ fn validate_op(c: &mut Candidate<'_>, i: usize, op: &Op) -> Result<()> {
                 ));
             }
         }
+        Op::SetCfUnifiedId { name, .. } => {
+            if !c.cf(name).exists {
+                return Err(precondition(
+                    i,
+                    format!("SetCFUnifiedId: no column family {name:?}"),
+                ));
+            }
+        }
         Op::SetNextFileId(v) => {
             if *v < c.next_file_id {
                 return Err(precondition(
@@ -1160,6 +1184,13 @@ fn mutate(m: &mut Manifest, op: &Op) {
             if let Some(i) = cf_index(m, cf) {
                 let drop: std::collections::HashSet<u64> = ids.iter().copied().collect();
                 m.cfs[i].sstables.retain(|s| !drop.contains(&s.id));
+            }
+        }
+        Op::SetCfUnifiedId { name, id } => {
+            if let Some(i) = cf_index(m, name) {
+                // Canonical form: the derived id is "no override", exactly as
+                // the manifest section omits it.
+                m.cfs[i].unified_id = (*id != crate::unified::cf_id(name)).then_some(*id);
             }
         }
     }
@@ -1585,6 +1616,10 @@ mod tests {
                 cf: "a".into(),
                 ids: vec![1, 2, 3],
             },
+            Op::SetCfUnifiedId {
+                name: "b".into(),
+                id: 0x0123_4567_89AB_CDEF,
+            },
         ]
     }
 
@@ -1674,7 +1709,7 @@ mod tests {
 
     #[test]
     fn unknown_op_code_is_corruption_naming_the_index() {
-        for code in [0u64, 13, 63, 64, 1000] {
+        for code in [0u64, 14, 63, 64, 1000] {
             let mut payload = Vec::new();
             append_u64(&mut payload, 5);
             append_uvarint(&mut payload, 2);

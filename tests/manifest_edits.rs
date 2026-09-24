@@ -1118,6 +1118,7 @@ fn shape(edit: &VersionEdit) -> Vec<String> {
             Op::SetNonce(n) => format!("SetNonce({n})"),
             Op::SetCapability(b) => format!("SetCapability({b})"),
             Op::RemoveTables { cf, ids } => format!("RemoveTables({cf},{ids:?})"),
+            Op::SetCfUnifiedId { name, id } => format!("SetCfUnifiedId({name},{id})"),
         })
         .collect()
 }

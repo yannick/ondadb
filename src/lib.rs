@@ -102,6 +102,7 @@ pub mod tailing;
 pub mod txn;
 pub(crate) mod txn_lock;
 pub mod unified;
+pub mod upgrade;
 pub mod util;
 pub mod wal;
 
@@ -114,7 +115,8 @@ pub use comparator::{Comparator, ComparatorRef};
 #[cfg(feature = "s3")]
 pub use config::{S3Config, S3CredentialSource};
 pub use config::{
-    ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
+    ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, FormatUpgrade,
+    FormatUpgradeVerify, IsolationLevel, LogLevel,
     MergeOperator, Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend,
     TierDef, TierRule,
 };
@@ -137,3 +139,4 @@ pub use storage::{CreateOutcome, LocalStorage, ObjectInfo, PrefixPage, Storage};
 pub use storage_s3::S3Storage;
 pub use tailing::TailingIterator;
 pub use txn::{PreparedTxn, Txn};
+pub use upgrade::{UpgradeObserver, UpgradePhase, UpgradeReport};

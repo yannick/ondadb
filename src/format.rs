@@ -493,6 +493,23 @@ pub mod vlog_header {
 const _: () = assert!(is_printable_ascii(&vlog_header::MAGIC));
 const _: () = assert!(vlog_header::HEADER_LEN == 32);
 
+/// The format-upgrade swap journal, `<parent>/.<name>.yolo-upgrade.journal`
+/// (plan C §1.3): `magic | version u32 | state u8 | (len u32, utf8)×3 —
+/// database, upgrade-dir and backup-dir names | crc32c u32` over everything
+/// before it. It lives **beside** the database, never inside it, because the
+/// swap it journals renames the database directory itself.
+pub mod upgrade_journal {
+    pub const MAGIC: [u8; 8] = *b"YOLODBUJ";
+    pub const VERSION: u32 = 1;
+    /// Both renames may be in flight; the next open resolves it.
+    pub const STATE_SWAPPING: u8 = 1;
+    /// Both renames are durable; only cleanup remains.
+    pub const STATE_DONE: u8 = 2;
+}
+
+const _: () = assert!(is_printable_ascii(&upgrade_journal::MAGIC));
+const _: () = assert!(upgrade_journal::STATE_SWAPPING != upgrade_journal::STATE_DONE);
+
 /// The column-family config blob: `magic | version u32 | (tag uvarint, len
 /// uvarint, bytes)*`, tags strictly ascending. Unknown tags are preserved on a
 /// decode→encode round trip. Durations are nanoseconds.
@@ -779,6 +796,12 @@ mod tests {
         );
         assert_eq!(&vlog_header::MAGIC, b"YOLODBVL");
         assert_eq!(vlog_header::VERSION, 1);
+        assert_eq!(&upgrade_journal::MAGIC, b"YOLODBUJ");
+        assert_eq!(upgrade_journal::VERSION, 1);
+        assert_eq!(
+            (upgrade_journal::STATE_SWAPPING, upgrade_journal::STATE_DONE),
+            (1, 2)
+        );
         assert_eq!(&cf_config::MAGIC, b"YOLODBCF");
         assert_eq!(cf_config::VERSION, 1);
         assert_eq!(
