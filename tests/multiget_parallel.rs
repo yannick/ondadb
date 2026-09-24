@@ -298,7 +298,9 @@ fn the_default_tier_keeps_the_sequential_path() {
     let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
     let (got, perf) = db.multi_get_with_perf(&cf, &refs);
     assert_eq!(perf.multiget_parallel_reads, 0, "a local table fanned out");
-    assert!(perf.block_misses > 4);
+    // Blocks were read (under mmap an uncompressed block is a zero-copy view,
+    // counted in `block_read_bytes` but never as a miss).
+    assert!(perf.block_read_bytes > 0, "{perf:?}");
     assert_eq!(got[1].as_ref().unwrap(), &value(3));
 }
 
