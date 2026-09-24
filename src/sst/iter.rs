@@ -909,7 +909,8 @@ mod tests {
         keys.sort();
         keys.dedup();
         for (i, k) in keys.iter().enumerate() {
-            w.add(k, b"v", (i + 1) as u64, 0, crate::format::KIND_PUT).unwrap();
+            w.add(k, b"v", (i + 1) as u64, 0, crate::format::KIND_PUT)
+                .unwrap();
         }
         w.finish().unwrap();
 
@@ -952,7 +953,8 @@ mod tests {
             let mut w = Writer::new(path.to_str().unwrap(), opts(4, 512, is_delta)).unwrap();
             for i in 0..100u64 {
                 let k = format!("tenant/alpha/{i:04}");
-                w.add(k.as_bytes(), b"value", i + 1, 0, crate::format::KIND_PUT).unwrap();
+                w.add(k.as_bytes(), b"value", i + 1, 0, crate::format::KIND_PUT)
+                    .unwrap();
             }
             w.finish().unwrap();
         }
@@ -986,8 +988,14 @@ mod tests {
         let mut w = Writer::new(klog, opts(4, 512, true)).unwrap();
         for i in 0..64u64 {
             let k = format!("tenant/alpha/{i:04}");
-            w.add(k.as_bytes(), b"the-inline-value", i + 1, 0, crate::format::KIND_PUT)
-                .unwrap();
+            w.add(
+                k.as_bytes(),
+                b"the-inline-value",
+                i + 1,
+                0,
+                crate::format::KIND_PUT,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
         let r = open(klog);

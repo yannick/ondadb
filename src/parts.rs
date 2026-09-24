@@ -858,7 +858,7 @@ impl DB {
             )));
         }
         let dir = dir.as_ref();
-        let cf_dir = dir.join(format!("cf-{}", cf.name()));
+        let cf_dir = dir.join(crate::format::cf_dir_name(cf.name()));
         std::fs::create_dir_all(&cf_dir)?;
 
         let mut metas: Vec<SstMeta> = Vec::new();
@@ -909,6 +909,7 @@ impl DB {
                 name: cf.name().to_string(),
                 config: cf.effective_config().encode(),
                 sstables: metas,
+                unified_id: None,
             }],
         };
         manifest.save(manifest_path(dir))?;
@@ -916,7 +917,10 @@ impl DB {
     }
 
     /// Move the bottom-level part for `partition` to storage tier `tier`
-    /// (which must be configured in [`Options::tiers`](crate::Options::tiers)).
+    /// (which must be configured in [`Options::tiers`](crate::Options::tiers)),
+    /// or — with the reserved name `"ssd"` — back to the **default tier** (the
+    /// database directory; see
+    /// [`move_part_to_default_tier`](Self::move_part_to_default_tier)).
     ///
     /// Copy → fsync → flip the manifest `tier` in one record → delete the
     /// source (the plan's mover protocol). Reads are uninterrupted: the flip
@@ -930,7 +934,28 @@ impl DB {
         partition: &str,
         tier: &str,
     ) -> Result<()> {
-        self.inner.relocate_part(cf, partition, tier, None)
+        self.inner
+            .relocate_part(cf, partition, move_target(tier), None)
+    }
+
+    /// Demote the bottom-level part for `partition` off whatever named tier it
+    /// lives on — local or S3 — back to the default tier (wavesdb `4fa392c`).
+    ///
+    /// The same crash-safe protocol as a move onto a tier: copy every file from
+    /// its current backend into the database directory and make it durable,
+    /// flip the catalog in one edit (the commit point), then retire the source
+    /// through the deletion path checkpoints pause. A crash before the flip
+    /// leaves the part where it was (the partial local copy is swept at the
+    /// next open); a crash after it leaves a stale source copy, which the sweep
+    /// also removes on a local tier. An object left on an S3 tier by such a
+    /// crash is not swept (the S3 orphan gap documented for moves onto S3).
+    ///
+    /// Tables published on a **shared** tier are left where they are — a
+    /// shared tier is delete-free — exactly as for moves onto a tier. A part
+    /// already on the default tier is a no-op. Equivalent to
+    /// `move_part_to_tier(cf, partition, "ssd")`.
+    pub fn move_part_to_default_tier(&self, cf: &Arc<ColumnFamily>, partition: &str) -> Result<()> {
+        self.inner.relocate_part(cf, partition, None, None)
     }
 
     /// Move one part while reporting every durability boundary to `observer`.
@@ -949,7 +974,7 @@ impl DB {
         observer: &dyn MovePhaseObserver,
     ) -> Result<()> {
         self.inner
-            .relocate_part(cf, partition, tier, Some(observer))
+            .relocate_part(cf, partition, move_target(tier), Some(observer))
     }
 
     /// Run one full pass of the background part mover across every column family
@@ -978,11 +1003,15 @@ impl crate::db::DbInner {
     /// & tiers plan). Shared by the manual
     /// [`DB::move_part_to_tier`](crate::DB::move_part_to_tier) lever and the
     /// policy-driven [`run_part_mover`](Self::run_part_mover).
+    ///
+    /// `tier == None` demotes the part to the default tier (F9). Sources are
+    /// read through their own tier's [`Storage`](crate::storage::Storage), so
+    /// the same protocol copies local→local, local→S3, S3→local and S3→S3.
     pub(crate) fn relocate_part(
         &self,
         cf: &Arc<ColumnFamily>,
         partition: &str,
-        tier: &str,
+        tier: Option<&str>,
         observer: Option<&dyn MovePhaseObserver>,
     ) -> Result<()> {
         if self.opts.read_only {
@@ -990,9 +1019,11 @@ impl crate::db::DbInner {
         }
         self.poison.check()?;
         let _parts_op = self.begin_parts_op();
-        if !cf.tiers().is_known(Some(tier)) {
+        if !cf.tiers().is_known(tier) {
             return Err(OndaError::InvalidArgs(format!("unknown tier {tier:?}")));
         }
+        // Observers and messages name the default tier by its reserved name.
+        let tier_label = tier.unwrap_or(DEFAULT_TIER_NAME);
         // Scoped to this partition, so the background mover no longer stops
         // compaction across the whole column family while it copies.
         let _range = lock_partition_span(cf, partition);
@@ -1015,7 +1046,7 @@ impl crate::db::DbInner {
             .collect();
         let handles: Vec<_> = handles
             .into_iter()
-            .filter(|handle| handle.meta.tier.as_deref() != Some(tier))
+            .filter(|handle| handle.meta.tier.as_deref() != tier)
             // A table on a SHARED tier is an immutable publication: moving it
             // would delete a source object another database may reference
             // (A2 — shared tiers are delete-free). Re-placement is the layer
@@ -1035,13 +1066,13 @@ impl crate::db::DbInner {
         // The destination backend may be local or remote (S3); route all writes
         // through it so the same mover protocol serves both — only the `Storage`
         // impl differs (a local copy+fsync vs. a buffered single-shot PUT).
-        let dest_storage = cf.tiers().storage_for(Some(tier));
-        let dest_cf_dir = cf.tiers().cf_dir(Some(tier), cf.name());
+        let dest_storage = cf.tiers().storage_for(tier);
+        let dest_cf_dir = cf.tiers().cf_dir(tier, cf.name());
         dest_storage.ensure_dir(&dest_cf_dir)?;
         // A2: on a SHARED tier, objects are named by the per-database instance
         // nonce so two databases pointed at one root cannot collide. On a
         // non-shared tier the legacy id-derived path is kept byte-for-byte.
-        let shared = self.opts.tiers.iter().any(|t| t.name == tier && t.shared);
+        let shared = tier.is_some_and(|tier| self.opts.tiers.iter().any(|t| t.name == tier && t.shared));
         let nonce = if shared {
             let n = *self.instance_nonce.lock();
             Some(n.expect("a shared tier always mints the instance nonce at open"))
@@ -1049,7 +1080,7 @@ impl crate::db::DbInner {
             None
         };
         let object_for = |id: u64| -> Option<String> {
-            nonce.map(|n| format!("cf-{}/{n:016x}-{id}", cf.name()))
+            nonce.map(|n| format!("{}/{n:016x}-{id}", crate::format::cf_dir_name(cf.name())))
         };
 
         // Copy every file to the target tier and open new handles there, before
@@ -1057,20 +1088,18 @@ impl crate::db::DbInner {
         // until the flip.
         let object_count = handles
             .iter()
-            .map(|handle| {
-                let source_klog = cf.klog_path_for(&handle.meta);
-                1 + usize::from(Path::new(&vlog_path_for(&source_klog)).exists())
-            })
+            .map(|handle| 1 + usize::from(self.source_has_vlog(cf, &handle.meta)))
             .sum();
         let mut object_index = 0;
         let mut new_handles: Vec<Arc<SstHandle>> = Vec::new();
         for h in &handles {
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
+            let src_storage = cf.tiers().storage_for(h.meta.tier.as_deref());
             let object = object_for(h.meta.id);
             let (dst_klog, dst_vlog) = match &object {
                 Some(o) => {
-                    let root = cf.tiers().root_for(Some(tier));
+                    let root = cf.tiers().root_for(tier);
                     (format!("{root}/{o}.klog"), format!("{root}/{o}.vlog"))
                 }
                 None => (
@@ -1079,26 +1108,26 @@ impl crate::db::DbInner {
                 ),
             };
             object_index += 1;
-            copy_to_storage(&src_klog, &dst_klog, &dest_storage, || {
+            copy_to_storage(&src_storage, &src_klog, &dst_klog, &dest_storage, || {
                 observe_move(
                     observer,
                     cf.name(),
                     partition,
-                    tier,
+                    tier_label,
                     MovePhase::CopyComplete {
                         object_index,
                         object_count,
                     },
                 )
             })?;
-            if Path::new(&src_vlog).exists() {
+            if self.source_has_vlog(cf, &h.meta) {
                 object_index += 1;
-                copy_to_storage(&src_vlog, &dst_vlog, &dest_storage, || {
+                copy_to_storage(&src_storage, &src_vlog, &dst_vlog, &dest_storage, || {
                     observe_move(
                         observer,
                         cf.name(),
                         partition,
-                        tier,
+                        tier_label,
                         MovePhase::CopyComplete {
                             object_index,
                             object_count,
@@ -1107,7 +1136,7 @@ impl crate::db::DbInner {
                 })?;
             }
             let mut meta = h.meta.clone();
-            meta.tier = Some(tier.to_string());
+            meta.tier = tier.map(str::to_string);
             meta.object = object;
             new_handles.push(cf.handle_for(meta.clone()));
         }
@@ -1115,7 +1144,7 @@ impl crate::db::DbInner {
             observer,
             cf.name(),
             partition,
-            tier,
+            tier_label,
             MovePhase::DestinationSynced,
         )?;
 
@@ -1141,39 +1170,84 @@ impl crate::db::DbInner {
             observer,
             cf.name(),
             partition,
-            tier,
+            tier_label,
             MovePhase::ManifestFlipped,
         );
 
-        // Delete the now-obsolete source files (default-tier copies). Crash
-        // before this leaves harmless orphans on the source tier; the manifest
-        // already points readers at the new tier.
+        // Delete the now-obsolete source files. Crash before this leaves
+        // harmless orphans on the source tier; the manifest already points
+        // readers at the new tier. A local source is unlinked by path; an
+        // object on a remote source tier (a demotion off S3) is deleted through
+        // that tier's backend — both through the pausable deletion path.
+        let mut deferred_remote = 0usize;
         for h in &handles {
             h.close();
             let src_klog = cf.klog_path_for(&h.meta);
             let src_vlog = vlog_path_for(&src_klog);
-            self.remove_sst_file(&src_klog, h.meta.klog_size);
-            if Path::new(&src_vlog).exists() {
-                self.remove_sst_file(&src_vlog, h.meta.vlog_size);
+            let has_vlog = self.source_has_vlog(cf, &h.meta);
+            if self.tier_is_local(h.meta.tier.as_deref()) {
+                self.remove_sst_file(&src_klog, h.meta.klog_size);
+                if has_vlog {
+                    self.remove_sst_file(&src_vlog, h.meta.vlog_size);
+                }
+            } else {
+                let storage = cf.tiers().storage_for(h.meta.tier.as_deref());
+                let mut retire = |path: &str, bytes: u64| {
+                    if self.remove_tier_file(storage.clone(), path, bytes) {
+                        deferred_remote += 1;
+                    }
+                };
+                retire(&src_klog, h.meta.klog_size);
+                if has_vlog {
+                    retire(&src_vlog, h.meta.vlog_size);
+                }
             }
         }
-        let remaining_files = handles
-            .iter()
-            .flat_map(|handle| {
-                let klog = cf.klog_path_for(&handle.meta);
-                let vlog = vlog_path_for(&klog);
-                [klog, vlog]
-            })
-            .filter(|path| Path::new(path).exists())
-            .count();
+        let remaining_files = deferred_remote
+            + handles
+                .iter()
+                .filter(|handle| self.tier_is_local(handle.meta.tier.as_deref()))
+                .flat_map(|handle| {
+                    let klog = cf.klog_path_for(&handle.meta);
+                    let vlog = vlog_path_for(&klog);
+                    [klog, vlog]
+                })
+                .filter(|path| Path::new(path).exists())
+                .count();
         observe_committed_move(
             observer,
             cf.name(),
             partition,
-            tier,
+            tier_label,
             MovePhase::SourceDeleteFinished { remaining_files },
         );
         Ok(())
+    }
+
+    /// Whether `tier` (`None` = default) keeps its files on a local filesystem,
+    /// so they are addressed by path — probed with `Path::exists`, unlinked by
+    /// the deletion worker, swept at open. An S3 or custom tier is not.
+    fn tier_is_local(&self, tier: Option<&str>) -> bool {
+        match tier {
+            None => true,
+            Some(name) => self
+                .opts
+                .tiers
+                .iter()
+                .find(|t| t.name == name)
+                .is_none_or(|t| matches!(t.backend, crate::config::TierBackend::Local)),
+        }
+    }
+
+    /// Whether the table's source has a value log to move. On a local tier the
+    /// file itself answers (the pre-F9 rule, kept byte-for-byte); a remote
+    /// object cannot be probed for free, so there the catalog's size does.
+    fn source_has_vlog(&self, cf: &ColumnFamily, meta: &SstMeta) -> bool {
+        if self.tier_is_local(meta.tier.as_deref()) {
+            Path::new(&vlog_path_for(&cf.klog_path_for(meta))).exists()
+        } else {
+            meta.vlog_size > 0
+        }
     }
 
     /// One full pass of the part mover; see
@@ -1200,7 +1274,7 @@ impl crate::db::DbInner {
                 let Some(target) = eligible_part_target(rules, &part, now) else {
                     continue;
                 };
-                match self.relocate_part(cf, &part.partition, target, None) {
+                match self.relocate_part(cf, &part.partition, Some(target), None) {
                     Ok(()) => moved += 1,
                     // A part that vanished (compacted/detached) between snapshot
                     // and move is a benign miss; a genuine durability failure has
@@ -1216,8 +1290,11 @@ impl crate::db::DbInner {
 
 fn eligible_part_target<'a>(rules: &'a [TierRule], part: &BottomPart, now: i64) -> Option<&'a str> {
     let rule = crate::config::tier_for_key(rules, &part.min_key)?;
-    // "ssd" denotes the default tier, and moving back to that tier has no copy
-    // target in the P4 mover protocol.
+    // "ssd" denotes the default tier. Demotion exists (F9,
+    // `move_part_to_default_tier`) but the policy pass deliberately does not
+    // demote: a rule naming "ssd" has always meant "stop moving this range",
+    // and turning it into "pull it back" would move data operators placed by
+    // hand the moment they upgrade.
     let target = (rule.tier != "ssd").then_some(rule.tier.as_str())?;
     if part.tier.as_deref() == Some(target) {
         return None;
@@ -1452,24 +1529,43 @@ fn move_file(from: &str, to: &str) -> Result<()> {
     }
 }
 
-/// Copy the local file `from` to `to` on `storage`, durably committing the
+/// Copy `from` on `src_storage` to `to` on `storage`, durably committing the
 /// destination before the manifest flip references it. For a local tier the
 /// [`StorageWriter`](crate::storage::StorageWriter) streams and fsyncs (file +
 /// parent dir); for an S3 tier it buffers and single-shot PUTs on finish. The
-/// source is always on a local tier (the mover only moves *onto* named tiers), so
-/// it is read with a plain file.
+/// source is read through its own backend in bounded chunks, so a demotion off
+/// S3 streams range GETs straight into the local file.
 fn copy_to_storage(
+    src_storage: &Arc<dyn crate::storage::Storage>,
     from: &str,
     to: &str,
     storage: &Arc<dyn crate::storage::Storage>,
     copied: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let mut src = std::fs::File::open(from)?;
+    use std::io::Write as _;
+    let src = src_storage.open_read(from)?;
+    let len = src.size()?;
     let mut dst = storage.create(to)?;
-    std::io::copy(&mut src, &mut *dst)?;
+    let mut buf = vec![0u8; HASH_CHUNK.min(len.max(1) as usize)];
+    let mut off = 0u64;
+    while off < len {
+        let n = HASH_CHUNK.min((len - off) as usize);
+        src.read_exact_at(&mut buf[..n], off)?;
+        dst.write_all(&buf[..n])?;
+        off += n as u64;
+    }
     copied()?;
     dst.finish()?;
     Ok(())
+}
+
+/// The reserved name of the implicit default tier (the database directory).
+const DEFAULT_TIER_NAME: &str = "ssd";
+
+/// Map a public tier argument to a move target: the reserved `"ssd"` is the
+/// default tier (`None`), anything else a named tier.
+fn move_target(tier: &str) -> Option<&str> {
+    (tier != DEFAULT_TIER_NAME).then_some(tier)
 }
 
 fn copy_into_storage(

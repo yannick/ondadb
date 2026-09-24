@@ -1,5 +1,408 @@
 # Changelog
 
+## 0.10.0 (unreleased) — Breaking: yoloDB format epoch 1
+
+**ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB
+and wavesdb converge on (plan C step 1). Every persisted identifier changes,
+so a directory written by this release is not readable by 0.9.x. **A 0.9.x
+database is upgraded automatically on open**: rebuilt in a sibling directory,
+verified entry by entry against the source, then swapped into place by a
+journaled rename, with the 0.9 directory kept as a backup
+(`Options::format_upgrade` = `Auto` by default; `Forbid` refuses and
+`ReadOnlyLegacy` opens it read-only as it is; `yolodb upgrade <path>` does the
+same offline). Any failure before the swap leaves the 0.9.x directory
+untouched. The crate is still
+`ondadb`; only the format changed. See `docs/formats.md` and the registry in
+`docs/format-registry.md`.
+
+**Measured** (interleaved `onda_bench` A/B against 0.9.1, `unsafe-fastpath`,
+8 threads, 4M ops, 6 rounds, fresh database per run, same-round median
+ratios): put 0.97 (0.94–1.00 in every round — a consistent ~3%; not yet
+profiled — CRC32-C on small WAL frames and the WAL segment-header fsync are
+the suspects),
+cold get 1.06 (1.02–1.09, point reads stopping early by table `max_seq`),
+forward scan 0.96 and backward scan 0.98 (within this machine's noise).
+
+### Breaking: the format epoch
+
+- **CRC32-C everywhere.** `encoding::checksum` now computes CRC32-C (the `crc32c`
+  crate: hardware CRC on aarch64 and x86-64). 0.9 documented CRC32-C but computed
+  CRC-32/IEEE; every artifact's checksum changes.
+- **SSTable footer** — 96 bytes, magic `YOLOST01`, `format_version` 1, a CRC32-C
+  over the footer (0.9's was unchecksummed), a table **capability word**, and the
+  aux-block handle inside the footer. Footer flags are only `0x01` bloom and
+  `0x02` btree: restart trailers are on **every** data block
+  (`WriterOptions::restart_interval = 0` is refused), vlog frames have one
+  format, and extended/prefix-delta/range meaning moved into the capability word.
+- **Value logs** start with a 32-byte `YOLODBVL` header; frame offsets are
+  absolute (the first frame is at 32).
+- **Codec ids**: LZ4 (and `Lz4Fast`) is stored as **6** — the same raw LZ4 block
+  bytes 0.9 stored as 2. Ids **2 and 4 are burned** (0.9 LZ4 / wavesdb zstd) and
+  refused as `UnsupportedFormat`; 7 (zstd-dict) and 8 (brotli) are reserved.
+  `Compression::from_u8` is replaced by `Compression::codec_id` /
+  `Compression::from_codec_id`.
+- **Bloom blocks**: the hash id leads (`1 | m | k | words`); only xxh3 filters
+  exist in epoch 1.
+- **MANIFEST** — magic `YOLODBMF`, version 1, the capability word as a fixed
+  `u64` header field, and every optional field (WAL layout, nonce, edit cursor,
+  partition/tier/object/max-entry-time, age stamps, range summaries) as a
+  **flagged section** under a strict mask, replacing the positional tails and
+  `ONDA*` tagged tails. A new per-CF **unified id** section (`CfManifest::unified_id`)
+  is stored only when the id diverges from FNV-1a-64 of the name.
+- **MANIFEST-EDITS** — a 32-byte `YOLODBED` header; record framing unchanged
+  (under CRC32-C).
+- **WAL segments** — every stripe file starts with a 32-byte `YOLODBWL` header
+  (version, layout, generation), written and fsynced before the first frame.
+  Replay refuses a segment without one as `UnsupportedFormat` at byte 0; a
+  zero-length file or a torn header is an empty segment. `Wal::open` and
+  `Wal::replay` take a `wal::SegmentId`.
+- **CF config blob** — a `YOLODBCF` TLV (`tag | len | value`, ascending tags,
+  defaults elided, durations in **nanoseconds**). Unknown tags are **preserved**
+  on a decode→encode round trip (`ColumnFamilyConfig::unknown_config_tags`).
+  Decoding is strict: `ColumnFamilyConfig::decode` now returns `Result`.
+- **Unified CF ids** use the correct FNV-1a-64 offset basis
+  (`14695981039346656037`, as wavesdb); 0.9 dropped a digit.
+- Error taxonomy, everywhere: malformed bytes are `Corruption`; an unknown
+  version, flag, capability bit, codec, kind or config enum value is
+  `UnsupportedFormat`.
+
+### Reading 0.9.x databases
+
+- The 0.9 decoders are frozen, decode-only, in `ondadb::legacy_onda`, behind the
+  new **default-on** cargo feature `legacy-onda`. `legacy_onda::open_read_only`
+  opens a 0.9 directory read-only through the engine — tables, WAL tails
+  (per-CF or unified), merge operands, range tombstones and the edit log — which
+  is the source side of the planned automatic upgrade. Without the feature a 0.9
+  directory is a hard `UnsupportedFormat` refusal.
+
+### Clear under the unified layout (plan C F5′)
+
+- `clear_column_family` now works under the unified WAL layout (it was refused).
+  The cleared family takes a fresh unified id, persisted in the same catalog
+  edit by the new `SetCFUnifiedId` op (edit-log op code 13; a binary without it
+  refuses such a log as `Corruption`), so the old id's entries in the shared
+  memtable and WAL belong to no family and are discarded by the unified flush,
+  including after a crash. Refused with `Busy` while a prepared transaction
+  names the family. Rename stays a non-goal.
+- Fixes a latent resurrection: dropping a family and re-creating the same name
+  before a unified flush used to hand the new family the old one's unflushed
+  entries (same derived id). A new family now takes a fresh id whenever the
+  derived one still owns entries.
+
+### Automatic upgrade of 0.9.x databases (plan C §1.3)
+
+- `DB::open` on a 0.9 directory **upgrades it to epoch 1** by default:
+  `Options::format_upgrade` = `FormatUpgrade::Auto` (default) | `Forbid`
+  (`UnsupportedFormat`, nothing written) | `ReadOnlyLegacy` (read it as it is).
+  A read-only open never upgrades. `Options::format_upgrade_verify`
+  (`Scan` default | `Counts`) and `Options::format_upgrade_keep_backup`
+  (default `true`) tune it; `DB::last_format_upgrade()` returns an
+  `UpgradeReport` (bytes, duration, backup path, counts).
+- The rebuild runs beside the database (`.<name>.yolo-upgrade-<nonce>/`) under
+  the source's exclusive `LOCK`, transcodes every table one-for-one (same id,
+  level, partition and age stamps; raw entries incl. tombstones, single
+  deletes, merge operands, TTLs and range fragments), writes the replayed WAL
+  tail as L0 tables, writes the epoch-1 `MANIFEST` last, verifies the result
+  against the source, and swaps it in with two renames under a durable
+  `YOLODBUJ` journal. A crash at any step is completed or rolled back by the
+  next open; any failure before the swap leaves the 0.9 directory
+  byte-identical. The old directory stays as `.<name>.pre-yolo-<nonce>/`.
+- Refused with the new `OndaError::FormatUpgradeUnsupported`: tables on a
+  named tier or object store, and unresolved prepared transactions. Too little
+  free space is `Io(StorageFull)` before anything is written.
+- New binary **`yolodb upgrade <path> [--verify scan|counts] [--no-backup]`**
+  runs the same protocol offline with progress output; it needs none of the
+  application's merge operators (operands are copied, never folded).
+- `ondadb::upgrade::{upgrade, upgrade_observed, open_observed}`,
+  `UpgradeObserver` / `UpgradePhase` (the crash matrix's fault hook),
+  `manifest::is_onda09_dir`. New dependency on unix: `rustix` (`fs`, for
+  `statvfs`; already in the tree via `tempfile`).
+
+### Other
+
+- `docs/format-registry.md` is now the yoloDB registry; `src/format.rs` pins every
+  epoch-1 number with a `const` assertion and a golden test, and
+  `tests/fixtures/epoch1/` is the frozen corpus. The 0.9 corpus moved to
+  `tests/fixtures/legacy-onda/`, with three whole 0.9.1 database directories.
+- The unified WAL rotation opens its next segment before draining writers, as
+  the per-CF rotation already did, so the segment-header fsync does not extend
+  the write gate.
+
+### Fixed
+
+- **Snapshot pins are atomic everywhere.** Transaction `begin`/`reset` read
+  the published watermark and registered it as a snapshot in two steps; a
+  compaction choosing its GC floor in between could collect the version the
+  new snapshot was entitled to, so the key read as missing. Every pin now goes through
+  `acquire_visible_snapshot`, which reads the watermark under the snapshot
+  lock. Read-committed transaction iterators and tailing-iterator segments had
+  the same window between reading their floor and pinning their sources, and
+  now hold a transient pin while they build.
+- **Pessimistic `Serializable` grant refresh** validated the read set first
+  and read the new watermark after, so a write to a read-set key landing in
+  between was adopted into the snapshot unvalidated and the transaction
+  committed a stale read. The candidate snapshot is now pinned before the
+  validation.
+- **Fix: an open iterator no longer fails when compaction unlinks its
+  tables.** Buffered reads re-opened a table by path on every uncached block,
+  so an iterator created before a compaction hit `NotFound` on the first
+  uncached block after the compaction retired its inputs — breaking the
+  documented "open iterators pin the pre-compaction files" contract (mmap
+  builds were affected only for vlog values). `Reader::pin_files` now holds
+  the descriptors of a retired or cache-evicted reader that a caller still
+  holds. Previously masked in practice by compaction admitting every input
+  block into the block cache.
+
+### Ported from wavesdb (plan C step 1, §1.4)
+
+#### Observability (wavesdb `DeletionsPaused`/`DeletionsQueued`, `ReadStats`, F13)
+
+- `DbStats::deletions_paused` (nesting depth of the obsolete-file deletion
+  pause; wavesdb reports a flag) and `DbStats::deletions_queued` (files held
+  behind it) make a checkpoint or backup's hold on space reclamation visible.
+- **Read profiling**: `DB::enable_read_profiling(bool)` / `read_stats()` /
+  `read_profiling_enabled()`. `ReadStats` counts profiled point reads,
+  `multi_get` calls and keys, and iterator positioning calls, and carries the
+  summed read-path mechanism counters as a `PerfContext` (bloom checks and
+  negatives, memtable/table probes, block-cache hits, block fetches, bytes,
+  vlog reads) — the same counters, gathered by running each profiled operation
+  in a private perf scope rather than by a second set of bumps. A caller's own
+  `PerfContext` scope still sees everything. Off, a point read or batch pays
+  one relaxed atomic load; an iterator decides at construction.
+
+#### Wide-column entities (wavesdb `entity.go`, F11)
+
+- `DB::put_entity` / `get_entity` / `get_columns` and the same three on `Txn`
+  store a set of named byte columns under one key as one ordinary value — the
+  wavesdb entity frame v1 (`WVE1`), reproduced byte for byte (golden frames in
+  `tests/entity.rs` come from wavesdb's own encoder). `ondadb::entity` has the
+  codec (`encode_entity`, `decode_entity`, `decode_entity_into`,
+  `sort_columns`) and the limits. No engine or on-disk change; the frame is
+  registered in `docs/format-registry.md` as a value-level format.
+- New error variant `OndaError::NotEntity` (code -18) for a value that is not
+  an entity frame. `get_columns` is an ondaDB convenience (wavesdb has none):
+  a projection that still reads and verifies the whole frame.
+
+#### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
+
+- `DB::checkpoint_to_object_store(store, prefix, &ObjectCheckpointOptions)`
+  uploads `<prefix>/cf-<name>/<id>.{klog,vlog}` then `<prefix>/MANIFEST`
+  last (the commit marker); incremental via `parent`; `receipts` gives
+  create-if-absent publication with per-object size + SHA-256 receipts.
+  Returns an `ObjectCheckpoint { global_seq, next_file_id, tables,
+  receipts }`. A read-only source is accepted (its WAL-only data is written
+  as L0 tables in a scratch dir, per 0.9.1's snapshot rule).
+- `restore_from_object_store(store, prefix, dir)` — MANIFEST fetched first,
+  written last; `NotFound` when the prefix holds no checkpoint.
+- `open_remote_checkpoint(store, prefix, opts)` — lazy, read-only mount:
+  one MANIFEST GET, then range GETs; sizes seeded from the MANIFEST.
+- Internal: `snapshot_to` is split into `plan_snapshot` + placement, so local
+  and object checkpoints copy the identical file set. No on-disk format
+  change: the MANIFEST bytes are the ones a local checkpoint writes.
+
+#### Demote a part to the default tier (wavesdb `4fa392c`)
+
+- `DB::move_part_to_default_tier(cf, partition)`; `move_part_to_tier` and
+  `move_part_to_tier_observed` accept the reserved name `"ssd"` for the
+  same thing (it was an "unknown tier" error before). Same crash-safe
+  protocol as a move onto a tier; sources are now read through their own
+  tier's `Storage`, so a part on S3 comes back via range GETs and its S3
+  objects are deleted through the tier's backend, still behind
+  `pause_deletions`. The policy mover does not demote (an `"ssd"` rule still
+  only stops moves).
+- `tests/s3_tier.rs`: prefixes are now unique per test (pid + counter), so
+  parallel S3 tests no longer collide on macOS's microsecond clock.
+
+#### Incremental-backup diff (wavesdb `SSTablesSince`)
+
+- `DB::live_sstables()`, `DB::sstables_since(seq)` and
+  `DB::sstables_diff(&prior)` (new module `checkpoint`, types
+  `CheckpointTable`, `TableSetDiff`). `sstables_since` is wavesdb's
+  `max_seq > seq` filter; it cannot see a compaction that rewrites only old
+  data, so `sstables_diff` — by `(cf, id)` identity, reporting `added` and
+  `removed` — is the one an incremental backup should use.
+
+#### S3 parity with wavesdb v0.8.2–v0.8.6 (feature `s3`)
+
+- `S3Config` gains `session_token`, `anonymous`, `profile` and `read_only`,
+  and derives `Default`. Credential precedence: explicit keys (+ token) >
+  anonymous > named profile (no fallback) > default chain (env → shared file
+  → web-identity STS → instance metadata, resolved lazily).
+  `S3Config::credential_source()` and `S3CredentialSource` expose the choice.
+  **Source-compatibility note:** a struct literal of `S3Config` must now end
+  in `..S3Config::default()`.
+- `read_only` refuses writes locally with `OndaError::ReadOnly`; no bucket
+  probe or create happens in any mode.
+- Uploads send `x-amz-checksum-sha256` and check the store's echo.
+- `Storage` gains default-implemented `put_object` (returns an `ObjectInfo`
+  receipt), `create_if_absent` (`CreateOutcome`), `list_prefixes`
+  (`PrefixPage`, paginated child-prefix listing) and `is_read_only`;
+  `LocalStorage` and `S3Storage` implement them. A 404 now surfaces as
+  `io::ErrorKind::NotFound` (`storage::is_not_found`). `S3Metrics` gains
+  `lists`.
+- Fixed the `--features s3` test build (a stale 4-tuple destructure of
+  `Reader::get`).
+
+#### Added
+
+- **Shared read resources** (wavesdb `ReadResources`, `23648c8`,
+  `f6b3def`): `ReadResources::new(ReadResourceOptions { block_cache_bytes,
+  max_open_files, max_open_readers, max_reader_bytes })` builds one block
+  cache, file-handle cache and reader cache that any number of **read-only**
+  opens lease through `Options::read_resources`, so N immutable databases
+  share one budget instead of N. Cache keys are namespaced per lease
+  (`Options::read_cache_namespace`, default the directory's canonical path),
+  so identical table ids in different databases never alias. A writable open
+  with resources is `InvalidArgs`; `close()` refuses new leases and the caches
+  are emptied when the last leased database closes. `stats()` reports block
+  hits/misses/evictions/entries/bytes, reader-cache stats, open files,
+  leases and closing. `CacheStats` gains `evictions`.
+- **`get_into`** caller-buffer point reads on `DB`, `Txn` and
+  `SnapshotHandle`: the value is appended to a caller-owned `Vec<u8>` (its
+  length is returned; a miss leaves the buffer unchanged), so a reused buffer
+  makes a hit allocation-free for the value — from the memtable and from a
+  cached table block alike. Same candidate pass as `get`, so results are
+  identical (checked by the randomized read oracle).
+- **Standalone read snapshots** (wavesdb `SnapshotHandle`): `DB::snapshot()`
+  returns a refcounted `SnapshotHandle` that pins its sequence exactly as a
+  `Snapshot` transaction does, so compaction retains every version it can
+  see until the last clone drops. Read through `SnapshotHandle::{get,
+  multi_get, new_iterator, new_iterator_bounded}` or `DB::get_at` /
+  `DB::new_iterator_at`; a handle from another database is `InvalidArgs`.
+  The pin is registered atomically with reading the watermark.
+- **`Options::default_isolation`** (wavesdb `d789912`): the isolation level
+  `DB::begin` and `DB::begin_pessimistic` use. Defaults to `Snapshot`, so
+  nothing changes unless it is set; not persisted. `Txn::isolation()` reports
+  a transaction's level. The per-family `default_isolation_level` stays
+  reserved (a transaction spans families, so no family's setting could decide).
+
+#### Compaction
+
+- **`DB::compact_range(cf, lower, upper)`** (plan C F3, wavesdb
+  `CompactRange`): manual compaction of the tables whose span reaches into
+  `Bound`-style bounds, level by level to the bottom, through the ordinary job
+  path (catalog transaction, retention, partition cuts), holding the family's
+  range lock like `DB::compact`; returns when done. `ReadOnly` on a read-only
+  handle. See `docs/compaction-and-write-pacing.md`.
+- **`DB::purge()` / `DB::purge_column_family(cf)`** (plan C F4, wavesdb
+  `Purge`/`PurgeColumnFamily`): flush, then `compact_range` over the whole
+  family, so overwritten versions, tombstones and expired TTL entries not
+  pinned by a snapshot are reclaimed and the data ends in the bottom level.
+
+- **Tombstone-density trigger wired** (plan C P4). `ColumnFamilyConfig::
+  tombstone_density_trigger` / `tombstone_density_min_entries`, declared but
+  read by nothing until now, compact a table whose tombstone fraction reaches
+  the trigger even when no size trigger fires: below capacity work, above
+  periodic work, densest first, through the ordinary bounded job (a bottom
+  table in place, once the oldest snapshot has passed it). Default `0.0`
+  (off). Both are now **persisted** as config TLV tags 34 and 35 (registered
+  in `docs/format-registry.md`); `validate` rejects a NaN or negative
+  trigger. A delete-heavy flush now wakes the compaction worker. New
+  `CfStats::tombstone_density_compactions`.
+- The config-blob encoder now merges preserved unknown tags into tag order
+  instead of appending them — required as soon as a known tag (34, 35) sits
+  above a reserved one (33), or a blob carrying 33 would re-encode out of
+  order and be refused by its own decoder.
+
+#### Defaults
+
+- **Graduated default codecs** (plan C P10, wavesdb's default):
+  `ColumnFamilyConfig::compression_per_level` now defaults to
+  `[None, Lz4, Zstd]` — L0 raw, L1 LZ4, L2 and deeper Zstd — instead of
+  empty (uniform `compression`, `None`). **Source-behaviour note:** a config
+  built as `ColumnFamilyConfig { compression: X, ..Default::default() }` no
+  longer applies `X` everywhere, because a non-empty per-level list overrides
+  `compression`; add `compression_per_level: Vec::new()` for a uniform codec.
+  **Existing databases are unaffected:** config TLV tag 13 is now written
+  whenever the list is non-empty (not elided as a default), and an absent tag
+  13 decodes as the empty list — so a family created before this change keeps
+  its uniform codec, and a new family records the graduated list explicitly.
+  The 0.9 legacy decoder uses the same baseline. `onda_bench -compression X`
+  still means uniform `X`; `-compression graduated` measures the default.
+  Provisional numbers (`tests/codec_defaults_bench.rs`, 400k text-like
+  136-byte values compacted to L2, `unsafe-fastpath` release, heavily loaded
+  machine, 2 alternating runs): on-disk **65.6 MB → 21.0 MB (−68%)**, point
+  reads of cold-in-cache blocks **~0.45M/s vs ~0.8–1.0M/s** (Zstd decompression
+  per block miss), full scans within noise (11.3–13.0M vs 12.5–14.0M keys/s),
+  load+compaction time within noise. To be re-measured on a quiet machine.
+
+#### Performance
+
+- **User-space WAL write buffer** (wavesdb `WALWriteBufferSize`, plan C P6):
+  `Options::wal_write_buffer_size` (bytes, default `0` = off, not persisted)
+  coalesces whole frames per WAL stripe — per-CF and unified — into one
+  `write` when the buffer fills, on every sync-interval tick (a flush-only
+  thread runs under `SyncMode::None` too), and before every fsync
+  (`sync_wal`, prepare and decision frames), rotation and close. `SyncMode::Full`
+  ignores it. **Durability trade:** an acknowledged commit still in the
+  buffer is lost on a *process* crash (unbuffered `None` loses it only on
+  power loss); batch atomicity and frame bytes are unchanged, and a crash
+  tearing a buffered write replays a prefix of whole batches. A failed
+  buffered write poisons the database. `Wal::open_buffered`,
+  `Wal::flush_buffer` and `Wal::write_calls` are the WAL-level API;
+  `onda_bench -wal_buffer <bytes>`. Provisional (loaded machine, 5 runs,
+  1 thread, 1 put per commit, 200k ops, `SyncMode::None`): 8.6k–32k ops/s
+  unbuffered vs 166k–387k ops/s with 256 KiB.
+- **Local disk cache for remote tiers** (wavesdb `LocalCachePath`, `f28aecc`,
+  plan C P8): `Options::local_cache_path` / `local_cache_max_bytes` (bytes,
+  `0` = unbounded; not persisted). Every non-local tier (S3, custom, remote
+  checkpoint mounts) reads its `.klog`/`.vlog` range reads through a bounded,
+  LRU, on-disk cache below the block cache, so blocks evicted from memory and
+  every read after a restart skip the range GET. Each entry file carries its
+  key and a CRC32-C; a torn or corrupt entry is a miss that reads through and
+  heals, never wrong bytes. Entries are namespaced by `read_cache_namespace`
+  or by the directory plus its `LOCK` file's identity, so a re-created
+  database never sees its predecessor's entries. New module `local_cache`
+  (`DiskCache`, `CachedStorage`, `LocalCacheStats`), `DB::local_cache_stats`.
+  Verified against MinIO (`tests/s3_tier.rs`,
+  `local_disk_cache_serves_s3_blocks_across_restart`: zero range GETs on a
+  warm restart with the block cache off).
+- **Bloom auto-allocation** (wavesdb `BloomAutoAllocate`, plan C P7):
+  `ColumnFamilyConfig::bloom_auto_allocate` (default `false`) sizes each new
+  table's filter at `bloom_fpr × level_size_ratio^(level − bottom)`, floored
+  at `config::BLOOM_AUTO_FLOOR` (1e-4, or `bloom_fpr` if lower) — the bottom
+  level keeps `bloom_fpr`, upper levels get stronger filters. Persisted as
+  **config TLV tag 33** (the slot epoch 1 reserved for it; `format::cf_config::tag::BLOOM_AUTO_ALLOCATE`,
+  `MAX_KNOWN` is now 33; `RESERVED_BLOOM_AUTO_ALLOCATE` stays as an alias).
+  Mutually exclusive with `bloom_fpr_per_level` (`validate` refuses both).
+  New `ColumnFamilyConfig::bloom_fpr_in_shape(level, bottom, bottom_level)`,
+  `config::bloom_auto_fpr`, `Reader::bloom_bits`. No capability bit: the
+  filters are ordinary filters, and an epoch-1 binary without P7 keeps tag 33
+  as a preserved-unknown tag and writes uniform filters. Opt-in for the reason
+  `docs/performance.md` gives for per-level rates.
+- **MultiGet bounded parallel block reads** (wavesdb
+  `MaxConcurrentBlockReads`, plan C P5): `Options::max_concurrent_block_reads`
+  (default 8; 0/1 = sequential; not persisted) bounds, database-wide, the
+  data-block reads batched gets keep in flight on **slow tiers** (storage with
+  `supports_mmap() == false`: S3, custom, `without_mmap`). A table plan with
+  at least four cold slow-tier blocks fetches them on scoped threads, a window
+  of `4 × bound` blocks at a time; local tables and warm blocks keep the
+  sequential path unchanged, as does `get`. Answers are identical; errors
+  stay per key (a failed block fails exactly its keys — wavesdb's contract).
+  `PerfContext` gains `multiget_parallel_reads` and `multiget_io_waits`
+  (worker counters merge into the caller's scope). Provisional: a 152-key cold
+  batch against a 2 ms-per-read tier took 404 ms at bound 1 and 60 ms at 8
+  (best of 5, loaded machine).
+- **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
+  and `multi_get` skip a candidate table whose `max_seq` is at or below the
+  version already in hand (point hit, tombstone, or covering range delete),
+  so a memtable hit reads no table and an L0 hit reads nothing older.
+  Results are unchanged (randomized oracle against the exhaustive walk); a
+  corrupt table older than the answer is no longer probed, so it no longer
+  fails the read.
+- **Background reads no longer admit into the block cache** (wavesdb
+  `ac16c8a`). A read on a background thread — compaction and its span
+  workers, the part mover, ingest validation, i.e. any `ioctrl::IoClass`
+  other than `Foreground` — still looks blocks and vlog values up in the
+  cache, but a hit does not refresh the entry's CLOCK bit, a miss is not
+  inserted, and neither is counted in `hits`/`misses`. One large compaction
+  therefore no longer cycles the cache and hands the hot set back cold
+  (`tests/cache_admission.rs`: zero evictions and zero hot-set misses across a
+  compaction of a family 17× the cache, against a flushed hot set with the old
+  policy). `Options::admit_background_scan_blocks` (default `false`, not
+  persisted) restores the old behaviour. `DbStats` gains
+  `block_cache_evictions` and `block_cache_bytes`.
+
 ## 0.9.1
 
 **Shared-bug corrective release.** Five defects that wavesdb fixed after

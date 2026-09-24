@@ -70,6 +70,17 @@ pub struct PerfContext {
     /// Keys this operation found deleted by a covering range tombstone rather
     /// than by a point tombstone or by absence.
     pub range_masked: u64,
+    /// Data blocks a [`crate::DB::multi_get`] fetched through its bounded
+    /// parallel runner ([`Options::max_concurrent_block_reads`]) instead of
+    /// one at a time on the calling thread. Only cold blocks of tables on a
+    /// slow tier (one whose storage reports `supports_mmap() == false`) take
+    /// that path; zero everywhere else.
+    ///
+    /// [`Options::max_concurrent_block_reads`]: crate::Options::max_concurrent_block_reads
+    pub multiget_parallel_reads: u64,
+    /// Parallel block reads that waited for a permit: the database-wide bound,
+    /// not the device, was the limit (wavesdb `MultiGetIOWaits`).
+    pub multiget_io_waits: u64,
 }
 
 impl PerfContext {
@@ -95,9 +106,125 @@ impl PerfContext {
             multiget_blocks_deduped: 0,
             range_sources: 0,
             range_masked: 0,
+            multiget_parallel_reads: 0,
+            multiget_io_waits: 0,
         }
     }
+
+    /// Add every counter of `o` into `self` — how a worker thread's counters
+    /// reach the scope of the thread that handed it the work.
+    pub(crate) fn absorb(&mut self, o: &PerfContext) {
+        // One implementation: `accumulate` goes through the exhaustive
+        // `fields` list, so a new counter cannot be missed here.
+        self.accumulate(o);
+    }
+
+    /// Every counter, in declaration order. The exhaustive destructuring makes
+    /// adding a field without extending this (and [`from_fields`]) a compile
+    /// error rather than a counter the database-wide aggregate silently drops.
+    pub(crate) fn fields(&self) -> [u64; PERF_FIELDS] {
+        let PerfContext {
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        } = *self;
+        [
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        ]
+    }
+
+    /// Inverse of [`fields`](Self::fields).
+    pub(crate) fn from_fields(f: [u64; PERF_FIELDS]) -> PerfContext {
+        let [
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        ] = f;
+        PerfContext {
+            bloom_probes,
+            bloom_negatives,
+            memtable_probes,
+            sstable_probes,
+            index_seeks,
+            block_cache_hits,
+            block_misses,
+            block_read_bytes,
+            bytes_decompressed,
+            vlog_reads,
+            vlog_read_bytes,
+            vlog_cache_hits,
+            iterator_seeks,
+            iterator_steps,
+            multiget_blocks_deduped,
+            range_sources,
+            range_masked,
+            multiget_parallel_reads,
+            multiget_io_waits,
+        }
+    }
+
+    /// Add `other`'s counters into this one, field by field.
+    pub fn accumulate(&mut self, other: &PerfContext) {
+        let mut sum = self.fields();
+        for (s, o) in sum.iter_mut().zip(other.fields()) {
+            *s += o;
+        }
+        *self = PerfContext::from_fields(sum);
+    }
 }
+
+/// Number of counters in a [`PerfContext`].
+pub(crate) const PERF_FIELDS: usize = 19;
 
 /// The state `bump` touches. Split from the outer frames on purpose: neither
 /// field owns anything, so this thread-local needs **no destructor** and its
@@ -190,12 +317,31 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// [`finish`](Self::finish), then add the counters to the enclosing scope
+    /// (if one is open). For an *internal* scope — read profiling — that must
+    /// measure an operation without hiding its work from a caller's own
+    /// `PerfContext`, which a plain nested scope would (inner scopes do not
+    /// roll up).
+    pub(crate) fn finish_into_parent(self) -> PerfContext {
+        let ctx = self.finish();
+        bump(|p| p.accumulate(&ctx));
+        ctx
+    }
+}
+
 impl Drop for Scope {
     fn drop(&mut self) {
         // A scope abandoned without `finish` — including one unwound past by a
         // panic — must still restore the stack to its prior depth.
         pop();
     }
+}
+
+/// Whether this thread has an open scope — so work handed to another thread
+/// knows whether its counters are wanted at all.
+pub(crate) fn active() -> bool {
+    HOT.try_with(|hot| hot.depth.get() > 0).unwrap_or(false)
 }
 
 /// Add to the innermost open scope on this thread; a no-op when none is open.

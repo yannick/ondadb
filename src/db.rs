@@ -127,6 +127,22 @@ struct DeleteTask {
     path: String,
     /// The file's size, floored at [`DELETE_METADATA_BYTES`].
     bytes: u64,
+    /// The backend holding `path` when it is not a local file — an object on a
+    /// remote tier a part was demoted off. `None` is a plain local unlink.
+    storage: Option<Arc<dyn crate::storage::Storage>>,
+}
+
+impl DeleteTask {
+    fn run(&self) {
+        match &self.storage {
+            Some(storage) => {
+                let _ = storage.delete(&self.path);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
 }
 
 /// The thread that performs paced unlinks, present only when
@@ -216,7 +232,7 @@ impl FileDeletionState {
             }
             None => task,
         };
-        let _ = std::fs::remove_file(&task.path);
+        task.run();
     }
 
     /// Close the queue and join the worker, unlinking everything already
@@ -257,7 +273,7 @@ fn deletion_worker(rx: Receiver<DeleteTask>, limiter: Option<Arc<dyn crate::ioct
     // on that to guarantee every queued file is gone before it returns.
     for task in rx {
         crate::ioctrl::charge(&limiter, task.bytes);
-        let _ = std::fs::remove_file(&task.path);
+        task.run();
     }
 }
 
@@ -288,7 +304,7 @@ pub struct DbInner {
     /// must not burn sequence numbers. And `read_seq` cannot serve as an
     /// identity — it is `visible_seq()` at the fixed levels but
     /// `read_floor_seq()` at the others, many concurrent transactions pin the
-    /// same watermark (which is why `acquire_snapshot` is refcounted), and
+    /// same watermark (which is why the snapshot pins are refcounted), and
     /// `reset` reassigns it.
     txn_ids: AtomicU64,
     /// Point locks held by pessimistic transactions (3.3).
@@ -426,6 +442,21 @@ pub struct DbInner {
     /// database (exclusive for read-write, shared for read-only). Dropped — and
     /// thereby released — at the end of `close()`.
     lock_file: Mutex<Option<std::fs::File>>,
+
+    /// What the open that produced this handle did to upgrade a 0.9 directory
+    /// (plan C §1.3), for [`DB::last_format_upgrade`]. `None` for every open
+    /// that found an epoch-1 directory.
+    pub(crate) format_upgrade: Mutex<Option<crate::upgrade::UpgradeReport>>,
+
+    /// This database's lease on a shared
+    /// [`ReadResources`](crate::read_resources::ReadResources), or `None` for
+    /// private caches. Released at the end of `close()` (or on drop), which is
+    /// what lets the resources purge this database's namespace and, once
+    /// closing, empty the shared caches.
+    read_lease: Mutex<Option<crate::read_resources::ReadLease>>,
+    /// The local disk cache remote tiers read through
+    /// ([`Options::local_cache_path`]), or `None`.
+    local_cache: Option<Arc<crate::local_cache::DiskCache>>,
 
     /// Fail-stop flag: tripped by any durability failure (WAL fsync, background
     /// flush, manifest persist); checked at every write commit.
@@ -645,6 +676,46 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// One-shot pause point on a reader's snapshot-pinning path, per thread.
+    /// Lets a test park a reader right after it has decided its read sequence
+    /// and run a flush + compaction before it builds anything, which is how
+    /// the pin-registration races are reproduced deterministically.
+    static SNAPSHOT_PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the calling thread's one-shot [`snapshot_pin_hook`].
+#[cfg(test)]
+pub(crate) fn set_snapshot_pin_hook(hook: impl FnOnce() + 'static) {
+    SNAPSHOT_PIN_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Test-only pause point; compiles to nothing outside `cfg(test)`.
+#[inline(always)]
+pub(crate) fn snapshot_pin_hook() {
+    #[cfg(test)]
+    {
+        let hook = SNAPSHOT_PIN_HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Guard returned by [`DbInner::pin_read_floor`]; releases its pin on drop.
+pub(crate) struct ReadFloorPin<'a> {
+    db: &'a DbInner,
+    seq: u64,
+}
+
+impl Drop for ReadFloorPin<'_> {
+    fn drop(&mut self) {
+        self.db.release_snapshot(self.seq);
+    }
+}
+
 impl DbInner {
     pub(crate) fn reserve_seq(&self, n: u64) -> u64 {
         self.next_seq.fetch_add(n, Ordering::SeqCst)
@@ -727,9 +798,47 @@ impl DbInner {
         self.visible.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn acquire_snapshot(&self, seq: u64) -> u64 {
-        *self.snapshots.lock().entry(seq).or_insert(0) += 1;
+    /// Pin the current published watermark and return it, **atomically**:
+    /// the watermark is read under the same `snapshots` lock that
+    /// [`oldest_snapshot`](Self::oldest_snapshot) holds while it reads, so a
+    /// compaction choosing its GC floor either sees this pin or read a
+    /// watermark no newer than it — never a newer "oldest snapshot" that could
+    /// collect a version this pin is entitled to. (Reading `visible_seq()` and
+    /// registering it in a second step leaves exactly that window open, which
+    /// is why no two-step `acquire_snapshot(seq)` exists any more.)
+    pub(crate) fn acquire_visible_snapshot(&self) -> u64 {
+        let mut s = self.snapshots.lock();
+        let seq = self.visible_seq();
+        *s.entry(seq).or_insert(0) += 1;
         seq
+    }
+
+    /// The pin a fixed-snapshot reader (a `RepeatableRead`, `Snapshot` or
+    /// `Serializable` transaction, or a [`SnapshotHandle`](crate::SnapshotHandle))
+    /// takes: wait for publication to reach this thread's own last commit (see
+    /// [`wait_visible_at_own_floor`](Self::wait_visible_at_own_floor)), then
+    /// pin the watermark atomically. Released with
+    /// [`release_snapshot`](Self::release_snapshot).
+    pub(crate) fn acquire_fixed_snapshot(&self) -> u64 {
+        self.wait_visible_at_own_floor();
+        self.acquire_visible_snapshot()
+    }
+
+    /// The read-committed floor ([`read_floor_seq`](Self::read_floor_seq)),
+    /// with a transient pin that keeps compaction from collecting any version
+    /// it can see while the guard lives.
+    ///
+    /// For readers that build something which then owns its sources (an
+    /// iterator pins its tables and memtables at construction) but that do not
+    /// hold a snapshot afterwards. The pin sits at the watermark, which may be
+    /// below the returned floor when this thread's own commit is ahead of it;
+    /// that is enough, because compaction keeps every version above its GC
+    /// floor plus the newest one at or below it, so whatever the floor sees
+    /// survives a GC floor at or below the pin.
+    pub(crate) fn pin_read_floor(&self) -> (u64, ReadFloorPin<'_>) {
+        let pinned = self.acquire_visible_snapshot();
+        let floor = pinned.max(self.own_commit_floor());
+        (floor, ReadFloorPin { db: self, seq: pinned })
     }
 
     pub(crate) fn release_snapshot(&self, seq: u64) {
@@ -750,6 +859,12 @@ impl DbInner {
             .next()
             .copied()
             .unwrap_or_else(|| self.visible_seq())
+    }
+
+    /// The id the next allocated file will get, without allocating it: every
+    /// table written after this call has an id at or above it.
+    pub(crate) fn file_id_watermark(&self) -> u64 {
+        self.next_file_id.load(Ordering::SeqCst)
     }
 
     pub(crate) fn next_file_id(&self) -> u64 {
@@ -1141,6 +1256,8 @@ impl DbInner {
                 name: cf.name().to_string(),
                 config: cf.effective_config().encode(),
                 sstables: cf.snapshot_ssts(),
+                // Stored only when it diverges from the name's FNV-1a.
+                unified_id: Some(cf.id()),
             });
         }
         drop(cfs);
@@ -1399,6 +1516,48 @@ impl DbInner {
         self.note_periodic_cf(cf);
     }
 
+    /// The unified-layout id a family being created (or re-created by
+    /// `clear_column_family`) under `name` takes — plan C F5′.
+    ///
+    /// The id derived from the name when it is free; otherwise a fresh random
+    /// one. "Free" means: no live family routes by it, `avoid` does not name it,
+    /// and — under the unified layout — the shared memtable holds nothing under
+    /// it. That last clause is the one that matters: a dropped or cleared
+    /// family's entries stay in the shared memtable (and WAL) until a flush
+    /// discards them, and a new family carrying the same id would inherit
+    /// them. While a prepared transaction withholds a WAL generation the
+    /// derived id is never reused either — a reopen would replay that
+    /// generation, and with it whatever a former incarnation left there.
+    ///
+    /// In the per-CF layout the id routes nothing and is always the derived
+    /// one. Called under `cf_lifecycle_mu`.
+    pub(crate) fn choose_unified_id(&self, name: &str, avoid: &[u64]) -> u64 {
+        let derived = crate::unified::cf_id(name);
+        let Some(u) = &self.unified else {
+            return derived;
+        };
+        let taken = |id: u64| {
+            avoid.contains(&id) || self.cf_by_id.read().contains_key(&id) || u.holds_cf(id)
+        };
+        if self.wal_gens.lock().withheld() == 0 && !taken(derived) {
+            return derived;
+        }
+        // splitmix64 over a per-call seed: 64 random bits make a repeat of any
+        // id ever used astronomically unlikely, and the probe rules out the
+        // ones that are live or still hold entries.
+        let mut x = mint_instance_nonce(&format!("{}/{name}", self.dir));
+        loop {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            if z != derived && !taken(z) {
+                return z;
+            }
+        }
+    }
+
     /// Remove a column family from the registries, returning the old handle.
     /// The other half of [`register_cf`](Self::register_cf).
     pub(crate) fn unregister_cf(&self, name: &str, _p: &Publish) -> Option<Arc<ColumnFamily>> {
@@ -1421,7 +1580,7 @@ impl DbInner {
     }
 
     pub(crate) fn cf_dir(&self, name: &str) -> String {
-        format!("{}/cf-{}", self.dir, name)
+        format!("{}/{}", self.dir, crate::format::cf_dir_name(name))
     }
 
     /// Release every thread parked on the background IO limiter and stop
@@ -1481,24 +1640,48 @@ impl DbInner {
     /// is charged when pacing is on. Unpaced (the default) it is ignored and
     /// the file is unlinked right here, on the caller's thread.
     pub(crate) fn remove_sst_file(&self, path: &str, bytes: u64) {
+        self.retire_file(path, bytes, None);
+    }
+
+    /// [`remove_sst_file`](Self::remove_sst_file) for a file that lives on a
+    /// tier's [`Storage`](crate::storage::Storage) rather than as a local path —
+    /// the source object of a part demoted off a remote tier. Same pause and
+    /// pacing rules. Returns whether the removal was deferred by a pause.
+    pub(crate) fn remove_tier_file(
+        &self,
+        storage: Arc<dyn crate::storage::Storage>,
+        path: &str,
+        bytes: u64,
+    ) -> bool {
+        self.retire_file(path, bytes, Some(storage))
+    }
+
+    fn retire_file(
+        &self,
+        path: &str,
+        bytes: u64,
+        storage: Option<Arc<dyn crate::storage::Storage>>,
+    ) -> bool {
         // Crash simulation only (`util::fault::Call::Unlink`): leave the file
         // where it is, which is exactly the orphan a crash between the durable
         // catalog edit and this unlink produces. Free — and gone entirely from
         // release builds' behaviour — when no plan is installed.
         if crate::util::fault::check(crate::util::fault::Call::Unlink).is_err() {
-            return;
+            return false;
         }
         let task = DeleteTask {
             path: path.to_string(),
             bytes: bytes.max(DELETE_METADATA_BYTES),
+            storage,
         };
         let mut paused = self.file_deletion.paused.lock();
         if paused.disabled > 0 {
             paused.pending.push(task);
-            return;
+            return true;
         }
         drop(paused);
         self.file_deletion.dispatch(task);
+        false
     }
 
     /// Pause obsolete-file deletion for the lifetime of the returned guard. Nested
@@ -1506,6 +1689,14 @@ impl DbInner {
     pub(crate) fn pause_deletions(&self) -> DeletionPause<'_> {
         self.file_deletion.paused.lock().disabled += 1;
         DeletionPause { inner: self }
+    }
+
+    /// `(nesting depth, files queued)` of the deletion pause — what backs
+    /// [`DbStats::deletions_paused`](crate::DbStats::deletions_paused) and
+    /// [`DbStats::deletions_queued`](crate::DbStats::deletions_queued).
+    pub(crate) fn deletion_pause_state(&self) -> (u32, usize) {
+        let paused = self.file_deletion.paused.lock();
+        (paused.disabled, paused.pending.len())
     }
 
     fn resume_deletions(&self) {
@@ -1538,6 +1729,16 @@ impl DbInner {
 ///
 /// `DropCF`'s precondition is that the same edit removed all of its tables, so
 /// the two always travel together.
+/// The `SetCFUnifiedId` op a (re)created family needs when its unified id is
+/// not the one derived from its name; nothing otherwise, so a catalog without
+/// a divergent id stays byte-identical to one written before F5′.
+pub(crate) fn unified_id_op(name: &str, id: u64) -> Option<crate::manifest_edit::Op> {
+    (id != crate::unified::cf_id(name)).then(|| crate::manifest_edit::Op::SetCfUnifiedId {
+        name: name.to_string(),
+        id,
+    })
+}
+
 fn drop_cf_ops(name: &str, cf: &Arc<ColumnFamily>) -> Vec<crate::manifest_edit::Op> {
     let ids: Vec<u64> = cf.snapshot_ssts().into_iter().map(|meta| meta.id).collect();
     let mut ops = Vec::with_capacity(2);
@@ -1616,6 +1817,9 @@ fn undo_capability_prepare(undo: CapabilityPrepareUndo) {
 struct OpenResources {
     tiers: Arc<crate::storage::TierRegistry>,
     block_cache: Arc<BlockCache>,
+    tables: Arc<crate::table_cache::TableCache>,
+    read_lease: Option<crate::read_resources::ReadLease>,
+    local_cache: Option<Arc<crate::local_cache::DiskCache>>,
     flush_tx: Sender<FlushJob>,
     flush_rx: Receiver<FlushJob>,
     compact_tx: Sender<Arc<ColumnFamily>>,
@@ -1629,13 +1833,51 @@ struct OpenResources {
 
 impl OpenResources {
     fn new(opts: &Options, dir: &str) -> Result<Self> {
-        let file_cache = Arc::new(FileCache::new(opts.max_open_sstables.max(1)));
-        let tiers = build_tier_registry(opts, dir, file_cache)?;
+        // A leased open takes all three caches from the shared resources; the
+        // per-database size options are then ignored (documented on
+        // `Options::read_resources`).
+        let read_lease = match &opts.read_resources {
+            Some(shared) => Some(shared.lease(read_cache_namespace(opts, dir)?)?),
+            None => None,
+        };
+        let (file_cache, block_cache, tables) = match &read_lease {
+            Some(lease) => (
+                lease.file_cache(),
+                Arc::new(
+                    lease
+                        .block_cache()
+                        .with_background_admission(opts.admit_background_scan_blocks),
+                ),
+                Arc::new(lease.table_cache()),
+            ),
+            None => (
+                Arc::new(FileCache::new(opts.max_open_sstables.max(1))),
+                Arc::new(
+                    BlockCache::new(opts.block_cache_size as i64)
+                        .with_background_admission(opts.admit_background_scan_blocks),
+                ),
+                Arc::new(crate::table_cache::TableCache::with_byte_budget(
+                    opts.max_open_readers,
+                    opts.max_open_reader_bytes,
+                )),
+            ),
+        };
+        let local_cache = match &opts.local_cache_path {
+            Some(path) => Some(crate::local_cache::DiskCache::open(
+                path,
+                opts.local_cache_max_bytes,
+            )?),
+            None => None,
+        };
+        let tiers = build_tier_registry(opts, dir, file_cache, local_cache.as_ref())?;
         let (flush_tx, flush_rx) = unbounded::<FlushJob>();
         let (compact_tx, compact_rx) = unbounded::<Arc<ColumnFamily>>();
         Ok(Self {
             tiers,
-            block_cache: Arc::new(BlockCache::new(opts.block_cache_size as i64)),
+            block_cache,
+            tables,
+            read_lease,
+            local_cache,
             flush_tx,
             flush_rx,
             compact_tx,
@@ -1649,6 +1891,16 @@ impl OpenResources {
     }
 }
 
+/// The cache namespace a leased open keys under: the caller's name, or the
+/// database directory's canonical path. Prefixed so a caller's name can never
+/// collide with some directory's path.
+fn read_cache_namespace(opts: &Options, dir: &str) -> Result<String> {
+    Ok(match &opts.read_cache_namespace {
+        Some(name) => format!("name:{name}"),
+        None => format!("path:{}", std::fs::canonicalize(dir)?.display()),
+    })
+}
+
 struct WorkerReceivers {
     flush: Receiver<FlushJob>,
     compact: Receiver<Arc<ColumnFamily>>,
@@ -1658,7 +1910,11 @@ fn build_tier_registry(
     opts: &Options,
     dir: &str,
     file_cache: Arc<FileCache>,
+    local_cache: Option<&Arc<crate::local_cache::DiskCache>>,
 ) -> Result<Arc<crate::storage::TierRegistry>> {
+    // Computed once, only if some tier will use it: it reads the LOCK file,
+    // which `DB::open` has created by now.
+    let mut cache_ns: Option<String> = None;
     // The default tier permits mmap when built; named local tiers honor their
     // flag so a slow mount can force positioned reads. "ssd" aliases default.
     let default = crate::storage::LocalStorage::new(file_cache.clone(), true);
@@ -1675,6 +1931,25 @@ fn build_tier_registry(
             crate::config::TierBackend::S3(config) => crate::storage_s3::S3Storage::new(config)?,
             // The embedder owns the construction and wrapping of custom stores.
             crate::config::TierBackend::Custom(storage) => storage.clone(),
+        };
+        // Remote tiers (anything but a plain local directory) read through
+        // the local disk cache when one is configured (P8).
+        let storage = match (local_cache, &tier.backend) {
+            (Some(cache), backend) if !matches!(backend, crate::config::TierBackend::Local) => {
+                let ns = match &cache_ns {
+                    Some(ns) => ns.clone(),
+                    None => {
+                        let ns = crate::local_cache::namespace_for(
+                            opts.read_cache_namespace.as_deref(),
+                            dir,
+                        )?;
+                        cache_ns = Some(ns.clone());
+                        ns
+                    }
+                };
+                crate::local_cache::CachedStorage::new(storage, cache.clone(), ns)
+            }
+            _ => storage,
         };
         extra.push((tier.name.clone(), tier.root.clone(), storage));
     }
@@ -1710,10 +1985,14 @@ fn build_db_inner(
     requested_layout: WalLayout,
     lock_file: std::fs::File,
     resources: OpenResources,
+    format: crate::format::FormatProfile,
 ) -> Result<(Arc<DbInner>, WorkerReceivers)> {
     let OpenResources {
         tiers,
         block_cache,
+        tables,
+        read_lease,
+        local_cache,
         flush_tx,
         flush_rx,
         compact_tx,
@@ -1749,11 +2028,8 @@ fn build_db_inner(
         &closing,
         &poison,
         &wal_syncs,
+        format,
     )?;
-    let tables = Arc::new(crate::table_cache::TableCache::with_byte_budget(
-        opts.max_open_readers,
-        opts.max_open_reader_bytes,
-    ));
     // Built once and shared: `None` unless background IO is limited, so the
     // default configuration costs one nil check at each charge point.
     let io_limiter = crate::ioctrl::limiter_for(
@@ -1774,6 +2050,7 @@ fn build_db_inner(
         range_fragment_registry: Arc::new(crate::range_tombstone::FragmentRegistry::default()),
         io_limiter: io_limiter.clone(),
         tables,
+        shared_reads: read_lease.is_some(),
         flush_tx,
         compact_tx,
         closing: closing.clone(),
@@ -1782,9 +2059,13 @@ fn build_db_inner(
         unified: unified.clone(),
         poison: poison.clone(),
         wal_syncs: wal_syncs.clone(),
+        wal_write_buffer_size: opts.wal_write_buffer_size,
+        block_reads: Arc::new(crate::util::Semaphore::new(opts.max_concurrent_block_reads)),
         caps: caps.clone(),
         clock: clock.clone(),
+        read_profile: Arc::default(),
         span_index: span_index.clone(),
+        format,
     });
     let inner = Arc::new(DbInner {
         opts: opts.clone(),
@@ -1844,6 +2125,9 @@ fn build_db_inner(
         file_deletion: FileDeletionState::new(opts),
         workers: Mutex::new(Vec::new()),
         lock_file: Mutex::new(Some(lock_file)),
+        format_upgrade: Mutex::new(None),
+        read_lease: Mutex::new(read_lease),
+        local_cache,
         handles: Arc::new(AtomicUsize::new(1)),
         poison,
         clock,
@@ -2005,6 +2289,7 @@ pub(crate) fn prepared_bytes(arena: usize, writes: usize) -> usize {
     arena + writes * std::mem::size_of::<crate::prepared::PreparedWrite>()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_unified_store(
     opts: &Options,
     dir: &str,
@@ -2013,6 +2298,7 @@ fn open_unified_store(
     closing: &Arc<AtomicBool>,
     poison: &Arc<crate::util::Poison>,
     wal_syncs: &Arc<AtomicU64>,
+    format: crate::format::FormatProfile,
 ) -> Result<(
     Option<Arc<crate::unified::UnifiedStore>>,
     u64,
@@ -2029,6 +2315,7 @@ fn open_unified_store(
         closing.clone(),
         poison.clone(),
         wal_syncs.clone(),
+        format,
     )?;
     Ok((Some(store), max_seq, recovered))
 }
@@ -2039,7 +2326,7 @@ fn recover_column_families(
     opts: &Options,
 ) -> Result<()> {
     for persisted in &manifest.cfs {
-        let mut config = ColumnFamilyConfig::decode(&persisted.config);
+        let mut config = ColumnFamilyConfig::decode(&persisted.config)?;
         let comparator = comparator_by_name(&config.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
         })?;
@@ -2048,6 +2335,7 @@ fn recover_column_families(
         let (cf, max_seq) = ColumnFamily::load(
             inner.ctx.clone(),
             persisted.name.clone(),
+            persisted.effective_unified_id(),
             inner.cf_dir(&persisted.name),
             config,
             comparator,
@@ -2179,11 +2467,36 @@ fn ensure_instance_nonce(inner: &Arc<DbInner>) -> Result<()> {
 
 impl DB {
     /// Open (creating if needed) the database at `opts.path`.
+    ///
+    /// An ondaDB **0.9.x** directory is upgraded to yoloDB format epoch 1
+    /// first, unless [`Options::format_upgrade`] says otherwise; see
+    /// [`crate::upgrade`]. A format upgrade interrupted by a crash is completed
+    /// or rolled back here before anything else is read.
     pub fn open(opts: Options) -> Result<DB> {
+        crate::upgrade::open_observed(opts, &crate::upgrade::NoObserver)
+    }
+
+    /// What the open that produced this handle did to upgrade an ondaDB 0.9
+    /// directory to yoloDB format epoch 1 — sizes, duration, the backup's path
+    /// — or `None` if the directory was already in epoch 1.
+    pub fn last_format_upgrade(&self) -> Option<crate::upgrade::UpgradeReport> {
+        self.inner.format_upgrade.lock().clone()
+    }
+
+    /// The epoch-1 open: everything [`open`](Self::open) does once the
+    /// directory is known not to be a 0.9 one.
+    pub(crate) fn open_epoch1(opts: Options) -> Result<DB> {
         if opts.path.is_empty() {
             return Err(OndaError::InvalidArgs("empty path".into()));
         }
         check_merge_fn_names(&opts)?;
+        // Shared read resources assume immutable tables: a writer would flush,
+        // compact and delete files other databases' cached readers may hold.
+        if opts.read_resources.is_some() && !opts.read_only {
+            return Err(OndaError::InvalidArgs(
+                "Options::read_resources requires Options::read_only".into(),
+            ));
+        }
         if opts.migrate_to_unified {
             if !opts.unified_memtable {
                 return Err(OndaError::InvalidArgs(
@@ -2203,6 +2516,29 @@ impl DB {
     /// Open without running layout migration. Kept separate so migration can
     /// recover and flush the legacy layout under the ordinary DB invariants.
     fn open_impl(opts: Options) -> Result<DB> {
+        Self::open_with_format(opts, crate::format::FormatProfile::Epoch1, None)
+    }
+
+    /// Open a database whose files are in format family `format`.
+    ///
+    /// Anything but [`FormatProfile::Epoch1`](crate::format::FormatProfile)
+    /// is a 0.9 directory read through `legacy_onda`, and only ever read-only:
+    /// this binary cannot write a 0.9 byte, so a writable open of one would
+    /// produce a directory that is neither.
+    ///
+    /// `lock` is a `<dir>/LOCK` handle the caller already holds (the format
+    /// upgrade, which must not drop its exclusive lock between building a
+    /// directory and opening it); `None` acquires it here as usual.
+    pub(crate) fn open_with_format(
+        opts: Options,
+        format: crate::format::FormatProfile,
+        lock: Option<std::fs::File>,
+    ) -> Result<DB> {
+        if format != crate::format::FormatProfile::Epoch1 && !opts.read_only {
+            return Err(OndaError::InvalidArgs(
+                "a 0.9 database can only be opened read-only".into(),
+            ));
+        }
         std::fs::create_dir_all(&opts.path)?;
         let dir = opts.path.clone();
 
@@ -2211,7 +2547,10 @@ impl DB {
         // opens take it shared so concurrent readers coexist but a writer is
         // excluded. The lock dies with the fd, so a crashed process never
         // leaves a stale lock behind.
-        let lock_file = acquire_dir_lock(&dir, opts.read_only)?;
+        let lock_file = match lock {
+            Some(f) => f,
+            None => acquire_dir_lock(&dir, opts.read_only)?,
+        };
         let resources = OpenResources::new(&opts, &dir)?;
 
         // A leftover MANIFEST.tmp / MANIFEST-EDITS.tmp is a crash artifact, not
@@ -2224,7 +2563,11 @@ impl DB {
         // The WAL layout is a durable database-wide choice once the catalog
         // contains a column family. Opening under the other layout would make
         // recovery consult one set of WALs while new commits write another.
-        let manifest = crate::manifest_edit::recover_catalog(&dir)?;
+        let manifest = match format {
+            crate::format::FormatProfile::Epoch1 => crate::manifest_edit::recover_catalog(&dir)?,
+            #[cfg(feature = "legacy-onda")]
+            crate::format::FormatProfile::Onda09 => crate::legacy_onda::recover_catalog(&dir)?,
+        };
         let requested_layout = requested_wal_layout(&opts);
         validate_wal_layout(&manifest, requested_layout)?;
         let (inner, receivers) = build_db_inner(
@@ -2234,6 +2577,7 @@ impl DB {
             requested_layout,
             lock_file,
             resources,
+            format,
         )?;
         recover_column_families(&inner, &manifest, &opts)?;
         finish_open(&inner, &manifest, receivers)?;
@@ -2302,17 +2646,21 @@ impl DB {
         if self.inner.cfs.read().contains_key(name) {
             return Err(OndaError::Exists(name.into()));
         }
+        let unified_id = self.inner.choose_unified_id(name, &[]);
         let cf = ColumnFamily::create(
             self.inner.ctx.clone(),
             name.to_string(),
             self.inner.cf_dir(name),
             config,
             cmp,
+            unified_id,
         )?;
-        let edit = VersionEdit::new(vec![crate::manifest_edit::Op::CreateCf {
+        let mut ops = vec![crate::manifest_edit::Op::CreateCf {
             name: name.to_string(),
             config: cf.effective_config().encode(),
-        }]);
+        }];
+        ops.extend(unified_id_op(name, unified_id));
+        let edit = VersionEdit::new(ops);
         // A failed transaction leaves the directory and its empty WAL behind,
         // referenced by no catalog — exactly what a crash between the old
         // create and its manifest persist left, and what the open-time sweep
@@ -2393,17 +2741,22 @@ impl DB {
             }
         }
         let mut created = Vec::with_capacity(specs.len());
+        let mut chosen: Vec<u64> = Vec::with_capacity(specs.len());
         for (name, config) in specs {
             let cmp =
                 comparator_by_name(&config.comparator_name).expect("comparator validated above");
             let mut config = config.clone();
             resolve_merge_operator(&mut config, &self.inner.opts, name)?;
+            // Distinct within the batch too: none is registered yet.
+            let unified_id = self.inner.choose_unified_id(name, &chosen);
+            chosen.push(unified_id);
             let cf = ColumnFamily::create(
                 self.inner.ctx.clone(),
                 (*name).to_string(),
                 self.inner.cf_dir(name),
                 config,
                 cmp,
+                unified_id,
             )?;
             created.push(cf);
         }
@@ -2413,9 +2766,12 @@ impl DB {
         let edit = VersionEdit::new(
             created
                 .iter()
-                .map(|cf| crate::manifest_edit::Op::CreateCf {
-                    name: cf.name().to_string(),
-                    config: cf.effective_config().encode(),
+                .flat_map(|cf| {
+                    std::iter::once(crate::manifest_edit::Op::CreateCf {
+                        name: cf.name().to_string(),
+                        config: cf.effective_config().encode(),
+                    })
+                    .chain(unified_id_op(cf.name(), cf.id()))
                 })
                 .collect(),
         );
@@ -2530,16 +2886,20 @@ impl DB {
     /// become stale (their writes fail), exactly as after
     /// [`drop_column_family`](Self::drop_column_family) + re-create.
     ///
-    /// Not supported in unified-memtable mode: the shared memtable still holds
-    /// the old entries under the same CF id, so they would resurface.
+    /// Under the unified layout (plan C F5′) the shared memtable and WAL still
+    /// hold the old entries, under the family's old unified id. The cleared
+    /// family therefore takes a **fresh** id ([`DbInner::choose_unified_id`]),
+    /// made durable by the same catalog edit (`SetCFUnifiedId`): the old
+    /// entries are then owned by no family, invisible to every read, and
+    /// discarded by the next unified flush — also after a crash, when the WAL
+    /// replays them under the old id. A handle to the old family keeps writing
+    /// under the old id, so its writes are discarded the same way. Refused with
+    /// `Busy` while an unresolved prepared transaction names the family.
+    ///
+    /// [`DbInner::choose_unified_id`]: crate::db::DbInner::choose_unified_id
     pub fn clear_column_family(&self, name: &str) -> Result<Arc<ColumnFamily>> {
         if self.inner.opts.read_only {
             return Err(OndaError::ReadOnly("database is read-only".into()));
-        }
-        if self.inner.unified.is_some() {
-            return Err(OndaError::InvalidArgs(
-                "clear_column_family is not supported in unified-memtable mode".into(),
-            ));
         }
         let _lifecycle = self.inner.cf_lifecycle_mu.lock();
         let old = self
@@ -2549,17 +2909,29 @@ impl DB {
             .get(name)
             .cloned()
             .ok_or(OndaError::NotFound)?;
+        // A prepared writeset names the family by its unified id; committing it
+        // after the id changed would apply it to nobody.
+        if self.inner.prepared.lock().touches_cf(old.id()) {
+            return Err(OndaError::Busy(format!(
+                "column family {name:?} is named by an unresolved prepared transaction; \
+                 resolve it with commit_prepared or abort_prepared (see list_prepared)"
+            )));
+        }
         let cfg = old.effective_config();
         let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
         })?;
+        // Never the old id: its entries are exactly what is being cleared.
+        let unified_id = self.inner.choose_unified_id(name, &[old.id()]);
         // ONE edit: every table removed, the family dropped, the same name
-        // re-created empty. Durable before a single byte is unlinked.
+        // re-created empty (under its new unified id). Durable before a single
+        // byte is unlinked.
         let mut ops = drop_cf_ops(name, &old);
         ops.push(crate::manifest_edit::Op::CreateCf {
             name: name.to_string(),
             config: cfg.encode(),
         });
+        ops.extend(unified_id_op(name, unified_id));
         // The wipe-and-recreate runs *inside* the publish step so the registry
         // never shows a gap: a concurrent `get_column_family` sees either the
         // full old family or the empty new one, which is this method's contract.
@@ -2577,6 +2949,7 @@ impl DB {
                 self.inner.cf_dir(name),
                 cfg,
                 cmp,
+                unified_id,
             );
             if let Ok(cf) = &made {
                 self.inner.register_cf(cf, p);
@@ -2688,6 +3061,99 @@ impl DB {
             cf.record_compaction_failure(error);
         }
         result
+    }
+
+    /// Counters of the local disk cache remote tiers read through
+    /// ([`Options::local_cache_path`](crate::Options::local_cache_path)), or
+    /// `None` when none is configured. The cache may be shared with other
+    /// databases of this process that name the same directory; the counters
+    /// are the cache's, not this database's share.
+    pub fn local_cache_stats(&self) -> Option<crate::local_cache::LocalCacheStats> {
+        self.inner.local_cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Compact the tables of `cf` whose key span reaches into
+    /// `[lower, upper]` down to the bottom level, and wait for it (plan C F3,
+    /// wavesdb `CompactRange`).
+    ///
+    /// Bounds follow [`Txn::new_iterator_bounded`](crate::Txn::new_iterator_bounded):
+    /// `Included`/`Excluded`/`Unbounded` user keys under the family's
+    /// comparator; `(Unbounded, Unbounded)` is the whole family. Selection is
+    /// by **whole table** — a table is taken when its span (point keys plus
+    /// range-tombstone fragments) intersects the bounds, so keys outside the
+    /// bounds that share a table with keys inside are rewritten too, and in L0
+    /// every file older than the newest in-span one moves with it (L0 files
+    /// overlap, and only an oldest-first window can move without reordering
+    /// versions).
+    ///
+    /// The work is ordinary compaction, level by level (`L -> L+1` jobs,
+    /// then an in-place rewrite of in-span bottom tables that no push
+    /// produced), through the normal catalog transaction and retention rules:
+    /// tombstones and expired TTL entries reaching the bottom are dropped
+    /// unless a live snapshot still sees what they shadow, and bottom output is
+    /// cut at partition boundaries. It runs on the caller's thread and holds
+    /// the family's whole key range while it does, like
+    /// [`compact`](Self::compact), so background compaction and parts/tiers
+    /// operations on the family wait; writes and flushes do not. A foreign
+    /// mount blocks only the push that would merge around it. A FIFO family
+    /// never merges: this runs its eviction pass and nothing else.
+    pub fn compact_range(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.inner.poison.check()?;
+        let result = compaction::run_range(&self.inner, cf, lower, upper);
+        if let Err(error) = &result {
+            cf.record_compaction_failure(error);
+        }
+        result
+    }
+
+    /// Flush `cf`'s memtable, then compact its whole key space into the bottom
+    /// level ([`compact_range`](Self::compact_range) over `(Unbounded,
+    /// Unbounded)`), and wait for both — wavesdb `PurgeColumnFamily`.
+    ///
+    /// What it reclaims is what any compaction to the bottom reclaims:
+    /// overwritten versions, tombstones together with the puts they shadow,
+    /// and expired TTL entries — except whatever a live snapshot or iterator
+    /// can still see, which survives exactly as it survives every other
+    /// compaction. Afterwards the family's data sits in its deepest level
+    /// (plus any L0 file a concurrent flush added meanwhile). Nothing is
+    /// deleted that a read could still return; this is reclamation, not
+    /// [`clear_column_family`](Self::clear_column_family). A FIFO family is
+    /// flushed and then runs its eviction pass. `ReadOnly` on a read-only
+    /// handle.
+    pub fn purge_column_family(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.flush_memtable(cf)?;
+        self.compact_range(
+            cf,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+        )
+    }
+
+    /// [`purge_column_family`](Self::purge_column_family) for every column
+    /// family, one after another (wavesdb `Purge`). Stops at the first error;
+    /// families purged before it stay purged.
+    pub fn purge(&self) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        let mut cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
+        // A stable order, so a failure is reproducible.
+        cfs.sort_by(|a, b| a.name().cmp(b.name()));
+        for cf in &cfs {
+            self.purge_column_family(cf)?;
+        }
+        Ok(())
     }
 
     /// Force an fsync of every write-ahead log (all column families plus the
@@ -3146,6 +3612,9 @@ impl DB {
         // now closed, and pacing was cancelled at the top of `close`, so this
         // drains at full speed rather than at the configured rate.
         self.inner.drain_deletions();
+        // The shared-cache lease goes after every reader of this database is
+        // done with: releasing it may purge this namespace's readers and blocks.
+        drop(self.inner.read_lease.lock().take());
         // Release the directory lock last, once all state is durable, so a
         // concurrent open never sees a half-closed database.
         *self.inner.lock_file.lock() = None;
@@ -3169,7 +3638,7 @@ impl DB {
 /// a collision needs two databases minting in the same nanosecond with the
 /// same path and pid — but unique enough that object names never collide
 /// under a shared tier root, which is all it exists for.
-fn mint_instance_nonce(dir: &str) -> u64 {
+pub(crate) fn mint_instance_nonce(dir: &str) -> u64 {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(dir.as_bytes());
@@ -3261,7 +3730,7 @@ fn parse_sst_file_id(name: &str) -> Option<u64> {
 }
 
 /// Acquire the advisory lock on `<dir>/LOCK` (exclusive unless `read_only`).
-fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
+pub(crate) fn acquire_dir_lock(dir: &str, read_only: bool) -> Result<std::fs::File> {
     use std::fs::TryLockError;
     let path = std::path::Path::new(dir).join("LOCK");
     let f = std::fs::OpenOptions::new()
@@ -3373,12 +3842,16 @@ fn should_schedule_compaction(
 fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
     crate::compaction::refresh_compaction_debt(db, cf);
     let fifo = cf.opts.compaction_style == crate::config::CompactionStyle::Fifo;
+    // The density arm (P4) rides on `ranges`' slot: both are "work worth
+    // waking the worker for with L0 nowhere near its trigger". A delete-heavy
+    // flush produces no size pressure at all, so without it the trigger would
+    // only ever be evaluated by a pass something else happened to start.
     if should_schedule_compaction(
         db.closing.load(Ordering::Relaxed),
         fifo,
         cf.l0_len(),
         cf.opts.l1_file_count_trigger as usize,
-        cf.has_range_fragments(),
+        cf.has_range_fragments() || (!fifo && crate::compaction::density_due(db, cf)),
     ) {
         let _ = db.ctx.compact_tx.send(cf.clone());
     }
@@ -3801,7 +4274,7 @@ mod catalog_txn_tests {
             !crate::manifest_edit::edit_log_path(dir.path()).exists(),
             "no capability, no log"
         );
-        assert_eq!(manifest_version(dir.path()), 1);
+        assert_eq!(manifest_caps(dir.path()), 0);
 
         db.enable_format_capabilities(crate::format::CAP_MANIFEST_EDITS)
             .unwrap();
@@ -3809,7 +4282,7 @@ mod catalog_txn_tests {
             crate::manifest_edit::edit_log_path(dir.path()).exists(),
             "the capability is durable before the first append, and creates the log"
         );
-        assert_eq!(manifest_version(dir.path()), 2);
+        assert_eq!(manifest_caps(dir.path()), crate::format::CAP_MANIFEST_EDITS);
         db.inner.catalog_txn(add_table(42), |_| {}).unwrap();
         assert_eq!(log_ids(dir.path()), vec![1]);
         db.close().unwrap();
@@ -3846,7 +4319,7 @@ mod catalog_txn_tests {
             db.flush_memtable(&cf).unwrap();
             db.close().unwrap();
         }
-        assert_eq!(manifest_version(dir.path()), 1);
+        assert_eq!(manifest_caps(dir.path()), 0);
         assert!(!crate::manifest_edit::edit_log_path(dir.path()).exists());
         {
             let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
@@ -3889,9 +4362,13 @@ mod catalog_txn_tests {
         db.close().unwrap();
     }
 
-    fn manifest_version(dir: &std::path::Path) -> u32 {
-        let bytes = std::fs::read(manifest_path(dir.to_str().unwrap())).unwrap();
-        u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+    /// The capability word of the manifest on disk. (0.9 bumped the manifest
+    /// version when a capability was enabled; epoch 1 carries the word in a
+    /// fixed header field, so the word itself is what these tests watch.)
+    fn manifest_caps(dir: &std::path::Path) -> u64 {
+        crate::manifest::Manifest::load(manifest_path(dir.to_str().unwrap()))
+            .unwrap()
+            .caps
     }
 
     /// Slice 8's last row, which only becomes checkable once the call sites are
@@ -4429,7 +4906,10 @@ mod tests {
             scope.spawn(|| {
                 done_tx.send(db.flush_memtable(&a)).unwrap();
             });
-            let completed = done_rx.recv_timeout(Duration::from_secs(1));
+            // Generous: the wait under test is unbounded without the fix, and
+            // a rotation fsyncs each new WAL stripe's header, which a loaded
+            // test machine can stretch well past a second.
+            let completed = done_rx.recv_timeout(Duration::from_secs(20));
             // Always release the artificial work before asserting, so the old
             // implementation can exit and the scoped thread cannot deadlock.
             db.inner.pending_flush.fetch_sub(1, Ordering::SeqCst);

@@ -24,21 +24,26 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtOrd};
 use std::sync::Arc;
 
+// Per thread, not process-wide: the tests that read it assert what *their*
+// iteration materialized, and a process-global count also saw every other test
+// of the same binary running in parallel (a spurious 1 under load).
 #[cfg(debug_assertions)]
-static SNAPSHOT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Reset the debug-build snapshot materialization counter.
+/// Reset the calling thread's debug-build snapshot materialization counter.
 #[doc(hidden)]
 #[cfg(debug_assertions)]
 pub fn reset_snapshot_calls() {
-    SNAPSHOT_CALLS.store(0, AtOrd::Relaxed);
+    SNAPSHOT_CALLS.with(|c| c.set(0));
 }
 
-/// Read the debug-build snapshot materialization counter.
+/// Read the calling thread's debug-build snapshot materialization counter.
 #[doc(hidden)]
 #[cfg(debug_assertions)]
 pub fn snapshot_calls() -> usize {
-    SNAPSHOT_CALLS.load(AtOrd::Relaxed)
+    SNAPSHOT_CALLS.with(|c| c.get())
 }
 
 #[cfg(not(feature = "arena-memtable"))]
@@ -674,7 +679,7 @@ impl Memtable {
     /// (user key ascending, sequence descending).
     pub fn snapshot(&self) -> Vec<Entry> {
         #[cfg(debug_assertions)]
-        SNAPSHOT_CALLS.fetch_add(1, AtOrd::Relaxed);
+        SNAPSHOT_CALLS.with(|c| c.set(c.get() + 1));
         let mut out = Vec::with_capacity(self.num_entries.load(AtOrd::Relaxed).max(0) as usize);
         #[cfg(not(feature = "arena-memtable"))]
         for shard in &self.shards {

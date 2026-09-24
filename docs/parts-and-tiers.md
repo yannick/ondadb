@@ -302,9 +302,18 @@ Notes:
   source) and idempotent; local orphans from a crash mid-move are swept at
   the next open. Reads never block on a move — the flip swaps handles and
   in-flight reads finish on the old ones.
-- The mover only moves parts **onto** named tiers. A rule with
+- The background mover only moves parts **onto** named tiers. A rule with
   `tier: "ssd".into()` (the reserved default-tier name) stops future moves
-  but does not move a part back; there is no automatic demotion in 0.3.0.
+  but does not move a part back — that stays true.
+- **Demotion is manual (0.9.2):** `db.move_part_to_default_tier(&cf, "img")`
+  — or `move_part_to_tier(&cf, "img", "ssd")` — brings a part back from any
+  named tier, local or S3, through the same copy → durable finish → catalog
+  flip → source delete protocol (the source is read with range GETs when it
+  is on S3, and the S3 objects are deleted through the tier afterwards, via
+  the same pausable deletion path). A crash before the flip leaves the part
+  where it was and its partial local copy is swept at open; a crash after it
+  leaves a stale source copy, swept at open on a local tier (not on S3 — the
+  S3 orphan gap below). Tables published on a **shared** tier never move.
 - A partition with no tier rule stays wherever it was written (the default
   tier — compaction output always lands there).
 
@@ -331,6 +340,7 @@ let s3cfg = S3Config {
     access_key: "minioadmin".into(),
     secret_key: "minioadmin".into(),
     path_style: true,                         // required by MinIO
+    ..S3Config::default()                     // session_token, anonymous, profile, read_only
 };
 
 let mut opts = Options::new("/data/onda");
@@ -380,6 +390,36 @@ What actually happens on the wire:
   blooms are held by the reader; data blocks compete for the cache). If S3
   reads matter to you, hundreds of MB (`Options::block_cache_size`, default
   64 MiB) is money well spent; watch `range_gets` to confirm your hit rate.
+
+### S3 credentials, read-only buckets and listing (0.9.2)
+
+`S3Config` picks **one** credential source, in this order
+(`S3Config::credential_source()` reports the choice without any I/O):
+
+| # | Configured | Behaviour |
+|---|---|---|
+| 1 | `access_key` + `secret_key` (+ optional `session_token`) | Static keys. The token is what temporary credentials (SSO, IRSA, an instance or assumed role) need; before 0.9.2 it was always sent empty. |
+| 2 | `anonymous: true` | Unsigned requests, for public-read buckets. Beats a profile and the chain. |
+| 3 | `profile: Some(name)` | That section of the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE`, default `~/.aws/credentials`) and **nothing else**: a missing profile fails at `S3Storage::new`, it never falls back to the environment. |
+| 4 | nothing | Default chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` → the shared file (section `AWS_PROFILE`, else `default`) → web-identity STS (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) → ECS/EC2 instance metadata. Resolved **on the first request**, so opening a database never blocks on a metadata service; expiring credentials are refreshed by rust-s3. |
+
+Half a key pair, or a `session_token` without keys, is refused with
+`InvalidArgs`.
+
+`read_only: true` refuses every write (`create`, `put_object`,
+`create_if_absent`, `delete`, `rename`) locally with `OndaError::ReadOnly`,
+before any request. ondaDB never probes or creates the bucket in either mode,
+so a principal holding only `s3:GetObject` + `s3:ListBucket` can read.
+
+Every PUT carries `x-amz-checksum-sha256`; the store recomputes the digest of
+what arrived and refuses a mismatch, and its echo is compared with what was
+sent. `Storage::put_object` returns the result as an `ObjectInfo { size,
+sha256, store_checksum, store_verified }`. `Storage::create_if_absent` is the
+conditional form (`If-None-Match: *`), and `Storage::list_prefixes(prefix,
+token, limit)` lists the immediate child prefixes one page at a time (the
+delimiter listing `list` does not expose) — the cheap way to discover
+checkpoint prefixes in a bucket. A 404 surfaces as `io::ErrorKind::NotFound`
+(`ondadb::storage::is_not_found`), the same as a missing local file.
 
 ## Custom tier backends (`TierBackend::Custom`)
 
@@ -442,6 +482,63 @@ is positional and a short read is an error; `create(...).finish()` must make
 the object durable (it runs *before* the manifest flip that publishes it);
 `delete` of a missing object must succeed; implementations must be
 `Send + Sync` — engine threads call concurrently.
+
+## Local disk cache for remote tiers (`Options::local_cache_path`, P8)
+
+The built-in version of the decorator sketched above (wavesdb
+`LocalCachePath`, `f28aecc`). Set a directory — and, usually, a bound:
+
+```rust
+let mut opts = Options::new("/data/db");
+opts.tiers = vec![TierDef::s3("s3", "onda-prod", s3cfg)];
+opts.local_cache_path = Some("/nvme/onda-cache".into());
+opts.local_cache_max_bytes = 50 << 30; // 50 GiB; 0 = unbounded
+```
+
+What it does:
+
+- **Which reads.** Every tier that is not a plain local directory — S3 and
+  `TierDef::custom` backends, including an `open_remote_checkpoint` mount — is
+  wrapped in `local_cache::CachedStorage`. Range reads of **table objects**
+  (`.klog`, `.vlog`) are looked up on local disk first; a miss is fetched from
+  the tier and admitted. Everything else (a remote checkpoint's `MANIFEST`,
+  listings, writes) passes straight through, because only table objects are
+  immutable once written. Reads larger than `local_cache::MAX_ENTRY_BYTES`
+  (4 MiB — whole-object copies during a demotion or checkpoint) are not
+  admitted.
+- **Where it sits.** Below the in-memory block cache: a block memory still
+  holds never reaches it. It pays on blocks memory evicted and on every read
+  after a restart — the second process to open the database reads warm.
+- **Crash safety.** An entry is written to a temp file and renamed into place,
+  never fsynced; each entry file carries its full key and a CRC32-C over
+  everything. A torn, truncated, or bit-flipped entry fails verification, is
+  deleted, and the read goes to the tier — a damaged cache costs GETs, never
+  wrong bytes. (The reader's own per-block CRC still runs on top.) Stray and
+  temp files are removed when the cache is opened.
+- **Namespacing.** Entries are keyed by `(namespace, object path, offset,
+  length)`. The namespace is `Options::read_cache_namespace` when set — the
+  same promise as for `ReadResources`: databases under one name hold
+  byte-identical tables under the same ids — else the database directory's
+  canonical path plus the inode and birth time of its `LOCK` file. The second
+  half matters: a database wiped and re-created in the same directory restarts
+  its table ids and may overwrite its old objects at the same keys, and must not
+  see the old entries (`tests/local_cache.rs`,
+  `a_recreated_database_does_not_see_the_old_entries`).
+- **Bound and eviction.** `local_cache_max_bytes` counts whole entry files;
+  least-recently-used entries are evicted after each admission. Bookkeeping is
+  in memory, rebuilt at open from a directory listing (entries sit in a
+  two-level hex tree named by SHA-256 of the key). A smaller bound on a later
+  open applies at once.
+- **Sharing.** Many databases in one process may name one directory — they
+  share one bound and one bookkeeping (`DiskCache::open` returns the live
+  instance). Two processes may share a directory safely (every entry is
+  verified on read) but each only accounts for what it has seen, so give each
+  process its own directory if the bound matters.
+- **Observability.** `DB::local_cache_stats()` → `LocalCacheStats { entries,
+  bytes, max_bytes, hits, misses, admits, evictions, corrupt }`.
+
+Nothing here is persisted in the database, and the cache directory must not be
+inside a database directory. Deleting it at any time is safe.
 
 ## Shared tiers & attach-by-reference (A2, 0.7.8)
 
@@ -534,6 +631,47 @@ bottom-level placement check compares **span** bounds — a table's fragments ma
 reach past its last point key, and two bottom tables with overlapping spans
 would break the level-≥1 disjointness reads depend on. An incoming table whose
 span overlaps a live or already-staged one goes to L0, where overlap is legal.
+
+## Object-store checkpoints (0.9.2)
+
+`DB::checkpoint_to_object_store(store, prefix, &opts)` writes a checkpoint to
+any `Storage` — an `S3Storage`, or a `LocalStorage` rooted anywhere:
+
+```text
+<prefix>/cf-<name>/<id>.klog      every live table
+<prefix>/cf-<name>/<id>.vlog      when the table has a value log
+<prefix>/MANIFEST                 uploaded LAST: the commit marker
+```
+
+- It flushes, pauses obsolete-file deletion for the whole upload, and copies
+  exactly the file set a local `checkpoint` would (tables on any tier are
+  read where they live). The MANIFEST is the same snapshot-only catalog: no
+  tier placement, no edit log. A read-only source is accepted; its
+  WAL-replayed memtables are written as new L0 tables into a local scratch
+  directory and uploaded, never into the source.
+- **No MANIFEST ⇒ no checkpoint.** An interrupted upload leaves table objects
+  but no MANIFEST; `restore_from_object_store` and `open_remote_checkpoint`
+  then return `OndaError::NotFound`, not corruption.
+- **Incremental:** `ObjectCheckpointOptions { parent: Some(previous), .. }`
+  skips objects the previous checkpoint of the same prefix uploaded and
+  rewrites the MANIFEST with the full set. Only the latest checkpoint in a
+  prefix is restorable. `DB::sstables_diff(&previous.tables)` shows what
+  will be shipped.
+- **Receipts:** `receipts: true` publishes with create-if-absent
+  (`If-None-Match: *` on S3) and returns an `ObjectReceipt { key, size,
+  sha256, store_checksum, store_verified }` per object, MANIFEST first. An
+  object already in place is accepted only if its size and SHA-256 match
+  (so a retry is idempotent); otherwise the call fails with
+  `OndaError::Exists`. Not combinable with `parent`.
+- `restore_from_object_store(store, prefix, dir)` downloads the MANIFEST
+  first but writes it into `dir` **last**, after every table is durable and
+  size-checked against it.
+- `open_remote_checkpoint(store, prefix, opts)` (requires
+  `opts.read_only`) downloads only the MANIFEST into `opts.path`, places
+  every table on a shared tier named `__ondadb_remote_checkpoint__` rooted
+  at `prefix`, and opens the database. Reads are range GETs through the
+  block cache; reader sizes come from the MANIFEST, so no HEAD per table.
+  A read-only `S3Config` (and `anonymous`) is enough.
 
 ## Operational notes
 

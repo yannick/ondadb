@@ -47,8 +47,74 @@ pub trait StorageWriter: Write + Send {
     fn finish(self: Box<Self>) -> Result<()>;
 }
 
+/// What a completed whole-object write left behind.
+///
+/// `sha256` is the digest of the bytes **this process sent**. `store_verified`
+/// is the stronger statement: the backend checked what it received against a
+/// checksum and would have refused the write had they disagreed, so a caller
+/// can treat the object as confirmed without reading it back. `store_checksum`
+/// is whatever token the backend reported (an S3 base64 SHA-256 echo), kept so
+/// a caller can record it in its own catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectInfo {
+    /// Object size in bytes.
+    pub size: u64,
+    /// SHA-256 of the bytes sent.
+    pub sha256: [u8; 32],
+    /// The backend's own checksum token for the object, when it returned one.
+    pub store_checksum: Option<String>,
+    /// Whether the backend verified the received bytes against a checksum.
+    pub store_verified: bool,
+}
+
+/// The result of [`Storage::create_if_absent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// The object did not exist and now holds exactly the bytes sent.
+    Created(ObjectInfo),
+    /// An object already existed under that name and was left untouched. Its
+    /// contents are unknown: the caller decides whether it is acceptable.
+    AlreadyExists,
+}
+
+/// One page of immediate child "directories" returned by
+/// [`Storage::list_prefixes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrefixPage {
+    /// Immediate children of the listed prefix, in lexicographic order. Each is
+    /// the listed prefix joined with the child name, with no trailing `/`: a
+    /// child `b` of `a` reads `a/b`.
+    pub prefixes: Vec<String>,
+    /// Resumes the listing where this page stopped; opaque. `None` exactly when
+    /// the listing is complete — stop on `None`, never on an empty page (an
+    /// object store may return a page of plain objects and no prefixes).
+    pub next_token: Option<String>,
+}
+
+/// SHA-256 of `data` (used by every default write path to fill
+/// [`ObjectInfo::sha256`]).
+pub(crate) fn sha256_of(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(data).into()
+}
+
+/// Whether `e` means "no such file/object" on any backend. Local backends say
+/// it with `io::ErrorKind::NotFound`; the S3 backend maps a 404 to the same
+/// kind so callers need one test, not one per backend.
+pub fn is_not_found(e: &crate::error::OndaError) -> bool {
+    match e {
+        crate::error::OndaError::NotFound => true,
+        crate::error::OndaError::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 /// A place SSTable files live and are read/written. Every method takes an
 /// absolute path (the [`TierRegistry`] builds them from the tier root).
+///
+/// The methods after [`release`](Storage::release) are optional capabilities
+/// with conservative defaults, so a caller-built backend
+/// ([`TierDef::custom`](crate::TierDef::custom)) keeps compiling unchanged.
 pub trait Storage: Send + Sync + std::fmt::Debug {
     /// Open `path` for positional reads, returning a shared handle. Local backends
     /// route this through the [`FileCache`] so the open-fd count stays bounded and
@@ -73,6 +139,54 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// Drop any cached descriptor for `path` (called when a file is obsoleted or
     /// moved). Readers still holding a handle keep the file open until they drop.
     fn release(&self, path: &str);
+
+    /// Write `data` as the whole object `path` (overwriting) and report what was
+    /// stored. The default goes through [`create`](Storage::create), so the
+    /// digest is of the bytes sent and nothing is store-verified; the S3 backend
+    /// overrides it to have the store check a SHA-256 on arrival.
+    fn put_object(&self, path: &str, data: &[u8]) -> Result<ObjectInfo> {
+        let mut w = self.create(path)?;
+        w.write_all(data)?;
+        w.finish()?;
+        Ok(ObjectInfo {
+            size: data.len() as u64,
+            sha256: sha256_of(data),
+            store_checksum: None,
+            store_verified: false,
+        })
+    }
+
+    /// Write `data` as `path` only if nothing exists there yet, atomically:
+    /// implementations must never emulate this with an unlocked existence check
+    /// followed by a write. The default refuses with `InvalidArgs` — a backend
+    /// that cannot do it atomically must say so rather than race.
+    fn create_if_absent(&self, path: &str, data: &[u8]) -> Result<CreateOutcome> {
+        let _ = data;
+        Err(crate::error::OndaError::InvalidArgs(format!(
+            "storage backend does not support create-if-absent ({path})"
+        )))
+    }
+
+    /// List the immediate child prefixes ("directories") of `prefix`, one page
+    /// at a time. `token` is a [`PrefixPage::next_token`] from an earlier page
+    /// or `None` to start; `limit` bounds the page (0 = the backend default).
+    ///
+    /// [`list`](Storage::list) names the *objects* directly under a directory;
+    /// this names the *subtrees*, without walking them — which is what lets a
+    /// caller discover checkpoint prefixes in a bucket cheaply. The default
+    /// refuses with `InvalidArgs`.
+    fn list_prefixes(&self, prefix: &str, token: Option<&str>, limit: usize) -> Result<PrefixPage> {
+        let _ = (token, limit);
+        Err(crate::error::OndaError::InvalidArgs(format!(
+            "storage backend does not support prefix listing ({prefix})"
+        )))
+    }
+
+    /// Whether this backend refuses every write locally
+    /// (`S3Config::read_only` on the S3 backend). Defaults to `false`.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }
 
 /// A tier backed by a local filesystem. Open descriptors are bounded by the
@@ -199,6 +313,80 @@ impl Storage for LocalStorage {
     fn release(&self, path: &str) {
         self.fc.evict(path);
     }
+
+    fn create_if_absent(&self, path: &str, data: &[u8]) -> Result<CreateOutcome> {
+        // Stage the bytes durably under a unique name, then `link(2)` them into
+        // place: link fails with EEXIST atomically when the target exists,
+        // which is the create-if-absent the contract demands, and the target is
+        // never visible half-written.
+        let p = std::path::Path::new(path);
+        let parent = p.parent().ok_or_else(|| {
+            crate::error::OndaError::InvalidArgs(format!("path {path:?} has no parent"))
+        })?;
+        std::fs::create_dir_all(parent)?;
+        static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staged = format!("{path}.create-{}-{seq}", std::process::id());
+        let result = (|| -> Result<CreateOutcome> {
+            let mut file = File::create(&staged)?;
+            file.write_all(data)?;
+            file.sync_all()?;
+            match std::fs::hard_link(&staged, path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(CreateOutcome::AlreadyExists)
+                }
+                Err(e) => return Err(e.into()),
+            }
+            Ok(CreateOutcome::Created(ObjectInfo {
+                size: data.len() as u64,
+                sha256: sha256_of(data),
+                store_checksum: None,
+                store_verified: false,
+            }))
+        })();
+        let _ = std::fs::remove_file(&staged);
+        if matches!(result, Ok(CreateOutcome::Created(_))) {
+            crate::util::sync_parent_dir(p)?;
+        }
+        result
+    }
+
+    fn list_prefixes(&self, prefix: &str, token: Option<&str>, limit: usize) -> Result<PrefixPage> {
+        let base = prefix.trim_end_matches('/');
+        let mut names = Vec::new();
+        match std::fs::read_dir(if base.is_empty() { "/" } else { base }) {
+            Ok(rd) => {
+                for entry in rd {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        names.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            // A prefix with nothing under it lists empty, as on an object store.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        names.sort();
+        // The token is the last child returned: resume strictly after it, the
+        // same "start after" rule an object store's listing uses.
+        let start = match token {
+            Some(t) => names.partition_point(|n| n.as_str() <= t),
+            None => 0,
+        };
+        let limit = if limit == 0 { 1000 } else { limit };
+        let end = (start + limit).min(names.len());
+        let page = &names[start..end];
+        Ok(PrefixPage {
+            prefixes: page.iter().map(|n| format!("{base}/{n}")).collect(),
+            next_token: if end < names.len() {
+                page.last().cloned()
+            } else {
+                None
+            },
+        })
+    }
 }
 
 /// One resolved tier: its name, filesystem root, and backend.
@@ -285,6 +473,85 @@ impl TierRegistry {
 
     /// The per-CF directory for `tier`: `<root>/cf-<cf_name>`.
     pub(crate) fn cf_dir(&self, tier: Option<&str>, cf_name: &str) -> String {
-        format!("{}/cf-{}", self.root_for(tier), cf_name)
+        format!(
+            "{}/{}",
+            self.root_for(tier),
+            crate::format::cf_dir_name(cf_name)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local() -> Arc<LocalStorage> {
+        LocalStorage::new(Arc::new(FileCache::new(16)), false)
+    }
+
+    #[test]
+    fn local_create_if_absent_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = local();
+        let path = format!("{}/sub/obj", dir.path().to_str().unwrap());
+        match s.create_if_absent(&path, b"first").unwrap() {
+            CreateOutcome::Created(info) => {
+                assert_eq!(info.size, 5);
+                assert_eq!(info.sha256, sha256_of(b"first"));
+            }
+            other => panic!("expected Created, got {other:?}"),
+        }
+        assert_eq!(
+            s.create_if_absent(&path, b"second").unwrap(),
+            CreateOutcome::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        // No staging file is left behind either way.
+        let names = s
+            .list(&format!("{}/sub", dir.path().to_str().unwrap()))
+            .unwrap();
+        assert_eq!(names, vec!["obj".to_string()]);
+    }
+
+    #[test]
+    fn local_list_prefixes_pages_directories_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        for c in ["c", "a", "e", "b", "d"] {
+            std::fs::create_dir_all(format!("{root}/{c}/deeper")).unwrap();
+        }
+        std::fs::write(format!("{root}/loose"), b"x").unwrap();
+        let s = local();
+        let mut seen = Vec::new();
+        let mut token = None;
+        loop {
+            let page = s.list_prefixes(root, token.as_deref(), 2).unwrap();
+            assert!(page.prefixes.len() <= 2);
+            seen.extend(page.prefixes);
+            match page.next_token {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        let want: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|c| format!("{root}/{c}"))
+            .collect();
+        assert_eq!(seen, want);
+        let missing = s
+            .list_prefixes(&format!("{root}/nothing"), None, 0)
+            .unwrap();
+        assert!(missing.prefixes.is_empty() && missing.next_token.is_none());
+    }
+
+    #[test]
+    fn missing_objects_are_not_found_on_the_local_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = local();
+        let e = s
+            .open_read(&format!("{}/nope", dir.path().to_str().unwrap()))
+            .err()
+            .unwrap();
+        assert!(is_not_found(&e), "{e}");
     }
 }

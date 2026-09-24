@@ -46,6 +46,37 @@ fn place_storage_file(
     copy_storage_file(storage, src, dst)
 }
 
+/// One file a snapshot copies: its place in the snapshot (`cf-<cf>/<id>.<ext>`)
+/// and where its bytes are read from now.
+pub(crate) struct SnapshotFile {
+    pub(crate) cf: String,
+    pub(crate) id: u64,
+    pub(crate) ext: &'static str,
+    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) src: String,
+    pub(crate) size: u64,
+}
+
+/// See [`DB::plan_snapshot`].
+pub(crate) struct SnapshotPlan {
+    pub(crate) manifest: crate::manifest::Manifest,
+    pub(crate) files: Vec<SnapshotFile>,
+    pub(crate) cfs: Vec<Arc<ColumnFamily>>,
+}
+
+impl SnapshotPlan {
+    /// Make the manifest snapshot-only before it is saved into a destination:
+    /// a fresh generation, nothing applied, and no `MANIFEST-EDITS` beside it.
+    /// It grows a log the first time it is opened writable and mutated.
+    /// Copying the source's cursor instead would describe a log the
+    /// destination does not have.
+    pub(crate) fn finalize_manifest(&mut self) {
+        self.manifest.generation = 1;
+        self.manifest.applied_through = 0;
+        self.manifest.next_edit_id = 1;
+    }
+}
+
 /// Per-column-family statistics.
 #[derive(Debug, Clone, Default)]
 pub struct CfStats {
@@ -70,6 +101,10 @@ pub struct CfStats {
     /// compaction. Counts completed jobs only: a job that failed leaves its
     /// input's stamp untouched, so the table stays eligible and is retried.
     pub periodic_compactions: u64,
+    /// Subset of `compaction_count` picked by the tombstone-density trigger
+    /// ([`ColumnFamilyConfig::tombstone_density_trigger`](crate::config::ColumnFamilyConfig::tombstone_density_trigger)).
+    /// Completed jobs only; zero while the trigger is off.
+    pub tombstone_density_compactions: u64,
     /// Number of manual or background compaction attempts that returned an
     /// error since this column family was opened.
     pub compaction_failures: u64,
@@ -155,6 +190,23 @@ pub struct DbStats {
     /// Bytes of the block cache currently held by decoded vlog values — the
     /// capacity vlog admission is taking from klog data blocks.
     pub vlog_cache_bytes: i64,
+    /// How many deletion pauses are currently held (nesting depth; `0` = not
+    /// paused). Checkpoint, backup, object-store checkpoints, the part mover
+    /// and demotion each hold one for their duration, during which obsolete
+    /// SSTable unlinks are queued instead of performed (wavesdb
+    /// `DeletionsPaused`, reported here as a count rather than a flag).
+    pub deletions_paused: u32,
+    /// Obsolete files queued behind the pause, unlinked when the last pause is
+    /// released. A number that climbs while `deletions_paused > 0` is the
+    /// expected shape of a long backup on a write-heavy database, not a leak.
+    pub deletions_queued: usize,
+    /// Entries (either domain) the block cache evicted to stay under
+    /// capacity. With background admission off (the default,
+    /// [`Options::admit_background_scan_blocks`](crate::Options::admit_background_scan_blocks))
+    /// only foreground reads insert, so compaction cannot drive this up.
+    pub block_cache_evictions: u64,
+    /// Bytes the block cache currently holds, both domains.
+    pub block_cache_bytes: i64,
 }
 
 impl ColumnFamily {
@@ -176,6 +228,9 @@ impl ColumnFamily {
                 .load(std::sync::atomic::Ordering::Relaxed),
             periodic_compactions: self
                 .periodic_compactions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            tombstone_density_compactions: self
+                .tombstone_density_compactions
                 .load(std::sync::atomic::Ordering::Relaxed),
             compaction_failures: self
                 .compaction_failures
@@ -227,6 +282,7 @@ impl DB {
             ranges += u.range_cache_stats();
         }
         let (cache_bytes, retained_bytes) = self.inner.ctx.range_fragment_registry.stats();
+        let (deletions_paused, deletions_queued) = self.inner.deletion_pause_state();
         DbStats {
             range_memtable_spans: ranges.spans,
             range_memtable_bytes: ranges.span_bytes,
@@ -242,6 +298,10 @@ impl DB {
             vlog_cache_hits: bc.vlog_hits,
             vlog_cache_misses: bc.vlog_misses,
             vlog_cache_bytes: bc.vlog_bytes,
+            deletions_paused,
+            deletions_queued,
+            block_cache_evictions: bc.evictions,
+            block_cache_bytes: bc.bytes,
         }
     }
 
@@ -261,7 +321,37 @@ impl DB {
         // Pause obsolete-file deletion so a concurrent compaction cannot unlink an
         // SSTable that the snapshot's manifest still references. Held until return.
         let _pause = self.inner.pause_deletions();
+        let mut plan = self.plan_snapshot()?;
 
+        std::fs::create_dir_all(dir)?;
+        for cfm in &plan.manifest.cfs {
+            std::fs::create_dir_all(dir.join(crate::format::cf_dir_name(&cfm.name)))?;
+        }
+        for f in &plan.files {
+            let dst = dir.join(crate::format::cf_dir_name(&f.cf)).join(format!("{}.{}", f.id, f.ext));
+            place_storage_file(f.storage.as_ref(), &f.src, &dst, hard_link)?;
+        }
+        if self.inner.opts.read_only {
+            self.write_sealed_memtables(dir, &plan.cfs, &mut plan.manifest)?;
+        }
+        plan.finalize_manifest();
+        plan.manifest.save(dir.join("MANIFEST"))?;
+        Ok(())
+    }
+
+    /// Everything a snapshot copies, gathered under the caller's
+    /// `pause_deletions` guard (which must outlive every use of the plan: it is
+    /// what keeps the listed source files on disk).
+    ///
+    /// Flushes every family (on a read-only source this only seals the
+    /// replayed memtables — the caller writes them with
+    /// `write_sealed_memtables`), persists the catalog, and loads it back with
+    /// `recover_catalog`. The returned manifest already names every table at
+    /// its snapshot-relative place (tier and object cleared), and `files` lists
+    /// each `.klog` / non-empty `.vlog` with the backend and path it is read
+    /// from — so a local checkpoint and an object-store checkpoint copy the
+    /// exact same set.
+    pub(crate) fn plan_snapshot(&self) -> Result<SnapshotPlan> {
         let cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
         // Flush memtables so all data lives in SSTables, then persist manifest.
         for cf in &cfs {
@@ -277,7 +367,6 @@ impl DB {
         }
         self.inner.persist_manifest()?;
 
-        std::fs::create_dir_all(dir)?;
         // Load the manifest and link exactly the files it references. With deletions
         // paused, every file any persisted manifest lists still exists on disk, so
         // the copied catalog and the copied files are guaranteed consistent — even if
@@ -289,13 +378,12 @@ impl DB {
         // would silently drop every edit since the last one — which is what
         // would make the "read-only-capable backup" claim false.
         let mut manifest = crate::manifest_edit::recover_catalog(&self.inner.dir)?;
+        let mut files = Vec::new();
         for cfm in &mut manifest.cfs {
             let source_cf = cfs
                 .iter()
                 .find(|cf| cf.name() == cfm.name)
                 .ok_or(OndaError::NotFound)?;
-            let cf_dir = dir.join(format!("cf-{}", cfm.name));
-            std::fs::create_dir_all(&cf_dir)?;
             for sst in &mut cfm.sstables {
                 let storage = source_cf.tiers().storage_for(sst.tier.as_deref());
                 let src_klog = source_cf.klog_path_for(sst);
@@ -306,27 +394,24 @@ impl DB {
                     if ext == "vlog" && size == 0 {
                         continue;
                     }
-                    let dst = cf_dir.join(format!("{}.{ext}", sst.id));
-                    place_storage_file(storage.as_ref(), &src, &dst, hard_link)?;
+                    files.push(SnapshotFile {
+                        cf: cfm.name.clone(),
+                        id: sst.id,
+                        ext,
+                        storage: storage.clone(),
+                        src,
+                        size,
+                    });
                 }
                 sst.tier = None;
                 sst.object = None;
             }
         }
-        if read_only {
-            self.write_sealed_memtables(dir, &cfs, &mut manifest)?;
-        }
-        // Persist the same manifest we linked against, so the backup catalog matches
-        // its files exactly. The destination is **snapshot-only**: a fresh
-        // generation, nothing applied, and no `MANIFEST-EDITS` beside it. It
-        // grows a log the first time it is opened writable and mutated. Copying
-        // the source's cursor instead would describe a log the destination does
-        // not have.
-        manifest.generation = 1;
-        manifest.applied_through = 0;
-        manifest.next_edit_id = 1;
-        manifest.save(dir.join("MANIFEST"))?;
-        Ok(())
+        Ok(SnapshotPlan {
+            manifest,
+            files,
+            cfs,
+        })
     }
 
     /// Carry a read-only database's memtable data into a snapshot.
@@ -345,7 +430,7 @@ impl DB {
     /// ids come from this handle's counter, which starts above every id the
     /// source catalog holds, and `global_seq`/`next_file_id` are raised to
     /// cover what was written.
-    fn write_sealed_memtables(
+    pub(crate) fn write_sealed_memtables(
         &self,
         dir: &Path,
         cfs: &[Arc<ColumnFamily>],
@@ -359,7 +444,9 @@ impl DB {
                          fragments: Vec<crate::range_tombstone::Fragment>|
          -> Result<()> {
             let id = self.inner.next_file_id();
-            let klog = dir.join(format!("cf-{}", cf.name())).join(format!("{id}.klog"));
+            let klog = dir
+                .join(crate::format::cf_dir_name(cf.name()))
+                .join(format!("{id}.klog"));
             let klog = klog.to_str().ok_or_else(|| {
                 OndaError::InvalidArgs(format!("snapshot path {klog:?} is not UTF-8"))
             })?;
@@ -447,6 +534,7 @@ impl DB {
             self.inner.cf_dir(dst),
             config,
             comparator,
+            self.inner.choose_unified_id(dst, &[]),
         )?;
 
         // Hard-link each src SSTable into dst under a fresh id.
@@ -497,6 +585,7 @@ impl DB {
             name: dst.to_string(),
             config: dst_cf.effective_config().encode(),
         }];
+        ops.extend(crate::db::unified_id_op(dst, dst_cf.id()));
         for meta in new_metas {
             ops.push(crate::manifest_edit::Op::AddTable {
                 cf: dst.to_string(),
@@ -519,5 +608,47 @@ impl DB {
             return Err(e);
         }
         Ok(dst_cf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ColumnFamilyConfig;
+    use crate::Options;
+    use std::time::Duration;
+
+    /// `deletions_paused` is the nesting depth and `deletions_queued` the
+    /// obsolete files held behind it; both drain when the last pause goes.
+    #[test]
+    fn deletion_pause_is_observable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let cf = db
+            .create_column_family("c", ColumnFamilyConfig::default())
+            .unwrap();
+        for v in [b"1", b"2"] {
+            db.put(&cf, b"k", v, Duration::ZERO).unwrap();
+            db.flush_memtable(&cf).unwrap();
+        }
+        let s = db.stats();
+        assert_eq!((s.deletions_paused, s.deletions_queued), (0, 0));
+
+        let outer = db.inner.pause_deletions();
+        let inner = db.inner.pause_deletions();
+        db.compact(&cf).unwrap();
+        let s = db.stats();
+        assert_eq!(s.deletions_paused, 2);
+        assert!(s.deletions_queued >= 2, "compaction inputs were not queued: {s:?}");
+
+        drop(inner);
+        let s = db.stats();
+        assert_eq!(s.deletions_paused, 1);
+        assert!(s.deletions_queued >= 2, "an inner release must not drain");
+
+        drop(outer);
+        let s = db.stats();
+        assert_eq!((s.deletions_paused, s.deletions_queued), (0, 0));
+        db.close().unwrap();
     }
 }

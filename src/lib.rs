@@ -23,11 +23,13 @@
 //!   append-only keyspace without rebuilding a cursor per poll.
 //! * [`PerfContext`] attributes one operation's cost to a mechanism.
 //!
-//! **Formats are capability-gated.** Every stored byte that is not 0.8.2's sits
-//! behind a `CAP_*` bit in [`mod@format`], enabled explicitly and one-way by
+//! **The on-disk format is yoloDB epoch 1** — the format family ondaDB and
+//! wavesdb converge on — with every magic, version, flag, capability bit, codec
+//! id and config tag in [`mod@format`]. Optional artifacts sit behind `CAP_*`
+//! bits, enabled explicitly and one-way by
 //! [`DB::enable_format_capabilities`](crate::DB::enable_format_capabilities).
-//! Nothing is on by default, so an upgraded database keeps writing bytes an
-//! older binary can read until an operator decides otherwise.
+//! ondaDB 0.9.x directories are read (read-only) only through `legacy_onda`,
+//! behind the default-on `legacy-onda` feature.
 
 // The default build is safe Rust.  The optional `mmap-reads` and
 // `arena-memtable` features each lift this to allow the localized `unsafe` in,
@@ -59,19 +61,25 @@ extern crate self as ondadb;
 pub mod block;
 pub mod bloom;
 pub mod cache;
+pub mod checkpoint;
 pub mod column_family;
 pub mod compaction;
 pub mod comparator;
 pub mod compress;
 pub mod config;
+pub(crate) mod config_blob;
 pub mod db;
 pub mod encoding;
+pub mod entity;
 pub mod error;
 pub(crate) mod excise;
 pub mod format;
 pub mod ingest;
 pub mod ioctrl;
 pub mod iterator;
+pub mod local_cache;
+#[cfg(feature = "legacy-onda")]
+pub mod legacy_onda;
 pub mod maintenance;
 pub mod manifest;
 pub mod manifest_edit;
@@ -83,7 +91,10 @@ pub mod perf;
 pub mod prepared;
 pub(crate) mod range_lock;
 pub mod range_tombstone;
+pub mod read_profile;
+pub mod read_resources;
 pub(crate) mod span_index;
+pub mod snapshot;
 pub mod sst;
 pub mod storage;
 #[cfg(feature = "s3")]
@@ -93,19 +104,26 @@ pub mod tailing;
 pub mod txn;
 pub(crate) mod txn_lock;
 pub mod unified;
+pub mod upgrade;
 pub mod util;
 pub mod wal;
 
+pub use checkpoint::{
+    open_remote_checkpoint, restore_from_object_store, CheckpointTable, ObjectCheckpoint,
+    ObjectCheckpointOptions, ObjectReceipt, TableSetDiff,
+};
 pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
 #[cfg(feature = "s3")]
-pub use config::S3Config;
+pub use config::{S3Config, S3CredentialSource};
 pub use config::{
-    ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, IsolationLevel, LogLevel,
+    ColumnFamilyConfig, CompactionStyle, Compression, CompressionRule, FormatUpgrade,
+    FormatUpgradeVerify, IsolationLevel, LogLevel,
     MergeOperator, Options, PartitionFn, PartitionRule, PartitionScheme, SyncMode, TierBackend,
     TierDef, TierRule,
 };
 pub use db::{DB, DELETE_METADATA_BYTES};
+pub use entity::{EntityColumn, EntityColumnLike, EntityColumnRef};
 pub use error::{OndaError, Result};
 pub use ingest::Ingestion;
 pub use iterator::Iterator;
@@ -114,10 +132,15 @@ pub use parts::{
     DetachedPart, MovePhase, MovePhaseEvent, MovePhaseObserver, PartManifest, PartTable,
     PartitionInfo,
 };
+pub use local_cache::LocalCacheStats;
 pub use perf::PerfContext;
 pub use prepared::PreparedInfo;
-pub use storage::{LocalStorage, Storage};
+pub use read_profile::ReadStats;
+pub use read_resources::{ReadResourceOptions, ReadResourceStats, ReadResources};
+pub use snapshot::SnapshotHandle;
+pub use storage::{CreateOutcome, LocalStorage, ObjectInfo, PrefixPage, Storage};
 #[cfg(feature = "s3")]
 pub use storage_s3::S3Storage;
 pub use tailing::TailingIterator;
 pub use txn::{PreparedTxn, Txn};
+pub use upgrade::{UpgradeObserver, UpgradePhase, UpgradeReport};

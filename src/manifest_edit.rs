@@ -30,19 +30,16 @@ use crate::encoding::{
 use crate::error::{OndaError, Result};
 use crate::manifest::{CfManifest, Manifest, SstMeta, WalLayout};
 
-/// `"ONDE"`, stored little-endian exactly as the manifest's `"WVMF"` is — on
-/// disk the first four bytes read `45 44 4E 4F`.
-///
-/// ondaDB-namespaced on purpose: a `"WD…"` magic belongs to wavesdb, and the
-/// two engines are expected to share storage tiers, so a wavesdb-looking magic
-/// on an ondaDB file would invite exactly the cross-engine mount confusion the
-/// format rules exist to prevent.
-pub const EDIT_LOG_MAGIC: u32 = 0x4F4E_4445;
+/// `YOLODBED`: the yoloDB edit-log magic, 8 ASCII bytes
+/// ([`crate::format::edit_log`]). The record framing and op table are shared
+/// with 0.9's `ONDE` log; only the header changed (and the checksum, to
+/// CRC32-C).
+pub const EDIT_LOG_MAGIC: [u8; 8] = crate::format::edit_log::MAGIC;
 /// Schema of the edit-log framing. Bumped only by an incompatible change to the
 /// header or the record frame — never by adding an op code.
-pub const EDIT_LOG_SCHEMA: u32 = 1;
+pub const EDIT_LOG_SCHEMA: u32 = crate::format::edit_log::SCHEMA;
 /// Fixed header width, at offset 0. Records begin immediately after it.
-pub const EDIT_LOG_HEADER_BYTES: usize = 28;
+pub const EDIT_LOG_HEADER_BYTES: usize = crate::format::edit_log::HEADER_BYTES;
 /// Fixed record-frame overhead (`len u32 | crc32 u32`).
 pub const EDIT_RECORD_HEADER_BYTES: usize = 8;
 /// Largest payload a single record may declare. Checked *before* any allocation,
@@ -64,6 +61,9 @@ fn corrupt(msg: impl Into<String>) -> OndaError {
     OndaError::Corruption(msg.into())
 }
 
+/// `"ONDE"`, the 0.9 edit-log magic as that binary stored it (a LE `u32`).
+const ONDA09_EDIT_LOG_MAGIC: u32 = 0x4F4E_4445;
+
 // ---------------------------------------------------------------------------
 // Ops
 // ---------------------------------------------------------------------------
@@ -83,9 +83,37 @@ mod code {
     pub const SET_NONCE: u64 = 10;
     pub const SET_CAPABILITY: u64 = 11;
     pub const REMOVE_TABLES: u64 = 12;
+    pub const SET_CF_UNIFIED_ID: u64 = 13;
     /// Highest op code that may ever be assigned a meaning.
     pub const MAX_ASSIGNABLE: u64 = 63;
 }
+
+// The op table is part of the registry (`docs/format-registry.md`): a code is
+// never renumbered, so a change here must fail the build, not just a test.
+const _: () = assert!(
+    code::ADD_TABLE == 1
+        && code::REMOVE_TABLE == 2
+        && code::UPDATE_TABLE == 3
+        && code::CREATE_CF == 4
+        && code::DROP_CF == 5
+        && code::SET_CF_CONFIG == 6
+        && code::SET_NEXT_FILE_ID == 7
+        && code::SET_GLOBAL_SEQ == 8
+        && code::SET_WAL_LAYOUT == 9
+        && code::SET_NONCE == 10
+        && code::SET_CAPABILITY == 11
+        && code::REMOVE_TABLES == 12
+        && code::SET_CF_UNIFIED_ID == 13
+        && code::MAX_ASSIGNABLE == 63
+);
+const _: () = assert!(
+    mask::LEVEL == 0x01
+        && mask::TIER == 0x02
+        && mask::OBJECT == 0x04
+        && mask::PARTITION == 0x08
+        && mask::MAX_ENTRY_TIME == 0x10
+        && mask::LAST_COMPACTION_TIME == 0x20
+);
 
 /// Bits of the [`Op::UpdateTable`] field mask. Present values follow the mask in
 /// **ascending bit order**.
@@ -212,6 +240,11 @@ pub enum Op {
     SetCapability(u64),
     /// Retire a batch of tables from one CF (compaction inputs, FIFO victims).
     RemoveTables { cf: String, ids: Vec<u64> },
+    /// Give a column family the unified-layout id its keys carry, when it is
+    /// not the one derived from its name (plan C F5′: a family cleared under
+    /// the unified layout takes a fresh id, so the old id's entries are owned
+    /// by nobody). Follows the `CreateCF` of the same edit.
+    SetCfUnifiedId { name: String, id: u64 },
 }
 
 /// One numbered, atomically applied group of ops.
@@ -386,6 +419,11 @@ pub fn encode_op(b: &mut Vec<u8>, op: &Op) {
             for id in ids {
                 append_uvarint(b, *id);
             }
+        }
+        Op::SetCfUnifiedId { name, id } => {
+            append_uvarint(b, code::SET_CF_UNIFIED_ID);
+            append_bytes(b, name.as_bytes());
+            append_u64(b, *id);
         }
     }
 }
@@ -621,6 +659,10 @@ impl<'a> Cur<'a> {
                 }
                 Ok(Op::RemoveTables { cf, ids })
             }
+            code::SET_CF_UNIFIED_ID => Ok(Op::SetCfUnifiedId {
+                name: self.string()?,
+                id: self.u64le()?,
+            }),
             other => Err(corrupt(format!(
                 "manifest edit: op index {}: op code {other} is {}",
                 self.op_index,
@@ -658,8 +700,13 @@ pub fn decode_payload(payload: &[u8]) -> Result<(u64, VersionEdit)> {
 // Log header
 // ---------------------------------------------------------------------------
 
-/// The 28-byte header at offset 0 of `MANIFEST-EDITS`. Written once, by
+/// The 32-byte header at offset 0 of `MANIFEST-EDITS`. Written once, by
 /// snapshot compaction, and fsynced before any record is appended.
+///
+/// ```text
+///  0 magic "YOLODBED" | 8 schema u32 = 1 | 12 base_applied_through u64
+/// 20 snapshot_generation u64 | 28 crc32c u32 over bytes 0..28
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditLogHeader {
     /// No record in this file has an id at or below this value.
@@ -675,7 +722,7 @@ pub struct EditLogHeader {
 impl EditLogHeader {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(EDIT_LOG_HEADER_BYTES);
-        append_u32(&mut b, EDIT_LOG_MAGIC);
+        b.extend_from_slice(&EDIT_LOG_MAGIC);
         append_u32(&mut b, EDIT_LOG_SCHEMA);
         append_u64(&mut b, self.base_applied_through);
         append_u64(&mut b, self.snapshot_generation);
@@ -685,10 +732,18 @@ impl EditLogHeader {
         b
     }
 
-    /// Decode the header. A short file, an unknown magic or schema, and a bad
-    /// header CRC are all `Corruption` — never a torn tail: the header is
-    /// written and fsynced before the file is ever appended to.
+    /// Decode the header. Never a torn tail — the header is written and fsynced
+    /// before the file is ever appended to: a short file, a foreign magic and a
+    /// bad header CRC are `Corruption`; an unknown schema, and a 0.9 `ONDE`
+    /// log, are `UnsupportedFormat`.
     pub fn decode(data: &[u8]) -> Result<EditLogHeader> {
+        if data.len() >= 4 && read_u32(data) == ONDA09_EDIT_LOG_MAGIC {
+            return Err(OndaError::UnsupportedFormat(
+                "manifest edit log: an ondaDB 0.9 log (ONDE); it is readable only through \
+                 legacy_onda, and the database must be upgraded to yoloDB epoch 1"
+                    .into(),
+            ));
+        }
         if data.len() < EDIT_LOG_HEADER_BYTES {
             return Err(corrupt(format!(
                 "manifest edit log: file is {} bytes, shorter than the {EDIT_LOG_HEADER_BYTES}-byte header",
@@ -696,24 +751,21 @@ impl EditLogHeader {
             )));
         }
         let head = &data[..EDIT_LOG_HEADER_BYTES];
-        if read_u32(&head[24..28]) != checksum(&head[..24]) {
+        if head[..8] != EDIT_LOG_MAGIC {
+            return Err(corrupt("manifest edit log: magic is not YOLODBED"));
+        }
+        let schema = read_u32(&head[8..12]);
+        if schema != EDIT_LOG_SCHEMA {
+            return Err(OndaError::UnsupportedFormat(format!(
+                "manifest edit log: schema {schema} is not implemented by this binary"
+            )));
+        }
+        if read_u32(&head[28..32]) != checksum(&head[..28]) {
             return Err(corrupt("manifest edit log: header CRC mismatch"));
         }
-        let magic = read_u32(&head[0..4]);
-        if magic != EDIT_LOG_MAGIC {
-            return Err(corrupt(format!(
-                "manifest edit log: magic {magic:#010x} is not {EDIT_LOG_MAGIC:#010x}"
-            )));
-        }
-        let schema = read_u32(&head[4..8]);
-        if schema != EDIT_LOG_SCHEMA {
-            return Err(corrupt(format!(
-                "manifest edit log: schema {schema} is not {EDIT_LOG_SCHEMA}"
-            )));
-        }
         Ok(EditLogHeader {
-            base_applied_through: read_u64(&head[8..16]),
-            snapshot_generation: read_u64(&head[16..24]),
+            base_applied_through: read_u64(&head[12..20]),
+            snapshot_generation: read_u64(&head[20..28]),
         })
     }
 }
@@ -1010,6 +1062,14 @@ fn validate_op(c: &mut Candidate<'_>, i: usize, op: &Op) -> Result<()> {
                 ));
             }
         }
+        Op::SetCfUnifiedId { name, .. } => {
+            if !c.cf(name).exists {
+                return Err(precondition(
+                    i,
+                    format!("SetCFUnifiedId: no column family {name:?}"),
+                ));
+            }
+        }
         Op::SetNextFileId(v) => {
             if *v < c.next_file_id {
                 return Err(precondition(
@@ -1107,6 +1167,7 @@ fn mutate(m: &mut Manifest, op: &Op) {
             name: name.clone(),
             config: config.clone(),
             sstables: Vec::new(),
+            unified_id: None,
         }),
         Op::DropCf { name } => m.cfs.retain(|c| &c.name != name),
         Op::SetCfConfig { name, config } => {
@@ -1123,6 +1184,13 @@ fn mutate(m: &mut Manifest, op: &Op) {
             if let Some(i) = cf_index(m, cf) {
                 let drop: std::collections::HashSet<u64> = ids.iter().copied().collect();
                 m.cfs[i].sstables.retain(|s| !drop.contains(&s.id));
+            }
+        }
+        Op::SetCfUnifiedId { name, id } => {
+            if let Some(i) = cf_index(m, name) {
+                // Canonical form: the derived id is "no override", exactly as
+                // the manifest section omits it.
+                m.cfs[i].unified_id = (*id != crate::unified::cf_id(name)).then_some(*id);
             }
         }
     }
@@ -1548,6 +1616,10 @@ mod tests {
                 cf: "a".into(),
                 ids: vec![1, 2, 3],
             },
+            Op::SetCfUnifiedId {
+                name: "b".into(),
+                id: 0x0123_4567_89AB_CDEF,
+            },
         ]
     }
 
@@ -1637,7 +1709,7 @@ mod tests {
 
     #[test]
     fn unknown_op_code_is_corruption_naming_the_index() {
-        for code in [0u64, 13, 63, 64, 1000] {
+        for code in [0u64, 14, 63, 64, 1000] {
             let mut payload = Vec::new();
             append_u64(&mut payload, 5);
             append_uvarint(&mut payload, 2);
@@ -2085,16 +2157,15 @@ mod tests {
             snapshot_generation: 0x1112_1314_1516_1718,
         };
         let bytes = h.encode();
-        assert_eq!(bytes.len(), EDIT_LOG_HEADER_BYTES);
-        // Magic on disk, little-endian: 'E' 'D' 'N' 'O'.
-        assert_eq!(&bytes[0..4], &[0x45, 0x44, 0x4E, 0x4F]);
-        assert_eq!(&bytes[4..8], &[1, 0, 0, 0]);
-        assert_eq!(&bytes[8..16], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[0..8], b"YOLODBED");
+        assert_eq!(&bytes[8..12], &[1, 0, 0, 0]);
+        assert_eq!(&bytes[12..20], &[8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(
-            &bytes[16..24],
+            &bytes[20..28],
             &[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]
         );
-        assert_eq!(read_u32(&bytes[24..28]), checksum(&bytes[..24]));
+        assert_eq!(read_u32(&bytes[28..32]), checksum(&bytes[..28]));
         assert_eq!(EditLogHeader::decode(&bytes).unwrap(), h);
     }
 
@@ -2138,7 +2209,7 @@ mod tests {
 
     #[test]
     fn short_file_is_corruption() {
-        for len in [0usize, 1, 27] {
+        for len in [0usize, 1, 27, 31] {
             let err = EditLogHeader::decode(&vec![0u8; len])
                 .expect_err("a file shorter than the header is never a torn tail");
             assert_eq!(err.kind(), "corruption");
@@ -2148,7 +2219,7 @@ mod tests {
     #[test]
     fn bad_header_crc_is_corruption() {
         let mut file = log_with(&sample_records());
-        file[8] ^= 0xFF;
+        file[14] ^= 0xFF;
         assert_eq!(
             EditLogHeader::decode(&file).unwrap_err().kind(),
             "corruption"
@@ -2163,25 +2234,31 @@ mod tests {
         }
         .encode();
         head[0] = b'W'; // the wavesdb namespace, deliberately rejected
-        let crc = checksum(&head[..24]);
-        crate::encoding::put_u32(&mut head[24..28], crc);
+        let crc = checksum(&head[..28]);
+        crate::encoding::put_u32(&mut head[28..32], crc);
         let err = EditLogHeader::decode(&head).expect_err("a foreign magic must fail closed");
         assert_eq!(err.kind(), "corruption");
+        // A 0.9 log is a named refusal.
+        head[..4].copy_from_slice(&ONDA09_EDIT_LOG_MAGIC.to_le_bytes());
+        assert_eq!(
+            EditLogHeader::decode(&head).unwrap_err().kind(),
+            "unsupported_format"
+        );
     }
 
     #[test]
-    fn unknown_schema_is_corruption() {
+    fn unknown_schema_is_unsupported_format() {
         let mut head = EditLogHeader {
             base_applied_through: 3,
             snapshot_generation: 1,
         }
         .encode();
-        head[4] = 2;
-        let crc = checksum(&head[..24]);
-        crate::encoding::put_u32(&mut head[24..28], crc);
+        head[8] = 2;
+        let crc = checksum(&head[..28]);
+        crate::encoding::put_u32(&mut head[28..32], crc);
         assert_eq!(
             EditLogHeader::decode(&head).unwrap_err().kind(),
-            "corruption"
+            "unsupported_format"
         );
     }
 

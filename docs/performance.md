@@ -271,13 +271,21 @@ both **off by default**, and the measurements are the reason. Harness:
 - The degradation is **one-way**: "bottom" is dynamic, and a table written
   filterless never regains a filter until a compaction rewrites it into a
   non-bottom target. See `ColumnFamilyConfig::optimize_filters_for_hits`.
+- **`bloom_auto_allocate` (P7, wavesdb `BloomAutoAllocate`) is off by default
+  for the same reason.** It is the geometric (Monkey) form of the per-level
+  vector — `bloom_fpr × level_size_ratio^(L − bottom)`, floored at `1e-4` — so
+  the "wash" finding above applies to it unchanged: it adds filter bytes to the
+  upper levels (resident memory) and pays back only where a miss really
+  cascades through several levels' candidates. Ported for wavesdb parity and
+  for workloads that measure a cascade; no speed claim is made for it here.
 
 ## Vlog reads: CRC-once, and the opt-in value cache
 
 Large values (`>= klog_value_threshold`) live in the vlog, and every read of one
 used to re-checksum the whole stored payload — a klog data block was verified
 once per open reader, a vlog frame every single time. On a value big enough to
-matter that checksum is most of the read: CRC32-C runs at about 6.3 GB/s here,
+matter that checksum is most of the read: the checksum (in 0.9.x CRC-32/IEEE
+via `crc32fast`, although documented as CRC32-C) ran at about 6.3 GB/s here,
 so a 5 MB value cost roughly 800 µs of pure re-verification per read, and
 spada's S-208 probe measured vlog reads at 6.96 GB/s against 11.3 GB/s for
 cached klog frames.
@@ -361,6 +369,53 @@ and re-opening a table re-verifies, which is the same guarantee the klog bitmap
 has always given. The first read of every frame still verifies, and a frame that
 fails verification is never marked, so corruption is reported on every read
 (`tests/sst.rs::corrupt_vlog_value_is_detected_on_every_read`).
+
+## Background reads do not admit into the block cache (plan C P2)
+
+A compaction reads every block of its inputs exactly once, and nothing asks for
+those blocks again: the inputs are retired when the job installs. Admitting
+them into the shared block cache can therefore only evict blocks a foreground
+reader wants. With a 256 KiB cache and a family ~17× that size being compacted
+beside a small hot family, the old policy evicted the entire hot set
+(`tests/cache_admission.rs`, control arm); the new one evicts nothing.
+
+The rule (wavesdb `ac16c8a`): a read on a thread whose `ioctrl` class is not
+`Foreground` uses `BlockCache::peek` — it is served by a resident block for
+free, but its hit sets no CLOCK reference bit and its miss inserts nothing —
+and neither is counted, so `DbStats::block_cache_hits`/`misses` describe
+foreground demand only. The thread class is already set wherever background
+work starts (the worker spawn, `run_manual`, span workers, ingest), and a
+reader is shared through the table cache between foreground and background
+callers, so the policy keys off the thread rather than off the reader.
+`Options::admit_background_scan_blocks = true` restores the old policy for A/B
+runs. Under `mmap-reads` an uncompressed block never touches the cache at all,
+so the change matters there only for compressed blocks and cached vlog
+values. A compaction pins each block for its whole walk over it, so not
+caching a block it missed never costs it a second read.
+
+## Graduated default codecs (plan C P10)
+
+Since 0.10 a family's default `compression_per_level` is `[None, Lz4, Zstd]`:
+L0 is rewritten constantly and stays raw, L1 pays LZ4's near-free pass, and L2
+and deeper — most of the data, the coldest of it — pays Zstd (level 3). The
+trade is space for cold-block point-read CPU. Provisional measurement
+(`tests/codec_defaults_bench.rs`, 400k text-like 136-byte values compacted into
+L2, `unsafe-fastpath` release, two alternating runs on a heavily loaded
+machine — ratios only):
+
+| | uniform `None` | graduated |
+|---|---|---|
+| on-disk SST bytes | 65.6 MB | 21.0 MB (−68%) |
+| random `get` (64 MiB cache, data 3× cache raw) | 0.81–1.03M/s | 0.44–0.49M/s |
+| full scan | 12.5–14.0M keys/s | 11.3–13.0M keys/s |
+
+The point-read cost is a Zstd decompression per block-cache miss: under
+`mmap-reads` an uncompressed block is served straight from the mapping and
+never needs the cache, a compressed one must be decompressed into it. A
+read-latency-bound family whose working set does not fit the block cache
+should set `compression_per_level: vec![]` (uniform `None`) or a lighter
+bottom codec. Persistence rule (tag 13 never elided when non-empty; absent =
+empty) is in `docs/format-registry.md`.
 
 ## Prefix-delta data blocks: why they are opt-in (2.1)
 

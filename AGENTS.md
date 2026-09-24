@@ -9,7 +9,8 @@ Deep documentation (read the one that matches your task):
 | Doc | Covers |
 |---|---|
 | `docs/architecture.md` | Module map, write/read/flush/compaction/recovery data flow |
-| `docs/formats.md` | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest + `MANIFEST-EDITS`, internal keys |
+| `docs/formats.md` | Every on-disk byte (yoloDB format epoch 1): WAL segments and frames, SSTable klog/vlog, manifest + `MANIFEST-EDITS`, config TLV, internal keys; appendix on the 0.9 formats |
+| `docs/format-registry.md` | The yoloDB registry: every magic, version, flag, capability bit, kind, codec id, TLV tag and edit op |
 | `docs/concurrency-and-safety.md` | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime/blocking contract, all `unsafe` contracts |
 | `docs/parts-and-tiers.md` | User-facing guide to partitions, parts and storage tiers (0.3.0): concepts, worked examples, S3 setup, operational notes |
 | `docs/performance.md` | Fast paths, benchmark methodology, known measurement artifacts |
@@ -19,15 +20,20 @@ Deep documentation (read the one that matches your task):
 ```sh
 cargo build                                    # default: deny unsafe; one audited Linux clock call
 cargo build --features unsafe-fastpath         # mmap reads + arena memtable
-cargo test                                     # must pass in BOTH configs
+cargo test                                     # must pass in ALL THREE configs
 cargo test --features unsafe-fastpath
-cargo clippy --all-targets                     # must be clean in BOTH configs
-cargo clippy --all-targets --features unsafe-fastpath
+cargo test --no-default-features               # without legacy-onda (the 0.9 decoders)
+cargo clippy --all-targets -- -D warnings      # must be clean in ALL THREE configs
+cargo clippy --all-targets --features unsafe-fastpath -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo build --features s3                      # the S3 tier compiles
 ```
 
-**Every change must keep both feature configurations green** — the two builds
-compile different memtable/reader code (`memtable_arena.rs` and the mmap paths
-exist only under `unsafe-fastpath`). CI-equivalent = 4 commands above.
+**Every change must keep all three feature configurations green** — the builds
+compile different code: `memtable_arena.rs` and the mmap paths exist only under
+`unsafe-fastpath`, and `src/legacy_onda/` (read-only 0.9.x decoders, default-on
+feature `legacy-onda`) exists only with default features. CI-equivalent = the
+seven commands above.
 
 When scripting the gate, check each test binary for the *presence of*
 `test result: ok`, not the *absence of* `FAILED`, and never pipe `cargo test`
@@ -80,9 +86,14 @@ ratios between engines, not absolute numbers across sessions. See
    silently lost. `DbInner::catalog_txn` is the only thing that may append.
 3. **WAL batch atomicity**: one frame per committed batch. Replay must never
    surface a partial batch (frame CRC covers the whole payload).
-4. **Every stored byte is checksummed**: WAL frames (CRC32-C), SSTable blocks
-   (CRC32-C), vlog values (per-value CRC32-C prefix), manifest (whole-file
-   CRC32-C), edit-log header and every edit record (CRC32-C). Blocks and vlog frames are verified **at least once per open
+4. **Every stored byte is checksummed**, with **CRC32-C** (Castagnoli,
+   `encoding::checksum` via the `crc32c` crate — pinned by the check value
+   `"123456789"` → `0xE3069283`): WAL segment headers and frames, SSTable
+   blocks and the 96-byte footer, vlog headers and values (per-value CRC
+   prefix), manifest (whole-file), edit-log header and every edit record.
+   (ondaDB 0.9.x claimed CRC32-C but computed CRC-32/IEEE, and left its SST
+   footer unchecksummed; IEEE now exists only in `legacy_onda` to read 0.9
+   files.) Blocks, vlog headers and vlog frames are verified **at least once per open
    reader** — never fewer (the first read always checks, and a frame that fails
    is never marked verified), and re-verified on re-open. Adding a new persisted
    structure without a checksum is a regression.
@@ -93,7 +104,7 @@ ratios between engines, not absolute numbers across sessions. See
    checkpoint/backup can pin the file set (`pause_deletions`). A bare
    `fs::remove_file` on an SST is a bug.
 7. **Comparator stability**: a CF's comparator defines its on-disk order and is
-   persisted by name in the manifest. The 8-byte **key-prefix compare trick**
+   persisted by name in the CF config blob (TLV tag 1). The 8-byte **key-prefix compare trick**
    (used in the memtable, merge iterator, and flush merge) is only valid when
    `Comparator::is_bytewise()` — every prefix shortcut must fall through to the
    full comparison on prefix equality and must be gated on `bytewise`.
@@ -108,6 +119,15 @@ ratios between engines, not absolute numbers across sessions. See
    `apply_commit`; rotation waits for drain before swapping the memtable. A
    sealed (imm) memtable is immutable — the zero-materialization flush cursors
    depend on it.
+10. **Format-upgrade swap** (`upgrade.rs`): the 0.9 source directory is
+   **never written before the swap** (only its `LOCK` is taken, exclusively,
+   for the whole run); the rebuild's `MANIFEST` is written last; the swap
+   journal is written only **after** verification passed, and it is the only
+   thing that may authorize renaming the source. Every crash-recovery branch
+   either rolls a *complete* rebuild forward or renames the untouched source
+   back — none deletes the source or the backup (only `format_upgrade_keep_backup
+   = false` does, after the upgraded database opened). A read-only open writes
+   neither a journal nor a 0.9 directory.
 
 ## Conventions
 
@@ -123,14 +143,38 @@ ratios between engines, not absolute numbers across sessions. See
   regresses. Both previous regressions in this repo's history were caught
   this way.
 
+## On-disk format: yoloDB epoch 1
+
+Since 0.10 ondaDB writes **yoloDB format epoch 1** (plan C,
+`docs/plans/phase-c-yolodb-convergence/plan.md`): the magics `YOLOST01` (SST
+footer), `YOLODBMF` (manifest), `YOLODBED` (edit log), `YOLODBWL` (WAL segment
+header), `YOLODBVL` (vlog header) and `YOLODBCF` (config TLV), CRC32-C
+everywhere, restart trailers on every data block, codec id 6 for LZ4 (2 and 4
+burned), a leading bloom hash tag and the correct FNV-1a-64 basis for unified
+CF ids. `src/format.rs` is the single home for every number, each pinned by a
+`const` assertion and a golden test (`tests/epoch1_golden.rs` over
+`tests/fixtures/epoch1/`); `docs/format-registry.md` is the registry. Fail
+closed: malformed bytes are `Corruption`; an unknown version, flag, capability
+bit, codec, kind or config enum value is `UnsupportedFormat`.
+
+A 0.9.x directory is **not** readable by the epoch-1 engine. The frozen 0.9
+decoders live in `src/legacy_onda/` (default-on feature `legacy-onda`,
+decode-only, pinned by `tests/fixtures/legacy-onda/`), and
+`legacy_onda::open_read_only` opens a 0.9 database read-only through the
+engine. `DB::open` **upgrades a 0.9 directory automatically** (plan C §1.3,
+`upgrade.rs`, `Options::format_upgrade` = `Auto` | `Forbid` |
+`ReadOnlyLegacy`): a one-for-one transcode into a sibling directory, verified,
+then swapped in under a journal that the next open resolves after a crash;
+`yolodb upgrade <path>` runs it offline. Never add a 0.9 *encoder* outside a
+`#[cfg(test)]` fixture builder.
+
 ## Optional format capabilities
 
-Seven `CAP_*` bits in the manifest's capability word gate every format that is
-not 0.8.2's. Each is **opt-in and one-way**: `DB::enable_format_capabilities`
+Seven `CAP_*` bits in the manifest's capability word gate the optional
+artifacts. Each is **opt-in and one-way**: `DB::enable_format_capabilities`
 persists the bit before the first byte using it exists, and from then on the
-database is unreadable by a binary that does not implement it. Nothing is
-enabled by default, so an upgraded database writes 0.8.2 bytes until an
-operator asks otherwise — that is what makes every feature here rollback-safe.
+database is unreadable by a binary that does not implement it. Each SSTable also
+declares the subset its bytes use in its footer's capability word.
 
 | Bit | Capability | Turns on |
 |---|---|---|
@@ -162,8 +206,12 @@ vintage produces it; an assigned kind this binary does not implement is
 | Prefix-delta blocks (2.1) | `sst/mod.rs` (`encode_entry_delta`) | |
 | Manifest edit log (2.2) | `manifest_edit.rs` | See invariants 1 and 2 |
 | PerfContext (0.10) | `perf.rs` | |
+| Read profiling (F13) | `read_profile.rs` | DB-wide opt-in aggregate of `PerfContext` counters; off = one relaxed load per read |
 | IO classes / rate limiter (0.6) | `ioctrl.rs` | |
 | Tailing iterators (0.9) | `tailing.rs` | |
+| Clear under the unified layout (F5′) | `db.rs` (`clear_column_family`, `DbInner::choose_unified_id`), `unified.rs` (`holds_cf`), `manifest_edit.rs` (`SetCfUnifiedId`) | Every name→id lookup uses the family's **stored** id (`ColumnFamily::id`, `cf_by_id`); `unified::cf_id(name)` is only the default. Tests: `tests/unified_clear.rs` |
+| 0.9 → epoch-1 upgrade (plan C §1.3) | `upgrade.rs`, `legacy_onda/`, `src/bin/yolodb.rs` | See invariant 10; crash matrix in `tests/format_upgrade.rs` (fault hook: `UpgradeObserver`) |
+| Wide-column entities (F11) | `entity.rs` | Value-level frame shared with wavesdb (`WVE1`); no engine change |
 
 **Cross-feature rules live in `tests/composition.rs`**, not in either feature's
 own file: a range delete is, for one key, a *deleted base at its sequence* (so a

@@ -185,7 +185,8 @@ fn read_only_checkpoint_and_backup_keep_wal_only_data() {
             db.enable_format_capabilities(ondadb::format::CAP_RANGE_DELETES)
                 .unwrap();
             db.delete_range(&cf, b"k00090", b"k00110").unwrap();
-            db.put(&other, b"o", b"only-in-wal", Duration::ZERO).unwrap();
+            db.put(&other, b"o", b"only-in-wal", Duration::ZERO)
+                .unwrap();
             db.sync_wal().unwrap();
             copy_tree(src.path(), crashed.path());
             db.close().unwrap();
@@ -194,7 +195,11 @@ fn read_only_checkpoint_and_backup_keep_wal_only_data() {
 
         let db = DB::open(options(crashed.path(), true)).unwrap();
         let cf = db.get_column_family("default").unwrap();
-        assert_eq!(db.get(&cf, b"k00150").unwrap(), b"value", "unified={unified}");
+        assert_eq!(
+            db.get(&cf, b"k00150").unwrap(),
+            b"value",
+            "unified={unified}"
+        );
         db.checkpoint(dest.path().join("ckpt")).unwrap();
         db.backup(dest.path().join("bk")).unwrap();
         db.close().unwrap();
@@ -2136,6 +2141,78 @@ fn close_compacts_the_log_and_reports_failure() {
         "close ran a snapshot compaction"
     );
     let bytes = std::fs::read(ondadb::manifest_edit::edit_log_path(dir.path())).unwrap();
-    assert_eq!(bytes.len(), 28, "the log restarts at its header");
+    assert_eq!(
+        bytes.len(),
+        ondadb::manifest_edit::EDIT_LOG_HEADER_BYTES,
+        "the log restarts at its header"
+    );
     assert_eq!(after.applied_through, after.next_edit_id - 1);
+}
+
+/// Tombstone-density trigger (plan C P4): a flush that leaves a table mostly
+/// tombstones gets it compacted without any size trigger firing, the
+/// tombstones are dropped at the bottom, and the setting survives a reopen.
+fn delete_heavy(dir: &std::path::Path, trigger: f64) -> (DB, std::sync::Arc<ondadb::ColumnFamily>) {
+    let db = DB::open(Options::new(dir.to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family(
+            "default",
+            ColumnFamilyConfig {
+                tombstone_density_trigger: trigger,
+                tombstone_density_min_entries: 100,
+                // No size trigger: only the density trigger can compact.
+                l1_file_count_trigger: 64,
+                ..ColumnFamilyConfig::default()
+            },
+        )
+        .unwrap();
+    fill(&db, &cf, 1_000);
+    db.flush_memtable(&cf).unwrap();
+    for i in 0..900u32 {
+        db.delete(&cf, format!("k{i:05}").as_bytes()).unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    (db, cf)
+}
+
+#[test]
+fn tombstone_density_trigger_reclaims_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = delete_heavy(dir.path(), 0.5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // The counter is bumped just after the job installs, so wait for both.
+    while cf.stats().num_tombstones > 0 || cf.stats().tombstone_density_compactions == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tombstones never reclaimed: {:?}",
+            cf.stats()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stats = cf.stats();
+    assert!(stats.tombstone_density_compactions >= 1, "{stats:?}");
+    assert_eq!(stats.num_entries, 100, "only the undeleted keys remain");
+    assert!(db.get(&cf, b"k00000").is_err());
+    assert_eq!(db.get(&cf, b"k00950").unwrap(), b"value");
+    db.close().unwrap();
+
+    // Persisted: a reopen keeps the trigger.
+    let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+    let cfg = db.column_family_config("default").unwrap();
+    assert_eq!(cfg.tombstone_density_trigger, 0.5);
+    assert_eq!(cfg.tombstone_density_min_entries, 100);
+    db.close().unwrap();
+}
+
+/// The control: with the trigger off the same workload keeps its tombstones,
+/// so the test above is measuring the trigger and not some other compaction.
+#[test]
+fn without_the_density_trigger_tombstones_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, cf) = delete_heavy(dir.path(), 0.0);
+    std::thread::sleep(Duration::from_millis(300));
+    let stats = cf.stats();
+    assert_eq!(stats.num_tombstones, 900, "{stats:?}");
+    assert_eq!(stats.tombstone_density_compactions, 0);
+    db.close().unwrap();
 }

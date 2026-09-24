@@ -88,8 +88,11 @@ impl std::fmt::Debug for TailingIterator {
 
 impl TailingIterator {
     pub(crate) fn new(db: Arc<DbInner>, cf: Arc<ColumnFamily>) -> TailingIterator {
-        let floor = db.read_floor_seq();
+        // Pinned only while the segment is built; see `DbInner::pin_read_floor`.
+        let (floor, pin) = db.pin_read_floor();
+        crate::db::snapshot_pin_hook();
         let it = cf.new_iterator(floor, None, (Bound::Unbounded, Bound::Unbounded));
+        drop(pin);
         TailingIterator {
             db,
             cf,
@@ -153,7 +156,12 @@ impl TailingIterator {
             Some(last) => Bound::Excluded(last.as_slice()),
             None => Bound::Unbounded,
         };
+        // The cheap check above read the floor unpinned; the rebuild re-reads
+        // it under a pin (never lower: the floor is monotonic per thread).
+        let (floor, pin) = self.db.pin_read_floor();
+        crate::db::snapshot_pin_hook();
         self.it = self.cf.new_iterator(floor, None, (lower, Bound::Unbounded));
+        drop(pin);
         self.floor = floor;
         self.segments += 1;
         // `seek_to_first` honours the declared lower bound, so this lands on
