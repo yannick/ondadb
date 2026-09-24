@@ -97,7 +97,10 @@ pub mod unified;
 pub mod util;
 pub mod wal;
 
-pub use checkpoint::{CheckpointTable, TableSetDiff};
+pub use checkpoint::{
+    open_remote_checkpoint, restore_from_object_store, CheckpointTable, ObjectCheckpoint,
+    ObjectCheckpointOptions, ObjectReceipt, TableSetDiff,
+};
 pub use column_family::{ColumnFamily, CommitHookFn, CommitOp, CompactionFilterFn, FilterDecision};
 pub use comparator::{Comparator, ComparatorRef};
 #[cfg(feature = "s3")]

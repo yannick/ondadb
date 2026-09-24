@@ -575,6 +575,47 @@ reach past its last point key, and two bottom tables with overlapping spans
 would break the level-≥1 disjointness reads depend on. An incoming table whose
 span overlaps a live or already-staged one goes to L0, where overlap is legal.
 
+## Object-store checkpoints (0.9.2)
+
+`DB::checkpoint_to_object_store(store, prefix, &opts)` writes a checkpoint to
+any `Storage` — an `S3Storage`, or a `LocalStorage` rooted anywhere:
+
+```text
+<prefix>/cf-<name>/<id>.klog      every live table
+<prefix>/cf-<name>/<id>.vlog      when the table has a value log
+<prefix>/MANIFEST                 uploaded LAST: the commit marker
+```
+
+- It flushes, pauses obsolete-file deletion for the whole upload, and copies
+  exactly the file set a local `checkpoint` would (tables on any tier are
+  read where they live). The MANIFEST is the same snapshot-only catalog: no
+  tier placement, no edit log. A read-only source is accepted; its
+  WAL-replayed memtables are written as new L0 tables into a local scratch
+  directory and uploaded, never into the source.
+- **No MANIFEST ⇒ no checkpoint.** An interrupted upload leaves table objects
+  but no MANIFEST; `restore_from_object_store` and `open_remote_checkpoint`
+  then return `OndaError::NotFound`, not corruption.
+- **Incremental:** `ObjectCheckpointOptions { parent: Some(previous), .. }`
+  skips objects the previous checkpoint of the same prefix uploaded and
+  rewrites the MANIFEST with the full set. Only the latest checkpoint in a
+  prefix is restorable. `DB::sstables_diff(&previous.tables)` shows what
+  will be shipped.
+- **Receipts:** `receipts: true` publishes with create-if-absent
+  (`If-None-Match: *` on S3) and returns an `ObjectReceipt { key, size,
+  sha256, store_checksum, store_verified }` per object, MANIFEST first. An
+  object already in place is accepted only if its size and SHA-256 match
+  (so a retry is idempotent); otherwise the call fails with
+  `OndaError::Exists`. Not combinable with `parent`.
+- `restore_from_object_store(store, prefix, dir)` downloads the MANIFEST
+  first but writes it into `dir` **last**, after every table is durable and
+  size-checked against it.
+- `open_remote_checkpoint(store, prefix, opts)` (requires
+  `opts.read_only`) downloads only the MANIFEST into `opts.path`, places
+  every table on a shared tier named `__ondadb_remote_checkpoint__` rooted
+  at `prefix`, and opens the database. Reads are range GETs through the
+  block cache; reader sizes come from the MANIFEST, so no HEAD per table.
+  A read-only `S3Config` (and `anonymous`) is enough.
+
 ## Operational notes
 
 **Durability model.** The commit point for every part/tier operation is the

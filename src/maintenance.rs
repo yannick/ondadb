@@ -46,6 +46,37 @@ fn place_storage_file(
     copy_storage_file(storage, src, dst)
 }
 
+/// One file a snapshot copies: its place in the snapshot (`cf-<cf>/<id>.<ext>`)
+/// and where its bytes are read from now.
+pub(crate) struct SnapshotFile {
+    pub(crate) cf: String,
+    pub(crate) id: u64,
+    pub(crate) ext: &'static str,
+    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) src: String,
+    pub(crate) size: u64,
+}
+
+/// See [`DB::plan_snapshot`].
+pub(crate) struct SnapshotPlan {
+    pub(crate) manifest: crate::manifest::Manifest,
+    pub(crate) files: Vec<SnapshotFile>,
+    pub(crate) cfs: Vec<Arc<ColumnFamily>>,
+}
+
+impl SnapshotPlan {
+    /// Make the manifest snapshot-only before it is saved into a destination:
+    /// a fresh generation, nothing applied, and no `MANIFEST-EDITS` beside it.
+    /// It grows a log the first time it is opened writable and mutated.
+    /// Copying the source's cursor instead would describe a log the
+    /// destination does not have.
+    pub(crate) fn finalize_manifest(&mut self) {
+        self.manifest.generation = 1;
+        self.manifest.applied_through = 0;
+        self.manifest.next_edit_id = 1;
+    }
+}
+
 /// Per-column-family statistics.
 #[derive(Debug, Clone, Default)]
 pub struct CfStats {
@@ -261,7 +292,37 @@ impl DB {
         // Pause obsolete-file deletion so a concurrent compaction cannot unlink an
         // SSTable that the snapshot's manifest still references. Held until return.
         let _pause = self.inner.pause_deletions();
+        let mut plan = self.plan_snapshot()?;
 
+        std::fs::create_dir_all(dir)?;
+        for cfm in &plan.manifest.cfs {
+            std::fs::create_dir_all(dir.join(format!("cf-{}", cfm.name)))?;
+        }
+        for f in &plan.files {
+            let dst = dir.join(format!("cf-{}/{}.{}", f.cf, f.id, f.ext));
+            place_storage_file(f.storage.as_ref(), &f.src, &dst, hard_link)?;
+        }
+        if self.inner.opts.read_only {
+            self.write_sealed_memtables(dir, &plan.cfs, &mut plan.manifest)?;
+        }
+        plan.finalize_manifest();
+        plan.manifest.save(dir.join("MANIFEST"))?;
+        Ok(())
+    }
+
+    /// Everything a snapshot copies, gathered under the caller's
+    /// `pause_deletions` guard (which must outlive every use of the plan: it is
+    /// what keeps the listed source files on disk).
+    ///
+    /// Flushes every family (on a read-only source this only seals the
+    /// replayed memtables — the caller writes them with
+    /// `write_sealed_memtables`), persists the catalog, and loads it back with
+    /// `recover_catalog`. The returned manifest already names every table at
+    /// its snapshot-relative place (tier and object cleared), and `files` lists
+    /// each `.klog` / non-empty `.vlog` with the backend and path it is read
+    /// from — so a local checkpoint and an object-store checkpoint copy the
+    /// exact same set.
+    pub(crate) fn plan_snapshot(&self) -> Result<SnapshotPlan> {
         let cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
         // Flush memtables so all data lives in SSTables, then persist manifest.
         for cf in &cfs {
@@ -277,7 +338,6 @@ impl DB {
         }
         self.inner.persist_manifest()?;
 
-        std::fs::create_dir_all(dir)?;
         // Load the manifest and link exactly the files it references. With deletions
         // paused, every file any persisted manifest lists still exists on disk, so
         // the copied catalog and the copied files are guaranteed consistent — even if
@@ -289,13 +349,12 @@ impl DB {
         // would silently drop every edit since the last one — which is what
         // would make the "read-only-capable backup" claim false.
         let mut manifest = crate::manifest_edit::recover_catalog(&self.inner.dir)?;
+        let mut files = Vec::new();
         for cfm in &mut manifest.cfs {
             let source_cf = cfs
                 .iter()
                 .find(|cf| cf.name() == cfm.name)
                 .ok_or(OndaError::NotFound)?;
-            let cf_dir = dir.join(format!("cf-{}", cfm.name));
-            std::fs::create_dir_all(&cf_dir)?;
             for sst in &mut cfm.sstables {
                 let storage = source_cf.tiers().storage_for(sst.tier.as_deref());
                 let src_klog = source_cf.klog_path_for(sst);
@@ -306,27 +365,24 @@ impl DB {
                     if ext == "vlog" && size == 0 {
                         continue;
                     }
-                    let dst = cf_dir.join(format!("{}.{ext}", sst.id));
-                    place_storage_file(storage.as_ref(), &src, &dst, hard_link)?;
+                    files.push(SnapshotFile {
+                        cf: cfm.name.clone(),
+                        id: sst.id,
+                        ext,
+                        storage: storage.clone(),
+                        src,
+                        size,
+                    });
                 }
                 sst.tier = None;
                 sst.object = None;
             }
         }
-        if read_only {
-            self.write_sealed_memtables(dir, &cfs, &mut manifest)?;
-        }
-        // Persist the same manifest we linked against, so the backup catalog matches
-        // its files exactly. The destination is **snapshot-only**: a fresh
-        // generation, nothing applied, and no `MANIFEST-EDITS` beside it. It
-        // grows a log the first time it is opened writable and mutated. Copying
-        // the source's cursor instead would describe a log the destination does
-        // not have.
-        manifest.generation = 1;
-        manifest.applied_through = 0;
-        manifest.next_edit_id = 1;
-        manifest.save(dir.join("MANIFEST"))?;
-        Ok(())
+        Ok(SnapshotPlan {
+            manifest,
+            files,
+            cfs,
+        })
     }
 
     /// Carry a read-only database's memtable data into a snapshot.
@@ -345,7 +401,7 @@ impl DB {
     /// ids come from this handle's counter, which starts above every id the
     /// source catalog holds, and `global_seq`/`next_file_id` are raised to
     /// cover what was written.
-    fn write_sealed_memtables(
+    pub(crate) fn write_sealed_memtables(
         &self,
         dir: &Path,
         cfs: &[Arc<ColumnFamily>],

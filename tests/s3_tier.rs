@@ -225,6 +225,94 @@ fn part_demotes_off_s3_back_to_the_default_tier() {
     cleanup(&cfg, &prefix);
 }
 
+/// F7 end-to-end on a real object store: a receipts checkpoint (every object
+/// store-verified), then a lazy remote open that reads through range GETs with
+/// no HEAD per table, then a download restore; and a prefix without a MANIFEST
+/// is "no checkpoint".
+#[test]
+fn object_checkpoint_roundtrip_on_s3() {
+    use ondadb::checkpoint::{
+        open_remote_checkpoint, restore_from_object_store, ObjectCheckpointOptions,
+    };
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 checkpoint test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(src.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .unwrap();
+    let big = vec![b'B'; 2 << 10];
+    for i in 0..50u32 {
+        db.put(&cf, format!("k{i:03}").as_bytes(), &big, Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.put(&cf, b"small", b"s", Duration::ZERO).unwrap();
+    let ck = db
+        .checkpoint_to_object_store(
+            s3.as_ref(),
+            &prefix,
+            &ObjectCheckpointOptions {
+                receipts: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.close().unwrap();
+    assert!(!ck.receipts.is_empty());
+    assert!(
+        ck.receipts.iter().all(|r| r.store_verified),
+        "every upload must be store-verified: {:?}",
+        ck.receipts
+    );
+
+    // Lazy open over a read-only view of the bucket.
+    let ro = S3Storage::new(&S3Config {
+        read_only: true,
+        ..cfg.clone()
+    })
+    .unwrap();
+    let metrics = ro.metrics();
+    let mount = tempfile::tempdir().unwrap();
+    let mut o = Options::new(mount.path().join("m").to_str().unwrap());
+    o.read_only = true;
+    let remote = open_remote_checkpoint(ro.clone(), &prefix, o).unwrap();
+    let rcf = remote.get_column_family("default").unwrap();
+    assert_eq!(remote.get(&rcf, b"k007").unwrap(), big);
+    assert_eq!(remote.get(&rcf, b"small").unwrap(), b"s");
+    assert_eq!(
+        metrics.heads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one HEAD for the MANIFEST download, none per table"
+    );
+    assert!(metrics.range_gets.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    remote.close().unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    restore_from_object_store(ro.as_ref(), &prefix, dest.path().join("db")).unwrap();
+    let mut o = Options::new(dest.path().join("db").to_str().unwrap());
+    o.read_only = true;
+    let restored = DB::open(o).unwrap();
+    let rcf = restored.get_column_family("default").unwrap();
+    assert_eq!(restored.get(&rcf, b"k049").unwrap(), big);
+    restored.close().unwrap();
+
+    // Nothing under a fresh prefix: NotFound, not corruption.
+    let empty = format!("{prefix}-nothing");
+    assert!(matches!(
+        restore_from_object_store(ro.as_ref(), &empty, dest.path().join("e")),
+        Err(ondadb::OndaError::NotFound)
+    ));
+
+    for r in &ck.receipts {
+        let _ = s3.delete(&r.key);
+    }
+}
+
 /// On an S3-resident part every uncached vlog read is a range GET, which is
 /// where the value cache pays for itself most visibly. The second read of a hot
 /// large value must issue **no** request at all: the klog block and the decoded

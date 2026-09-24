@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
+
+- `DB::checkpoint_to_object_store(store, prefix, &ObjectCheckpointOptions)`
+  uploads `<prefix>/cf-<name>/<id>.{klog,vlog}` then `<prefix>/MANIFEST`
+  last (the commit marker); incremental via `parent`; `receipts` gives
+  create-if-absent publication with per-object size + SHA-256 receipts.
+  Returns an `ObjectCheckpoint { global_seq, next_file_id, tables,
+  receipts }`. A read-only source is accepted (its WAL-only data is written
+  as L0 tables in a scratch dir, per 0.9.1's snapshot rule).
+- `restore_from_object_store(store, prefix, dir)` — MANIFEST fetched first,
+  written last; `NotFound` when the prefix holds no checkpoint.
+- `open_remote_checkpoint(store, prefix, opts)` — lazy, read-only mount:
+  one MANIFEST GET, then range GETs; sizes seeded from the MANIFEST.
+- Internal: `snapshot_to` is split into `plan_snapshot` + placement, so local
+  and object checkpoints copy the identical file set. No on-disk format
+  change: the MANIFEST bytes are the ones a local checkpoint writes.
+
 ### Demote a part to the default tier (wavesdb `4fa392c`)
 
 - `DB::move_part_to_default_tier(cf, partition)`; `move_part_to_tier` and
