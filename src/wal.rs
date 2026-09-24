@@ -3457,7 +3457,10 @@ mod tests {
         let stripe = my_stripe_path(&path);
         wal.append(rec("a", "1", 1)).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while len_of(&stripe) == SEGMENT_HEADER_LEN as u64 {
+        // Wait on the write counter, not the file length: the length moves
+        // while the flusher's `write_all` is still in progress, the counter
+        // only once it has returned.
+        while wal.write_calls() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the interval thread never flushed a cold buffer"
@@ -3465,6 +3468,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(wal.write_calls(), 1);
+        assert!(len_of(&stripe) > SEGMENT_HEADER_LEN as u64);
     }
 
     #[test]
