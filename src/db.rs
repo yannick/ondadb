@@ -2880,6 +2880,48 @@ impl DB {
         result
     }
 
+    /// Flush `cf`'s memtable, then compact its whole key space into the bottom
+    /// level ([`compact_range`](Self::compact_range) over `(Unbounded,
+    /// Unbounded)`), and wait for both — wavesdb `PurgeColumnFamily`.
+    ///
+    /// What it reclaims is what any compaction to the bottom reclaims:
+    /// overwritten versions, tombstones together with the puts they shadow,
+    /// and expired TTL entries — except whatever a live snapshot or iterator
+    /// can still see, which survives exactly as it survives every other
+    /// compaction. Afterwards the family's data sits in its deepest level
+    /// (plus any L0 file a concurrent flush added meanwhile). Nothing is
+    /// deleted that a read could still return; this is reclamation, not
+    /// [`clear_column_family`](Self::clear_column_family). A FIFO family is
+    /// flushed and then runs its eviction pass. `ReadOnly` on a read-only
+    /// handle.
+    pub fn purge_column_family(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        self.flush_memtable(cf)?;
+        self.compact_range(
+            cf,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+        )
+    }
+
+    /// [`purge_column_family`](Self::purge_column_family) for every column
+    /// family, one after another (wavesdb `Purge`). Stops at the first error;
+    /// families purged before it stay purged.
+    pub fn purge(&self) -> Result<()> {
+        if self.inner.opts.read_only {
+            return Err(OndaError::ReadOnly("database is read-only".into()));
+        }
+        let mut cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
+        // A stable order, so a failure is reproducible.
+        cfs.sort_by(|a, b| a.name().cmp(b.name()));
+        for cf in &cfs {
+            self.purge_column_family(cf)?;
+        }
+        Ok(())
+    }
+
     /// Force an fsync of every write-ahead log (all column families plus the
     /// unified store, when enabled).
     ///

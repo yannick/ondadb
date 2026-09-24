@@ -188,6 +188,10 @@ directory written by this release is not readable by 0.9.x. The crate is still
   path (catalog transaction, retention, partition cuts), holding the family's
   range lock like `DB::compact`; returns when done. `ReadOnly` on a read-only
   handle. See `docs/compaction-and-write-pacing.md`.
+- **`DB::purge()` / `DB::purge_column_family(cf)`** (plan C F4, wavesdb
+  `Purge`/`PurgeColumnFamily`): flush, then `compact_range` over the whole
+  family, so overwritten versions, tombstones and expired TTL entries not
+  pinned by a snapshot are reclaimed and the data ends in the bottom level.
 
 - **Tombstone-density trigger wired** (plan C P4). `ColumnFamilyConfig::
   tombstone_density_trigger` / `tombstone_density_min_entries`, declared but

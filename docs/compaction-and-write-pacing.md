@@ -295,6 +295,18 @@ is the whole family.
   A foreign mount skips only the push that would merge around it. FIFO
   families run their eviction pass instead.
 
+### `DB::purge` / `DB::purge_column_family` (plan C F4)
+
+wavesdb's semantics exactly: `purge_column_family(cf)` flushes the family's
+memtable, then runs `compact_range(cf, Unbounded, Unbounded)`; `purge()` does
+that for every family in name order and stops at the first error. The result
+is the family's data in its deepest level with overwritten versions,
+tombstones (and what they shadow) and expired TTL entries gone — except what
+a live snapshot or iterator can still see. It is reclamation, not deletion:
+nothing a read could return disappears (that is `clear_column_family`).
+Compared with `DB::compact`, purge also flushes first and does not run the
+triggered rounds; both end with everything pushed to the bottom.
+
 ## Splitting one job across threads
 
 `Options::num_compaction_threads` limits how many *jobs* run at once, and jobs
