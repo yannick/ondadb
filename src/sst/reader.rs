@@ -111,6 +111,24 @@ pub struct Reader {
     /// is nothing to reconfigure without reopening the table.
     vlog_cache_limit: usize,
 
+    /// The table's descriptors, held for the rest of this reader's life once
+    /// [`pin_files`](Self::pin_files) runs — which the engine does when the
+    /// table is retired (or its reader evicted) while a caller still holds the
+    /// reader.
+    ///
+    /// Buffered reads otherwise re-acquire the file **by path** through the
+    /// shared file cache on every block, so a table's readable lifetime was its
+    /// *path's* lifetime: once compaction retired it and unlinked the path, an
+    /// iterator opened before the compaction failed its next uncached block
+    /// with `NotFound`, breaking the documented "open iterators pin the
+    /// pre-compaction files" contract. (Under `mmap-reads` the klog mapping
+    /// already held the inode; its lazily-mapped vlog did not.) Pinning only
+    /// then keeps the file-descriptor budget where `max_open_sstables` puts it
+    /// for every table still in the catalog: a pinned descriptor exists only
+    /// while an in-flight user holds a reader nothing else can reach.
+    pinned_klog: OnceLock<Arc<dyn crate::storage::ReadHandle>>,
+    pinned_vlog: OnceLock<Arc<dyn crate::storage::ReadHandle>>,
+
     #[cfg(feature = "mmap-reads")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
     #[cfg(feature = "mmap-reads")]
@@ -307,6 +325,8 @@ impl Reader {
             fragments: Arc::from([]),
             vlog_verified: OnceLock::new(),
             vlog_cache_limit,
+            pinned_klog: OnceLock::new(),
+            pinned_vlog: OnceLock::new(),
             #[cfg(feature = "mmap-reads")]
             klog_mmap: None,
             #[cfg(feature = "mmap-reads")]
@@ -668,7 +688,7 @@ impl Reader {
         // Charged before the read is issued, so a job cancelled while waiting
         // never consumes the bandwidth it queued for.
         crate::ioctrl::charge(&self.limiter, h.length);
-        let f = self.storage.open_read(&self.klog_path)?;
+        let f = self.klog_file()?;
         let (raw, alg) = read_block_at(&*f, h.offset, h.length, self.profile)?;
         if alg != Compression::None {
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
@@ -1082,7 +1102,7 @@ impl Reader {
     }
 
     fn read_vlog_from_file(&self, off: u64, len: usize, out: &mut Vec<u8>) -> Result<()> {
-        let file = self.storage.open_read(&self.vlog_path)?;
+        let file = self.vlog_file()?;
         self.check_vlog_frame_offset(off, || {
             let mut h = vec![0u8; VLOG_HEADER_LEN];
             file.read_exact_at(&mut h, 0)?;
@@ -1193,7 +1213,7 @@ impl Reader {
         if let Some(m) = guard.as_ref() {
             return Ok(m.clone());
         }
-        let f = self.storage.open_read(&self.vlog_path)?;
+        let f = self.vlog_file()?;
         let file = f
             .as_file()
             .expect("a tier reporting supports_mmap() must back reads with a local file");
@@ -1235,6 +1255,43 @@ impl Reader {
     pub fn close(&self) {
         self.storage.release(&self.klog_path);
         self.storage.release(&self.vlog_path);
+    }
+
+    /// The klog descriptor: the pinned one if [`pin_files`](Self::pin_files)
+    /// ran, otherwise the shared file cache's by path.
+    fn klog_file(&self) -> Result<Arc<dyn crate::storage::ReadHandle>> {
+        match self.pinned_klog.get() {
+            Some(h) => Ok(h.clone()),
+            None => self.storage.open_read(&self.klog_path),
+        }
+    }
+
+    /// The vlog descriptor; see [`klog_file`](Self::klog_file).
+    fn vlog_file(&self) -> Result<Arc<dyn crate::storage::ReadHandle>> {
+        match self.pinned_vlog.get() {
+            Some(h) => Ok(h.clone()),
+            None => self.storage.open_read(&self.vlog_path),
+        }
+    }
+
+    /// Hold this table's klog and vlog descriptors for the rest of the
+    /// reader's life, so reads keep working after the paths are unlinked.
+    ///
+    /// Must run **before** the table's files are removed — it opens them by
+    /// path. A missing vlog is not an error (most tables have none), and
+    /// neither is a failed klog open: the reader then behaves as before, and
+    /// the read that needs the file reports the error.
+    pub(crate) fn pin_files(&self) {
+        if self.pinned_klog.get().is_none() {
+            if let Ok(h) = self.storage.open_read(&self.klog_path) {
+                let _ = self.pinned_klog.set(h);
+            }
+        }
+        if self.pinned_vlog.get().is_none() {
+            if let Ok(h) = self.storage.open_read(&self.vlog_path) {
+                let _ = self.pinned_vlog.set(h);
+            }
+        }
     }
 }
 

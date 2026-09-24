@@ -717,6 +717,21 @@ compaction/deferred deletion only *unlink* it — pages stay valid while the
 mmap holds the inode. `Block::Mapped` views carry the `Arc<Mmap>` so they
 outlive the reader if needed.
 
+**Retired tables stay readable to their holders.** An iterator opens every
+table it reads at construction and holds the `Arc<Reader>`; compaction may
+retire and unlink those tables before the iterator finishes. The mmap'd klog
+holds its inode, but buffered reads (the default build) and the lazily mapped
+vlog re-acquire the file **by path** through the shared `FileCache`, so an
+unlinked path used to fail the iterator's next uncached block with `NotFound`.
+`Reader::pin_files` now takes the klog and vlog descriptors into the reader
+for the rest of its life, and runs exactly where a held reader stops being
+reachable from the catalog: `SstHandle::close` (retirement, before the unlink)
+and `TableCache` eviction, each only when `Arc::strong_count > 1` — someone
+in flight still holds it. A pinned descriptor therefore exists only for the
+lifetime of that holder, and every table still in the catalog stays under the
+`max_open_sstables` descriptor bound. Pinned by
+`tests/engine_regressions.rs::open_iterator_survives_*`.
+
 CRC-once bitmap: `Reader::verified` (one bit per data block, AtomicU64 words).
 First reader of a block verifies its CRC (`block_payload`), sets the bit with
 `AcqRel`; later readers use `block_payload_preverified`. Immutability of the

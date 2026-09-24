@@ -94,6 +94,13 @@ impl SstHandle {
     /// A table that is not open needs no close, so nothing is opened here.
     pub fn close(&self) {
         if let Some(r) = self.cache.close(self.tref.file_id) {
+            // Someone mid-read (an open iterator, most often) still holds this
+            // reader, and the caller is about to unlink the files: pin their
+            // descriptors first so that reader keeps working. The cache entry
+            // is already gone, so the count cannot rise behind this check.
+            if Arc::strong_count(&r) > 1 {
+                r.pin_files();
+            }
             r.close();
         }
     }

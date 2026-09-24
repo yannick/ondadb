@@ -75,6 +75,16 @@ directory written by this release is not readable by 0.9.x. The crate is still
   the per-CF rotation already did, so the segment-header fsync does not extend
   the write gate.
 
+- **Fix: an open iterator no longer fails when compaction unlinks its
+  tables.** Buffered reads re-opened a table by path on every uncached block,
+  so an iterator created before a compaction hit `NotFound` on the first
+  uncached block after the compaction retired its inputs — breaking the
+  documented "open iterators pin the pre-compaction files" contract (mmap
+  builds were affected only for vlog values). `Reader::pin_files` now holds
+  the descriptors of a retired or cache-evicted reader that a caller still
+  holds. Previously masked in practice by compaction admitting every input
+  block into the block cache.
+
 ### Ported from wavesdb (plan C step 1, §1.4)
 
 #### Object-store checkpoints (wavesdb `CheckpointToObjectStore`)
