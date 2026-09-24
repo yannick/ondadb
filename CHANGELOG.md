@@ -61,6 +61,20 @@ directory written by this release is not readable by 0.9.x. The crate is still
   is the source side of the planned automatic upgrade. Without the feature a 0.9
   directory is a hard `UnsupportedFormat` refusal.
 
+### Clear under the unified layout (plan C F5′)
+
+- `clear_column_family` now works under the unified WAL layout (it was refused).
+  The cleared family takes a fresh unified id, persisted in the same catalog
+  edit by the new `SetCFUnifiedId` op (edit-log op code 13; a binary without it
+  refuses such a log as `Corruption`), so the old id's entries in the shared
+  memtable and WAL belong to no family and are discarded by the unified flush,
+  including after a crash. Refused with `Busy` while a prepared transaction
+  names the family. Rename stays a non-goal.
+- Fixes a latent resurrection: dropping a family and re-creating the same name
+  before a unified flush used to hand the new family the old one's unflushed
+  entries (same derived id). A new family now takes a fresh id whenever the
+  derived one still owns entries.
+
 ### Automatic upgrade of 0.9.x databases (plan C §1.3)
 
 - `DB::open` on a 0.9 directory **upgrades it to epoch 1** by default:

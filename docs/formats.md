@@ -837,11 +837,20 @@ reaches past a table's first and last point key.
 Under the unified WAL layout every key in the shared WAL and memtable carries an
 8-byte big-endian column-family id. It defaults to **FNV-1a-64 of the name**
 (the standard offset basis `14695981039346656037`, as wavesdb computes it); a
-family whose id diverges from that stores it here. Epoch-1 writers never produce
-a divergent id yet — the section is the ground plan C F5′ (clearing a family
-under the unified layout by giving it a fresh id) builds on, and it is how a
-0.9 directory opened through `legacy_onda` keeps the truncated-basis ids its WAL
+family whose id diverges from that stores it here — and it is how a 0.9
+directory opened through `legacy_onda` keeps the truncated-basis ids its WAL
 keys carry.
+
+A divergent id is written by plan C F5′. `clear_column_family` under the
+unified layout gives the family a **fresh random id**, so every entry the
+shared memtable and WAL still hold under the old id is owned by no family: no
+read sees it, and the unified flush — which routes by each family's *stored*
+id, never by a hash of its name — discards it, also when a reopen replays it
+from the WAL. `create_column_family` (and clone) keep the derived id unless it
+is live, still owns entries in the shared memtable (a dropped incarnation's), or
+a prepared transaction withholds a WAL generation; then they take a fresh one
+too. Every such id is persisted by the `SetCFUnifiedId` edit (op 13) in the same
+record as the `CreateCF`, or by the snapshot when the edit log is off.
 
 ### Config blob (`ColumnFamilyConfig::encode`, `config_blob.rs`)
 
@@ -974,8 +983,9 @@ sst_meta: id, level, num_entries, num_tombstones, max_seq, klog_size,
 | 10 | `SetNonce` | nonce u64 | not yet minted |
 | 11 | `SetCapability` | bits u64 | `KNOWN_CAPS` only |
 | 12 | `RemoveTables` | cf str, count, id × count | every id present in cf |
+| 13 | `SetCFUnifiedId` | name str, id u64 | name present; applied as "no override" when `id` is the derived FNV |
 
-Codes 13..63 are unassigned and reject as `Corruption` naming the code and the
+Codes 14..63 are unassigned and reject as `Corruption` naming the code and the
 op index; codes ≥ 64 are never assigned, mirroring the WAL's kind rule.
 
 Column families are **name-keyed**: `CfManifest.name` is a CF's only catalog

@@ -794,12 +794,19 @@ impl ColumnFamily {
     }
 
     /// Create a fresh column family (directory + generation-0 WAL).
+    ///
+    /// `unified_id` is the id its keys carry in a unified WAL and memtable —
+    /// `unified::cf_id(&name)` unless [`DbInner::choose_unified_id`] had to
+    /// pick another (plan C F5′). The caller persists a divergent one.
+    ///
+    /// [`DbInner::choose_unified_id`]: crate::db::DbInner::choose_unified_id
     pub(crate) fn create(
         ctx: Arc<CfCtx>,
         name: String,
         dir: String,
         opts: ColumnFamilyConfig,
         cmp: ComparatorRef,
+        unified_id: u64,
     ) -> Result<Arc<ColumnFamily>> {
         std::fs::create_dir_all(&dir)?;
         let mem = Memtable::new(cmp.clone());
@@ -820,7 +827,7 @@ impl ColumnFamily {
         let live_partition_rules = RwLock::new(opts.partition_rules.clone());
         let cf = Arc::new(ColumnFamily {
             ctx,
-            id: crate::unified::cf_id(&name),
+            id: unified_id,
             name,
             dir,
             opts,

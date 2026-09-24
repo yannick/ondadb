@@ -1443,6 +1443,48 @@ impl DbInner {
         self.note_periodic_cf(cf);
     }
 
+    /// The unified-layout id a family being created (or re-created by
+    /// `clear_column_family`) under `name` takes — plan C F5′.
+    ///
+    /// The id derived from the name when it is free; otherwise a fresh random
+    /// one. "Free" means: no live family routes by it, `avoid` does not name it,
+    /// and — under the unified layout — the shared memtable holds nothing under
+    /// it. That last clause is the one that matters: a dropped or cleared
+    /// family's entries stay in the shared memtable (and WAL) until a flush
+    /// discards them, and a new family carrying the same id would inherit
+    /// them. While a prepared transaction withholds a WAL generation the
+    /// derived id is never reused either — a reopen would replay that
+    /// generation, and with it whatever a former incarnation left there.
+    ///
+    /// In the per-CF layout the id routes nothing and is always the derived
+    /// one. Called under `cf_lifecycle_mu`.
+    pub(crate) fn choose_unified_id(&self, name: &str, avoid: &[u64]) -> u64 {
+        let derived = crate::unified::cf_id(name);
+        let Some(u) = &self.unified else {
+            return derived;
+        };
+        let taken = |id: u64| {
+            avoid.contains(&id) || self.cf_by_id.read().contains_key(&id) || u.holds_cf(id)
+        };
+        if self.wal_gens.lock().withheld() == 0 && !taken(derived) {
+            return derived;
+        }
+        // splitmix64 over a per-call seed: 64 random bits make a repeat of any
+        // id ever used astronomically unlikely, and the probe rules out the
+        // ones that are live or still hold entries.
+        let mut x = mint_instance_nonce(&format!("{}/{name}", self.dir));
+        loop {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            if z != derived && !taken(z) {
+                return z;
+            }
+        }
+    }
+
     /// Remove a column family from the registries, returning the old handle.
     /// The other half of [`register_cf`](Self::register_cf).
     pub(crate) fn unregister_cf(&self, name: &str, _p: &Publish) -> Option<Arc<ColumnFamily>> {
@@ -1606,6 +1648,16 @@ impl DbInner {
 ///
 /// `DropCF`'s precondition is that the same edit removed all of its tables, so
 /// the two always travel together.
+/// The `SetCFUnifiedId` op a (re)created family needs when its unified id is
+/// not the one derived from its name; nothing otherwise, so a catalog without
+/// a divergent id stays byte-identical to one written before F5′.
+pub(crate) fn unified_id_op(name: &str, id: u64) -> Option<crate::manifest_edit::Op> {
+    (id != crate::unified::cf_id(name)).then(|| crate::manifest_edit::Op::SetCfUnifiedId {
+        name: name.to_string(),
+        id,
+    })
+}
+
 fn drop_cf_ops(name: &str, cf: &Arc<ColumnFamily>) -> Vec<crate::manifest_edit::Op> {
     let ids: Vec<u64> = cf.snapshot_ssts().into_iter().map(|meta| meta.id).collect();
     let mut ops = Vec::with_capacity(2);
@@ -2469,17 +2521,21 @@ impl DB {
         if self.inner.cfs.read().contains_key(name) {
             return Err(OndaError::Exists(name.into()));
         }
+        let unified_id = self.inner.choose_unified_id(name, &[]);
         let cf = ColumnFamily::create(
             self.inner.ctx.clone(),
             name.to_string(),
             self.inner.cf_dir(name),
             config,
             cmp,
+            unified_id,
         )?;
-        let edit = VersionEdit::new(vec![crate::manifest_edit::Op::CreateCf {
+        let mut ops = vec![crate::manifest_edit::Op::CreateCf {
             name: name.to_string(),
             config: cf.effective_config().encode(),
-        }]);
+        }];
+        ops.extend(unified_id_op(name, unified_id));
+        let edit = VersionEdit::new(ops);
         // A failed transaction leaves the directory and its empty WAL behind,
         // referenced by no catalog — exactly what a crash between the old
         // create and its manifest persist left, and what the open-time sweep
@@ -2560,17 +2616,22 @@ impl DB {
             }
         }
         let mut created = Vec::with_capacity(specs.len());
+        let mut chosen: Vec<u64> = Vec::with_capacity(specs.len());
         for (name, config) in specs {
             let cmp =
                 comparator_by_name(&config.comparator_name).expect("comparator validated above");
             let mut config = config.clone();
             resolve_merge_operator(&mut config, &self.inner.opts, name)?;
+            // Distinct within the batch too: none is registered yet.
+            let unified_id = self.inner.choose_unified_id(name, &chosen);
+            chosen.push(unified_id);
             let cf = ColumnFamily::create(
                 self.inner.ctx.clone(),
                 (*name).to_string(),
                 self.inner.cf_dir(name),
                 config,
                 cmp,
+                unified_id,
             )?;
             created.push(cf);
         }
@@ -2580,9 +2641,12 @@ impl DB {
         let edit = VersionEdit::new(
             created
                 .iter()
-                .map(|cf| crate::manifest_edit::Op::CreateCf {
-                    name: cf.name().to_string(),
-                    config: cf.effective_config().encode(),
+                .flat_map(|cf| {
+                    std::iter::once(crate::manifest_edit::Op::CreateCf {
+                        name: cf.name().to_string(),
+                        config: cf.effective_config().encode(),
+                    })
+                    .chain(unified_id_op(cf.name(), cf.id()))
                 })
                 .collect(),
         );
@@ -2697,16 +2761,20 @@ impl DB {
     /// become stale (their writes fail), exactly as after
     /// [`drop_column_family`](Self::drop_column_family) + re-create.
     ///
-    /// Not supported in unified-memtable mode: the shared memtable still holds
-    /// the old entries under the same CF id, so they would resurface.
+    /// Under the unified layout (plan C F5′) the shared memtable and WAL still
+    /// hold the old entries, under the family's old unified id. The cleared
+    /// family therefore takes a **fresh** id ([`DbInner::choose_unified_id`]),
+    /// made durable by the same catalog edit (`SetCFUnifiedId`): the old
+    /// entries are then owned by no family, invisible to every read, and
+    /// discarded by the next unified flush — also after a crash, when the WAL
+    /// replays them under the old id. A handle to the old family keeps writing
+    /// under the old id, so its writes are discarded the same way. Refused with
+    /// `Busy` while an unresolved prepared transaction names the family.
+    ///
+    /// [`DbInner::choose_unified_id`]: crate::db::DbInner::choose_unified_id
     pub fn clear_column_family(&self, name: &str) -> Result<Arc<ColumnFamily>> {
         if self.inner.opts.read_only {
             return Err(OndaError::ReadOnly("database is read-only".into()));
-        }
-        if self.inner.unified.is_some() {
-            return Err(OndaError::InvalidArgs(
-                "clear_column_family is not supported in unified-memtable mode".into(),
-            ));
         }
         let _lifecycle = self.inner.cf_lifecycle_mu.lock();
         let old = self
@@ -2716,17 +2784,29 @@ impl DB {
             .get(name)
             .cloned()
             .ok_or(OndaError::NotFound)?;
+        // A prepared writeset names the family by its unified id; committing it
+        // after the id changed would apply it to nobody.
+        if self.inner.prepared.lock().touches_cf(old.id()) {
+            return Err(OndaError::Busy(format!(
+                "column family {name:?} is named by an unresolved prepared transaction; \
+                 resolve it with commit_prepared or abort_prepared (see list_prepared)"
+            )));
+        }
         let cfg = old.effective_config();
         let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
             OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
         })?;
+        // Never the old id: its entries are exactly what is being cleared.
+        let unified_id = self.inner.choose_unified_id(name, &[old.id()]);
         // ONE edit: every table removed, the family dropped, the same name
-        // re-created empty. Durable before a single byte is unlinked.
+        // re-created empty (under its new unified id). Durable before a single
+        // byte is unlinked.
         let mut ops = drop_cf_ops(name, &old);
         ops.push(crate::manifest_edit::Op::CreateCf {
             name: name.to_string(),
             config: cfg.encode(),
         });
+        ops.extend(unified_id_op(name, unified_id));
         // The wipe-and-recreate runs *inside* the publish step so the registry
         // never shows a gap: a concurrent `get_column_family` sees either the
         // full old family or the empty new one, which is this method's contract.
@@ -2744,6 +2824,7 @@ impl DB {
                 self.inner.cf_dir(name),
                 cfg,
                 cmp,
+                unified_id,
             );
             if let Ok(cf) = &made {
                 self.inner.register_cf(cf, p);

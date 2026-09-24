@@ -208,6 +208,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | PerfContext (0.10) | `perf.rs` | |
 | IO classes / rate limiter (0.6) | `ioctrl.rs` | |
 | Tailing iterators (0.9) | `tailing.rs` | |
+| Clear under the unified layout (F5′) | `db.rs` (`clear_column_family`, `DbInner::choose_unified_id`), `unified.rs` (`holds_cf`), `manifest_edit.rs` (`SetCfUnifiedId`) | Every name→id lookup uses the family's **stored** id (`ColumnFamily::id`, `cf_by_id`); `unified::cf_id(name)` is only the default. Tests: `tests/unified_clear.rs` |
 | 0.9 → epoch-1 upgrade (plan C §1.3) | `upgrade.rs`, `legacy_onda/`, `src/bin/yolodb.rs` | See invariant 10; crash matrix in `tests/format_upgrade.rs` (fault hook: `UpgradeObserver`) |
 
 **Cross-feature rules live in `tests/composition.rs`**, not in either feature's

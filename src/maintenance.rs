@@ -505,6 +505,7 @@ impl DB {
             self.inner.cf_dir(dst),
             config,
             comparator,
+            self.inner.choose_unified_id(dst, &[]),
         )?;
 
         // Hard-link each src SSTable into dst under a fresh id.
@@ -555,6 +556,7 @@ impl DB {
             name: dst.to_string(),
             config: dst_cf.effective_config().encode(),
         }];
+        ops.extend(crate::db::unified_id_op(dst, dst_cf.id()));
         for meta in new_metas {
             ops.push(crate::manifest_edit::Op::AddTable {
                 cf: dst.to_string(),
