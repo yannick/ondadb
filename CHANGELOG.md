@@ -208,6 +208,28 @@ directory written by this release is not readable by 0.9.x. The crate is still
   above a reserved one (33), or a blob carrying 33 would re-encode out of
   order and be refused by its own decoder.
 
+#### Defaults
+
+- **Graduated default codecs** (plan C P10, wavesdb's default):
+  `ColumnFamilyConfig::compression_per_level` now defaults to
+  `[None, Lz4, Zstd]` — L0 raw, L1 LZ4, L2 and deeper Zstd — instead of
+  empty (uniform `compression`, `None`). **Source-behaviour note:** a config
+  built as `ColumnFamilyConfig { compression: X, ..Default::default() }` no
+  longer applies `X` everywhere, because a non-empty per-level list overrides
+  `compression`; add `compression_per_level: Vec::new()` for a uniform codec.
+  **Existing databases are unaffected:** config TLV tag 13 is now written
+  whenever the list is non-empty (not elided as a default), and an absent tag
+  13 decodes as the empty list — so a family created before this change keeps
+  its uniform codec, and a new family records the graduated list explicitly.
+  The 0.9 legacy decoder uses the same baseline. `onda_bench -compression X`
+  still means uniform `X`; `-compression graduated` measures the default.
+  Provisional numbers (`tests/codec_defaults_bench.rs`, 400k text-like
+  136-byte values compacted to L2, `unsafe-fastpath` release, heavily loaded
+  machine, 2 alternating runs): on-disk **65.6 MB → 21.0 MB (−68%)**, point
+  reads of cold-in-cache blocks **~0.45M/s vs ~0.8–1.0M/s** (Zstd decompression
+  per block miss), full scans within noise (11.3–13.0M vs 12.5–14.0M keys/s),
+  load+compaction time within noise. To be re-measured on a quiet machine.
+
 #### Performance
 
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`

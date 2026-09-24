@@ -887,11 +887,29 @@ pub struct ColumnFamilyConfig {
     /// Must be either 0 or at least `klog_value_threshold` — nothing shorter
     /// than the threshold ever reaches the vlog.
     pub max_cached_vlog_value_bytes: usize,
+    /// The codec for every level — **only when
+    /// [`compression_per_level`](Self::compression_per_level) is empty**,
+    /// which it is not by default. Set `compression_per_level: Vec::new()`
+    /// alongside it for a uniform codec.
     pub compression: Compression,
     /// Per-level override of `compression`. Empty = use `compression` for
     /// every level. Otherwise level L uses `compression_per_level[min(L,
     /// len-1)]` — the last entry repeats for all deeper levels (so
     /// `[None, None, Zstd]` = hot L0/L1 uncompressed, everything below Zstd).
+    ///
+    /// **Default `[None, Lz4, Zstd]`** (since 0.10, plan C P10; wavesdb's
+    /// default): L0 is rewritten constantly and stays raw, L1 pays LZ4's
+    /// near-free pass, and L2 and deeper — most of the data, and the coldest —
+    /// pays Zstd. Before 0.10 the default was empty (uniform `compression`,
+    /// itself `None`).
+    ///
+    /// **Persistence.** Unlike every other field, this one is not elided when
+    /// it equals the default: its TLV tag (13) is written whenever the list is
+    /// non-empty, and an **absent** tag means *empty* — the pre-0.10 default —
+    /// whatever `Default` says. A family created before the change therefore
+    /// keeps its uniform codec after an upgrade, and a new family records the
+    /// graduated list explicitly, so moving the default again can never
+    /// silently re-codec an existing database.
     pub compression_per_level: Vec<Compression>,
     /// Per-key-prefix override of the level compression. The **longest**
     /// matching prefix wins; keys matching no rule use
@@ -1153,7 +1171,7 @@ impl Default for ColumnFamilyConfig {
             block_restart_interval: crate::sst::RESTART_INTERVAL,
             max_cached_vlog_value_bytes: 0, // vlog value caching off
             compression: Compression::None,
-            compression_per_level: Vec::new(),
+            compression_per_level: vec![Compression::None, Compression::Lz4, Compression::Zstd],
             compression_rules: Vec::new(),
             partition_rules: Vec::new(),
             partition_scheme: PartitionScheme::Rules,
@@ -1727,6 +1745,7 @@ mod tests {
         assert_eq!(compression_for_key(&rules, b"zz"), None);
         let cfg = ColumnFamilyConfig {
             compression: Compression::Snappy,
+            compression_per_level: Vec::new(),
             compression_rules: rules,
             ..Default::default()
         };
@@ -2083,8 +2102,23 @@ mod tests {
         assert_eq!(d.compression_for_level(9), Compression::Zstd); // last repeats
         let u = ColumnFamilyConfig {
             compression: Compression::Lz4,
+            compression_per_level: Vec::new(),
             ..ColumnFamilyConfig::default()
         };
         assert_eq!(u.compression_for_level(5), Compression::Lz4);
+        // The default is graduated, and `compression` is then ignored.
+        let g = ColumnFamilyConfig {
+            compression: Compression::Snappy,
+            ..ColumnFamilyConfig::default()
+        };
+        assert_eq!(
+            [0, 1, 2, 7].map(|l| g.compression_for_level(l)),
+            [
+                Compression::None,
+                Compression::Lz4,
+                Compression::Zstd,
+                Compression::Zstd
+            ]
+        );
     }
 }

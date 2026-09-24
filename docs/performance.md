@@ -386,6 +386,30 @@ so the change matters there only for compressed blocks and cached vlog
 values. A compaction pins each block for its whole walk over it, so not
 caching a block it missed never costs it a second read.
 
+## Graduated default codecs (plan C P10)
+
+Since 0.10 a family's default `compression_per_level` is `[None, Lz4, Zstd]`:
+L0 is rewritten constantly and stays raw, L1 pays LZ4's near-free pass, and L2
+and deeper — most of the data, the coldest of it — pays Zstd (level 3). The
+trade is space for cold-block point-read CPU. Provisional measurement
+(`tests/codec_defaults_bench.rs`, 400k text-like 136-byte values compacted into
+L2, `unsafe-fastpath` release, two alternating runs on a heavily loaded
+machine — ratios only):
+
+| | uniform `None` | graduated |
+|---|---|---|
+| on-disk SST bytes | 65.6 MB | 21.0 MB (−68%) |
+| random `get` (64 MiB cache, data 3× cache raw) | 0.81–1.03M/s | 0.44–0.49M/s |
+| full scan | 12.5–14.0M keys/s | 11.3–13.0M keys/s |
+
+The point-read cost is a Zstd decompression per block-cache miss: under
+`mmap-reads` an uncompressed block is served straight from the mapping and
+never needs the cache, a compressed one must be decompressed into it. A
+read-latency-bound family whose working set does not fit the block cache
+should set `compression_per_level: vec![]` (uniform `None`) or a lighter
+bottom codec. Persistence rule (tag 13 never elided when non-empty; absent =
+empty) is in `docs/format-registry.md`.
+
 ## Prefix-delta data blocks: why they are opt-in (2.1)
 
 `ColumnFamilyConfig::enable_prefix_delta_keys` (default `false`) stores each

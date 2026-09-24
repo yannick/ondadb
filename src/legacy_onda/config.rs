@@ -20,7 +20,13 @@ use crate::config::{
 /// Decode a 0.9 config blob. Never fails: 0.9's decoder fell back to defaults
 /// on anything short or unrecognized, and a 0.9 database was opened that way.
 pub fn decode(blob: &[u8]) -> ColumnFamilyConfig {
-    let mut cfg = ColumnFamilyConfig::default();
+    // 0.9's default was an empty per-level list (uniform `compression`); the
+    // epoch-1 default is graduated. A short 0.9 blob that never reached the
+    // list must keep 0.9's meaning, or upgrading would re-codec the family.
+    let mut cfg = ColumnFamilyConfig {
+        compression_per_level: Vec::new(),
+        ..ColumnFamilyConfig::default()
+    };
     decode_into(blob, &mut cfg);
     cfg
 }
@@ -875,6 +881,7 @@ mod tests {
         let c = ColumnFamilyConfig {
             comparator_name: "uint64".into(),
             compression: Compression::Zstd,
+            compression_per_level: Vec::new(),
             write_buffer_size: 123456,
             enable_bloom_filter: false,
             compression_rules: vec![
@@ -1015,6 +1022,8 @@ mod tests {
         let c = ColumnFamilyConfig {
             sync_mode: SyncMode::Full,
             comparator_name: "uint64".into(),
+            // A 0.9 fixture: 0.9's default, one count byte in the tail below.
+            compression_per_level: Vec::new(),
             ..ColumnFamilyConfig::default()
         };
         let full = c.enc09();
@@ -1024,6 +1033,9 @@ mod tests {
         assert_eq!(d.comparator_name, "uint64");
         assert_eq!(d.sync_mode, SyncMode::None);
         assert_eq!(d.sync_interval, ColumnFamilyConfig::default().sync_interval);
+        // A blob that never reached the per-level list keeps 0.9's default
+        // (uniform codec), not epoch 1's graduated one.
+        assert!(d.compression_per_level.is_empty());
     }
 }
 
@@ -1048,6 +1060,7 @@ mod per_level_tests {
         // Empty policy falls back to the uniform setting.
         let u = ColumnFamilyConfig {
             compression: Compression::Lz4,
+            compression_per_level: Vec::new(),
             ..ColumnFamilyConfig::default()
         };
         assert_eq!(u.compression_for_level(0), Compression::Lz4);

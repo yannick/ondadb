@@ -141,6 +141,10 @@ pub(crate) fn encode(cfg: &ColumnFamilyConfig) -> Vec<u8> {
     if cfg.sync_interval != d.sync_interval {
         put_uvar(&mut out, tag::SYNC_INTERVAL, nanos(cfg.sync_interval));
     }
+    // Written whenever non-empty, NOT compared against `Default`: its
+    // default moved (empty -> graduated, 0.10), and a tag elided under one
+    // default would decode under the other. Absent therefore always means
+    // empty, which is what `decode` assumes.
     if !cfg.compression_per_level.is_empty() {
         let ids: Vec<u8> = cfg
             .compression_per_level
@@ -448,7 +452,13 @@ pub(crate) fn decode(blob: &[u8]) -> Result<ColumnFamilyConfig> {
             "config blob version {version} is not implemented by this binary"
         )));
     }
-    let mut cfg = ColumnFamilyConfig::default();
+    // The one field whose absent tag does NOT mean `Default`: an absent
+    // `COMPRESSION_PER_LEVEL` means an empty list (uniform `compression`), the
+    // default every blob written before 0.10 elided. See `encode`.
+    let mut cfg = ColumnFamilyConfig {
+        compression_per_level: Vec::new(),
+        ..ColumnFamilyConfig::default()
+    };
     let mut p = &blob[HEADER_LEN..];
     let mut last: Option<u64> = None;
     while !p.is_empty() {
@@ -688,12 +698,38 @@ mod tests {
         assert_eq!(a.unknown_config_tags, b.unknown_config_tags);
     }
 
+    /// Every default is elided except the per-level codec list, which is
+    /// written explicitly (see `encode`).
     #[test]
-    fn a_default_config_is_just_the_header() {
+    fn a_default_config_is_the_header_and_its_codec_list() {
         let b = encode(&ColumnFamilyConfig::default());
-        assert_eq!(b, header(), "every default is elided");
+        let mut want = header();
+        want.extend_from_slice(&[13, 3, 0, 6, 3]); // [None, Lz4, Zstd]
+        assert_eq!(b, want);
         let d = decode(&b).unwrap();
         same(&d, &ColumnFamilyConfig::default());
+        assert_eq!(
+            d.compression_per_level,
+            vec![Compression::None, Compression::Lz4, Compression::Zstd]
+        );
+    }
+
+    /// An absent tag 13 is an empty list — the pre-0.10 default — not the
+    /// current `Default`, so a family created before the default moved keeps
+    /// its uniform codec. And an empty list round-trips as empty.
+    #[test]
+    fn an_absent_codec_list_means_uniform_compression() {
+        let d = decode(&header()).unwrap();
+        assert!(d.compression_per_level.is_empty());
+        assert_eq!(d.compression_for_level(5), Compression::None);
+        let uniform = ColumnFamilyConfig {
+            compression: Compression::Zstd,
+            compression_per_level: Vec::new(),
+            ..ColumnFamilyConfig::default()
+        };
+        let back = decode(&encode(&uniform)).unwrap();
+        assert!(back.compression_per_level.is_empty());
+        assert_eq!(back.compression_for_level(0), Compression::Zstd);
     }
 
     #[test]
@@ -758,6 +794,7 @@ mod tests {
     fn golden_bytes() {
         let cfg = ColumnFamilyConfig {
             compression: Compression::Lz4,
+            compression_per_level: Vec::new(),
             sync_interval: Duration::from_micros(1),
             merge_operator_name: Some("m".into()),
             ..ColumnFamilyConfig::default()

@@ -852,8 +852,10 @@ entry := tag uvarint | len uvarint | value[len]
 
 One tag per durable `ColumnFamilyConfig` field (the table is in
 [`format-registry.md`](format-registry.md#cf-config-tlv-tags)). Entries are in
-**strictly ascending** tag order; a field at its default is **elided**, so a
-default family's blob is the 12-byte header; durations are **nanoseconds**.
+**strictly ascending** tag order; a field at its default is **elided** —
+except `compression_per_level` (tag 13), written whenever non-empty because
+its default moved in 0.10 and an absent tag 13 must keep meaning *empty* — so a
+default family's blob is the 12-byte header plus tag 13; durations are **nanoseconds**.
 Scalars are exactly one minimal uvarint, booleans one byte `0`/`1`, codec
 fields epoch-1 codec ids, lists `count uvarint | item*` with no bytes left over.
 

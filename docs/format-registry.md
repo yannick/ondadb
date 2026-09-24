@@ -223,7 +223,7 @@ minimal uvarint; booleans one byte `0`/`1`; codec values are codec ids.
 | 10 | `use_btree` | bool |
 | 11 | `sync_mode` | u8: 0 none, 1 full, 2 interval |
 | 12 | `sync_interval` | uvarint ns |
-| 13 | `compression_per_level` | codec id per level |
+| 13 | `compression_per_level` | codec id per level. **Never elided when non-empty; absent = empty** (uniform tag 2), whatever the in-memory default — see below |
 | 14 | `compaction_style` | u8: 0 leveled, 1 FIFO |
 | 15 | `fifo_max_bytes` | uvarint |
 | 16 | `fifo_ttl` | uvarint ns |
@@ -246,6 +246,12 @@ minimal uvarint; booleans one byte `0`/`1`; codec values are codec ids.
 | 33 | *reserved*: bloom auto-allocation (plan C P7) | — |
 | 34 | `tombstone_density_trigger` | f64 bits (u64 LE), finite and ≥ 0 |
 | 35 | `tombstone_density_min_entries` | uvarint |
+
+Tag 13 is the one exception to "defaults elided": its default moved from the
+empty list to `[None, LZ4, Zstd]` (plan C P10), so a blob written before the
+change (tag absent) must keep meaning *empty*. Encoders therefore write tag 13
+whenever the list is non-empty — the default included — and decoders read an
+absent tag 13 as an empty list. The 0.9 legacy decoder applies the same rule.
 
 Unknown and reserved tags are preserved **in tag order**, merged among the
 known ones on re-encode — a reserved tag (33) sits below known tags (34, 35),

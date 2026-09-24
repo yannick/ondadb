@@ -159,6 +159,9 @@ fn sample_manifest() -> Manifest {
             name: "photos".into(),
             config: ondadb::ColumnFamilyConfig {
                 compression: Compression::Lz4,
+                // Explicit: the corpus predates the graduated default (P10)
+                // and pins the config bytes, which must not move with it.
+                compression_per_level: Vec::new(),
                 merge_operator_name: Some("counter.v1".into()),
                 sync_mode: SyncMode::Full,
                 ..Default::default()
