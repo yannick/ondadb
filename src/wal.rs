@@ -26,6 +26,20 @@
 //! commit**: the first thread in becomes the leader and writes every queued
 //! frame plus a single `fsync`, then wakes the followers.  The other sync modes
 //! write directly under the file lock.
+//!
+//! **User-space write buffer** (opt-in, [`Options::wal_write_buffer_size`],
+//! wavesdb `WALWriteBufferSize`): under `Interval` and `None` each stripe may
+//! coalesce whole frames in memory and hand them to the OS in one `write`
+//! when the buffer fills, at every interval tick, and before any fsync,
+//! rotation or close. Frames are only ever appended whole to the buffer, so a
+//! flush is a run of complete frames; a crash that tears the flush leaves a
+//! torn frame at the tail, which replay already discards (the frame CRC covers
+//! the whole payload), so replay still yields a prefix of whole batches. The
+//! cost is the documented one: an acknowledged commit still in the buffer dies
+//! with the process. `Full` ignores the buffer — every commit is written and
+//! fsynced before it is acknowledged, so buffering could only add a copy.
+//!
+//! [`Options::wal_write_buffer_size`]: crate::Options::wal_write_buffer_size
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -961,12 +975,50 @@ pub fn remove_wal_files(base: impl AsRef<Path>) {
     }
 }
 
+/// One stripe's file and its user-space write buffer.
+///
+/// The buffer only ever holds **whole frames** (each appended under the stripe
+/// mutex in one piece), which is what makes a torn flush equivalent to a torn
+/// unbuffered append: replay sees a prefix of whole frames and then a torn one.
+struct Stripe {
+    file: File,
+    buf: Vec<u8>,
+}
+
+impl Stripe {
+    /// Hand every buffered frame to the OS in one `write_all`.
+    ///
+    /// The buffer is cleared even when the write fails: a partial write may
+    /// already have landed some of its bytes, and writing them again would
+    /// put a second copy of a frame's head after a torn one. The caller
+    /// poisons the database instead — the lost frames were acknowledged.
+    fn flush(&mut self, writes: &AtomicU64) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let r = self.file.write_all(&self.buf);
+        self.buf.clear();
+        writes.fetch_add(1, Ordering::Relaxed);
+        r
+    }
+}
+
 struct Shared {
     /// One file per stripe (a single entry under [`SyncMode::Full`]).
-    files: Vec<Mutex<Option<File>>>,
+    files: Vec<Mutex<Option<Stripe>>>,
     sync: SyncMode,
+    /// Per-stripe user-space buffer capacity in bytes; 0 = unbuffered (and
+    /// always 0 under [`SyncMode::Full`]).
+    buf_cap: usize,
+    /// Logical size: every frame appended, buffered or not. Rotation keys off
+    /// it, and a buffered frame is as much part of the generation as a
+    /// written one.
     size: AtomicI64,
     dirty: AtomicBool,
+    /// Some stripe buffer may hold frames the OS has not seen yet.
+    buffered: AtomicBool,
+    /// `write` calls issued for frames (diagnostics and the coalescing tests).
+    writes: AtomicU64,
     qstate: Mutex<QueueState>,
     /// DB-wide fail-stop flag, tripped on any fsync failure (see
     /// [`crate::util::Poison`]). `None` only for standalone WALs in tests.
@@ -981,6 +1033,16 @@ impl Shared {
         if let Some(p) = self.poison.lock().as_ref() {
             p.set(why);
         }
+    }
+
+    /// Flush one stripe's buffer, poisoning the database on failure: the
+    /// frames in it were acknowledged, so losing them is a durability failure
+    /// exactly like a failed fsync.
+    fn flush_stripe(&self, st: &mut Stripe) -> Result<()> {
+        st.flush(&self.writes).map_err(|e| {
+            self.poison(format!("wal buffered write failed: {e}"));
+            e.into()
+        })
     }
 
     fn count_sync(&self) {
@@ -1023,11 +1085,30 @@ impl Wal {
         interval: Duration,
         id: SegmentId,
     ) -> Result<Wal> {
+        Self::open_buffered(path, mode, interval, id, 0)
+    }
+
+    /// [`open`](Self::open) with a per-stripe user-space write buffer of
+    /// `buffer_bytes` (0 = unbuffered). Ignored under [`SyncMode::Full`]; see
+    /// the module docs for the durability trade.
+    ///
+    /// A buffered WAL always runs the background thread — under
+    /// [`SyncMode::None`] too, where it only flushes (no fsync) — so buffered
+    /// frames reach the OS within one `interval` even when the buffer stays
+    /// cold.
+    pub fn open_buffered(
+        path: impl AsRef<Path>,
+        mode: SyncMode,
+        interval: Duration,
+        id: SegmentId,
+        buffer_bytes: usize,
+    ) -> Result<Wal> {
         Self::open_inner(
             path.as_ref(),
             mode,
             interval,
             id,
+            buffer_bytes,
             crate::util::sync_parent_dir,
         )
     }
@@ -1037,8 +1118,14 @@ impl Wal {
         mode: SyncMode,
         interval: Duration,
         id: SegmentId,
+        buffer_bytes: usize,
         sync_parent: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<Wal> {
+        let buf_cap = if mode == SyncMode::Full {
+            0
+        } else {
+            buffer_bytes
+        };
         let nstripes = if mode == SyncMode::Full {
             1
         } else {
@@ -1070,7 +1157,10 @@ impl Wal {
                 f.sync_data()?;
             }
             size += f.metadata()?.len() as i64;
-            files.push(Mutex::new(Some(f)));
+            files.push(Mutex::new(Some(Stripe {
+                file: f,
+                buf: Vec::with_capacity(buf_cap),
+            })));
         }
         if created {
             sync_parent(path)?;
@@ -1078,8 +1168,11 @@ impl Wal {
         let shared = Arc::new(Shared {
             files,
             sync: mode,
+            buf_cap,
             size: AtomicI64::new(size),
             dirty: AtomicBool::new(false),
+            buffered: AtomicBool::new(false),
+            writes: AtomicU64::new(0),
             qstate: Mutex::new(QueueState {
                 queue: Vec::new(),
                 flushing: false,
@@ -1088,7 +1181,7 @@ impl Wal {
             syncs: Mutex::new(None),
         });
         let (mut stop_tx, mut bg) = (None, None);
-        if mode == SyncMode::Interval {
+        if mode == SyncMode::Interval || buf_cap > 0 {
             let iv = if interval.is_zero() {
                 Duration::from_millis(128)
             } else {
@@ -1238,11 +1331,29 @@ impl Wal {
         if self.shared.sync != SyncMode::Full {
             let stripe = my_stripe(self.shared.files.len());
             let mut guard = self.shared.files[stripe].lock();
-            let f = match guard.as_mut() {
-                Some(f) => f,
+            let st = match guard.as_mut() {
+                Some(st) => st,
                 None => return Err(OndaError::InvalidDb("wal closed".into())),
             };
-            f.write_all(&buf)?;
+            let cap = self.shared.buf_cap;
+            if cap == 0 {
+                st.file.write_all(&buf)?;
+                self.shared.writes.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Whole frames only: flush what is there before a frame that
+                // would overflow it, so the buffer never holds a frame head.
+                if !st.buf.is_empty() && st.buf.len() + buf.len() > cap {
+                    self.shared.flush_stripe(st)?;
+                }
+                if buf.len() >= cap {
+                    // Too big to coalesce: the copy would buy nothing.
+                    st.file.write_all(&buf)?;
+                    self.shared.writes.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    st.buf.extend_from_slice(&buf);
+                    self.shared.buffered.store(true, Ordering::Relaxed);
+                }
+            }
             if self.shared.sync == SyncMode::Interval {
                 self.shared.dirty.store(true, Ordering::Relaxed);
             }
@@ -1297,7 +1408,7 @@ impl Wal {
         // Group commit only runs under SyncMode::Full, which uses one stripe.
         let mut guard = self.shared.files[0].lock();
         let f = match guard.as_mut() {
-            Some(f) => f,
+            Some(st) => &mut st.file,
             None => return -10, // closed
         };
         for req in batch {
@@ -1305,6 +1416,9 @@ impl Wal {
                 return OndaError::from(e).code();
             }
         }
+        self.shared
+            .writes
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
         match self.shared.sync {
             SyncMode::Full => {
                 if let Err(e) = f.sync_data() {
@@ -1324,14 +1438,16 @@ impl Wal {
         0
     }
 
-    /// fsync every stripe file.
+    /// Flush every stripe's write buffer, then fsync every stripe file.
     pub fn sync(&self) -> Result<()> {
         self.shared.dirty.store(false, Ordering::Relaxed);
+        self.shared.buffered.store(false, Ordering::Relaxed);
         for file in &self.shared.files {
-            let guard = file.lock();
-            match guard.as_ref() {
-                Some(f) => {
-                    if let Err(e) = f.sync_data() {
+            let mut guard = file.lock();
+            match guard.as_mut() {
+                Some(st) => {
+                    self.shared.flush_stripe(st)?;
+                    if let Err(e) = st.file.sync_data() {
                         self.shared.poison(format!("wal fsync failed: {e}"));
                         return Err(e.into());
                     }
@@ -1343,12 +1459,32 @@ impl Wal {
         Ok(())
     }
 
-    /// Current on-disk size in bytes.
+    /// Hand every buffered frame to the OS **without** an fsync: after this a
+    /// process crash loses nothing appended before the call (a power loss
+    /// still may, exactly as for an unbuffered `None`/`Interval` WAL). A no-op
+    /// on an unbuffered WAL.
+    pub fn flush_buffer(&self) -> Result<()> {
+        flush_buffers(&self.shared)
+    }
+
+    /// Logical size in bytes: every frame appended, including frames still
+    /// in the write buffer.
     pub fn size(&self) -> i64 {
         self.shared.size.load(Ordering::Relaxed)
     }
 
-    /// fsync and close the underlying file. Safe to call more than once.
+    /// `write` calls issued for frames so far (a buffered flush counts once).
+    pub fn write_calls(&self) -> u64 {
+        self.shared.writes.load(Ordering::Relaxed)
+    }
+
+    /// Flush the write buffer, fsync and close the underlying files. Safe to
+    /// call more than once.
+    ///
+    /// Every stripe is flushed and closed even if an earlier one failed —
+    /// the first error is returned — and a failed flush poisons the database:
+    /// rotation discards this result, so the poison is what keeps a lost
+    /// acknowledged frame from going unnoticed.
     pub fn close(&self) -> Result<()> {
         if let Some(tx) = self.stop_tx.lock().take() {
             let _ = tx.send(());
@@ -1356,13 +1492,25 @@ impl Wal {
         if let Some(h) = self.bg.lock().take() {
             let _ = h.join();
         }
+        let mut first_err = None;
         for file in &self.shared.files {
-            if let Some(f) = file.lock().take() {
-                f.sync_data()?;
-                self.shared.count_sync();
+            if let Some(mut st) = file.lock().take() {
+                let r = self
+                    .shared
+                    .flush_stripe(&mut st)
+                    .and_then(|()| st.file.sync_data().map_err(Into::into));
+                match r {
+                    Ok(()) => self.shared.count_sync(),
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
+                }
             }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Replay records from the WAL segment `id` based at `path`, invoking `f`
@@ -1531,16 +1679,39 @@ fn my_stripe(n: usize) -> usize {
     })
 }
 
+/// Write out every stripe's buffered frames (no fsync). Poisons on failure.
+fn flush_buffers(shared: &Shared) -> Result<()> {
+    if !shared.buffered.swap(false, Ordering::Relaxed) {
+        return Ok(());
+    }
+    let mut first_err = None;
+    for file in &shared.files {
+        let mut guard = file.lock();
+        if let Some(st) = guard.as_mut() {
+            if let Err(e) = shared.flush_stripe(st) {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 fn sync_dirty_files(shared: &Shared) {
-    if !shared.dirty.swap(false, Ordering::Relaxed) {
+    // Buffered frames first: an fsync covers only what the OS has been given.
+    // A failure has already poisoned the database.
+    let _ = flush_buffers(shared);
+    if shared.sync != SyncMode::Interval || !shared.dirty.swap(false, Ordering::Relaxed) {
         return;
     }
     for file in &shared.files {
         let guard = file.lock();
-        let Some(file) = guard.as_ref() else {
+        let Some(st) = guard.as_ref() else {
             continue;
         };
-        if let Err(error) = file.sync_data() {
+        if let Err(error) = st.file.sync_data() {
             // Commits acknowledged since the last successful sync may be lost;
             // fail-stop rather than silently dropping the error.
             shared.poison(format!("wal interval fsync failed: {error}"));
@@ -2676,6 +2847,7 @@ mod tests {
             SyncMode::Full,
             Duration::ZERO,
             SegmentId::per_cf(0),
+            0,
             |_| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Err(std::io::Error::other("injected parent sync failure").into())
@@ -2700,6 +2872,7 @@ mod tests {
                 SyncMode::Full,
                 Duration::ZERO,
                 SegmentId::per_cf(0),
+                0,
                 |_| {
                     calls.fetch_add(1, Ordering::Relaxed);
                     Ok(())
@@ -3155,6 +3328,240 @@ mod tests {
                 encode_segment_header(SegmentId::per_cf(2)).to_vec(),
                 "stripe {k}"
             );
+        }
+    }
+
+    // ---- user-space write buffer (P6) ----------------------------------
+
+    /// The stripe the calling thread writes (sticky per thread).
+    fn my_stripe_path(base: &Path) -> std::path::PathBuf {
+        stripe_path(base, my_stripe(WAL_STRIPES))
+    }
+
+    fn len_of(p: &Path) -> u64 {
+        std::fs::metadata(p).unwrap().len()
+    }
+
+    /// A batch of `n` records whose keys encode the batch number, so replay
+    /// output can be checked for whole-batch prefixes.
+    fn batch_recs(b: usize, n: usize) -> Vec<Record> {
+        (0..n)
+            .map(|i| {
+                rec(
+                    &format!("b{b:04}-{i}"),
+                    &"v".repeat(1 + (b * 7 + i) % 40),
+                    (b * 10 + i + 1) as u64,
+                )
+            })
+            .collect()
+    }
+
+    fn replay_keys(path: &Path, id: SegmentId) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        Wal::replay(path, id, |r| {
+            out.push(point(r).key);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn buffered_wal_coalesces_small_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_buffered(
+            &path,
+            SyncMode::None,
+            Duration::from_secs(3600),
+            SegmentId::per_cf(0),
+            64 << 10,
+        )
+        .unwrap();
+        let stripe = my_stripe_path(&path);
+        for i in 0..1000u64 {
+            wal.append(rec(&format!("k{i:05}"), "v", i + 1)).unwrap();
+        }
+        let frames_bytes = wal.size() as u64 - SEGMENT_HEADER_LEN as u64 * WAL_STRIPES as u64;
+        // ~20 KB of frames: nothing reached the file, and no write was issued.
+        assert!(frames_bytes < 64 << 10);
+        assert_eq!(wal.write_calls(), 0, "buffered frames were written early");
+        assert_eq!(len_of(&stripe), SEGMENT_HEADER_LEN as u64);
+        wal.flush_buffer().unwrap();
+        assert_eq!(wal.write_calls(), 1, "one flush, one write");
+        assert_eq!(len_of(&stripe), SEGMENT_HEADER_LEN as u64 + frames_bytes);
+        // More than a buffer's worth: writes happen as it fills, far fewer
+        // than one per frame.
+        for i in 1000..11_000u64 {
+            wal.append(rec(&format!("k{i:05}"), "v", i + 1)).unwrap();
+        }
+        let calls = wal.write_calls();
+        assert!(calls > 1 && calls < 20, "{calls} writes for 10k frames");
+        wal.close().unwrap();
+        let keys = replay_keys(&path, SegmentId::per_cf(0));
+        assert_eq!(keys.len(), 11_000);
+        assert_eq!(keys.last().unwrap(), b"k10999");
+    }
+
+    #[test]
+    fn buffered_wal_sync_and_close_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_buffered(
+            &path,
+            SyncMode::Interval,
+            Duration::from_secs(3600),
+            SegmentId::per_cf(0),
+            1 << 20,
+        )
+        .unwrap();
+        let stripe = my_stripe_path(&path);
+        wal.append(rec("a", "1", 1)).unwrap();
+        assert_eq!(len_of(&stripe), SEGMENT_HEADER_LEN as u64);
+        // An fsync covers only what the OS has: sync must flush first.
+        wal.sync().unwrap();
+        assert!(len_of(&stripe) > SEGMENT_HEADER_LEN as u64);
+        // A 2PC prepare frame is synced on the same handle by its caller.
+        let p = rec("p", "x", 9);
+        wal.append_prepare(ENVELOPE_SCHEMA_UNIFIED, &[7; 16], &[1], &[p.as_ref()])
+            .unwrap();
+        let before = len_of(&stripe);
+        wal.sync().unwrap();
+        assert!(
+            len_of(&stripe) > before,
+            "prepare frame was not flushed by sync"
+        );
+        wal.append(rec("b", "2", 2)).unwrap();
+        wal.close().unwrap();
+        let mut n = 0;
+        Wal::replay(&path, SegmentId::per_cf(0), |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 3, "a, the prepare (one control record), b");
+    }
+
+    #[test]
+    fn buffered_wal_background_flush_under_sync_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_buffered(
+            &path,
+            SyncMode::None,
+            Duration::from_millis(5),
+            SegmentId::per_cf(0),
+            1 << 20,
+        )
+        .unwrap();
+        let stripe = my_stripe_path(&path);
+        wal.append(rec("a", "1", 1)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while len_of(&stripe) == SEGMENT_HEADER_LEN as u64 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the interval thread never flushed a cold buffer"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(wal.write_calls(), 1);
+    }
+
+    #[test]
+    fn full_mode_ignores_the_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_buffered(
+            &path,
+            SyncMode::Full,
+            Duration::ZERO,
+            SegmentId::per_cf(0),
+            1 << 20,
+        )
+        .unwrap();
+        wal.append(rec("a", "1", 1)).unwrap();
+        // Acknowledged under Full means written and fsynced.
+        assert!(len_of(&path) > SEGMENT_HEADER_LEN as u64);
+        assert_eq!(wal.write_calls(), 1);
+    }
+
+    #[test]
+    fn oversized_frame_bypasses_the_buffer_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let wal = Wal::open_buffered(
+            &path,
+            SyncMode::None,
+            Duration::from_secs(3600),
+            SegmentId::per_cf(0),
+            256,
+        )
+        .unwrap();
+        wal.append(rec("a", "small", 1)).unwrap();
+        wal.append(rec("b", &"x".repeat(1000), 2)).unwrap();
+        wal.append(rec("c", "small", 3)).unwrap();
+        wal.close().unwrap();
+        let keys = replay_keys(&path, SegmentId::per_cf(0));
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    /// Crash matrix for a buffered flush: the flush is one `write` of many
+    /// frames, and a crash can tear it at any byte. For every cut point the
+    /// replay must be exactly the whole batches that fit — never part of a
+    /// batch, never a batch after a torn one.
+    #[test]
+    fn torn_buffered_flush_replays_a_prefix_of_whole_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal");
+        let id = SegmentId::unified(3);
+        let wal = Wal::open_buffered(
+            &path,
+            SyncMode::None,
+            Duration::from_secs(3600),
+            id,
+            1 << 20,
+        )
+        .unwrap();
+        let stripe = my_stripe_path(&path);
+        let mut batches = Vec::new();
+        let mut ends = Vec::new(); // file offset at which each frame ends
+        let mut off = SEGMENT_HEADER_LEN as u64;
+        for b in 0..24 {
+            let recs = batch_recs(b, 1 + b % 4);
+            let refs: Vec<RecordRef<'_>> = recs.iter().map(|r| r.as_ref()).collect();
+            // Alternate the two frame forms: both must tear the same way.
+            let before = wal.size();
+            if b % 2 == 0 {
+                wal.append_batch(&refs).unwrap();
+            } else {
+                wal.append_batch_enveloped(ENVELOPE_SCHEMA_UNIFIED, &refs)
+                    .unwrap();
+            }
+            off += (wal.size() - before) as u64;
+            ends.push(off);
+            batches.push(recs);
+        }
+        assert_eq!(
+            wal.write_calls(),
+            0,
+            "the whole run must be one buffered flush"
+        );
+        wal.close().unwrap();
+        assert_eq!(wal.write_calls(), 1);
+        let bytes = std::fs::read(&stripe).unwrap();
+        assert_eq!(bytes.len() as u64, off);
+
+        let crash = tempfile::tempdir().unwrap();
+        let torn = crash.path().join("wal");
+        for cut in SEGMENT_HEADER_LEN..=bytes.len() {
+            std::fs::write(&torn, &bytes[..cut]).unwrap();
+            let got = replay_keys(&torn, id);
+            let whole = ends.iter().take_while(|&&e| e <= cut as u64).count();
+            let want: Vec<Vec<u8>> = batches[..whole]
+                .iter()
+                .flat_map(|b| b.iter().map(|r| r.key.clone()))
+                .collect();
+            assert_eq!(got, want, "cut at byte {cut}");
         }
     }
 }

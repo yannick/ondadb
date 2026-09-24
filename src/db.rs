@@ -1881,6 +1881,7 @@ fn build_db_inner(
         unified: unified.clone(),
         poison: poison.clone(),
         wal_syncs: wal_syncs.clone(),
+        wal_write_buffer_size: opts.wal_write_buffer_size,
         caps: caps.clone(),
         clock: clock.clone(),
         span_index: span_index.clone(),

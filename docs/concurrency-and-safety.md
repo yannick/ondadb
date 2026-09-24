@@ -730,6 +730,47 @@ coordination. Full mode: single stripe + group commit (leader drains
 `qstate.queue`, one write + one `sync_data`, wakes followers over bounded
 channels). `Wal::close` is idempotent and `&self` (callable through `Arc`).
 
+**User-space write buffer** (`Options::wal_write_buffer_size`, off by
+default; wavesdb `WALWriteBufferSize`). Non-Full modes only — `Full` ignores
+it, because every commit is written and fsynced before it is acknowledged.
+Each stripe owns its buffer, inside the stripe's existing `Mutex<Option<Stripe>>`,
+so there is no new lock and no new ordering: the committing thread appends its
+whole encoded frame to its stripe's buffer under the stripe mutex, flushing the
+buffer first if the frame would overflow it (a frame at least as large as the
+buffer is written directly, after that flush — frame order within a stripe is
+preserved). Rules:
+
+- **Whole frames only.** The buffer never holds part of a frame, so a flush is
+  one `write` of complete frames; a crash tearing it leaves a torn frame at the
+  tail, which replay discards by CRC (invariant 3 is untouched —
+  `torn_buffered_flush_replays_a_prefix_of_whole_batches` cuts a flush at every
+  byte).
+- **Every fsync flushes first.** `Wal::sync` (hence `DB::sync_wal`, and the
+  prepare/decision path, which syncs the very handle it appended to) flushes
+  each stripe's buffer under that stripe's mutex before `sync_data`. So 3.2's
+  "forced durable" frames stay forced durable, and a prepare also carries every
+  ordinary commit buffered before it to disk.
+- **Rotation and close flush.** `Wal::close` flushes then fsyncs each stripe;
+  rotation closes the old WAL after the writer drain (invariant 9), so every
+  frame of the sealed memtable reaches the old generation's files before the
+  flush job is queued. `close` flushes every stripe even after one fails and
+  **poisons** on a failed flush: rotation discards `close`'s result, and those
+  frames were acknowledged.
+- **Background flusher.** A buffered WAL always has the `onda-wal-sync` thread —
+  under `None` too, where it only flushes (no fsync) — so a cold buffer reaches
+  the OS within one sync interval. It takes the stripe mutexes one at a time,
+  like `sync`.
+- **A failed buffered write poisons** and the buffer is dropped, not retried: a
+  partial write may have landed part of it, and rewriting would put a second
+  copy of a frame head after a torn one.
+- `Wal::size` is logical (buffered bytes included) — rotation sizing does not
+  change meaning.
+
+What the buffer costs is the documented trade: an acknowledged commit still in
+a buffer is lost with the **process**, not only with the machine. Nothing else
+reads a live WAL file (checkpoints and backups flush memtables into SSTables,
+recovery happens before any writer exists), so no reader can observe the gap.
+
 The WAL layout is persisted in the manifest. Explicit per-CF→unified migration
 recovers and flushes all legacy memtables while the manifest still says
 per-CF, then flips the manifest to unified before the first unified open accepts

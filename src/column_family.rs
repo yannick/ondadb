@@ -151,6 +151,9 @@ pub(crate) struct CfCtx {
     /// DB-wide counter of successful physical WAL `sync_data` calls; wired into
     /// every WAL this DB opens (see [`crate::DB::wal_sync_count`]).
     pub wal_syncs: Arc<std::sync::atomic::AtomicU64>,
+    /// [`Options::wal_write_buffer_size`](crate::Options::wal_write_buffer_size),
+    /// applied to every WAL generation this database opens.
+    pub wal_write_buffer_size: usize,
     /// The same `Arc` `DbInner::caps` holds, so a flush landing an L0 table can
     /// see whether `CAP_PERIODIC_AGE` is active without reaching for the whole
     /// database.
@@ -807,11 +810,12 @@ impl ColumnFamily {
         let wal = if ctx.read_only {
             None
         } else {
-            let w = Wal::open(
+            let w = Wal::open_buffered(
                 &wal0,
                 opts.sync_mode,
                 opts.sync_interval,
                 crate::wal::SegmentId::per_cf(0),
+                ctx.wal_write_buffer_size,
             )?;
             w.set_poison(ctx.poison.clone());
             w.set_sync_counter(ctx.wal_syncs.clone());
@@ -978,11 +982,12 @@ impl ColumnFamily {
             (None, replay_paths)
         } else {
             let p = format!("{dir}/wal-{next_gen}.log");
-            let w = Wal::open(
+            let w = Wal::open_buffered(
                 &p,
                 opts.sync_mode,
                 opts.sync_interval,
                 crate::wal::SegmentId::per_cf(next_gen),
+                ctx.wal_write_buffer_size,
             )?;
             w.set_poison(ctx.poison.clone());
             w.set_sync_counter(ctx.wal_syncs.clone());
@@ -1255,11 +1260,12 @@ impl ColumnFamily {
             let new_wal = if self.ctx.read_only {
                 None
             } else {
-                Wal::open(
+                Wal::open_buffered(
                     &new_path,
                     self.opts.sync_mode,
                     self.opts.sync_interval,
                     crate::wal::SegmentId::per_cf(new_gen),
+                    self.ctx.wal_write_buffer_size,
                 )
                 .ok()
                 .map(|w| {

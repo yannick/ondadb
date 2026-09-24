@@ -172,6 +172,21 @@ directory written by this release is not readable by 0.9.x. The crate is still
 
 #### Performance
 
+- **User-space WAL write buffer** (wavesdb `WALWriteBufferSize`, plan C P6):
+  `Options::wal_write_buffer_size` (bytes, default `0` = off, not persisted)
+  coalesces whole frames per WAL stripe — per-CF and unified — into one
+  `write` when the buffer fills, on every sync-interval tick (a flush-only
+  thread runs under `SyncMode::None` too), and before every fsync
+  (`sync_wal`, prepare and decision frames), rotation and close. `SyncMode::Full`
+  ignores it. **Durability trade:** an acknowledged commit still in the
+  buffer is lost on a *process* crash (unbuffered `None` loses it only on
+  power loss); batch atomicity and frame bytes are unchanged, and a crash
+  tearing a buffered write replays a prefix of whole batches. A failed
+  buffered write poisons the database. `Wal::open_buffered`,
+  `Wal::flush_buffer` and `Wal::write_calls` are the WAL-level API;
+  `onda_bench -wal_buffer <bytes>`. Provisional (loaded machine, 5 runs,
+  1 thread, 1 put per commit, 200k ops, `SyncMode::None`): 8.6k–32k ops/s
+  unbuffered vs 166k–387k ops/s with 256 KiB.
 - **Point reads stop early by table `max_seq`** (wavesdb `5ef39df`). `get`
   and `multi_get` skip a candidate table whose `max_seq` is at or below the
   version already in hand (point hit, tombstone, or covering range delete),

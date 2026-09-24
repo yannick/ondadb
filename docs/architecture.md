@@ -111,7 +111,11 @@ in the database directory; only bottom-level parts may live on a named tier
      or `append_batch_enveloped` for a point-only batch). One frame either way,
      because batch atomicity is per frame. The test is on the batch, not the
      family, so every ordinary commit keeps its 0.8.2 frame bytes, including on
-     a family that merely *has* a merge operator
+     a family that merely *has* a merge operator. With
+     `Options::wal_write_buffer_size` set (non-Full modes), the frame is
+     appended to the stripe's user-space buffer instead and reaches the file
+     when the buffer fills, on the interval tick, or before any fsync, rotation
+     or close (`docs/concurrency-and-safety.md` § WAL concurrency)
    - `Memtable::put_batch(&recs)` — counting-sorts into per-shard runs, one
      shard lock per batch, nodes prebuilt outside locks, counters updated once
    - `Memtable::add_range` per range delete, into the `RangeTombstoneSet`

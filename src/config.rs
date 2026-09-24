@@ -512,6 +512,30 @@ pub struct Options {
     /// same ids (copies of one published checkpoint, say). Two databases with
     /// different contents must never share a name.
     pub read_cache_namespace: Option<String>,
+    /// Per-stripe user-space WAL write buffer, in bytes (wavesdb
+    /// `WALWriteBufferSize`). `0` (the default) writes every commit's frame
+    /// to the OS as it is acknowledged, as before.
+    ///
+    /// With a size set, [`SyncMode::None`] and [`SyncMode::Interval`] WALs —
+    /// per-column-family and unified alike — coalesce whole frames in memory
+    /// and write them in one syscall when the buffer fills, at every
+    /// sync-interval tick (a background thread runs under `None` too, flushing
+    /// without fsync), on [`DB::sync_wal`](crate::DB::sync_wal) and every
+    /// other fsync (prepared-transaction frames included), on memtable
+    /// rotation and on close. [`SyncMode::Full`] ignores it: each commit is
+    /// written and fsynced before it is acknowledged, so a buffer could only
+    /// add a copy.
+    ///
+    /// **The durability trade:** an acknowledged commit still in the buffer
+    /// is lost if the *process* crashes — unbuffered `None` loses such a
+    /// commit only on power loss. The window is at most one sync interval (or
+    /// one buffer's worth). Frame boundaries and batch atomicity are
+    /// unchanged: a crash tearing a buffered write still replays a prefix of
+    /// whole batches. 64–256 KiB captures nearly all of the syscall saving;
+    /// larger buffers only widen the window.
+    ///
+    /// **Not persisted.** Host policy, taken from the options of every open.
+    pub wal_write_buffer_size: usize,
 }
 
 /// A named storage location — for now, a directory on some mount (ssd, hdd,
@@ -809,6 +833,7 @@ impl Default for Options {
             default_isolation: IsolationLevel::Snapshot,
             read_resources: None,
             read_cache_namespace: None,
+            wal_write_buffer_size: 0,
         }
     }
 }

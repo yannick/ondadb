@@ -126,6 +126,9 @@ struct Args {
     /// Percent of a batch's slots drawn from the populated key set; the rest
     /// are synthetic keys that miss.
     mg_hit_pct: usize,
+    /// `Options::wal_write_buffer_size` in bytes (0 = unbuffered, the
+    /// default).
+    wal_buffer: usize,
 }
 
 /// How the Get phase exercises [`ondadb::perf`]. The nil-path acceptance for
@@ -172,6 +175,7 @@ where
         mg_batch: 64,
         mg_dup_pct: 0,
         mg_hit_pct: 100,
+        wal_buffer: 0,
     };
     let argv: Vec<String> = args
         .into_iter()
@@ -218,6 +222,12 @@ where
             "-mg_batch" => a.mg_batch = positive("-mg_batch", val(&mut i)?)?,
             "-mg_dup_ratio" => a.mg_dup_pct = percent("-mg_dup_ratio", val(&mut i)?)?,
             "-mg_hit_ratio" => a.mg_hit_pct = percent("-mg_hit_ratio", val(&mut i)?)?,
+            "-wal_buffer" => {
+                let v = val(&mut i)?;
+                a.wal_buffer = v
+                    .parse()
+                    .map_err(|_| format!("-wal_buffer must be a byte count: {v}"))?;
+            }
             "-keep" => a.keep = true,
             "-engine" => {
                 let _ = val(&mut i)?; // accepted for CLI compatibility
@@ -329,6 +339,12 @@ fn main() {
 
     let keys = gen_keys(&a);
     let value = vec![b'v'; a.value_size];
+    fn bench_options(path: &str, a: &Args) -> Options {
+        Options {
+            wal_write_buffer_size: a.wal_buffer,
+            ..Options::new(path)
+        }
+    }
 
     let cfg = ColumnFamilyConfig {
         compression: compression(&a.compression),
@@ -336,7 +352,7 @@ fn main() {
     };
 
     // ---- Put -----------------------------------------------------------------
-    let initial_db = Arc::new(DB::open(Options::new(&db_path)).expect("open"));
+    let initial_db = Arc::new(DB::open(bench_options(&db_path, &a)).expect("open"));
     let initial_cf = initial_db
         .create_column_family("bench", cfg.clone())
         .expect("create cf");
@@ -355,7 +371,7 @@ fn main() {
         initial_db.close().expect("close before post-put phases");
         drop(initial_cf);
         drop(initial_db);
-        let db = Arc::new(DB::open(Options::new(&db_path)).expect("reopen"));
+        let db = Arc::new(DB::open(bench_options(&db_path, &a)).expect("reopen"));
         let cf = db.get_column_family("bench").expect("cf after reopen");
         (db, cf)
     } else {
@@ -683,6 +699,7 @@ mod tests {
             mg_batch: 64,
             mg_dup_pct: 0,
             mg_hit_pct: 100,
+            wal_buffer: 0,
         };
 
         let _ = populate(&db, &cf, &keys, value, &args);
