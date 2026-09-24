@@ -1,13 +1,27 @@
 # Changelog
 
-## Unreleased — Breaking: yoloDB format epoch 1
+## 0.10.0 (unreleased) — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB
 and wavesdb converge on (plan C step 1). Every persisted identifier changes,
-so **a 0.9.x database is not readable by this release's engine**, and a
-directory written by this release is not readable by 0.9.x. The crate is still
+so a directory written by this release is not readable by 0.9.x. **A 0.9.x
+database is upgraded automatically on open**: rebuilt in a sibling directory,
+verified entry by entry against the source, then swapped into place by a
+journaled rename, with the 0.9 directory kept as a backup
+(`Options::format_upgrade` = `Auto` by default; `Forbid` refuses and
+`ReadOnlyLegacy` opens it read-only as it is; `yolodb upgrade <path>` does the
+same offline). Any failure before the swap leaves the 0.9.x directory
+untouched. The crate is still
 `ondadb`; only the format changed. See `docs/formats.md` and the registry in
 `docs/format-registry.md`.
+
+**Measured** (interleaved `onda_bench` A/B against 0.9.1, `unsafe-fastpath`,
+8 threads, 4M ops, 6 rounds, fresh database per run, same-round median
+ratios): put 0.97 (0.94–1.00 in every round — a consistent ~3%; not yet
+profiled — CRC32-C on small WAL frames and the WAL segment-header fsync are
+the suspects),
+cold get 1.06 (1.02–1.09, point reads stopping early by table `max_seq`),
+forward scan 0.96 and backward scan 0.98 (within this machine's noise).
 
 ### Breaking: the format epoch
 
