@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.1 (unreleased)
+## 0.10.1
 
 ### Transactions: read-your-own-writes no longer scans the whole buffer
 
@@ -122,8 +122,6 @@ table edits".
   - an `int64` family mixing negative 8-byte keys with keys of other lengths.
 
   Rewrite such a family (scan it into a fresh family) to be certain.
-
-## 0.10.0 — Breaking: yoloDB format epoch 1
 
 ## 0.10.0 — Breaking: yoloDB format epoch 1
 
