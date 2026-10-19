@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.10.1 (unreleased)
+
+### Transactions: read-your-own-writes no longer scans the whole buffer
+
+- **`Txn::get` / `get_into` / `multi_get` and the merge-chain fold are indexed.**
+  Every point read of a transaction's own writes scanned its entire buffer
+  (and every read also walked all buffered writes looking for range deletes),
+  so writing N keys and reading them back was O(N²). A transaction whose
+  buffer holds ≥ 32 writes now builds, on its first point read, a hash index
+  of its point writes (`xxh3(cf, key bytes)` → newest write, plus a per-write
+  link to the previous write with the same hash, which the merge chain walks
+  newest first). Appends keep it current, a savepoint rollback unwinds exactly
+  the discarded writes, and commit/rollback/reset/prepare drop it. Buffered
+  range deletes are tracked in their own position list, so a point read checks
+  only the spans. Keys still match by **byte equality**, as the buffer always
+  did (also under a non-bytewise comparator); spans still use the comparator.
+  Measured (`tests/txn_index_bench.rs`, release + `unsafe-fastpath`, median of
+  5): 10k writes then 10k `get`s 138.6 ms → 0.37 ms; 50k: 3533 ms → 4.8 ms;
+  50k merge operands read back 6342 ms → 7.2 ms. Transactions of 1-8 writes
+  are unchanged (they never build the index).
+- **Fix: a buffered range delete read back as a value on a merge family.** The
+  buffered-chain scan matched a range delete whose *start* bound equalled the
+  key and returned its *end* bound as the key's value (`delete_range(a, z)`
+  then `get(a)` → `"z"`). It now skips range deletes; coverage is decided by
+  the span check, as on every other family.
+
 ## 0.10.0 (unreleased) — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB
