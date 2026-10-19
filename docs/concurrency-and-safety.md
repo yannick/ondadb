@@ -144,7 +144,7 @@ the two unexamined candidates.
 | `DbInner::publish` (Mutex) | publish cursor | short |
 | `DbInner::file_deletion.paused` | pause counter + deferred-delete list | short; `pause_deletions` returns an RAII guard. Never held across the unlink or the channel send |
 | `DbInner::file_deletion.worker.{tx,handle}` | deletion-queue sender / join handle | one unbounded `send` (never blocks) or one `take`; the join in `drain_deletions` happens with neither held |
-| `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating` | gate checks, rotation drain |
+| `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating`, `preparing`, `retiring`, `flushes` (in-flight flush claims) | gate checks, rotation drain; a drop's/clear's `begin_retire` waits on its condvar (holding `cf_lifecycle_mu`, nothing else) for in-flight rotations and flush claims |
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
 | `ColumnFamily::compact_mu` (Mutex) | whole-CF compaction operations | manual compaction sweep and FIFO eviction; acquired before the whole-keyspace range lock |
 | `ColumnFamily::range_locks` | key ranges being rewritten | bounded compaction jobs use non-blocking acquisition; attach takes the whole keyspace; detach and part moves block on the affected partition span, including copy + manifest flip; delete-only excise (1.2) uses `parts::try_lock_key_span` — non-blocking over the union of its candidates' **span** bounds, held across revalidation, the catalog transaction and file retirement |
@@ -664,6 +664,32 @@ Consequences agents rely on:
 - A record's WAL write and memtable insert happen under one `active_writers`
   span, so rotation can never split a batch across memtables (its WAL
   generation always covers its memtable).
+
+### Drop / clear against rotation, flush and table edits (0.10.1)
+
+`drop_column_family` and `clear_column_family` call
+`ColumnFamily::begin_retire` before their catalog edit: under `rot` it sets
+`retiring` and waits until no rotation (`rotating || preparing`) and no flush
+claim (`flushes > 0`) is in flight. From the mark on, `rotate_memtable` returns
+without sealing — and a rotation that was creating its next segment abandons it
+— and `begin_flush` refuses, so the flush job (per-CF, or the family's slice of
+a unified flush) discards the memtable instead of writing it. A flush claim is
+held from before the table is written until after its edit is appended. Without
+this a rotation created its next WAL in a directory the drop had just removed,
+or in the *re-created* family's directory when the name was reused (a write
+through the stale handle then succeeded and replayed into the new family), and
+a flush either failed (fail-stopping a unified database) or appended an
+`AddTable` naming the replacement.
+
+Every other table edit of one family — compaction, FIFO eviction, excise, part
+detach/attach/move, ingest — goes through `DbInner::catalog_txn_for`, which
+under `manifest_mu` refuses (`NotFound`, nothing appended) unless the issuing
+handle is still the registered instance. The drop's own table list is built
+under the same lock (`catalog_txn_built`), so every edit lands either before
+the `DropCF` and inside its list, or not at all. A compaction is *not* waited
+for: it runs to its install and is refused there. `flush_memtable` through a
+dropped handle is `NotFound`. `abort_retire` undoes the mark if the drop's own
+edit fails.
 
 Unified rotation uses the same `rot → state` lock order. Writers additionally
 wait while the sealed unified queue is at

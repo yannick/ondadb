@@ -1058,7 +1058,7 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
                 cf: cf.name().to_string(),
                 ids: ids.clone(),
             }]);
-        db.catalog_txn(edit, |p| cf.remove_l0_tables(&ids, p))?;
+        db.catalog_txn_for(cf, edit, |p| cf.remove_l0_tables(&ids, p))?;
         for t in &victims {
             db.remove_sst_file(&cf.klog_path(t.meta.id), t.meta.klog_size);
             db.remove_sst_file(
@@ -2645,7 +2645,10 @@ fn compact_inputs_inner(
     }
     let publish_handles = new_handles.clone();
     let rollback_handles = new_handles;
-    if let Err(error) = db.catalog_txn_with_rollback(
+    #[cfg(debug_assertions)]
+    crate::db::cf_park::park_if_armed(cf, crate::db::cf_park::Point::CompactionBeforeInstall);
+    if let Err(error) = db.catalog_txn_for_with_rollback(
+        cf,
         edit,
         |p| install_compaction_outputs(cf, &cmp, level, target, &inputs, &publish_handles, p),
         |p| rollback_compaction_outputs(cf, &cmp, &inputs, &rollback_handles, p),

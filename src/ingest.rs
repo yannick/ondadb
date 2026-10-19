@@ -157,7 +157,7 @@ impl Ingestion {
             }
             let cf = Arc::clone(&self.cf);
             self.db
-                .catalog_txn(edit, move |p| cf.install_handles_l0(handles, p))?;
+                .catalog_txn_for(&self.cf, edit, move |p| cf.install_handles_l0(handles, p))?;
             self.finished = true;
             // Bulk ingest must arm compaction, exactly as a memtable flush
             // does. It did not, and the consequence was not subtle: a

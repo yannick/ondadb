@@ -219,6 +219,16 @@ struct RotState {
     /// a segment fsyncs one header per stripe plus the directory, and commits
     /// keep landing in the current memtable/WAL meanwhile.
     preparing: bool,
+    /// The family is being dropped or cleared ([`ColumnFamily::begin_retire`]).
+    /// One way, except when the drop's catalog edit fails: no rotation seals
+    /// its memtable from here on and no flush job starts on it, because both
+    /// would write into a directory the drop is about to remove — or, once the
+    /// name is reused, into the replacement's.
+    retiring: bool,
+    /// Flush jobs between [`ColumnFamily::begin_flush`] and
+    /// [`ColumnFamily::end_flush`]: writing a table into this family's
+    /// directory, or publishing its `AddTable`.
+    flushes: usize,
 }
 
 struct PointReadCandidate {
@@ -871,6 +881,8 @@ impl ColumnFamily {
                 active_writers: 0,
                 rotating: false,
                 preparing: false,
+                retiring: false,
+                flushes: 0,
             }),
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
@@ -1049,6 +1061,8 @@ impl ColumnFamily {
                 active_writers: 0,
                 rotating: false,
                 preparing: false,
+                retiring: false,
+                flushes: 0,
             }),
             cond: Condvar::new(),
             flushing: AtomicBool::new(false),
@@ -1193,10 +1207,14 @@ impl ColumnFamily {
         {
             let mut g = self.rot.lock();
             loop {
+                // A retiring family's sealed memtables are never flushed, so
+                // waiting for its queue to shrink would wait forever; the write
+                // goes on and fails (or is discarded) with the family.
                 let stalled = g.rotating
                     || ((self.state.read().imm.len() >= threshold
                         || self.over_hard_compaction_limit())
-                        && !self.ctx.closing.load(Ordering::Relaxed));
+                        && !self.ctx.closing.load(Ordering::Relaxed)
+                        && !g.retiring);
                 if stalled {
                     self.cond.wait(&mut g);
                 } else {
@@ -1268,6 +1286,13 @@ impl ColumnFamily {
                     self.cond.wait(&mut g);
                 }
             }
+            // A family being dropped is not rotated: its memtable goes with it,
+            // and the next WAL would be created in a directory the drop is
+            // about to remove (or that a re-created family of the same name
+            // already owns).
+            if g.retiring {
+                return;
+            }
             {
                 let s = self.state.read();
                 // Range tombstones alone are enough to rotate: they are not
@@ -1291,6 +1316,11 @@ impl ColumnFamily {
                 (s.wal_gen + 1, self.wal_path(s.wal_gen + 1))
             };
             drop(g);
+            #[cfg(debug_assertions)]
+            crate::db::cf_park::park_if_armed(
+                self,
+                crate::db::cf_park::Point::RotationBeforeWalOpen,
+            );
             let new_wal = if self.ctx.read_only {
                 None
             } else {
@@ -1310,6 +1340,18 @@ impl ColumnFamily {
             };
             let mut g = self.rot.lock();
             g.preparing = false;
+            if g.retiring {
+                // The drop marked the family while the segment was being
+                // created, and is waiting on `preparing` — so the directory
+                // still exists. Abandon the rotation: the segment is unused.
+                self.cond.notify_all();
+                drop(g);
+                if let Some(w) = new_wal {
+                    let _ = w.close();
+                    crate::wal::remove_wal_files(&new_path);
+                }
+                return;
+            }
             g.rotating = true;
             while g.active_writers > 0 {
                 self.cond.wait(&mut g);
@@ -3080,6 +3122,66 @@ impl ColumnFamily {
     /// Whether a compaction is in progress.
     pub fn is_compacting(&self) -> bool {
         self.compacting.load(Ordering::Relaxed)
+    }
+
+    /// Mark the family retiring and wait until no rotation or flush of it is
+    /// in flight. Called by a drop or clear *before* its catalog edit, with
+    /// `cf_lifecycle_mu` held.
+    ///
+    /// From the mark on, [`rotate_memtable`](Self::rotate_memtable) returns
+    /// without sealing and [`begin_flush`](Self::begin_flush) refuses, so
+    /// once this returns nothing else will create a file in the family's
+    /// directory or append an edit naming it: the `DropCF` edit is the last
+    /// one, and the directory can be removed. A rotation that passed its check
+    /// before the mark has finished (its WAL is then closed by
+    /// [`close_resources`](Self::close_resources)) or abandoned itself; a flush
+    /// that began has published. Lock order: only `rot` is taken, and neither
+    /// path waited for holds anything the drop holds.
+    pub(crate) fn begin_retire(&self) {
+        let mut g = self.rot.lock();
+        g.retiring = true;
+        // Wake writers stalled on this family's flush queue (see the commit
+        // path's stall condition).
+        self.cond.notify_all();
+        while g.rotating || g.preparing || g.flushes > 0 {
+            #[cfg(debug_assertions)]
+            crate::db::cf_park::note_retire_waiting(self);
+            self.cond.wait(&mut g);
+        }
+    }
+
+    /// Undo [`begin_retire`](Self::begin_retire) after the drop's catalog edit
+    /// failed, so the family — still registered — rotates and flushes again.
+    pub(crate) fn abort_retire(&self) {
+        let mut g = self.rot.lock();
+        g.retiring = false;
+        self.cond.notify_all();
+    }
+
+    /// Whether the family has been (or is being) dropped or cleared: this
+    /// handle is stale.
+    pub(crate) fn is_dropped(&self) -> bool {
+        self.rot.lock().retiring
+    }
+
+    /// Claim a flush of this family: `false` when it is retiring, in which
+    /// case the caller discards the memtable instead of writing it. Every
+    /// `true` must be paired with [`end_flush`](Self::end_flush) once the
+    /// flush's edit has been appended (or the flush failed).
+    pub(crate) fn begin_flush(&self) -> bool {
+        let mut g = self.rot.lock();
+        if g.retiring {
+            return false;
+        }
+        g.flushes += 1;
+        true
+    }
+
+    /// Release a [`begin_flush`](Self::begin_flush) claim.
+    pub(crate) fn end_flush(&self) {
+        let mut g = self.rot.lock();
+        g.flushes -= 1;
+        self.cond.notify_all();
     }
 
     /// Close the active WAL and all open readers.

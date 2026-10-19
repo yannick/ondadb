@@ -355,7 +355,12 @@ impl DB {
         let cfs: Vec<Arc<ColumnFamily>> = self.inner.cfs.read().values().cloned().collect();
         // Flush memtables so all data lives in SSTables, then persist manifest.
         for cf in &cfs {
-            self.flush_memtable(cf)?;
+            match self.flush_memtable(cf) {
+                // Dropped since the list was taken: the catalog persisted
+                // below no longer names it either.
+                Err(OndaError::NotFound) => {}
+                other => other?,
+            }
         }
         let read_only = self.inner.opts.read_only;
         if read_only {

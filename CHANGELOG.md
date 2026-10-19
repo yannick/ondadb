@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.10.1 (unreleased)
+
+### Fixed: dropping a column family while it rotates, flushes or compacts
+
+`drop_column_family` and `clear_column_family` did not wait for, or fence off,
+the family's background work (the bug wavesdb fixed in 63e084f). Reproduced
+deterministically in `tests/drop_rotation.rs`, each outcome on the old code:
+
+- a memtable rotation in flight created its next WAL after the drop — when the
+  name was re-created, **in the new family's directory**, so a write through
+  the stale handle succeeded and replayed into the new family on reopen;
+- the dropped memtable's flush wrote its table into the new family's directory
+  and appended an `AddTable` naming it: **the dropped data reappeared** in the
+  re-created (or cleared) family after a crash;
+- under the unified layout a flush slice of a family dropped mid-flush failed
+  and **fail-stopped the whole database**;
+- a compaction installing after the drop appended its edit after the `DropCF`,
+  and the next open refused it (`RemoveTables: table N absent`): **the database
+  no longer opened** after a crash.
+
+Now a drop or clear marks the family retiring and waits for an in-flight
+rotation or flush first; a retiring family is neither rotated nor flushed (its
+memtable goes with it); every other table edit of a family is refused unless the
+issuing handle is still the registered one (`DbInner::catalog_txn_for`), and the
+drop's table list is read under `manifest_mu`. `flush_memtable` through a
+dropped family's handle now returns `NotFound`. See
+`docs/concurrency-and-safety.md`, "Drop / clear against rotation, flush and
+table edits".
+
 ## 0.10.0 (unreleased) — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB
