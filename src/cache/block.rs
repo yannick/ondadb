@@ -1,6 +1,13 @@
 //! Sharded, byte-bounded CLOCK (second-chance) cache of decompressed SSTable
-//! bytes keyed by `(file_id, domain, offset)`.  Cached values are immutable
-//! (`Arc<[u8]>`); callers must not mutate them.
+//! bytes keyed by `(namespace, file_id, domain, offset)`.  Cached values are
+//! immutable (`Arc<[u8]>`); callers must not mutate them.
+//!
+//! A `BlockCache` is a **view**: shared storage plus a namespace id. Every
+//! private cache ([`BlockCache::new`]) is namespace 0 and owns its storage
+//! alone. [`ReadResources`](crate::read_resources::ReadResources) hands each
+//! leased database a view of one shared storage under its own namespace, so the
+//! databases share one byte budget while table `7` of one can never be served
+//! for table `7` of another.
 //!
 //! Reads are deliberately **non-serializing**: a hit takes the shard's
 //! `RwLock` in *read* mode and sets an atomic reference bit — unlike an LRU,
@@ -48,6 +55,9 @@ impl BlockDomain {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct BlockKey {
+    /// Which database's file-id space `file_id` belongs to; see the module
+    /// docs. `0` for every private cache.
+    ns: u64,
     file_id: u64,
     off: u64,
     domain: BlockDomain,
@@ -104,8 +114,9 @@ impl Shard {
     /// thousands of slots clearing bits while readers stall. After
     /// [`CLOCK_SWEEP_BUDGET`] spared entries the hand evicts regardless —
     /// put latency stays bounded and capacity always converges.
-    fn evict_to_cap(&mut self) {
+    fn evict_to_cap(&mut self) -> u64 {
         let mut spared = 0usize;
+        let mut evicted = 0u64;
         while self.used > self.cap && self.map.len() > 1 {
             let Some(k) = self.ring.pop_front() else {
                 break;
@@ -118,8 +129,19 @@ impl Shard {
                 self.ring.push_back(k); // second chance
             } else {
                 self.unlink(&k);
+                evicted += 1;
             }
         }
+        evicted
+    }
+
+    /// Drop every entry and reset the tallies.
+    fn clear(&mut self) {
+        self.map.clear();
+        self.ring.clear();
+        self.used = 0;
+        self.vlog_entries = 0;
+        self.vlog_used = 0;
     }
 }
 
@@ -144,22 +166,42 @@ pub struct CacheStats {
     pub vlog_entries: usize,
     /// The vlog share of `bytes`.
     pub vlog_bytes: i64,
+    /// Entries (either domain) the clock hand evicted to stay under capacity.
+    /// Explicit removals and namespace purges are not evictions.
+    pub evictions: u64,
 }
 
-/// A sharded CLOCK block cache (see module docs).
-pub struct BlockCache {
+/// The storage behind one or more [`BlockCache`] views.
+struct Core {
     shards: Vec<RwLock<Shard>>,
     mask: u64,
     hits: AtomicU64,
     misses: AtomicU64,
     vlog_hits: AtomicU64,
     vlog_misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// A sharded CLOCK block cache (see module docs): a namespaced view of shared
+/// storage. Counters and capacity belong to the storage, so every view of it
+/// reports the same [`stats`](Self::stats).
+pub struct BlockCache {
+    core: Arc<Core>,
+    ns: u64,
+    /// Whether a *background* read (see [`admits_current_thread`]) inserts
+    /// what it misses. `false` for every view unless the database opts back
+    /// in with `Options::admit_background_scan_blocks`.
+    ///
+    /// [`admits_current_thread`]: BlockCache::admits_current_thread
+    admit_background: bool,
 }
 
 impl std::fmt::Debug for BlockCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockCache")
-            .field("shards", &self.shards.len())
+            .field("shards", &self.core.shards.len())
+            .field("ns", &self.ns)
+            .field("admit_background", &self.admit_background)
             .finish()
     }
 }
@@ -171,14 +213,15 @@ impl BlockCache {
     /// (or less) yields a disabled cache (every `get` misses).
     pub fn new(capacity_bytes: i64) -> BlockCache {
         if capacity_bytes <= 0 {
-            return BlockCache {
+            return BlockCache::from_core(Core {
                 shards: Vec::new(),
                 mask: 0,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 vlog_hits: AtomicU64::new(0),
                 vlog_misses: AtomicU64::new(0),
-            };
+                evictions: AtomicU64::new(0),
+            });
         }
         let per = (capacity_bytes / NUM_SHARDS as i64).max(1);
         let shards = (0..NUM_SHARDS)
@@ -193,26 +236,124 @@ impl BlockCache {
                 })
             })
             .collect();
-        BlockCache {
+        BlockCache::from_core(Core {
             shards,
             mask: (NUM_SHARDS - 1) as u64,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             vlog_hits: AtomicU64::new(0),
             vlog_misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        })
+    }
+
+    fn from_core(core: Core) -> BlockCache {
+        BlockCache {
+            core: Arc::new(core),
+            ns: 0,
+            admit_background: false,
+        }
+    }
+
+    /// Another view of this cache's storage, keyed under namespace `ns`.
+    /// Entries of different namespaces never alias, whatever their file ids.
+    pub(crate) fn namespaced(&self, ns: u64) -> BlockCache {
+        BlockCache {
+            core: Arc::clone(&self.core),
+            ns,
+            admit_background: self.admit_background,
+        }
+    }
+
+    /// This view with its background-admission policy set (see
+    /// [`admits_current_thread`](Self::admits_current_thread)). The policy is
+    /// per view, so two databases leasing one shared storage may differ.
+    pub(crate) fn with_background_admission(mut self, admit: bool) -> BlockCache {
+        self.admit_background = admit;
+        self
+    }
+
+    /// Should a read on the calling thread insert what it misses, and refresh
+    /// the recency of what it hits?
+    ///
+    /// Yes for foreground reads — point reads and user iterators, whatever
+    /// the policy. For a **background** thread (any [`IoClass`] other than
+    /// `Foreground`: compaction and its span workers, the part mover, flush
+    /// and ingest validation) only when the view opted in. Such a reader walks
+    /// every block of a table exactly once and never asks for it again, so
+    /// admitting its blocks can only evict ones a foreground reader does want:
+    /// one large compaction used to cycle the whole cache and hand the hot set
+    /// back cold (wavesdb `ac16c8a`).
+    ///
+    /// The class is the thread's [`crate::ioctrl`] tag rather than a flag
+    /// threaded through every reader, because it is already set at exactly the
+    /// places background work starts, and a reader is shared between the two
+    /// kinds of caller through the table cache.
+    ///
+    /// [`IoClass`]: crate::ioctrl::IoClass
+    #[inline]
+    pub(crate) fn admits_current_thread(&self) -> bool {
+        self.admit_background || crate::ioctrl::current() == crate::ioctrl::IoClass::Foreground
+    }
+
+    /// Look up without touching the entry's reference bit or the hit/miss
+    /// counters: a background read's lookup.
+    ///
+    /// A background scan still *reads through* the cache — a block a point
+    /// read already paid for is served for free — but its hit must not give
+    /// the block a second chance, or what stays resident would reflect the
+    /// scan instead of foreground demand. It is not counted either, so
+    /// `hits`/`misses` keep describing foreground reads, which is what an
+    /// operator sizing the cache is looking at.
+    pub(crate) fn peek(&self, file_id: u64, off: u64, domain: BlockDomain) -> Option<Arc<[u8]>> {
+        if !self.enabled() {
+            return None;
+        }
+        let k = self.key(file_id, off, domain);
+        let s = self.shard_for(&k).read();
+        s.map.get(&k).map(|e| e.data.clone())
+    }
+
+    /// [`get`](Self::get) for a foreground caller, [`peek`](Self::peek) for a
+    /// background one — the lookup half of
+    /// [`admits_current_thread`](Self::admits_current_thread). Returns the
+    /// decision too, so the caller's insert on a miss follows the same one.
+    #[inline]
+    pub(crate) fn lookup(
+        &self,
+        file_id: u64,
+        off: u64,
+        domain: BlockDomain,
+    ) -> (Option<Arc<[u8]>>, bool) {
+        if self.admits_current_thread() {
+            (self.get(file_id, off, domain), true)
+        } else {
+            (self.peek(file_id, off, domain), false)
         }
     }
 
     /// Whether the cache stores anything.
     pub fn enabled(&self) -> bool {
-        !self.shards.is_empty()
+        !self.core.shards.is_empty()
+    }
+
+    #[inline]
+    fn key(&self, file_id: u64, off: u64, domain: BlockDomain) -> BlockKey {
+        BlockKey {
+            ns: self.ns,
+            file_id,
+            off,
+            domain,
+        }
     }
 
     fn shard_for(&self, k: &BlockKey) -> &RwLock<Shard> {
         let mut h = k.file_id.wrapping_mul(1099511628211) ^ k.off;
         h = h.wrapping_add(k.domain.salt());
+        // Namespace 0 (every private cache) keeps its historical placement.
+        h ^= k.ns.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         h ^= h >> 33;
-        &self.shards[(h & self.mask) as usize]
+        &self.core.shards[(h & self.core.mask) as usize]
     }
 
     /// Look up the bytes cached at `(file_id, domain, off)`. Hits take the
@@ -221,11 +362,7 @@ impl BlockCache {
         if !self.enabled() {
             return None;
         }
-        let k = BlockKey {
-            file_id,
-            off,
-            domain,
-        };
+        let k = self.key(file_id, off, domain);
         let out = {
             let s = self.shard_for(&k).read();
             s.map.get(&k).map(|e| {
@@ -234,8 +371,8 @@ impl BlockCache {
             })
         };
         let (hit, miss) = match domain {
-            BlockDomain::Klog => (&self.hits, &self.misses),
-            BlockDomain::Vlog => (&self.vlog_hits, &self.vlog_misses),
+            BlockDomain::Klog => (&self.core.hits, &self.core.misses),
+            BlockDomain::Vlog => (&self.core.vlog_hits, &self.core.vlog_misses),
         };
         match &out {
             Some(_) => hit.fetch_add(1, Ordering::Relaxed),
@@ -244,17 +381,25 @@ impl BlockCache {
         out
     }
 
+    /// Whether `(file_id, domain, off)` is resident, without counting a hit or
+    /// a miss or marking the entry referenced: a planner asking "would this
+    /// read go to storage?" is not a read, and must neither skew the hit rate
+    /// nor keep an entry alive.
+    pub(crate) fn contains(&self, file_id: u64, off: u64, domain: BlockDomain) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        let k = self.key(file_id, off, domain);
+        self.shard_for(&k).read().map.contains_key(&k)
+    }
+
     /// Insert a value, evicting not-recently-referenced entries if over
     /// capacity.
     pub fn put(&self, file_id: u64, off: u64, domain: BlockDomain, val: Arc<[u8]>) {
         if !self.enabled() {
             return;
         }
-        let k = BlockKey {
-            file_id,
-            off,
-            domain,
-        };
+        let k = self.key(file_id, off, domain);
         let mut s = self.shard_for(&k).write();
         if let Some(e) = s.map.get(&k) {
             // Already present: blocks are immutable, so keep the existing
@@ -279,7 +424,10 @@ impl BlockCache {
         );
         s.ring.push_back(k);
         if s.used > s.cap {
-            s.evict_to_cap();
+            let evicted = s.evict_to_cap();
+            if evicted > 0 {
+                self.core.evictions.fetch_add(evicted, Ordering::Relaxed);
+            }
         }
     }
 
@@ -293,22 +441,40 @@ impl BlockCache {
         if !self.enabled() {
             return;
         }
-        let k = BlockKey {
-            file_id,
-            off,
-            domain,
-        };
+        let k = self.key(file_id, off, domain);
         let mut s = self.shard_for(&k).write();
         s.unlink(&k);
     }
 
-    /// Aggregate hit/miss counters and approximate size.
+    /// Drop every entry of this view's namespace.
+    ///
+    /// Only map entries are unlinked; their ring slots are reaped by the clock
+    /// hand, exactly as for [`remove`](Self::remove).
+    pub(crate) fn purge_namespace(&self, ns: u64) {
+        for shard in &self.core.shards {
+            let mut s = shard.write();
+            let doomed: Vec<BlockKey> = s.map.keys().filter(|k| k.ns == ns).copied().collect();
+            for k in &doomed {
+                s.unlink(k);
+            }
+        }
+    }
+
+    /// Drop every entry of every namespace sharing this storage.
+    pub(crate) fn clear(&self) {
+        for shard in &self.core.shards {
+            shard.write().clear();
+        }
+    }
+
+    /// Aggregate hit/miss counters and approximate size — of the whole
+    /// storage, every namespace included.
     pub fn stats(&self) -> CacheStats {
         let mut entries = 0;
         let mut bytes = 0;
         let mut vlog_entries = 0;
         let mut vlog_bytes = 0;
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let s = shard.read();
             entries += s.map.len();
             bytes += s.used;
@@ -316,14 +482,15 @@ impl BlockCache {
             vlog_bytes += s.vlog_used;
         }
         CacheStats {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
+            hits: self.core.hits.load(Ordering::Relaxed),
+            misses: self.core.misses.load(Ordering::Relaxed),
             entries,
             bytes,
-            vlog_hits: self.vlog_hits.load(Ordering::Relaxed),
-            vlog_misses: self.vlog_misses.load(Ordering::Relaxed),
+            vlog_hits: self.core.vlog_hits.load(Ordering::Relaxed),
+            vlog_misses: self.core.vlog_misses.load(Ordering::Relaxed),
             vlog_entries,
             vlog_bytes,
+            evictions: self.core.evictions.load(Ordering::Relaxed),
         }
     }
 }
@@ -420,11 +587,13 @@ mod tests {
         for i in 0..total as u64 {
             let (file_id, off) = (i / 8 + 1, (i % 8) * 4096);
             let kk = BlockKey {
+                ns: 0,
                 file_id,
                 off,
                 domain: BlockDomain::Klog,
             };
             let vk = BlockKey {
+                ns: 0,
                 file_id,
                 off,
                 domain: BlockDomain::Vlog,
@@ -446,6 +615,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             for i in 0..total as u64 {
                 let k = BlockKey {
+                    ns: 0,
                     file_id: i / 8 + 1,
                     off: (i % 8) * 4096,
                     domain,
@@ -463,7 +633,8 @@ mod tests {
     /// The shard index `shard_for` picked, by pointer identity.
     fn self_shard_index(c: &BlockCache, k: &BlockKey) -> usize {
         let target = c.shard_for(k) as *const _;
-        c.shards
+        c.core
+            .shards
             .iter()
             .position(|s| std::ptr::eq(s, target))
             .expect("shard_for returns one of our shards")
@@ -527,5 +698,73 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn namespaces_never_alias_and_purge_alone() {
+        let a = BlockCache::new(1 << 20);
+        let b = a.namespaced(7);
+        a.put(1, 0, BlockDomain::Klog, blk(10, 1));
+        b.put(1, 0, BlockDomain::Klog, blk(10, 2));
+        assert_eq!(a.get(1, 0, BlockDomain::Klog).unwrap()[0], 1);
+        assert_eq!(b.get(1, 0, BlockDomain::Klog).unwrap()[0], 2);
+        assert_eq!(a.stats().entries, 2, "one storage, two namespaces");
+        a.purge_namespace(7);
+        assert!(b.get(1, 0, BlockDomain::Klog).is_none());
+        assert_eq!(a.get(1, 0, BlockDomain::Klog).unwrap()[0], 1);
+        a.clear();
+        assert_eq!(a.stats().entries, 0);
+        assert_eq!(a.stats().bytes, 0);
+    }
+
+    #[test]
+    fn evictions_are_counted() {
+        let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
+        for i in 0..200u64 {
+            c.put(i, 0, BlockDomain::Klog, blk(512, 1));
+        }
+        let st = c.stats();
+        assert!(st.evictions > 0);
+        assert_eq!(st.evictions + st.entries as u64, 200);
+    }
+
+    /// A peek finds the entry but neither counts nor sets the reference bit,
+    /// so the next sweep evicts an entry only a background scan touched.
+    #[test]
+    fn peek_neither_counts_nor_refreshes() {
+        let c = BlockCache::new(NUM_SHARDS as i64 * 1024);
+        c.put(1, 0, BlockDomain::Klog, blk(600, 1));
+        assert!(c.peek(1, 0, BlockDomain::Klog).is_some());
+        assert!(c.peek(2, 0, BlockDomain::Klog).is_none());
+        let st = c.stats();
+        assert_eq!((st.hits, st.misses), (0, 0), "a peek is not a foreground access");
+        let k = c.key(1, 0, BlockDomain::Klog);
+        let shard = c.shard_for(&k).read();
+        assert!(
+            !shard.map[&k].referenced.load(Ordering::Relaxed),
+            "a peek must not give the entry a second chance"
+        );
+    }
+
+    /// The lookup policy follows the thread's IO class, and the opt-in view
+    /// admits everywhere.
+    #[test]
+    fn lookup_admits_only_foreground_unless_opted_in() {
+        use crate::ioctrl::{scoped, IoClass};
+        let c = BlockCache::new(1 << 20);
+        c.put(1, 0, BlockDomain::Klog, blk(10, 1));
+        assert!(c.admits_current_thread(), "test threads are foreground");
+        {
+            let _bg = scoped(IoClass::Compaction);
+            assert!(!c.admits_current_thread());
+            let (hit, admit) = c.lookup(1, 0, BlockDomain::Klog);
+            assert!(hit.is_some() && !admit);
+            let opted = c.namespaced(0).with_background_admission(true);
+            assert!(opted.admits_current_thread());
+            assert!(!c.namespaced(0).admits_current_thread(), "views inherit the policy");
+        }
+        let (hit, admit) = c.lookup(1, 0, BlockDomain::Klog);
+        assert!(hit.is_some() && admit);
+        assert_eq!(c.stats().hits, 1, "only the foreground lookup counted");
     }
 }

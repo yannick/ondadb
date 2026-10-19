@@ -2408,15 +2408,20 @@ fn mixed_filter_tables_in_one_level_read_correctly() {
 // ---- format capabilities (1.0-B) --------------------------------------------
 
 /// Version field of the manifest at `dir` (bytes 4..8, LE).
-fn manifest_version(dir: &std::path::Path) -> u32 {
+/// The capability word of the manifest on disk, read at its fixed epoch-1
+/// header offset (`format::manifest_file`: bytes 12..20) rather than through
+/// the decoder.
+fn manifest_caps(dir: &std::path::Path) -> u64 {
     let bytes = std::fs::read(dir.join("MANIFEST")).unwrap();
-    u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+    assert_eq!(&bytes[..8], b"YOLODBMF");
+    u64::from_le_bytes(bytes[12..20].try_into().unwrap())
 }
 
-/// A database that enables nothing keeps writing VERSION-1 manifests forever —
-/// the lowest-version discipline, proven at the byte the old binary checks.
+/// A database that enables nothing keeps a zero capability word forever, at
+/// the byte a reader checks. (0.9 bumped the manifest version when a bit was
+/// enabled; epoch 1 has one manifest version and the word itself is the fence.)
 #[test]
-fn legacy_db_keeps_writing_version_1_manifest() {
+fn db_without_capabilities_keeps_a_zero_capability_word() {
     let dir = tempfile::tempdir().unwrap();
     {
         let (db, cf) = open(dir.path());
@@ -2424,7 +2429,7 @@ fn legacy_db_keeps_writing_version_1_manifest() {
         db.flush_memtable(&cf).unwrap();
         db.close().unwrap();
     }
-    assert_eq!(manifest_version(dir.path()), 1);
+    assert_eq!(manifest_caps(dir.path()), 0);
 
     // A reopen (which persists again) must not drift upward either.
     {
@@ -2435,7 +2440,7 @@ fn legacy_db_keeps_writing_version_1_manifest() {
         db.flush_memtable(&cf).unwrap();
         db.close().unwrap();
     }
-    assert_eq!(manifest_version(dir.path()), 1);
+    assert_eq!(manifest_caps(dir.path()), 0);
 }
 
 /// Crash matrix row 1 — crash before the enable's persist: no new-format bytes
@@ -2455,7 +2460,7 @@ fn caps_crash_before_persist() {
     }
     let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
     assert_eq!(db.format_capabilities(), 0, "no capability may survive");
-    assert_eq!(manifest_version(dir.path()), 1);
+    assert_eq!(manifest_caps(dir.path()), 0);
     // The API is available again, and enabling now works.
     db.enable_format_capabilities(ondadb::format::CAP_EXTENDED_RECORDS)
         .unwrap();
@@ -2481,9 +2486,9 @@ fn caps_crash_after_persist() {
         drop(db);
     }
     assert_eq!(
-        manifest_version(dir.path()),
-        2,
-        "the bit bumped the version"
+        manifest_caps(dir.path()),
+        ondadb::format::CAP_EXTENDED_RECORDS,
+        "the bit is durable in the manifest"
     );
 
     let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
@@ -2524,7 +2529,7 @@ fn caps_race_first_enable() {
                 db.format_capabilities(),
                 ondadb::format::CAP_EXTENDED_RECORDS
             );
-            assert_eq!(manifest_version(&path), 2);
+            assert_eq!(manifest_caps(&path), ondadb::format::CAP_EXTENDED_RECORDS);
         }));
     }
     for h in handles {
@@ -2574,7 +2579,7 @@ fn enable_on_readonly_is_readonly_error() {
         .expect_err("a read-only database cannot take a capability");
     assert!(matches!(err, OndaError::ReadOnly(_)), "{err:?}");
     assert_eq!(db.format_capabilities(), 0);
-    assert_eq!(manifest_version(dir.path()), 1);
+    assert_eq!(manifest_caps(dir.path()), 0);
 }
 
 #[test]

@@ -1400,3 +1400,172 @@ fn periodic_ignores_attached_parts() {
     drop(cf);
     db.close().unwrap();
 }
+
+// ---- F9: demote a part back to the default tier ---------------------------
+
+fn setup_on_hdd() -> (tempfile::TempDir, tempfile::TempDir, Options) {
+    let dir = tempfile::tempdir().unwrap();
+    let hdd = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::new("hdd", hdd.path().to_str().unwrap()).without_mmap()];
+    opts.part_mover_interval = Duration::ZERO;
+    (dir, hdd, opts)
+}
+
+fn assert_all_parts_read(db: &DB, cf: &Arc<ColumnFamily>) {
+    for i in 0..5u32 {
+        assert_eq!(db.get(cf, format!("img/{i:03}").as_bytes()).unwrap(), b"IMG");
+        assert_eq!(db.get(cf, format!("log/{i:03}").as_bytes()).unwrap(), b"LOG");
+        assert_eq!(db.get(cf, format!("etc/{i:03}").as_bytes()).unwrap(), b"ETC");
+    }
+}
+
+#[test]
+fn demote_moves_a_part_back_to_the_default_tier_durably() {
+    let (dir, hdd, opts) = setup_on_hdd();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let ssd_root = dir.path().to_str().unwrap().to_string();
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        let ssd_before = klog_count(&ssd_root);
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+        assert_eq!(klog_count(&hdd_root), 1);
+        assert_eq!(klog_count(&ssd_root), ssd_before - 1);
+
+        db.move_part_to_default_tier(&cf, "img").unwrap();
+        assert_eq!(klog_count(&hdd_root), 0, "the source copy is retired");
+        assert_eq!(klog_count(&ssd_root), ssd_before, "the part is local again");
+        assert!(db
+            .list_partitions(&cf)
+            .iter()
+            .filter(|p| p.partition == "img")
+            .all(|p| p.tier.is_none()));
+        assert_all_parts_read(&db, &cf);
+        // Idempotent, and "ssd" is the same lever by its reserved name.
+        db.move_part_to_default_tier(&cf, "img").unwrap();
+        db.move_part_to_tier(&cf, "img", "ssd").unwrap();
+        // And the part can go out again.
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+        db.move_part_to_tier(&cf, "img", "ssd").unwrap();
+        assert_eq!(klog_count(&hdd_root), 0);
+        db.close().unwrap();
+    }
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_all_parts_read(&db, &cf);
+    assert_eq!(klog_count(&hdd_root), 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn observed_demote_reports_the_default_tier_and_every_boundary() {
+    let (_dir, _hdd, opts) = setup_on_hdd();
+    let db = DB::open(opts).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+
+    #[derive(Default)]
+    struct Tiers(Mutex<Vec<(String, MovePhase)>>);
+    impl MovePhaseObserver for Tiers {
+        fn observe(&self, e: &MovePhaseEvent<'_>) -> ondadb::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((e.destination_tier.to_string(), e.phase.clone()));
+            Ok(())
+        }
+    }
+    let seen = Tiers::default();
+    db.move_part_to_tier_observed(&cf, "img", "ssd", &seen).unwrap();
+    let seen = seen.0.into_inner().unwrap();
+    assert!(seen.iter().all(|(t, _)| t == "ssd"), "{seen:?}");
+    let phases: Vec<_> = seen.into_iter().map(|(_, p)| p).collect();
+    assert_eq!(
+        phases[phases.len() - 3..],
+        [
+            MovePhase::DestinationSynced,
+            MovePhase::ManifestFlipped,
+            MovePhase::SourceDeleteFinished { remaining_files: 0 },
+        ]
+    );
+    db.close().unwrap();
+}
+
+/// A crash before the flip (modelled by an observer error at each pre-commit
+/// boundary, then a reopen): the part is still on its named tier, and the
+/// partial local copy the demote made is swept.
+#[test]
+fn demote_interrupted_before_the_flip_keeps_the_part_on_its_tier() {
+    for phase in [
+        MovePhase::CopyComplete {
+            object_index: 1,
+            object_count: 1,
+        },
+        MovePhase::DestinationSynced,
+    ] {
+        let (dir, hdd, opts) = setup_on_hdd();
+        let hdd_root = hdd.path().to_str().unwrap().to_string();
+        let ssd_root = dir.path().to_str().unwrap().to_string();
+        let ssd_on_hdd;
+        {
+            let db = DB::open(opts.clone()).unwrap();
+            let cf = db.create_column_family("default", parts_cfg()).unwrap();
+            materialize_parts(&db, &cf);
+            db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+            ssd_on_hdd = klog_count(&ssd_root);
+            let observer = RecordingMoveObserver::new(Some(phase.clone()));
+            let e = db
+                .move_part_to_tier_observed(&cf, "img", "ssd", &observer)
+                .unwrap_err();
+            assert!(e.to_string().contains("injected move failure"));
+            assert_all_parts_read(&db, &cf);
+            db.close().unwrap();
+        }
+        let db = DB::open(opts).unwrap();
+        let cf = db.get_column_family("default").unwrap();
+        assert_eq!(klog_count(&hdd_root), 1, "{phase:?}: part must stay on hdd");
+        assert_eq!(
+            klog_count(&ssd_root),
+            ssd_on_hdd,
+            "{phase:?}: the partial local copy must be swept"
+        );
+        assert_all_parts_read(&db, &cf);
+        db.close().unwrap();
+    }
+}
+
+/// A crash after the flip but before the source delete leaves the old copy on
+/// the named tier; the manifest says the part is local, so reopen sweeps it.
+#[test]
+fn startup_sweeps_the_named_tier_copy_left_by_a_crash_after_the_demote_flip() {
+    let (dir, hdd, opts) = setup_on_hdd();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let ssd_root = dir.path().to_str().unwrap().to_string();
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", parts_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+        let on_hdd: Vec<_> = part_files(&hdd_root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        db.move_part_to_default_tier(&cf, "img").unwrap();
+        // Recreate the stale source a crash would have left behind.
+        let hdd_cf = std::path::Path::new(&hdd_root).join("cf-default");
+        let ssd_cf = std::path::Path::new(&ssd_root).join("cf-default");
+        for name in &on_hdd {
+            std::fs::copy(ssd_cf.join(name), hdd_cf.join(name)).unwrap();
+        }
+        assert_eq!(klog_count(&hdd_root), 1);
+        db.close().unwrap();
+    }
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert_eq!(klog_count(&hdd_root), 0, "the stale hdd copy must be swept");
+    assert_all_parts_read(&db, &cf);
+    db.close().unwrap();
+}

@@ -24,16 +24,13 @@ use crate::error::Result;
 use crate::memtable::{Entry, Lookup, MemIter, Memtable};
 use crate::wal::{self, Wal};
 
-/// Stable column-family id: 64-bit FNV-1a of the name.
+/// The column-family id a name derives: FNV-1a-64 of its bytes, with the
+/// standard offset basis ([`crate::format::FNV1A64_OFFSET_BASIS`]) — the same
+/// id wavesdb derives. A manifest may override it per family
+/// ([`crate::manifest::CfManifest::unified_id`]); 0.9's truncated-basis ids
+/// survive only in `legacy_onda`.
 pub(crate) fn cf_id(name: &str) -> u64 {
-    const OFFSET: u64 = 1469598103934665603;
-    const PRIME: u64 = 1099511628211;
-    let mut h = OFFSET;
-    for &b in name.as_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(PRIME);
-    }
-    h
+    crate::format::fnv1a64(name.as_bytes())
 }
 
 fn prefixed(id: u64, user_key: &[u8]) -> Vec<u8> {
@@ -161,7 +158,14 @@ struct UState {
 
 struct RotState {
     active_writers: usize,
+    /// Commits are gated: the rotator is draining writers and swapping the
+    /// memtable/WAL pair.
     rotating: bool,
+    /// A rotator is creating the next WAL segment. Serializes rotators (the
+    /// next generation must stay stable) but does *not* gate commits: creating
+    /// a segment fsyncs one header per stripe plus the directory, and commits
+    /// keep landing in the current memtable/WAL meanwhile.
+    preparing: bool,
 }
 
 /// The database-wide shared memtable + WAL.
@@ -170,6 +174,8 @@ pub(crate) struct UnifiedStore {
     write_buffer_size: usize,
     sync_mode: crate::config::SyncMode,
     sync_interval: std::time::Duration,
+    /// [`Options::wal_write_buffer_size`](crate::Options::wal_write_buffer_size).
+    wal_buffer: usize,
     stall_threshold: usize,
     read_only: bool,
     state: RwLock<UState>,
@@ -210,6 +216,7 @@ impl UnifiedStore {
     /// have no recoverable relative order — matching them is
     /// `DbInner::resolve_recovered_prepares`'s job, once `DbInner` exists and
     /// `observe_seq` is callable.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         dir: &str,
         opts: &Options,
@@ -218,6 +225,7 @@ impl UnifiedStore {
         closing: Arc<AtomicBool>,
         poison: Arc<crate::util::Poison>,
         wal_syncs: Arc<std::sync::atomic::AtomicU64>,
+        format: crate::format::FormatProfile,
     ) -> Result<(Arc<UnifiedStore>, u64, crate::prepared::RecoveredPrepares)> {
         let mem = Memtable::new(default_comparator());
         let mut max_seq = 0;
@@ -241,7 +249,7 @@ impl UnifiedStore {
         for g in &gens {
             let p = wal_path(dir, *g);
             replay_paths.push(p.clone());
-            let last = Wal::replay(&p, |rec| {
+            let mut apply = |rec| {
                 match rec {
                     crate::wal::ReplayRecord::Point(r) => {
                         mem.put(&r.key, r.value, r.seq, r.ttl, r.kind);
@@ -276,7 +284,16 @@ impl UnifiedStore {
                     }
                 }
                 Ok(())
-            })?;
+            };
+            let last = match format {
+                crate::format::FormatProfile::Epoch1 => {
+                    Wal::replay(&p, wal::SegmentId::unified(*g), &mut apply)?
+                }
+                #[cfg(feature = "legacy-onda")]
+                crate::format::FormatProfile::Onda09 => {
+                    crate::legacy_onda::wal::replay(&p, &mut apply)?
+                }
+            };
             max_seq = max_seq.max(last);
         }
         let next_gen = gens.last().map(|g| g + 1).unwrap_or(0);
@@ -289,10 +306,12 @@ impl UnifiedStore {
             (None, replay_paths)
         } else {
             let p = wal_path(dir, next_gen);
-            let w = Wal::open(
+            let w = Wal::open_buffered(
                 &p,
                 opts.unified_memtable_sync_mode,
                 opts.unified_memtable_sync_interval,
+                wal::SegmentId::unified(next_gen),
+                opts.wal_write_buffer_size,
             )?;
             w.set_poison(poison.clone());
             w.set_sync_counter(wal_syncs.clone());
@@ -306,6 +325,7 @@ impl UnifiedStore {
             write_buffer_size: wbs,
             sync_mode: opts.unified_memtable_sync_mode,
             sync_interval: opts.unified_memtable_sync_interval,
+            wal_buffer: opts.wal_write_buffer_size,
             stall_threshold: opts.unified_memtable_stall_threshold.max(1),
             read_only: opts.read_only,
             state: RwLock::new(UState {
@@ -318,6 +338,7 @@ impl UnifiedStore {
             rot: Mutex::new(RotState {
                 active_writers: 0,
                 rotating: false,
+                preparing: false,
             }),
             cond: Condvar::new(),
             flush_tx,
@@ -668,6 +689,30 @@ impl UnifiedStore {
         }
     }
 
+    /// Whether the active or any sealed shared memtable still holds a point
+    /// entry or a range tombstone under the id `id`.
+    ///
+    /// Entries of a dropped or cleared family stay in the shared memtable (and
+    /// its WAL, which replays them back into it) until the unified flush
+    /// discards them as owned by nobody. An id this reports `true` for must not
+    /// be handed to a new family: it would inherit them (plan C F5′).
+    pub(crate) fn holds_cf(&self, id: u64) -> bool {
+        let prefix = id.to_be_bytes();
+        let s = self.state.read();
+        std::iter::once(&s.mem)
+            .chain(s.imm.iter().map(|i| &i.mem))
+            .any(|mem| {
+                let mut it = UnifiedMemIter::new(mem.clone(), id);
+                it.seek_to_first();
+                it.valid()
+                    || (!mem.ranges().is_empty()
+                        && mem
+                            .ranges()
+                            .fragments(None, None)
+                            .any(|f| f.start.len() >= 8 && f.start[..8] == prefix))
+            })
+    }
+
     /// Extract a column family's entries (prefix stripped) for an iterator
     /// overlay; ordering is the caller's responsibility.
     pub(crate) fn entries_for_cf(&self, id: u64) -> Vec<Entry> {
@@ -710,7 +755,7 @@ impl UnifiedStore {
     pub(crate) fn rotate(self: &Arc<Self>, force: bool) {
         let imm = {
             let mut g = self.rot.lock();
-            while g.rotating {
+            while g.rotating || g.preparing {
                 self.cond.wait(&mut g);
             }
             {
@@ -724,6 +769,34 @@ impl UnifiedStore {
                     return;
                 }
             }
+            g.preparing = true;
+            // Open the next WAL before gating commits, as the per-CF rotation
+            // does: creating a segment fsyncs a header per stripe and the
+            // directory, and that must not extend the window during which new
+            // commits are gated. Rotations are serialized by `preparing`, so
+            // the next generation is stable.
+            let new_gen = self.state.read().wal_gen + 1;
+            let new_path = wal_path(&self.dir, new_gen);
+            drop(g);
+            let new_wal = if self.read_only {
+                None
+            } else {
+                Wal::open_buffered(
+                    &new_path,
+                    self.sync_mode,
+                    self.sync_interval,
+                    wal::SegmentId::unified(new_gen),
+                    self.wal_buffer,
+                )
+                .ok()
+                .map(|w| {
+                    w.set_poison(self.poison.clone());
+                    w.set_sync_counter(self.wal_syncs.clone());
+                    Arc::new(w)
+                })
+            };
+            let mut g = self.rot.lock();
+            g.preparing = false;
             g.rotating = true;
             while g.active_writers > 0 {
                 self.cond.wait(&mut g);
@@ -739,19 +812,8 @@ impl UnifiedStore {
                 });
                 s.imm.push(imm.clone());
                 old_wal = s.wal.take();
-                s.wal_gen += 1;
-                let new_path = wal_path(&self.dir, s.wal_gen);
-                s.wal = if self.read_only {
-                    None
-                } else {
-                    Wal::open(&new_path, self.sync_mode, self.sync_interval)
-                        .ok()
-                        .map(|w| {
-                            w.set_poison(self.poison.clone());
-                            w.set_sync_counter(self.wal_syncs.clone());
-                            Arc::new(w)
-                        })
-                };
+                s.wal_gen = new_gen;
+                s.wal = new_wal;
                 s.pending_wals = vec![new_path];
             }
             if let Some(w) = old_wal {
@@ -899,6 +961,7 @@ mod tests {
                 &path,
                 crate::config::SyncMode::None,
                 std::time::Duration::ZERO,
+                crate::wal::SegmentId::unified(0),
             )
             .unwrap();
             let key = prefixed(id, b"hello");
@@ -920,6 +983,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
+            crate::format::FormatProfile::Epoch1,
         )
         .unwrap();
 
@@ -953,6 +1017,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
+            crate::format::FormatProfile::Epoch1,
         )
         .unwrap();
         store
@@ -974,6 +1039,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
+            crate::format::FormatProfile::Epoch1,
         )
         .unwrap();
         store
@@ -1152,6 +1218,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
+            crate::format::FormatProfile::Epoch1,
         )
         .unwrap();
 

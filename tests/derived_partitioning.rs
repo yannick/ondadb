@@ -112,7 +112,7 @@ fn rules_config_encoding_is_byte_identical() {
     );
 
     // And it still round-trips to the same rules.
-    let back = ColumnFamilyConfig::decode(&blob);
+    let back = ColumnFamilyConfig::decode(&blob).unwrap();
     assert_eq!(back.partition_rules, cfg.partition_rules);
     assert!(matches!(back.partition_scheme, PartitionScheme::Rules));
 }
@@ -263,14 +263,14 @@ fn an_unresolved_scheme_survives_re_encoding() {
         partition_scheme: PartitionScheme::Derived(Arc::new(NameAndBucket)),
         ..ColumnFamilyConfig::default()
     };
-    let once = ColumnFamilyConfig::decode(&cfg.encode());
+    let once = ColumnFamilyConfig::decode(&cfg.encode()).unwrap();
     assert!(matches!(
         &once.partition_scheme,
         PartitionScheme::Unresolved(n) if n == "test.name-and-bucket.v1"
     ));
 
     // Re-encode from the unresolved state and decode again: still there.
-    let twice = ColumnFamilyConfig::decode(&once.encode());
+    let twice = ColumnFamilyConfig::decode(&once.encode()).unwrap();
     assert!(matches!(
         &twice.partition_scheme,
         PartitionScheme::Unresolved(n) if n == "test.name-and-bucket.v1"

@@ -29,9 +29,43 @@ flush that fails because its CF was dropped/cleared mid-flight does not poison
   Readers snapshot `visible_seq()`; nothing ever reads at `next_seq`.
 - Snapshots: `snapshots: Mutex<BTreeMap<seq, refcount>>`;
   Repeatable-Read/Snapshot/Serializable txns pin their `read_seq` via
-  `acquire_snapshot`/`release_snapshot`. Compaction's version GC keeps every
-  version newer than `oldest_snapshot()`.
-- Isolation (`txn.rs`): ReadUncommitted/ReadCommitted read live `visible_seq`;
+  `acquire_fixed_snapshot` (own-floor wait + `acquire_visible_snapshot`) and
+  `release_snapshot`. Compaction's version GC keeps every version newer than
+  `oldest_snapshot()`.
+  A standalone `SnapshotHandle` (`DB::snapshot`, `snapshot.rs`) is one more
+  entry in the same map: it pins through `acquire_visible_snapshot`, which reads
+  `visible_seq()` **under** the `snapshots` lock (the lock `oldest_snapshot()`
+  holds while it reads the watermark), so no compaction can pick a GC floor
+  above the pin in the window between reading the watermark and registering
+  it. Clones share one pin (`Arc`); the last drop releases it. Excise and
+  span-index pruning key off `oldest_snapshot()` too, so a handle holds them
+  back exactly as a transaction does. **Every** pin is taken this way — there
+  is no two-step "read the watermark, then register it" left: transaction
+  `begin`/`reset`, the pessimistic grant refresh, `SnapshotHandle`, and the
+  transient `pin_read_floor` guard that read-committed `Txn` iterators and
+  tailing-iterator segments hold only while they build (once built, an
+  iterator owns its tables and memtables). A read at a sequence chosen and
+  pinned in two steps could have its version collected by a compaction running
+  in between (regressions: `txn::tests::*_pins_*`, deterministic via the
+  `cfg(test)` `snapshot_pin_hook`).
+  Point reads (`DB::get`, read-committed `Txn::get`) still read the floor and
+  then their sources without a pin: that window spans a whole flush **and**
+  a compaction of the key between two instructions, and closing it on the
+  point-read hot path would put the `snapshots` mutex on every `get`. Known,
+  not fixed.
+- Shared read resources (`read_resources.rs`): `BlockCache` and `TableCache`
+  are *views* — `Arc` storage plus a namespace id — and both key on
+  `(namespace, file id)`, so leased databases share one budget without ever
+  aliasing two databases' table ids. `ReadResources::state` (a leaf mutex)
+  counts leases per namespace. A leased database's `close` skips closing its
+  readers (`CfCtx::shared_reads`: another open of the same namespace may be
+  reading through them) and drops the lease last; the last lease of a
+  namespace purges that namespace's readers (closing their file handles) and
+  blocks, and after `ReadResources::close` the last lease empties all three
+  caches. Only read-only opens may lease — a writer's compaction would delete
+  files a shared reader holds.
+- Isolation (`txn.rs`): `DB::begin` uses `Options::default_isolation`
+  (default `Snapshot`, not persisted); ReadUncommitted/ReadCommitted read live `visible_seq`;
   the pinned levels read their snapshot. Snapshot+Serializable serialize
   commit-time validation under `commit_mu` and abort with `Conflict` on
   write-write conflicts (first-committer-wins). **Serializable validates point
@@ -119,6 +153,8 @@ the two unexamined candidates.
 | `ArenaShard::arena` (Mutex) | skip-list structure per shard | one batch group's inserts |
 | `commit_hook` (Mutex) | hook fn | hook invocation |
 | `DbInner::span_permits` (Mutex&lt;usize&gt;) | count of free compaction **span workers** (0.8) | one non-blocking take/release; never held across IO |
+| `CfCtx::block_reads` (`util::Semaphore`, Mutex&lt;usize&gt; + Condvar) | free permits for batched-get data-block reads on slow tiers (P5, `Options::max_concurrent_block_reads`) | the **permit** (not the mutex) is held across exactly one `read_data_block`; the mutex only for take/release. A **leaf**: a permit holder takes no engine lock — the read path below it only touches the block cache's shard locks and the storage backend. `multi_get` holds no CF lock while it waits (its source snapshot is `Arc`s taken earlier) |
+| `DiskCache::state` (Mutex, `local_cache.rs`, P8) | the local disk cache's bookkeeping (entry sizes, LRU order, byte total) | one map update per lookup/admission/eviction; **never held across file IO** (entry reads, writes, renames and unlinks happen outside it). A leaf: taken from a reader's block-miss path, which holds no engine lock |
 | `<dir>/LOCK` (OS advisory file lock) | whole DB directory against other processes/handles | entire open→close lifetime; exclusive for read-write, shared for read-only opens; second open fails with `OndaError::Locked` |
 
 Order among the four that meet: `cf_lifecycle_mu` → `manifest_mu` → `cfs` →
@@ -320,12 +356,16 @@ transaction's snapshot, in this order:
    `wait_visible_at_own_floor`) for `visible_seq() >= last_commit_seq`.
    Publication is gap-free (invariant 5), so this is transient by construction
    and the bound only guards a torn process.
-3. At `Serializable`, `validate_read_conflicts` re-runs against the **old**
-   `read_seq` first. That is what makes the refresh sound: the reads are proven
-   unchanged at the new snapshot, so it is as if they had all happened there.
-4. `acquire_snapshot(new)` **before** `release_snapshot(old)`, so
-   `oldest_snapshot()` never transiently jumps forward and lets compaction GC a
-   version this transaction still needs.
+3. The new snapshot is pinned (`acquire_visible_snapshot`) **before**
+   `release_snapshot(old)`, so `oldest_snapshot()` never transiently jumps
+   forward and lets compaction GC a version this transaction still needs.
+4. At `Serializable`, `validate_read_conflicts` then re-runs against the
+   **old** `read_seq`. That is what makes the refresh sound: the reads are
+   proven unchanged at the new snapshot, so it is as if they had all happened
+   there. It must follow step 3: validating first and reading the watermark
+   after let a write to a read-set key land in between, at or below the
+   adopted `read_seq`, where commit-time validation cannot see it
+   (`serializable_refresh_cannot_adopt_an_unvalidated_write`).
 
 What it costs, stated plainly:
 
@@ -695,6 +735,21 @@ compaction/deferred deletion only *unlink* it — pages stay valid while the
 mmap holds the inode. `Block::Mapped` views carry the `Arc<Mmap>` so they
 outlive the reader if needed.
 
+**Retired tables stay readable to their holders.** An iterator opens every
+table it reads at construction and holds the `Arc<Reader>`; compaction may
+retire and unlink those tables before the iterator finishes. The mmap'd klog
+holds its inode, but buffered reads (the default build) and the lazily mapped
+vlog re-acquire the file **by path** through the shared `FileCache`, so an
+unlinked path used to fail the iterator's next uncached block with `NotFound`.
+`Reader::pin_files` now takes the klog and vlog descriptors into the reader
+for the rest of its life, and runs exactly where a held reader stops being
+reachable from the catalog: `SstHandle::close` (retirement, before the unlink)
+and `TableCache` eviction, each only when `Arc::strong_count > 1` — someone
+in flight still holds it. A pinned descriptor therefore exists only for the
+lifetime of that holder, and every table still in the catalog stays under the
+`max_open_sstables` descriptor bound. Pinned by
+`tests/engine_regressions.rs::open_iterator_survives_*`.
+
 CRC-once bitmap: `Reader::verified` (one bit per data block, AtomicU64 words).
 First reader of a block verifies its CRC (`block_payload`), sets the bit with
 `AcqRel`; later readers use `block_payload_preverified`. Immutability of the
@@ -707,6 +762,47 @@ it to its sticky stripe under that stripe's file mutex — no cross-thread
 coordination. Full mode: single stripe + group commit (leader drains
 `qstate.queue`, one write + one `sync_data`, wakes followers over bounded
 channels). `Wal::close` is idempotent and `&self` (callable through `Arc`).
+
+**User-space write buffer** (`Options::wal_write_buffer_size`, off by
+default; wavesdb `WALWriteBufferSize`). Non-Full modes only — `Full` ignores
+it, because every commit is written and fsynced before it is acknowledged.
+Each stripe owns its buffer, inside the stripe's existing `Mutex<Option<Stripe>>`,
+so there is no new lock and no new ordering: the committing thread appends its
+whole encoded frame to its stripe's buffer under the stripe mutex, flushing the
+buffer first if the frame would overflow it (a frame at least as large as the
+buffer is written directly, after that flush — frame order within a stripe is
+preserved). Rules:
+
+- **Whole frames only.** The buffer never holds part of a frame, so a flush is
+  one `write` of complete frames; a crash tearing it leaves a torn frame at the
+  tail, which replay discards by CRC (invariant 3 is untouched —
+  `torn_buffered_flush_replays_a_prefix_of_whole_batches` cuts a flush at every
+  byte).
+- **Every fsync flushes first.** `Wal::sync` (hence `DB::sync_wal`, and the
+  prepare/decision path, which syncs the very handle it appended to) flushes
+  each stripe's buffer under that stripe's mutex before `sync_data`. So 3.2's
+  "forced durable" frames stay forced durable, and a prepare also carries every
+  ordinary commit buffered before it to disk.
+- **Rotation and close flush.** `Wal::close` flushes then fsyncs each stripe;
+  rotation closes the old WAL after the writer drain (invariant 9), so every
+  frame of the sealed memtable reaches the old generation's files before the
+  flush job is queued. `close` flushes every stripe even after one fails and
+  **poisons** on a failed flush: rotation discards `close`'s result, and those
+  frames were acknowledged.
+- **Background flusher.** A buffered WAL always has the `onda-wal-sync` thread —
+  under `None` too, where it only flushes (no fsync) — so a cold buffer reaches
+  the OS within one sync interval. It takes the stripe mutexes one at a time,
+  like `sync`.
+- **A failed buffered write poisons** and the buffer is dropped, not retried: a
+  partial write may have landed part of it, and rewriting would put a second
+  copy of a frame head after a torn one.
+- `Wal::size` is logical (buffered bytes included) — rotation sizing does not
+  change meaning.
+
+What the buffer costs is the documented trade: an acknowledged commit still in
+a buffer is lost with the **process**, not only with the machine. Nothing else
+reads a live WAL file (checkpoints and backups flush memtables into SSTables,
+recovery happens before any writer exists), so no reader can observe the gap.
 
 The WAL layout is persisted in the manifest. Explicit per-CF→unified migration
 recovers and flushes all legacy memtables while the manifest still says

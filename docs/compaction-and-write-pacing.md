@@ -223,6 +223,31 @@ stamps stay readable and are simply never consulted.
 The option is invalid on a `CompactionStyle::Fifo` family (`validate` returns
 `Err`), which evicts by age through `fifo_ttl` and never merges at all.
 
+## Tombstone density (plan C P4) — the delete trigger
+
+A family whose writes are mostly deletes may never reach a size trigger, so
+its tombstones — and the puts they shadow — sit in the tree, costing reads a
+walk over dead versions and holding space. `ColumnFamilyConfig::
+tombstone_density_trigger` (default `0.0`, off; persisted as TLV tag 34)
+compacts a table whose `num_tombstones / num_entries` (from its manifest
+entry) is **at least** the trigger; `tombstone_density_min_entries` (tag 35)
+ignores tables too small to be worth a job. A value above `1.0` never fires.
+
+- **Priority.** Below capacity work, above periodic (age) work; the densest
+  eligible table first (ties to the shallower level). A candidate whose range
+  another job holds is skipped for the next one, never waited on.
+- **Shape.** Non-bottom: the ordinary bounded push-down (an L0 table through
+  L0's oldest-first window). Bottom: an in-place rewrite — but only once every
+  version in the table is older than the oldest live snapshot, because until
+  then the snapshot keeps every tombstone and the rewrite would produce the
+  same table. A table written by the current `run` pass is not rewritten in
+  place again by it, so a tombstone that must survive (a merge chain's
+  terminating delete) cannot loop the worker.
+- **Scheduling.** A flush that leaves a dense table wakes the worker even with
+  L0 below its file-count trigger, exactly as a flush carrying range-delete
+  fragments does.
+- **Observability.** `CfStats::tombstone_density_compactions`.
+
 ## Concurrency
 
 Jobs on disjoint key ranges share no inputs and no outputs, so they run at once;
@@ -242,6 +267,45 @@ Two consequences worth knowing operationally:
 
 `DB::compact` (the manual sweep) still takes the column family whole — it
 rewrites every level by design.
+
+## Compacting a key span: `DB::compact_range` (plan C F3)
+
+`db.compact_range(&cf, lower, upper)` compacts the tables whose key span
+reaches into `[lower, upper]` down to the bottom level and returns when the
+result is installed. Bounds are `std::ops::Bound<&[u8]>` under the family's
+comparator, exactly as for `new_iterator_bounded`; `(Unbounded, Unbounded)`
+is the whole family.
+
+- **Whole tables.** A table is taken when its span (point keys plus range
+  fragments) intersects the bounds, so neighbouring keys that share a table
+  are rewritten too. In L0 the oldest-first window up to and including the
+  newest in-span file moves — an older overlapping file may never stay above a
+  newer one that moved down.
+- **Level by level.** `L -> L+1` pushes (each an ordinary job whose target set
+  covers the source's whole key span), then an in-place rewrite of the in-span
+  bottom tables no push produced. A one-level family pushes its window into a
+  new L1. One multi-level merge into the deepest level would be cheaper but is
+  only correct if the input set is closed under overlap at every intermediate
+  level; the chain of ordinary pushes is correct by construction.
+- **Retention and partitions** are the ordinary job's: tombstones and expired
+  TTL entries that reach the bottom are dropped unless a live snapshot still
+  reads what they shadow; bottom output is cut at partition boundaries.
+- **Exclusion**, as for `DB::compact`: the family's whole key range for the
+  duration (the pushed tables extend past the span). Writes and flushes go on.
+  A foreign mount skips only the push that would merge around it. FIFO
+  families run their eviction pass instead.
+
+### `DB::purge` / `DB::purge_column_family` (plan C F4)
+
+wavesdb's semantics exactly: `purge_column_family(cf)` flushes the family's
+memtable, then runs `compact_range(cf, Unbounded, Unbounded)`; `purge()` does
+that for every family in name order and stops at the first error. The result
+is the family's data in its deepest level with overwritten versions,
+tombstones (and what they shadow) and expired TTL entries gone — except what
+a live snapshot or iterator can still see. It is reclamation, not deletion:
+nothing a read could return disappears (that is `clear_column_family`).
+Compared with `DB::compact`, purge also flushes first and does not run the
+triggered rounds; both end with everything pushed to the bottom.
 
 ## Splitting one job across threads
 
@@ -325,6 +389,7 @@ rather than by many small ones, and measure.
 | Point reads slow in steady state | Level count and bloom settings, not this document — see `docs/performance.md` |
 | Compaction never seems to run on a mostly-idle CF | Size triggers do not fire below capacity; `DB::compact` sweeps explicitly (this is what reclaims tombstones from a fully deleted CF), or set `periodic_compaction_interval` so the engine revisits stale tables on its own — see § Periodic compaction |
 | Space is not reclaimed although TTLs have expired | Same cause: nothing was due. `periodic_compaction_interval` plus `CAP_PERIODIC_AGE`; watch `CfStats::periodic_compactions` |
+| Deletes never free space although no snapshot is open | Size triggers do not fire for a delete-heavy family; set `tombstone_density_trigger` (e.g. `0.5`) — see § Tombstone density |
 | `periodic_compactions` stays at zero with the option set | The capability is not enabled (`DB::enable_format_capabilities(CAP_PERIODIC_AGE)`), so no table carries age state |
 
 ## What 0.7.x did wrong

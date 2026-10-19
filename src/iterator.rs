@@ -457,6 +457,10 @@ pub struct Iterator {
     /// it.
     operands: Vec<u8>,
     operand_spans: Vec<(usize, usize, u64)>,
+    /// Set iff read profiling (F13) was on when this iterator was built; each
+    /// positioning call then runs in a profiled scope. `None` keeps an
+    /// unprofiled scan at one branch per call.
+    profile: Option<std::sync::Arc<crate::read_profile::ReadProfiler>>,
 }
 
 impl std::fmt::Debug for Iterator {
@@ -541,7 +545,26 @@ impl Iterator {
             merge_op: None,
             operands: Vec::new(),
             operand_spans: Vec::new(),
+            profile: None,
         }
+    }
+
+    pub(crate) fn with_read_profile(
+        mut self,
+        profile: Option<std::sync::Arc<crate::read_profile::ReadProfiler>>,
+    ) -> Iterator {
+        self.profile = profile;
+        self
+    }
+
+    /// The profiling guard for one positioning call, or `None` (unprofiled).
+    #[inline]
+    fn profiled_step(
+        profile: &Option<std::sync::Arc<crate::read_profile::ReadProfiler>>,
+    ) -> Option<crate::read_profile::Profiled<'_>> {
+        profile
+            .as_ref()
+            .and_then(|p| p.begin_always(crate::read_profile::ReadOp::IteratorStep))
     }
 
     /// Newest range delete (1.2) covering the group key, or `None`.
@@ -908,6 +931,8 @@ impl Iterator {
     }
 
     pub fn seek_to_first(&mut self) {
+        let profile = self.profile.clone();
+        let _profiled = Self::profiled_step(&profile);
         crate::perf::bump(|p| p.iterator_seeks += 1);
         // Start at the lower bound, not the raw heap minimum: SSTables fully
         // outside the bounds were pruned at construction, but memtables and
@@ -923,6 +948,8 @@ impl Iterator {
         self.advance_forward();
     }
     pub fn seek_to_last(&mut self) {
+        let profile = self.profile.clone();
+        let _profiled = Self::profiled_step(&profile);
         crate::perf::bump(|p| p.iterator_seeks += 1);
         // Mirror of `seek_to_first`: start at the upper bound.
         match &self.upper {
@@ -934,16 +961,22 @@ impl Iterator {
         self.advance_backward();
     }
     pub fn seek(&mut self, user_key: &[u8]) {
+        let profile = self.profile.clone();
+        let _profiled = Self::profiled_step(&profile);
         crate::perf::bump(|p| p.iterator_seeks += 1);
         self.m.seek_ge(user_key, u64::MAX);
         self.advance_forward();
     }
     pub fn seek_for_prev(&mut self, user_key: &[u8]) {
+        let profile = self.profile.clone();
+        let _profiled = Self::profiled_step(&profile);
         crate::perf::bump(|p| p.iterator_seeks += 1);
         self.m.seek_le(user_key, 0);
         self.advance_backward();
     }
     pub fn next(&mut self) {
+        let profile = self.profile.clone();
+        let _profiled = Self::profiled_step(&profile);
         // Direction switch backward->forward: the children sit below the
         // current group (and forward-exhausted ones were dropped from the
         // heap), so reposition everyone just past it. (k, seq 0) sorts after
@@ -955,6 +988,8 @@ impl Iterator {
         self.advance_forward();
     }
     pub fn prev(&mut self) {
+        let profile = self.profile.clone();
+        let _profiled = Self::profiled_step(&profile);
         // Direction switch forward->backward: mirror of `next`.
         if self.valid && self.m.dir > 0 {
             let k = self.key().to_vec();

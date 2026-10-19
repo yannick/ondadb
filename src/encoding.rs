@@ -1,19 +1,25 @@
 //! Low-level serialization primitives shared across ondaDB: little-endian
-//! fixed-width integers, LEB128 varints (plain + zig-zag), and block checksums
+//! fixed-width integers, LEB128 varints (plain + zig-zag), and checksums
 //! (CRC32-C and xxHash32).
 //!
 //! All on-disk integers are little-endian so database files are portable across
-//! architectures . CRC32-C is the
-//! framing checksum used by the WAL and SSTable blocks;
+//! architectures. [`checksum`] — CRC32-C — is the one integrity checksum of
+//! every yoloDB epoch-1 artifact: WAL frames and segment headers, SSTable
+//! blocks and footers, vlog frames and headers, the manifest, and the edit log.
 
 use xxhash_rust::xxh32::xxh32;
 
-/// CRC32-C (Castagnoli) checksum — hardware-accelerated on x86-64/aarch64.
+/// CRC32-C (Castagnoli, reflected polynomial `0x82F63B78`), via the `crc32c`
+/// crate: the ARMv8 CRC instructions on aarch64, SSE4.2 on x86-64, a table
+/// fallback elsewhere.
+///
+/// Before epoch 1 this function's documentation said CRC32-C while its code
+/// computed CRC-32/IEEE (`crc32fast`); every 0.9.x artifact carries the IEEE
+/// value, which is why `legacy_onda::checksum_ieee` exists. The check-value
+/// test below pins the polynomial so the two can never be confused again.
 #[inline]
 pub fn checksum(b: &[u8]) -> u32 {
-    let mut h = crc32fast::Hasher::new();
-    h.update(b);
-    h.finalize()
+    crc32c::crc32c(b)
 }
 
 /// xxHash32 of `b` with the given seed.
@@ -223,6 +229,15 @@ mod tests {
         let mut v = Vec::new();
         append_u32(&mut v, 7);
         assert_eq!(v, vec![7, 0, 0, 0]); // little-endian
+    }
+
+    /// The standard CRC-32C check value: `"123456789"` -> `0xE3069283`. This
+    /// is what distinguishes CRC32-C from CRC-32/IEEE (`0xCBF43926`).
+    #[test]
+    fn checksum_is_crc32c() {
+        assert_eq!(checksum(b"123456789"), 0xe306_9283);
+        assert_eq!(checksum(b""), 0);
+        assert_ne!(checksum(b"123456789"), 0xcbf4_3926, "that is IEEE");
     }
 
     #[test]

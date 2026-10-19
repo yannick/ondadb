@@ -24,9 +24,11 @@ use ondadb::sst::{Reader, Writer, WriterOptions};
 use ondadb::storage::LocalStorage;
 use ondadb::{ColumnFamilyConfig, Options, DB};
 
-const FOOTER_SIZE: usize = 64;
-const FOOTER_PREFIX_DELTA: u8 = 0x20;
-const FOOTER_EXTENDED_BLOCK: u8 = 0x10;
+/// The epoch-1 footer width; its capability word (at +56) says which layout a
+/// table's blocks use.
+const FOOTER_SIZE: usize = ondadb::format::sst_footer::SIZE;
+const FOOTER_PREFIX_DELTA: u64 = CAP_PREFIX_DELTA;
+const FOOTER_EXTENDED_BLOCK: u64 = CAP_EXTENDED_RECORDS;
 /// `[alg u8][comp_len u32 LE][raw_len u32 LE][crc32c u32 LE]`.
 const BLOCK_HEADER: usize = 13;
 
@@ -806,8 +808,9 @@ fn delta_cfg() -> ColumnFamilyConfig {
     }
 }
 
-/// Footer flags of every `.klog` under `dir`, recursively.
-fn klog_footer_flags(dir: &std::path::Path) -> Vec<(String, u8)> {
+/// The footer capability word of every `.klog` under `dir`, recursively —
+/// where epoch 1 records a table's entry layout (extended, prefix-delta).
+fn klog_footer_flags(dir: &std::path::Path) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -819,12 +822,13 @@ fn klog_footer_flags(dir: &std::path::Path) -> Vec<(String, u8)> {
                 let bytes = std::fs::read(&p).unwrap();
                 // A background compaction may be part-way through a new table;
                 // an unfinished file has no footer to read yet.
-                if bytes.len() < FOOTER_SIZE {
+                if bytes.len() < FOOTER_SIZE || bytes[bytes.len() - 8..] != *b"YOLOST01" {
                     continue;
                 }
+                let at = bytes.len() - FOOTER_SIZE + ondadb::format::sst_footer::CAPS;
                 out.push((
                     p.file_name().unwrap().to_string_lossy().into_owned(),
-                    bytes[bytes.len() - FOOTER_SIZE + 48],
+                    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
                 ));
             }
         }

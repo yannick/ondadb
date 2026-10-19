@@ -32,15 +32,21 @@ fn env_s3() -> Option<S3Config> {
         access_key: std::env::var("ONDADB_S3_KEY").unwrap_or_else(|_| "ayu".into()),
         secret_key: std::env::var("ONDADB_S3_SECRET").unwrap_or_else(|_| "ayudevsecret".into()),
         path_style: true,
+        ..S3Config::default()
     })
 }
 
 fn unique_prefix() -> String {
+    // The clock alone is not unique: macOS reports microseconds, so tests the
+    // harness starts together can mint the same prefix and trample each
+    // other's objects (same table ids, same keys). Add pid + a counter.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("ondadb-tier-test/{nanos}")
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("ondadb-tier-test/{nanos}-{}-{seq}", std::process::id())
 }
 
 /// CF with img/ and log/ partitions; img/ is tiered to `s3` as soon as the part
@@ -161,6 +167,152 @@ fn part_mover_moves_aged_part_to_s3_and_reads_back_across_reopen() {
     cleanup(&cfg, &prefix);
 }
 
+/// F9: a part on S3 demotes back to the default tier — its objects are copied
+/// down with range GETs, the catalog flips, and the S3 objects are deleted
+/// through the tier's backend. Values above the klog threshold make the part
+/// carry a vlog, so both object kinds travel.
+#[test]
+fn part_demotes_off_s3_back_to_the_default_tier() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 demote test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::s3("s3", prefix.clone(), cfg.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+    let big = vec![b'V'; 4 << 10];
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let s3_tables = || {
+        s3.list(&format!("{prefix}/cf-default"))
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.ends_with(".klog") || n.ends_with(".vlog"))
+            .count()
+    };
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+        for i in 0..5u32 {
+            db.put(&cf, format!("img/{i:03}").as_bytes(), &big, Duration::ZERO)
+                .unwrap();
+            db.put(&cf, format!("log/{i:03}").as_bytes(), b"LOG", Duration::ZERO)
+                .unwrap();
+        }
+        db.flush_memtable(&cf).unwrap();
+        db.compact(&cf).unwrap();
+        assert_eq!(db.run_part_mover().unwrap(), 1);
+        assert_eq!(s3_tables(), 2, "klog + vlog on s3");
+
+        db.move_part_to_default_tier(&cf, "img").unwrap();
+        assert_eq!(s3_tables(), 0, "the S3 source objects are retired");
+        for i in 0..5u32 {
+            assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), big);
+        }
+        db.close().unwrap();
+    }
+    // Local after reopen — with no S3 tier configured at all.
+    let mut local_only = opts.clone();
+    local_only.tiers.clear();
+    let db = DB::open(local_only).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    for i in 0..5u32 {
+        assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), big);
+    }
+    assert_eq!(db.get(&cf, b"log/000").unwrap(), b"LOG");
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}
+
+/// F7 end-to-end on a real object store: a receipts checkpoint (every object
+/// store-verified), then a lazy remote open that reads through range GETs with
+/// no HEAD per table, then a download restore; and a prefix without a MANIFEST
+/// is "no checkpoint".
+#[test]
+fn object_checkpoint_roundtrip_on_s3() {
+    use ondadb::checkpoint::{
+        open_remote_checkpoint, restore_from_object_store, ObjectCheckpointOptions,
+    };
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 checkpoint test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(src.path().to_str().unwrap())).unwrap();
+    let cf = db
+        .create_column_family("default", ColumnFamilyConfig::default())
+        .unwrap();
+    let big = vec![b'B'; 2 << 10];
+    for i in 0..50u32 {
+        db.put(&cf, format!("k{i:03}").as_bytes(), &big, Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.put(&cf, b"small", b"s", Duration::ZERO).unwrap();
+    let ck = db
+        .checkpoint_to_object_store(
+            s3.as_ref(),
+            &prefix,
+            &ObjectCheckpointOptions {
+                receipts: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    db.close().unwrap();
+    assert!(!ck.receipts.is_empty());
+    assert!(
+        ck.receipts.iter().all(|r| r.store_verified),
+        "every upload must be store-verified: {:?}",
+        ck.receipts
+    );
+
+    // Lazy open over a read-only view of the bucket.
+    let ro = S3Storage::new(&S3Config {
+        read_only: true,
+        ..cfg.clone()
+    })
+    .unwrap();
+    let metrics = ro.metrics();
+    let mount = tempfile::tempdir().unwrap();
+    let mut o = Options::new(mount.path().join("m").to_str().unwrap());
+    o.read_only = true;
+    let remote = open_remote_checkpoint(ro.clone(), &prefix, o).unwrap();
+    let rcf = remote.get_column_family("default").unwrap();
+    assert_eq!(remote.get(&rcf, b"k007").unwrap(), big);
+    assert_eq!(remote.get(&rcf, b"small").unwrap(), b"s");
+    assert_eq!(
+        metrics.heads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one HEAD for the MANIFEST download, none per table"
+    );
+    assert!(metrics.range_gets.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    remote.close().unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    restore_from_object_store(ro.as_ref(), &prefix, dest.path().join("db")).unwrap();
+    let mut o = Options::new(dest.path().join("db").to_str().unwrap());
+    o.read_only = true;
+    let restored = DB::open(o).unwrap();
+    let rcf = restored.get_column_family("default").unwrap();
+    assert_eq!(restored.get(&rcf, b"k049").unwrap(), big);
+    restored.close().unwrap();
+
+    // Nothing under a fresh prefix: NotFound, not corruption.
+    let empty = format!("{prefix}-nothing");
+    assert!(matches!(
+        restore_from_object_store(ro.as_ref(), &empty, dest.path().join("e")),
+        Err(ondadb::OndaError::NotFound)
+    ));
+
+    for r in &ck.receipts {
+        let _ = s3.delete(&r.key);
+    }
+}
+
 /// On an S3-resident part every uncached vlog read is a range GET, which is
 /// where the value cache pays for itself most visibly. The second read of a hot
 /// large value must issue **no** request at all: the klog block and the decoded
@@ -239,6 +391,66 @@ fn warm_vlog_value_issues_no_range_get() {
         "each warm read must be a vlog cache hit"
     );
 
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}
+
+/// P8: with `Options::local_cache_path`, a restart reads an S3-resident part's
+/// blocks from the local disk cache — **no** range GET — even with the
+/// in-memory block cache off. The tier is `TierDef::custom` over the test's own
+/// `S3Storage` only so `S3Metrics.range_gets` counts the database's requests;
+/// the cache wraps every non-local tier the same way.
+#[test]
+fn local_disk_cache_serves_s3_blocks_across_restart() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 local-cache test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let metrics = s3.metrics();
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let opts = || {
+        let mut o = Options::new(dir.path().to_str().unwrap());
+        o.tiers = vec![TierDef::custom("s3", prefix.clone(), s3.clone())];
+        o.part_mover_interval = Duration::ZERO;
+        o.block_cache_size = 0;
+        o.local_cache_path = Some(cache_dir.path().to_str().unwrap().into());
+        o
+    };
+    let gets = || {
+        metrics
+            .range_gets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    {
+        let db = DB::open(opts()).unwrap();
+        let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        assert_eq!(db.run_part_mover().unwrap(), 1, "the img/ part must move");
+        let before = gets();
+        for i in 0..5u32 {
+            assert_eq!(
+                db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+                b"IMG"
+            );
+        }
+        assert!(gets() > before, "the cold pass must reach S3");
+        assert!(db.local_cache_stats().unwrap().admits > 0);
+        db.close().unwrap();
+    }
+    let db = DB::open(opts()).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    let before = gets();
+    for i in 0..5u32 {
+        assert_eq!(
+            db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(),
+            b"IMG"
+        );
+    }
+    assert_eq!(gets(), before, "a warm restart issued range GETs");
+    assert!(db.local_cache_stats().unwrap().hits > 0);
     db.close().unwrap();
     cleanup(&cfg, &prefix);
 }

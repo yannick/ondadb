@@ -66,7 +66,12 @@ Full release history is in [`CHANGELOG.md`](CHANGELOG.md).
   on-disk index shallow as SSTables grow. [Details below](#btree-hybrid-klog-columnfamilyconfiguse_btree).
 - **Six comparators** (`memcmp`, `reverse`, `lexicographic`, `uint64`, `int64`,
   `case_insensitive`) plus custom comparators, persisted by name in the manifest.
-- On-disk format documented byte-for-byte in [`docs/formats.md`](docs/formats.md).
+- On-disk format: **yoloDB format epoch 1** (CRC32-C everywhere, versioned
+  magics on every artifact), documented byte-for-byte in
+  [`docs/formats.md`](docs/formats.md) with every number registered in
+  [`docs/format-registry.md`](docs/format-registry.md). ondaDB 0.9.x
+  directories open read-only through `legacy_onda` (default-on `legacy-onda`
+  feature).
 
 ### Write path & durability
 
@@ -209,7 +214,8 @@ memtable/reader code. See [`AGENTS.md`](AGENTS.md) for the CI-equivalent gate.
 | Doc | Covers |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Module map, write/read/flush/compaction/recovery data flow, partitions, storage tiers, part lifecycle & mover, S3 tier |
-| [`docs/formats.md`](docs/formats.md) | Every on-disk byte: WAL frames, SSTable klog/vlog, manifest (incl. the append-tolerant tail and shared-tier sections), internal keys |
+| [`docs/formats.md`](docs/formats.md) | Every on-disk byte (yoloDB epoch 1): WAL segments, SSTable klog/vlog, manifest sections, config TLV, edit log, internal keys |
+| [`docs/format-registry.md`](docs/format-registry.md) | The yoloDB registry: magics, versions, flags, capability bits, kinds, codec ids, config tags |
 | [`docs/concurrency-and-safety.md`](docs/concurrency-and-safety.md) | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime contract, every `unsafe` contract |
 | [`docs/parts-and-tiers.md`](docs/parts-and-tiers.md) | User guide to partitions, parts and tiers — worked examples, S3 setup, attach-by-reference, operational notes |
 | [`docs/compaction-and-write-pacing.md`](docs/compaction-and-write-pacing.md) | User guide to compaction geometry, bounded jobs, debt-based write pacing, close semantics, tuning by symptom |
@@ -269,7 +275,7 @@ db.close()?;
 By default an SSTable's klog is sorted data blocks + a flat single-level index.
 With `use_btree = true`, the index is written as a **B+tree** on disk: leaf nodes
 point at data blocks, internal nodes at leaves, and the root carries the min key
-(`FOOTER_BTREE` flag). It is a per-column-family, opt-in on-disk format. The
+(the footer's `FLAG_BTREE`). It is a per-column-family, opt-in on-disk format. The
 data-block format is unchanged, so it composes with compression, bloom filters
 and WiscKey.
 
@@ -409,17 +415,19 @@ Full data-flow walkthrough in [`docs/architecture.md`](docs/architecture.md).
 
 ```
 src/
-  config.rs        Options / ColumnFamilyConfig (+ defaults, manifest blob codec)
+  config.rs        Options / ColumnFamilyConfig (+ defaults)
+  config_blob.rs   the YOLODBCF config TLV (unknown tags preserved)
   error.rs         OndaError
   encoding.rs      varints, fixed ints, CRC32-C, xxHash32
   compress.rs      none/snappy/lz4/zstd/lz4fast/flate codecs
-  bloom.rs         bloom filter (dense + sparse)
+  bloom.rs         bloom filter (xxh3, leading hash tag)
   comparator.rs    6 built-ins + custom comparators
-  format.rs        flag bits + MVCC internal-key trailer
+  format.rs        every on-disk number (epoch-1 magics, flags, caps, kinds, codecs, tags) + MVCC trailer
   block.rs         SSTable block framing (compress + checksum)
   cache/           byte-bounded LRU block cache + file-handle cache
-  wal.rs           group-commit WAL
-  manifest.rs      durable catalog (atomic rewrite)
+  wal.rs           group-commit WAL (YOLODBWL segment headers)
+  manifest.rs      durable catalog (YOLODBMF, flagged sections, atomic rewrite)
+  legacy_onda/     frozen read-only 0.9.x decoders (feature "legacy-onda")
   memtable.rs      sharded MVCC memtable (crossbeam, or arena under fastpath)
   memtable_arena.rs  arena skip-list shard (arena-memtable feature only)
   sst/             SSTable writer/reader/iterator (+ B+tree hybrid klog)

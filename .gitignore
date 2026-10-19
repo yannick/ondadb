@@ -3,3 +3,6 @@
 /target-040
 __pycache__/
 *.py[cod]
+
+# Local S3 (rustfs) credentials for the s3 integration tests — never commit.
+.rustfs.env

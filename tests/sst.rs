@@ -572,19 +572,29 @@ fn per_prefix_compression_rules() {
     assert_eq!(seen, keys);
 }
 
+/// Re-seal the epoch-1 footer's CRC32-C after an edit, so a test reaches the
+/// checks behind the checksum.
+fn reseal_footer(bytes: &mut [u8]) {
+    use ondadb::format::sst_footer::{CRC, SIZE};
+    let at = bytes.len() - SIZE;
+    let crc = ondadb::encoding::checksum(&bytes[at..at + CRC]);
+    bytes[at + CRC..at + CRC + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
 /// A footer flag bit this binary does not implement is `UnsupportedFormat`, not
 /// `Corruption`: the bytes are well-formed, they just name a feature we lack.
 #[test]
 fn footer_unknown_flag_bit_is_unsupported_format() {
-    const FOOTER_SIZE: usize = 64;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
+    use ondadb::format::sst_footer::{FLAGS, SIZE};
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("src.klog");
+    write_extended(&src, extended_opts(false, true));
     let mut bytes = std::fs::read(&src).unwrap();
-    let flags_at = bytes.len() - FOOTER_SIZE + 48;
-    // 0x40 is above every assigned footer bit (0x10 is 1.0B's extended-block
-    // flag, 0x20 is 2.1's prefix-delta flag), and the footer carries no
-    // checksum of its own.
-    bytes[flags_at] |= 0x40;
+    let flags_at = bytes.len() - SIZE + FLAGS;
+    // 0x04 is above both assigned footer flags (bloom, btree): epoch 1 keeps
+    // format meaning in the capability word, never in a flag.
+    bytes[flags_at] |= 0x04;
+    reseal_footer(&mut bytes);
 
     let dir = tempfile::tempdir().unwrap();
     let klog = dir.path().join("1.klog");
@@ -611,19 +621,23 @@ fn footer_unknown_flag_bit_is_unsupported_format() {
 /// opens the table or returns an error, and none panics.
 #[test]
 fn fuzz_footer_flags_never_panic() {
-    const FOOTER_SIZE: usize = 64;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1/klog_legacy_flat_restarts_bloom.klog");
+    use ondadb::format::sst_footer::{FLAGS, SIZE};
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = src_dir.path().join("src.klog");
+    write_extended(&src, extended_opts(false, true));
     let original = std::fs::read(&src).unwrap();
     let vlog = std::fs::read(src.with_extension("vlog")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let klog = dir.path().join("1.klog");
     std::fs::write(klog.with_extension("vlog"), &vlog).unwrap();
 
-    for value in 0u8..=255 {
+    for (value, reseal) in (0u8..=255).flat_map(|v| [(v, false), (v, true)]) {
         let mut bytes = original.clone();
-        let flags_at = bytes.len() - FOOTER_SIZE + 48;
+        let flags_at = bytes.len() - SIZE + FLAGS;
         bytes[flags_at] = value;
+        if reseal {
+            reseal_footer(&mut bytes);
+        }
         std::fs::write(&klog, &bytes).unwrap();
         let res = Reader::open(
             klog.to_str().unwrap(),
@@ -885,55 +899,6 @@ fn concurrent_vlog_misses_both_return_correct_bytes() {
     );
 }
 
-/// Tables written before the v2 vlog frame layout (`FOOTER_VLOG_V2` clear) must
-/// cache and serve identically — the cache keys on the frame offset, not on the
-/// frame's shape. Today's writer only emits v2, so the v1 table is synthesised:
-/// one value, so its frame is at vlog offset 0 either way.
-#[test]
-fn legacy_v1_vlog_frames_are_cached() {
-    const FOOTER_SIZE: usize = 64;
-    const FOOTER_VLOG_V2: u8 = 0x08;
-
-    let dir = tempfile::tempdir().unwrap();
-    let big = vec![b'L'; 8192];
-    let klog = build_vlog_table(dir.path(), "v1", b"k", &big);
-
-    // v1 frame: CRC32-C of the value, then the raw value.
-    let vlog = dir.path().join("v1.vlog");
-    let mut frame = ondadb::encoding::checksum(&big).to_le_bytes().to_vec();
-    frame.extend_from_slice(&big);
-    std::fs::write(&vlog, &frame).unwrap();
-
-    // Clear the v2 flag in the klog footer (the footer carries no checksum of
-    // its own, only the trailing magic).
-    let mut klog_bytes = std::fs::read(&klog).unwrap();
-    let flags = klog_bytes.len() - FOOTER_SIZE + 48;
-    assert!(
-        klog_bytes[flags] & FOOTER_VLOG_V2 != 0,
-        "expected a v2 table"
-    );
-    klog_bytes[flags] &= !FOOTER_VLOG_V2;
-    std::fs::write(&klog, &klog_bytes).unwrap();
-
-    let bc = Arc::new(BlockCache::new(1 << 20));
-    let r = open_reader(&klog, bc.clone(), 51, 1 << 20);
-    let before = bc.stats().vlog_entries;
-
-    let cold = ondadb::perf::enter();
-    let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
-    let cold = cold.finish();
-    assert!(found && v.as_deref() == Some(big.as_slice()));
-    assert_eq!(cold.vlog_reads, 1);
-    assert_eq!(bc.stats().vlog_entries, before + 1, "v1 frame not admitted");
-
-    let warm = ondadb::perf::enter();
-    let (v, _, found, ..) = r.get(b"k", u64::MAX, 0).unwrap();
-    let warm = warm.finish();
-    assert!(found && v.as_deref() == Some(big.as_slice()));
-    assert_eq!(warm.vlog_reads, 0);
-    assert_eq!(warm.vlog_cache_hits, 1);
-}
-
 // ---------------------------------------------------------------------------
 // 0.6-A: what the SSTable reader and writer charge the IO limiter.
 // ---------------------------------------------------------------------------
@@ -1173,13 +1138,6 @@ fn writer_writes_a_bloom_block_when_fpr_is_some() {
 
 // ---- extended entry layout (FOOTER_EXTENDED_BLOCK, 1.0-B) -------------------
 
-/// Path of a frozen phase-1 fixture.
-fn phase1_fixture(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/phase1")
-        .join(name)
-}
-
 /// Every entry shape a writer produces, so the extended layout is exercised on
 /// tombstones, TTLs and vlog-separated values alike.
 fn extended_entries() -> Vec<(String, Vec<u8>, u64, i64, bool, bool)> {
@@ -1222,7 +1180,9 @@ fn extended_opts(use_btree: bool, restarts: bool) -> WriterOptions {
         block_size: 256,
         expected_entries: 64,
         use_btree,
-        restart_interval: if restarts { 8 } else { 0 },
+        // Every epoch-1 block has a restart trailer; the densest one stands in
+        // for 0.9's "no trailer" shape.
+        restart_interval: if restarts { 8 } else { 1 },
         extended_entries: true,
         prefix_delta: false,
     }
@@ -1278,34 +1238,30 @@ fn extended_table_round_trips() {
     }
 }
 
-/// The aux-block handle is the 16 bytes immediately before the footer, and 1.0
-/// writes it empty. Asserted against the raw file so the *position* is pinned,
-/// not just the value the reader reports.
+/// Every epoch-1 table carries its aux-block handle inside the footer, at
+/// +64, zero when it has no aux block — base and extended tables alike (0.9
+/// wrote it ahead of the footer, and only for extended tables). Asserted
+/// against the raw file so the *position* is pinned, not just the value.
 #[test]
-fn extended_footer_prefix_is_16_bytes() {
-    const FOOTER_SIZE: usize = 64;
+fn aux_handle_lives_in_the_footer() {
+    use ondadb::format::sst_footer::{AUX, CAPS, SIZE};
     let dir = tempfile::tempdir().unwrap();
-    let klog = dir.path().join("ext.klog");
-    write_extended(&klog, extended_opts(false, true));
-    let bytes = std::fs::read(&klog).unwrap();
-    let at = bytes.len() - FOOTER_SIZE - 16;
-    assert_eq!(&bytes[at..at + 8], &[0u8; 8], "aux_off");
-    assert_eq!(&bytes[at + 8..at + 16], &[0u8; 8], "aux_len");
-    // Footer flag 0x10 is set, and the reader reports the handle it read.
-    assert_eq!(bytes[bytes.len() - FOOTER_SIZE + 48] & 0x10, 0x10);
-    assert_eq!(open_klog(&klog).unwrap().aux_block_handle(), Some((0, 0)));
-
-    // A legacy table has no such prefix at all.
-    let legacy = dir.path().join("legacy.klog");
-    write_extended(
-        &legacy,
-        WriterOptions {
-            extended_entries: false,
-            prefix_delta: false,
-            ..extended_opts(false, true)
-        },
-    );
-    assert_eq!(open_klog(&legacy).unwrap().aux_block_handle(), None);
+    for (name, extended) in [("ext.klog", true), ("base.klog", false)] {
+        let klog = dir.path().join(name);
+        write_extended(
+            &klog,
+            WriterOptions {
+                extended_entries: extended,
+                ..extended_opts(false, true)
+            },
+        );
+        let bytes = std::fs::read(&klog).unwrap();
+        let at = bytes.len() - SIZE;
+        assert_eq!(&bytes[at + AUX..at + AUX + 16], &[0u8; 16], "{name}: aux handle");
+        let caps = u64::from_le_bytes(bytes[at + CAPS..at + CAPS + 8].try_into().unwrap());
+        assert_eq!(caps, u64::from(extended), "{name}: CAP_EXTENDED_RECORDS iff extended");
+        assert_eq!(open_klog(&klog).unwrap().aux_block_handle(), Some((0, 0)), "{name}");
+    }
 }
 
 /// The restart trailer indexes entry *offsets*, which still come from
@@ -1332,99 +1288,6 @@ fn extended_table_restart_search_matches_scan() {
         assert!(it.valid(), "{k}");
         assert_eq!(it.user_key(), k.as_bytes());
         assert_eq!(it.seq(), seq, "{k}");
-    }
-}
-
-/// The frozen extended klog pins the wire bytes: a change to the entry layout,
-/// the footer bit or the aux prefix is a test failure, not a silent break.
-#[test]
-fn extended_golden_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let klog = dir.path().join("ext.klog");
-    let mut w = Writer::new(klog.to_str().unwrap(), extended_opts(false, true)).unwrap();
-    // Same entry set as the frozen legacy corpus (`klog_entries` there).
-    let big = vec![b'V'; 64];
-    let mut entries: Vec<(String, Vec<u8>, u64, i64, bool, bool)> = vec![
-        ("k01".into(), b"small".to_vec(), 11, 0, false, false),
-        (
-            "k02".into(),
-            b"small".to_vec(),
-            12,
-            1_700_000_000_000_000_000,
-            false,
-            false,
-        ),
-        ("k03".into(), Vec::new(), 13, 0, true, false),
-        ("k04".into(), Vec::new(), 14, 0, true, true),
-        ("k05".into(), big.clone(), 15, 0, false, false),
-        (
-            "k06".into(),
-            big,
-            16,
-            1_700_000_000_000_000_001,
-            false,
-            false,
-        ),
-    ];
-    for i in 7..40u64 {
-        entries.push((
-            format!("k{i:02}"),
-            b"filler".to_vec(),
-            20 + i,
-            0,
-            false,
-            false,
-        ));
-    }
-    for (k, v, seq, ttl, tomb, sdel) in &entries {
-        w.add(
-            k.as_bytes(),
-            v,
-            *seq,
-            *ttl,
-            ondadb::format::point_kind(*tomb, *sdel),
-        )
-        .unwrap();
-    }
-    w.finish().unwrap();
-    assert_eq!(
-        std::fs::read(&klog).unwrap(),
-        std::fs::read(phase1_fixture("klog_extended.klog")).unwrap(),
-        "the extended klog bytes are frozen"
-    );
-    assert_eq!(
-        std::fs::read(klog.with_extension("vlog")).unwrap(),
-        std::fs::read(phase1_fixture("klog_extended.vlog")).unwrap(),
-    );
-}
-
-/// Compiling the extended layout in must not change how a legacy table reads:
-/// the flag is table-level and absent, so every frozen legacy klog still
-/// decodes through the legacy path.
-#[test]
-fn legacy_table_still_decodes_with_extended_support_compiled() {
-    let dir = tempfile::tempdir().unwrap();
-    for name in [
-        "klog_legacy_flat_restarts_bloom.klog",
-        "klog_legacy_btree_norestarts_nobloom.klog",
-    ] {
-        let klog = dir.path().join(name);
-        std::fs::write(&klog, std::fs::read(phase1_fixture(name)).unwrap()).unwrap();
-        std::fs::write(
-            klog.with_extension("vlog"),
-            std::fs::read(phase1_fixture(&name.replace(".klog", ".vlog"))).unwrap(),
-        )
-        .unwrap();
-        let r = open_klog(&klog).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(r.aux_block_handle(), None, "{name}: no aux prefix");
-        let mut it = r.iter();
-        it.seek_to_first();
-        let mut n = 0;
-        while it.valid() {
-            n += 1;
-            it.next();
-        }
-        assert_eq!(n, r.num_entries(), "{name}");
     }
 }
 
