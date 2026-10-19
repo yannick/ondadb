@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.0 (unreleased) — Breaking: yoloDB format epoch 1
+## 0.10.0 — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB
 and wavesdb converge on (plan C step 1). Every persisted identifier changes,
