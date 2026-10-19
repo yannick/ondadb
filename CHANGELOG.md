@@ -110,6 +110,14 @@ forward scan 0.96 and backward scan 0.98 (within this machine's noise).
 - Refused with the new `OndaError::FormatUpgradeUnsupported`: tables on a
   named tier or object store, and unresolved prepared transactions. Too little
   free space is `Io(StorageFull)` before anything is written.
+- Also refused, before anything is written: a database directory that is a
+  **mount point** or a **symlink**. The swap renames the directory within its
+  parent: Linux refuses to rename a mount point, macOS renames it with the
+  volume still attached (so the rebuilt database, staged on the parent's
+  filesystem, would replace it *off the volume*), and a symlink would be moved
+  instead of its target. A container that mounts its volume *at* the database
+  path must move the database into a subdirectory first (marekvs 0.3.5 does
+  this on start: `<data_dir>/db`).
 - New binary **`yolodb upgrade <path> [--verify scan|counts] [--no-backup]`**
   runs the same protocol offline with progress output; it needs none of the
   application's merge operators (operands are copied, never folded).

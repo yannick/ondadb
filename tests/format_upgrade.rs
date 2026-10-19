@@ -434,6 +434,99 @@ fn preflight_failures_leave_the_source_byte_identical() {
     db.close().unwrap();
 }
 
+/// The swap renames the database directory, which moves a symlink rather than
+/// its target: refused before anything is written, the target untouched.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_database_path_is_refused_untouched() {
+    let case = Case::new("db-caps");
+    let link = case.parent.join("via-link");
+    std::os::unix::fs::symlink(&case.dir, &link).unwrap();
+    let mut opts = case.opts();
+    opts.path = link.to_str().unwrap().to_string();
+    let err = DB::open(opts).err().unwrap();
+    assert_eq!(err.kind(), "format_upgrade_unsupported", "{err}");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert!(link.is_symlink(), "the link itself must stay");
+    case.assert_untouched("symlinked path");
+    let beside_link = std::fs::read_dir(&case.parent)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".via-link."))
+        .count();
+    assert_eq!(beside_link, 0, "nothing may be staged beside the link");
+}
+
+/// A volume mounted *at* the database path: Linux cannot rename it, and macOS
+/// renames it with the mount attached — the upgraded database would replace it
+/// on the parent's filesystem. Refused before anything is written.
+///
+/// Needs a real mount, so it is opt-in on macOS (hdiutil, no root):
+/// `cargo test --test format_upgrade -- --ignored mount_point`.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "mounts a disk image with hdiutil"]
+fn a_mount_point_database_path_is_refused_untouched() {
+    use std::process::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let image = tmp.path().join("vol.sparseimage");
+    let mnt = tmp.path().join("db-caps");
+    std::fs::create_dir(&mnt).unwrap();
+    let ok = |c: &mut Command| assert!(c.status().unwrap().success(), "{c:?}");
+    ok(Command::new("hdiutil")
+        .args(["create", "-quiet", "-size", "64m", "-fs", "APFS"])
+        .args(["-volname", "ondadbtest", "-type", "SPARSE"])
+        .arg(&image));
+    let out = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-mountpoint"])
+        .arg(&mnt)
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "hdiutil attach: {out:?}");
+    // Detach by device, not by path: a regression that renames the mount point
+    // away (what this test guards against) must not leak an attached image.
+    // The first device hdiutil prints is the whole disk.
+    let device = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find(|w| w.starts_with("/dev/disk"))
+        .expect("hdiutil attach printed no device")
+        .to_string();
+    struct Detach(String);
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "-quiet", "-force", &self.0])
+                .status();
+        }
+    }
+    let _detach = Detach(device);
+    copy_dir(&fixture_root().join("db-caps"), &mnt);
+    // Only the database's own entries: the volume root also holds macOS
+    // housekeeping (`.fseventsd`) that changes on its own.
+    let db_only = |m: BTreeMap<String, String>| -> BTreeMap<String, String> {
+        m.into_iter().filter(|(k, _)| !k.starts_with('.')).collect()
+    };
+    let before = db_only(tree_hash(&mnt));
+
+    let mut opts = Options::new(mnt.to_str().unwrap());
+    opts.merge_fns = vec![Arc::new(Concat)];
+    let err = DB::open(opts).err().unwrap();
+    assert_eq!(err.kind(), "format_upgrade_unsupported", "{err}");
+    assert!(err.to_string().contains("mount point"), "{err}");
+    assert_eq!(
+        db_only(tree_hash(&mnt)),
+        before,
+        "the volume's contents changed"
+    );
+    let staged = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".db-caps."))
+        .count();
+    assert_eq!(staged, 0, "nothing may be staged beside the mount point");
+}
+
 /// A failure at every step before the journal removes the upgrade directory
 /// and leaves the source exactly as it was; the next open upgrades.
 #[test]

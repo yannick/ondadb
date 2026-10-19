@@ -15,7 +15,9 @@
 //!
 //! 1. `P/LOCK` is taken **exclusively** and held throughout, so no 0.9 process
 //!    (and no second upgrader) can write concurrently.
-//! 2. Preflight: the requested WAL layout must match the catalog's, no table
+//! 2. Preflight: the database directory must be renamable within its parent —
+//!    not a mount point or a symlink (see `check_renamable`) — the requested
+//!    WAL layout must match the catalog's, no table
 //!    may live on a non-default tier or an object store, no prepared
 //!    transaction may be unresolved, and the parent filesystem must have room
 //!    for the source's bytes plus a margin.
@@ -235,6 +237,49 @@ impl Paths {
     fn journal_tmp(&self) -> PathBuf {
         self.journal.with_extension("journal.tmp")
     }
+}
+
+/// The swap renames the database directory within its parent, so the
+/// directory must be an ordinary entry of the parent's filesystem. Two
+/// layouts are not, and both are refused before anything is written:
+///
+/// * a **mount point** (a volume mounted *at* the database path — the usual
+///   container layout). Linux refuses to rename it (`EBUSY`); macOS allows it
+///   and the mount follows the rename, so the rebuilt database, staged on the
+///   parent's filesystem, would silently replace it *off the volume*;
+/// * a **symlink**: the rename moves the link, not its target, and the rebuilt
+///   database would again land beside the link instead of on the target.
+#[cfg(feature = "legacy-onda")]
+fn check_renamable(paths: &Paths) -> Result<()> {
+    let refuse = |why: String| {
+        Err(OndaError::FormatUpgradeUnsupported(format!(
+            "{}: {why}; the upgrade swaps the database in by renaming its directory. \
+             Move the database's contents into a subdirectory (e.g. {}/db) and open \
+             that path instead — nothing has been written",
+            paths.db.display(),
+            paths.db.display()
+        )))
+    };
+    if std::fs::symlink_metadata(&paths.db)?
+        .file_type()
+        .is_symlink()
+    {
+        return refuse("the database path is a symbolic link".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let db_dev = std::fs::metadata(&paths.db)?.dev();
+        let parent_dev = std::fs::metadata(&paths.parent)?.dev();
+        if db_dev != parent_dev {
+            return refuse(format!(
+                "the database directory is a mount point (filesystem {db_dev:#x}, its \
+                 parent {} is on {parent_dev:#x})",
+                paths.parent.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn utf8(p: &Path) -> Result<&str> {
@@ -1396,6 +1441,7 @@ fn run_upgrade(
     if !crate::manifest::is_onda09_dir(&paths.db)? {
         return Ok(None);
     }
+    check_renamable(&paths)?;
     sweep_stale_upgrade_dirs(&paths)?;
 
     // Step 2.
