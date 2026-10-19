@@ -102,16 +102,116 @@ enum PlannedRead {
     Store(u64),
 }
 
-/// The range deletes this transaction has buffered, as `(cf, start, end)`
-/// borrowed from the arena.
-fn buffered_ranges<'a>(
-    buf: &'a [u8],
-    writes: &'a [WriteEntry],
-) -> impl std::iter::Iterator<Item = (&'a Arc<ColumnFamily>, &'a [u8], &'a [u8])> {
-    writes
-        .iter()
-        .filter(|w| w.is_range())
-        .map(move |w| (&w.cf, buf_slice(buf, w.key), buf_slice(buf, w.value)))
+/// Buffer length from which a transaction's point reads stop scanning its
+/// buffer and build a [`WriteIndex`] instead. Below it a backward scan is a few
+/// cache lines and cheaper than hashing; above it the scan makes N reads of N
+/// own writes O(N²) (10k writes read back: ~140 ms scanning).
+const WRITE_INDEX_MIN: usize = 32;
+
+/// End of a [`WriteIndex`] chain.
+const NO_WRITE: usize = usize::MAX;
+
+/// A `Hasher` for keys that already are a 64-bit hash: [`WriteIndex`] maps
+/// [`write_hash`] values, so hashing them a second time buys nothing.
+#[derive(Default)]
+struct Prehashed(u64);
+
+impl std::hash::Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _bytes: &[u8]) {
+        unreachable!("WriteIndex only hashes u64 keys")
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// The hash a point write is filed under: its column family's identity (the
+/// same `cf_id` every buffer comparison uses) and its key **bytes**.
+///
+/// Bytes, not the comparator, on purpose: the buffer has always matched a key
+/// by byte equality (as does commit's `deduplicated_write_order`), even in a
+/// family whose comparator would call two different byte strings equal. The
+/// index keeps that semantics exactly; it changes how a match is found, never
+/// what matches.
+#[inline]
+fn write_hash(id: usize, key: &[u8]) -> u64 {
+    #[cfg(test)]
+    if tests::COLLIDE_WRITE_HASHES.with(std::cell::Cell::get) {
+        return 0;
+    }
+    xxhash_rust::xxh3::xxh3_64_with_seed(key, id as u64)
+}
+
+/// An index of a transaction's buffered point writes, so read-your-own-writes
+/// does not scan the buffer.
+///
+/// It mirrors `Txn::writes` position for position. `newest` maps a
+/// [`write_hash`] to the position of the newest point write (put, delete,
+/// single delete or merge operand) with that hash, and `prev[i]` is the
+/// position of the previous point write with write `i`'s hash ([`NO_WRITE`] for
+/// none, and always for a range delete, which is an interval rather than a
+/// version of a key). Walking `prev` from `newest` visits candidates newest
+/// first; a candidate is a match only if its family and key bytes are equal,
+/// so a hash collision costs one extra comparison and never a wrong answer.
+///
+/// Built lazily: the first point read of a transaction whose buffer holds
+/// [`WRITE_INDEX_MIN`] writes builds it in one pass, so small and write-only
+/// transactions never pay for it. From then on every append updates it, a
+/// savepoint rollback unwinds exactly the writes it discards (newest first,
+/// restoring each chain head), and every path that empties the buffer drops
+/// it.
+struct WriteIndex {
+    newest: HashMap<u64, usize, std::hash::BuildHasherDefault<Prehashed>>,
+    prev: Vec<usize>,
+}
+
+impl WriteIndex {
+    fn build(buf: &[u8], writes: &[WriteEntry]) -> WriteIndex {
+        let mut index = WriteIndex {
+            newest: HashMap::with_capacity_and_hasher(writes.len(), Default::default()),
+            prev: Vec::with_capacity(writes.len()),
+        };
+        for w in writes {
+            index.push(buf, w);
+        }
+        index
+    }
+
+    /// File `w`, just appended at position `self.prev.len()`.
+    fn push(&mut self, buf: &[u8], w: &WriteEntry) {
+        let at = self.prev.len();
+        if w.is_range() {
+            self.prev.push(NO_WRITE);
+            return;
+        }
+        let prev = self
+            .newest
+            .insert(write_hash(cf_id(&w.cf), buf_slice(buf, w.key)), at)
+            .unwrap_or(NO_WRITE);
+        self.prev.push(prev);
+    }
+
+    /// Forget every write from position `len` on. `writes` and `buf` must
+    /// still hold them: their hashes are recomputed to find their chains.
+    fn truncate(&mut self, buf: &[u8], writes: &[WriteEntry], len: usize) {
+        for at in (len..self.prev.len()).rev() {
+            let w = &writes[at];
+            if w.is_range() {
+                continue;
+            }
+            let hash = write_hash(cf_id(&w.cf), buf_slice(buf, w.key));
+            // Unwinding newest first, so `at` is its chain's head.
+            debug_assert_eq!(self.newest.get(&hash), Some(&at));
+            match self.prev[at] {
+                NO_WRITE => self.newest.remove(&hash),
+                prev => self.newest.insert(hash, prev),
+            };
+        }
+        self.prev.truncate(len);
+    }
 }
 
 /// A durably prepared transaction (3.2), named by the id its coordinator
@@ -140,6 +240,17 @@ pub struct Txn {
     /// per operation.
     buf: Vec<u8>,
     writes: Vec<WriteEntry>,
+    /// Index of `writes`' point writes, once a read found the buffer large
+    /// enough to need one; see [`WriteIndex`]. `None` means "scan".
+    write_index: Option<WriteIndex>,
+    /// Buffer length from which a point read builds `write_index`:
+    /// [`WRITE_INDEX_MIN`], except in tests that pin it to always or never.
+    write_index_min: usize,
+    /// Positions in `writes` of the buffered range deletes, ascending. Kept
+    /// always (not lazily): it is empty for every transaction that never
+    /// called `delete_range`, and it is what lets a point read check the
+    /// transaction's own spans without walking all of its point writes.
+    range_writes: Vec<usize>,
     read_set: HashSet<(usize, Vec<u8>)>,
     /// First-insertion order for `read_set`, allowing savepoint rollback to
     /// remove only reads performed after that savepoint.
@@ -371,6 +482,9 @@ impl DB {
             snapshot_held: fixed,
             buf: take_buf(),
             writes: Vec::new(),
+            write_index: None,
+            write_index_min: WRITE_INDEX_MIN,
+            range_writes: Vec::new(),
             read_set: HashSet::new(),
             read_log: Vec::new(),
             read_cfs: HashMap::new(),
@@ -555,7 +669,7 @@ impl Txn {
         self.buf.extend_from_slice(key);
         let voff = self.buf.len();
         self.buf.extend_from_slice(value);
-        self.writes.push(WriteEntry {
+        self.push_write(WriteEntry {
             cf: cf.clone(),
             key: (koff, key.len()),
             value: (voff, value.len()),
@@ -563,6 +677,84 @@ impl Txn {
             kind,
         });
         Ok(())
+    }
+
+    /// Append `w` to the buffer, keeping `range_writes` and a built
+    /// `write_index` current. Every buffered write goes through here.
+    fn push_write(&mut self, w: WriteEntry) {
+        if w.is_range() {
+            self.range_writes.push(self.writes.len());
+        }
+        if let Some(index) = &mut self.write_index {
+            index.push(&self.buf, &w);
+        }
+        self.writes.push(w);
+    }
+
+    /// Empty the buffer's bookkeeping: `writes`, `range_writes` and the index.
+    /// (The arena itself is each caller's business.)
+    fn clear_writes(&mut self) {
+        self.writes.clear();
+        self.write_index = None;
+        self.range_writes.clear();
+    }
+
+    /// Build `write_index` if the buffer has grown large enough to want one.
+    /// Called by the `&mut` point-read entry points before they look anything
+    /// up; the lookups themselves use the index when it exists and scan when
+    /// it does not, so both paths answer identically.
+    #[inline]
+    fn ensure_write_index(&mut self) {
+        if self.write_index.is_none() && self.writes.len() >= self.write_index_min {
+            self.write_index = Some(WriteIndex::build(&self.buf, &self.writes));
+        }
+    }
+
+    /// Pin the buffer length from which point reads index the buffer: 0
+    /// indexes every buffer, `usize::MAX` none. Lets tests run one script
+    /// through both lookup paths; not part of the API.
+    #[doc(hidden)]
+    pub fn set_write_index_min_for_tests(&mut self, min: usize) {
+        self.write_index_min = min;
+        if self.writes.len() < min {
+            self.write_index = None;
+        }
+    }
+
+    /// Position of the newest buffered point write (put, delete, single
+    /// delete or merge operand) on `key` in column family `id`.
+    fn newest_point_write(&self, id: usize, key: &[u8]) -> Option<usize> {
+        let matches = |w: &WriteEntry| {
+            !w.is_range() && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key
+        };
+        match &self.write_index {
+            Some(index) => {
+                let mut at = *index.newest.get(&write_hash(id, key))?;
+                while at != NO_WRITE {
+                    if matches(&self.writes[at]) {
+                        return Some(at);
+                    }
+                    at = index.prev[at];
+                }
+                None
+            }
+            None => self.writes.iter().rposition(matches),
+        }
+    }
+
+    /// The range deletes this transaction has buffered, as `(cf, start, end)`
+    /// borrowed from the arena.
+    fn buffered_ranges(
+        &self,
+    ) -> impl std::iter::Iterator<Item = (&Arc<ColumnFamily>, &[u8], &[u8])> {
+        self.range_writes.iter().map(move |&at| {
+            let w = &self.writes[at];
+            (
+                &w.cf,
+                buf_slice(&self.buf, w.key),
+                buf_slice(&self.buf, w.value),
+            )
+        })
     }
 
     /// Take (or wait for) the point lock on `key`, then refresh the snapshot if
@@ -717,7 +909,7 @@ impl Txn {
         self.buf.extend_from_slice(start);
         let eoff = self.buf.len();
         self.buf.extend_from_slice(end);
-        self.writes.push(WriteEntry {
+        self.push_write(WriteEntry {
             cf: cf.clone(),
             key: (soff, start.len()),
             value: (eoff, end.len()),
@@ -731,12 +923,13 @@ impl Txn {
     ///
     /// Read-your-writes for range deletes: a key covered by a span this
     /// transaction has buffered reads as absent, exactly as a buffered point
-    /// tombstone does. One `any` over a list that is empty for every
-    /// transaction that never called `delete_range`.
+    /// tombstone does. One `any` over `range_writes`, which is empty for every
+    /// transaction that never called `delete_range` — the point writes are
+    /// never walked.
     fn own_range_covers(&self, cf: &Arc<ColumnFamily>, key: &[u8]) -> bool {
         let id = cf_id(cf);
         let cmp = cf.comparator();
-        buffered_ranges(&self.buf, &self.writes).any(|(c, start, end)| {
+        self.buffered_ranges().any(|(c, start, end)| {
             cf_id(c) == id && cmp.compare(start, key).is_le() && cmp.compare(end, key).is_gt()
         })
     }
@@ -760,7 +953,7 @@ impl Txn {
             let key = buf_slice(&self.buf, w.key);
             let id = cf_id(&w.cf);
             let cmp = w.cf.comparator();
-            for (c, start, end) in buffered_ranges(&self.buf, &self.writes) {
+            for (c, start, end) in self.buffered_ranges() {
                 if cf_id(c) == id
                     && cmp.compare(start, key).is_le()
                     && cmp.compare(end, key).is_gt()
@@ -871,11 +1064,17 @@ impl Txn {
     /// chain ahead of the committed ones".
     #[allow(clippy::type_complexity)]
     fn buffered_chain(&self, id: usize, key: &[u8]) -> Option<BufferedChain> {
+        if let Some(index) = &self.write_index {
+            return self.indexed_chain(index, id, key);
+        }
         let mut seen = false;
         let mut base: Option<Option<Vec<u8>>> = None;
         let mut operands: Vec<Vec<u8>> = Vec::new();
         for w in &self.writes {
-            if cf_id(&w.cf) != id || buf_slice(&self.buf, w.key) != key {
+            // A range delete is an interval, not a version of its start bound:
+            // matching it here read the *end* bound back as the key's value.
+            // Its coverage is `own_range_covers`' job.
+            if w.is_range() || cf_id(&w.cf) != id || buf_slice(&self.buf, w.key) != key {
                 continue;
             }
             seen = true;
@@ -889,6 +1088,37 @@ impl Txn {
                 operands.clear();
             }
         }
+        seen.then_some(BufferedChain { base, operands })
+    }
+
+    /// [`buffered_chain`](Self::buffered_chain) through the index: walk the
+    /// key's writes newest first, collecting operands until the first base,
+    /// so the cost is the key's own chain rather than the whole buffer.
+    fn indexed_chain(&self, index: &WriteIndex, id: usize, key: &[u8]) -> Option<BufferedChain> {
+        let mut at = *index.newest.get(&write_hash(id, key))?;
+        let mut seen = false;
+        let mut base: Option<Option<Vec<u8>>> = None;
+        let mut operands: Vec<Vec<u8>> = Vec::new();
+        while at != NO_WRITE {
+            let w = &self.writes[at];
+            at = index.prev[at];
+            if cf_id(&w.cf) != id || buf_slice(&self.buf, w.key) != key {
+                continue;
+            }
+            seen = true;
+            if w.is_merge() {
+                operands.push(buf_slice(&self.buf, w.value).to_vec());
+                continue;
+            }
+            base = Some(if w.tombstone() {
+                None
+            } else {
+                Some(buf_slice(&self.buf, w.value).to_vec())
+            });
+            break;
+        }
+        // Collected newest first; the fold wants them oldest first.
+        operands.reverse();
         seen.then_some(BufferedChain { base, operands })
     }
 
@@ -933,6 +1163,7 @@ impl Txn {
 
     /// Read a key, honoring the transaction's own buffered writes.
     pub fn get(&mut self, cf: &Arc<ColumnFamily>, key: &[u8]) -> Result<Vec<u8>> {
+        self.ensure_write_index();
         let id = cf_id(cf);
         // Read-your-writes on a merge family: the buffered chain is resolved
         // first, and only a chain with no buffered base still needs the store —
@@ -972,6 +1203,7 @@ impl Txn {
     /// A merge family's key with buffered operands resolves through
     /// [`get`](Self::get) — the fold produces a fresh value regardless.
     pub fn get_into(&mut self, cf: &Arc<ColumnFamily>, key: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+        self.ensure_write_index();
         let id = cf_id(cf);
         if cf.merge_op().is_some() && self.buffered_chain(id, key).is_some() {
             let value = self.get(cf, key)?;
@@ -994,14 +1226,13 @@ impl Txn {
     /// `Serializable` read set, and the read sequence. Shared by `get` and
     /// `get_into` so the two cannot disagree.
     fn plan_point_read(&mut self, cf: &Arc<ColumnFamily>, id: usize, key: &[u8]) -> PlannedRead {
-        // Read-your-writes: scan the buffer backward for the latest write.
-        for w in self.writes.iter().rev() {
-            if !w.is_range() && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == key {
-                if w.tombstone() {
-                    return PlannedRead::Missing;
-                }
-                return PlannedRead::Buffered(w.value);
+        // Read-your-writes: the latest buffered write wins.
+        if let Some(at) = self.newest_point_write(id, key) {
+            let w = &self.writes[at];
+            if w.tombstone() {
+                return PlannedRead::Missing;
             }
+            return PlannedRead::Buffered(w.value);
         }
         // Read-your-writes for range deletes. Reached only when no buffered
         // point write matched: own-write overlap is rejected at commit, so the
@@ -1045,6 +1276,7 @@ impl Txn {
     /// entries N [`get`](Self::get)s of the same keys would have — buffered
     /// keys excluded, since reading one's own write is not a read of the store.
     pub fn multi_get(&mut self, cf: &Arc<ColumnFamily>, keys: &[&[u8]]) -> Vec<Result<Vec<u8>>> {
+        self.ensure_write_index();
         let id = cf_id(cf);
         // A merge family's buffer can hold operands that still need the store's
         // base, which the "buffered or pending, never both" split below cannot
@@ -1061,12 +1293,9 @@ impl Txn {
         let mut pending: Vec<&[u8]> = Vec::new();
 
         for (i, key) in keys.iter().enumerate() {
-            // Read-your-writes: scan the buffer backward for the latest write.
-            let buffered =
-                self.writes.iter().rev().find(|w| {
-                    !w.is_range() && cf_id(&w.cf) == id && buf_slice(&self.buf, w.key) == *key
-                });
-            if let Some(w) = buffered {
+            // Read-your-writes: the latest buffered write wins.
+            if let Some(at) = self.newest_point_write(id, key) {
+                let w = &self.writes[at];
                 out[i] = Some(if w.tombstone() {
                     Err(OndaError::NotFound)
                 } else {
@@ -1280,6 +1509,13 @@ impl Txn {
             .rposition(|(n, _, _, _)| n == name)
             .ok_or_else(|| OndaError::InvalidArgs(format!("no savepoint {name}")))?;
         let (_, wlen, blen, read_len) = self.savepoints[pos];
+        // Unwind the index before the arena shrinks: it rehashes the
+        // discarded keys to find their chains.
+        if let Some(index) = &mut self.write_index {
+            index.truncate(&self.buf, &self.writes, wlen);
+        }
+        let ranges_kept = self.range_writes.partition_point(|&at| at < wlen);
+        self.range_writes.truncate(ranges_kept);
         self.writes.truncate(wlen);
         self.buf.truncate(blen);
         for read in &self.read_log[read_len..] {
@@ -1785,7 +2021,7 @@ impl Txn {
         for (cf, ops) in &application.hooks {
             cf.run_commit_hook(commit_seq, ops);
         }
-        self.writes.clear();
+        self.clear_writes();
         self.read_set.clear();
         self.read_log.clear();
         self.read_cfs.clear();
@@ -2008,7 +2244,7 @@ impl Txn {
         }
         self.db.wal_gens.lock().pin(prepare_gen);
         drop(_guard);
-        self.writes.clear();
+        self.clear_writes();
         self.read_set.clear();
         self.read_log.clear();
         self.read_cfs.clear();
@@ -2067,7 +2303,7 @@ impl Txn {
             return Ok(());
         }
         self.state = TxnState::Finished;
-        self.writes.clear();
+        self.clear_writes();
         self.read_set.clear();
         self.read_log.clear();
         self.read_cfs.clear();
@@ -2099,7 +2335,7 @@ impl Txn {
         self.read_seq = read_seq;
         self.fixed = fixed;
         self.snapshot_held = fixed;
-        self.writes.clear();
+        self.clear_writes();
         if self.buf.capacity() == 0 {
             self.buf = take_buf();
         } else {
@@ -2143,7 +2379,7 @@ impl Txn {
 
 impl Drop for Txn {
     fn drop(&mut self) {
-        self.writes.clear();
+        self.clear_writes();
         // After `prepare` the arena belongs to the registry and `self.buf` is
         // the empty `Vec` `mem::take` left behind; `put_buf` returns
         // immediately on a zero-capacity buffer, so nothing is recycled.
@@ -2157,6 +2393,62 @@ mod tests {
     use super::*;
     use crate::config::ColumnFamilyConfig;
     use crate::Options;
+
+    thread_local! {
+        /// Files every buffered write under one hash, so `WriteIndex` chains
+        /// hold every key and family and each lookup must skip non-matches.
+        pub(super) static COLLIDE_WRITE_HASHES: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// With every write hashed alike, the index is one chain through the whole
+    /// buffer: lookups must still find exactly the newest write of their own
+    /// family and key bytes, and a savepoint rollback must restore the chain
+    /// head across interleaved keys.
+    #[test]
+    fn write_index_survives_total_hash_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        let a = db
+            .create_column_family("a", ColumnFamilyConfig::default())
+            .unwrap();
+        let b = db
+            .create_column_family("b", ColumnFamilyConfig::default())
+            .unwrap();
+        db.put(&a, b"k1", b"stored", Duration::ZERO).unwrap();
+        COLLIDE_WRITE_HASHES.with(|c| c.set(true));
+        let mut t = db.begin();
+        t.set_write_index_min_for_tests(0);
+        for i in 0..50u32 {
+            let k = format!("k{}", i % 7);
+            t.put(&a, k.as_bytes(), format!("a{i}").as_bytes(), Duration::ZERO)
+                .unwrap();
+            t.put(&b, k.as_bytes(), format!("b{i}").as_bytes(), Duration::ZERO)
+                .unwrap();
+            // Built on the first read, then maintained by every append.
+            assert_eq!(t.get(&a, k.as_bytes()).unwrap(), format!("a{i}").as_bytes());
+        }
+        assert!(t.write_index.is_some());
+        assert!(t.write_index.as_ref().unwrap().newest.len() == 1);
+        t.set_savepoint("s").unwrap();
+        t.delete(&a, b"k1").unwrap();
+        t.put(&b, b"k1", b"later", Duration::ZERO).unwrap();
+        t.put(&a, b"new", b"n", Duration::ZERO).unwrap();
+        assert!(matches!(t.get(&a, b"k1"), Err(OndaError::NotFound)));
+        assert_eq!(t.get(&b, b"k1").unwrap(), b"later");
+        t.rollback_to_savepoint("s").unwrap();
+        // k1 was last written at i = 43 (the largest i < 50 with i % 7 == 1).
+        assert_eq!(t.get(&a, b"k1").unwrap(), b"a43");
+        assert_eq!(t.get(&b, b"k1").unwrap(), b"b43");
+        assert!(matches!(t.get(&a, b"new"), Err(OndaError::NotFound)));
+        assert!(matches!(t.get(&a, b"absent"), Err(OndaError::NotFound)));
+        let got = t.multi_get(&b, &[b"k6".as_slice(), b"k0".as_slice()]);
+        assert_eq!(got[0].as_ref().unwrap(), b"b48");
+        assert_eq!(got[1].as_ref().unwrap(), b"b49");
+        COLLIDE_WRITE_HASHES.with(|c| c.set(false));
+        t.rollback().unwrap();
+        assert!(t.write_index.is_none());
+    }
 
     #[test]
     fn reset_fixed_snapshot_waits_for_own_commit_floor() {
