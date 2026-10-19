@@ -26,6 +26,48 @@
   then `get(a)` → `"z"`). It now skips range deletes; coverage is decided by
   the span check, as on every other family.
 
+### A transaction iterator's overlay is bounded to the iterator's range
+
+- **Perf: `Txn::new_iterator_bounded` copies only the buffered writes its
+  bounds can reach** (port of wavesdb f5a5dc4). The overlay used to receive
+  every buffered write and range delete of the family, so each scan inside a
+  transaction of N writes paid N memtable inserts. Point writes outside
+  `[lower, upper]` and range deletes that cannot cover a key inside it are now
+  skipped, under the family's comparator, on both the plain and the
+  merge-operator paths; a merged key inside the bounds keeps its whole chain.
+  An unbounded iterator copies everything, as before. The pass over the buffer
+  is still O(buffer) — it is in write order with no key-ordered index — but an
+  unreachable write now costs a comparison, not an insert. The merge path also
+  builds its chains in one pass instead of one buffer scan per merged key.
+  Measured (`tests/txn_overlay_bench.rs`, release + `unsafe-fastpath`, median
+  of 5): 10,000 puts each followed by a one-key bounded scan 5.59 s -> 0.27 s;
+  1,000 of them 54 ms -> 9.9 ms; iterator creation over a 100,000-write buffer
+  15.8 ms -> 0.52 ms; the merge-family variant, 3,000 operands, 46.9 s ->
+  0.041 s.
+- **Fix (`unsafe-fastpath`): a key written more than once in a transaction
+  scanned backward as its first write.** Every overlay entry shares the read
+  sequence, and the arena memtable keeps an equal `(key, seq)` as a second node
+  instead of replacing the first, so a backward scan could return a superseded
+  value or resurrect a key the transaction had since deleted. The overlay now
+  holds one version per key — its last write.
+- **Fix: a transaction's own range delete on a merge family.** The merge
+  overlay replayed a buffered range delete as a point put of its end key at its
+  start key, and `Txn::get` read it the same way through the buffered chain: a
+  scan showed `start => end` and did not mask the span, and `get(start)`
+  returned the end key (`delete_range(k33, k38)` read back as `k33 => "k38"`,
+  with `k34`..`k37` still visible). Range deletes are now spans in the overlay
+  and are never part of a key's buffered chain; regression test
+  `own_range_delete_is_a_span_not_a_value` (both family kinds, both
+  directions, bounded and unbounded).
+- **Fix (debug builds): the SSTable writer's fragment-order assertion** used
+  byte order instead of the family's comparator, so flushing two range deletes
+  on a `reverse` family panicked the flush thread (and `flush_memtable` then
+  waited forever). Release builds were unaffected.
+- **Known, not fixed:** a transaction scan does not mask the committed version
+  at exactly its read sequence (the newest write when it began) under its own
+  range delete, while `Txn::get` does; see the ignored
+  `own_span_masks_the_newest_committed_write` in `tests/txn_bounded_overlay.rs`.
+
 ## 0.10.0 — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB

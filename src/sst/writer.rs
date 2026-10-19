@@ -195,8 +195,12 @@ impl Writer {
     /// implies it) must be set; [`finish`](Self::finish) refuses the
     /// combination otherwise rather than silently dropping the fragments.
     pub fn set_range_fragments(&mut self, frags: Vec<crate::range_tombstone::Fragment>) {
+        // Under the table's comparator, not byte order: a reverse family's
+        // correctly ordered fragments are descending bytes.
         debug_assert!(
-            frags.windows(2).all(|w| w[0].end <= w[1].start),
+            frags
+                .windows(2)
+                .all(|w| self.opts.cmp.compare(&w[0].end, &w[1].start).is_le()),
             "range fragments must be sorted and disjoint"
         );
         self.range_fragments = frags;
