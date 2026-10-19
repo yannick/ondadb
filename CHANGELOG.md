@@ -95,6 +95,36 @@ dropped family's handle now returns `NotFound`. See
 `docs/concurrency-and-safety.md`, "Drop / clear against rotation, flush and
 table edits".
 
+### Comparators: `Equal` means byte-identical; `int64` is a total order
+
+- **`case_insensitive` breaks ties on the raw bytes.** Keys that differ only
+  in letter case used to compare `Equal`. Point reads match keys by their bytes
+  (bloom filter, memtable, table and transaction-buffer lookups), while scans
+  group keys by the comparator, so the two disagreed: `get("K10")` missed a
+  stored `k10`, a later `put("K10")` was invisible to `get("k10")`, and a scan
+  showed one entry. Case variants are now distinct, adjacent keys
+  (`"K10" < "k10"`), and `get` and scans agree. The ordering otherwise is
+  unchanged.
+- **`int64` was not transitive once key lengths mixed.** It compared two 8-byte
+  keys as signed integers and every other pair byte-wise, so `1 < "z" < -1 < 1`.
+  A table holding such keys could be misordered, and `get` missed keys a scan
+  still showed. Negative 8-byte keys now sort just below the 8-byte zero key,
+  and every other pair keeps its byte-wise order. A family whose keys are all
+  8 bytes, or that holds no negative 8-byte key, orders exactly as before.
+- **The `Comparator` contract now says it:** a comparator may return `Equal`
+  only for byte-identical keys, and must be a total order. Every built-in is
+  checked exhaustively for antisymmetry, transitivity and byte identity.
+  `tests/comparator_semantics.rs` checks that `get` agrees with a scan for
+  every built-in, in both layouts, before and after a flush.
+- **Compatibility:** no byte format changes, and the comparator names are
+  unchanged. Only data that was already misordered can be affected:
+  - a `case_insensitive` family holding two spellings of one key;
+  - an `int64` family mixing negative 8-byte keys with keys of other lengths.
+
+  Rewrite such a family (scan it into a fresh family) to be certain.
+
+## 0.10.0 — Breaking: yoloDB format epoch 1
+
 ## 0.10.0 — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB

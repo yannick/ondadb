@@ -3765,7 +3765,9 @@ mod tests {
         assert!(key_is_below_upper(&bytewise, b"B", Bound::Included(b"a")));
         assert!(!key_is_below_upper(&folded, b"B", Bound::Included(b"a")));
         assert!(key_is_below_upper(&folded, b"A", Bound::Included(b"a")));
-        assert!(!key_is_below_upper(&folded, b"A", Bound::Excluded(b"a")));
+        // `a` < `B` ignoring case, but `a` > `B` byte-wise.
+        assert!(key_is_below_upper(&folded, b"a", Bound::Excluded(b"B")));
+        assert!(!key_is_below_upper(&bytewise, b"a", Bound::Excluded(b"B")));
     }
 
     /// Wait for background compaction to drain L0 into the levels below. A
