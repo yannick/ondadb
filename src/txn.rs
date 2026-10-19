@@ -114,6 +114,63 @@ fn buffered_ranges<'a>(
         .map(move |w| (&w.cf, buf_slice(buf, w.key), buf_slice(buf, w.value)))
 }
 
+/// [`BufferedChain`], borrowed from the arena: one merged key's chain as a
+/// scan's overlay builds it.
+#[derive(Clone, Default)]
+struct OverlayChain<'a> {
+    key: &'a [u8],
+    /// `Some(Some(v))` a buffered put, `Some(None)` a buffered delete.
+    base: Option<Option<&'a [u8]>>,
+    /// Operands buffered after that base, oldest first.
+    operands: Vec<&'a [u8]>,
+}
+
+/// A transaction iterator's declared bounds, under its family's comparator:
+/// which buffered writes its overlay can need. The same semantics the iterator
+/// applies to the keys it yields (`Iterator::past_upper` / `below_lower`).
+struct OverlayBounds<'a> {
+    cmp: &'a crate::comparator::ComparatorRef,
+    lower: std::ops::Bound<&'a [u8]>,
+    upper: std::ops::Bound<&'a [u8]>,
+}
+
+impl OverlayBounds<'_> {
+    /// Can the iterator yield `key`?
+    fn contains(&self, key: &[u8]) -> bool {
+        use std::ops::Bound;
+        let above = match self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(l) => self.cmp.compare(key, l).is_ge(),
+            Bound::Excluded(l) => self.cmp.compare(key, l).is_gt(),
+        };
+        above
+            && match self.upper {
+                Bound::Unbounded => true,
+                Bound::Included(u) => self.cmp.compare(key, u).is_le(),
+                Bound::Excluded(u) => self.cmp.compare(key, u).is_lt(),
+            }
+    }
+
+    /// Can the half-open span `[start, end)` cover a key the iterator can
+    /// yield? Conservative at an exclusive lower bound (`end` just above it may
+    /// leave no key between them), which only keeps a span that masks nothing.
+    fn may_cover(&self, start: &[u8], end: &[u8]) -> bool {
+        use std::ops::Bound;
+        // `end` is exclusive, so a span ending at the lower bound covers
+        // nothing inside it, whether that bound is inclusive or not.
+        let above = match self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(l) | Bound::Excluded(l) => self.cmp.compare(end, l).is_gt(),
+        };
+        above
+            && match self.upper {
+                Bound::Unbounded => true,
+                Bound::Included(u) => self.cmp.compare(start, u).is_le(),
+                Bound::Excluded(u) => self.cmp.compare(start, u).is_lt(),
+            }
+    }
+}
+
 /// A durably prepared transaction (3.2), named by the id its coordinator
 /// supplied.
 ///
@@ -875,7 +932,10 @@ impl Txn {
         let mut base: Option<Option<Vec<u8>>> = None;
         let mut operands: Vec<Vec<u8>> = Vec::new();
         for w in &self.writes {
-            if cf_id(&w.cf) != id || buf_slice(&self.buf, w.key) != key {
+            // A range delete is an interval, not a version of its start bound:
+            // matching it here read the *end* bound back as the key's value.
+            // Its coverage is `own_range_covers`' job.
+            if w.is_range() || cf_id(&w.cf) != id || buf_slice(&self.buf, w.key) != key {
                 continue;
             }
             seen = true;
@@ -1151,47 +1211,71 @@ impl Txn {
         // must not construct a throwaway overlay memtable per iterator.
         let overlay: Option<Arc<Memtable>> = if self.writes.is_empty() {
             None
-        } else if cf.merge_op().is_some() {
-            match self.merge_overlay(cf, id, rs) {
+        } else {
+            let bounds = OverlayBounds {
+                cmp: cf.comparator(),
+                lower,
+                upper,
+            };
+            let built = if cf.merge_op().is_some() {
+                self.merge_overlay(cf, id, rs, &bounds)
+            } else {
+                Ok(self.plain_overlay(cf, id, rs, &bounds))
+            };
+            match built {
                 Ok(overlay) => overlay,
                 Err(error) => return Iterator::failed(cf.comparator().clone(), error),
-            }
-        } else {
-            let mem = Memtable::new(cf.comparator().clone());
-            let mut any = false;
-            for w in &self.writes {
-                if cf_id(&w.cf) != id {
-                    continue;
-                }
-                if w.is_range() {
-                    // At `rs`, so the overlay's spans mask exactly what the
-                    // transaction can already see plus its own writes.
-                    mem.add_range(
-                        buf_slice(&self.buf, w.key),
-                        buf_slice(&self.buf, w.value),
-                        rs,
-                    );
-                } else {
-                    mem.put_ref(
-                        buf_slice(&self.buf, w.key),
-                        buf_slice(&self.buf, w.value),
-                        rs,
-                        w.ttl,
-                        w.kind,
-                    );
-                }
-                any = true;
-            }
-            if any {
-                Some(mem)
-            } else {
-                None
             }
         };
         cf.new_iterator(rs, overlay, (lower, upper))
     }
 
-    /// Build the overlay memtable for a scan over a merge family.
+    /// Build the overlay memtable for a scan over a family without a merge
+    /// operator: this transaction's writes of the family that `bounds` can
+    /// reach, at `rs`, one version per key: its last write.
+    ///
+    /// Only reachable writes are copied — the iterator never yields a key
+    /// outside its bounds, and copying the rest cost every scan in a large
+    /// transaction O(all its writes) of inserts (wavesdb f5a5dc4). The pass
+    /// itself is still O(buffer): the buffer is in write order and has no
+    /// key-ordered index to seek, but an unreachable write costs one or two
+    /// comparisons and no allocation.
+    fn plain_overlay(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        id: usize,
+        rs: u64,
+        bounds: &OverlayBounds<'_>,
+    ) -> Option<Arc<Memtable>> {
+        let mut mem: Option<Arc<Memtable>> = None;
+        // Newest first, one version per key: every overlay entry shares `rs`,
+        // and a memtable's `(key, seq)` must be unique — the arena memtable
+        // keeps a duplicate as a second node rather than replacing the first,
+        // and a backward scan then surfaced the key's *first* buffered write.
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        for w in self.writes.iter().rev() {
+            if cf_id(&w.cf) != id {
+                continue;
+            }
+            let key = buf_slice(&self.buf, w.key);
+            if w.is_range() {
+                let end = buf_slice(&self.buf, w.value);
+                if bounds.may_cover(key, end) {
+                    // At `rs`, so the overlay's spans mask what the transaction
+                    // can already see plus its own writes.
+                    mem.get_or_insert_with(|| Memtable::new(cf.comparator().clone()))
+                        .add_range(key, end, rs);
+                }
+            } else if bounds.contains(key) && seen.insert(key) {
+                mem.get_or_insert_with(|| Memtable::new(cf.comparator().clone()))
+                    .put_ref(key, buf_slice(&self.buf, w.value), rs, w.ttl, w.kind);
+            }
+        }
+        mem
+    }
+
+    /// Build the overlay memtable for a scan over a merge family, from the
+    /// writes `bounds` can reach (see [`plain_overlay`](Self::plain_overlay)).
     ///
     /// Every buffered write of this transaction lands at the same sequence
     /// (`rs`), which is what makes last-write-wins work for puts — the memtable
@@ -1202,43 +1286,87 @@ impl Txn {
     /// the overlay carries a single ordinary put per key. That keeps the merge
     /// iterator free of any overlay special case, at the cost of those reads —
     /// which the scan would have paid anyway.
+    ///
+    /// Bounding is per key, so a merged key inside the bounds keeps its whole
+    /// chain. The chains are built in the same single pass, with the same
+    /// rule as [`buffered_chain`](Self::buffered_chain): the last base, then
+    /// every operand after it.
     fn merge_overlay(
         &self,
         cf: &Arc<ColumnFamily>,
         id: usize,
         rs: u64,
+        bounds: &OverlayBounds<'_>,
     ) -> Result<Option<Arc<Memtable>>> {
-        // Keys this transaction merged. Everything else replays exactly as the
-        // ordinary overlay does, TTL and single-delete kind included.
-        let mut merged: Vec<&[u8]> = Vec::new();
-        let mut any = false;
+        // Keys this transaction merged, in first-merge order, and their chains.
+        // Byte equality, as `buffered_chain` and the point-read path use.
+        let mut merged: HashMap<&[u8], usize> = HashMap::new();
+        let mut reached: Vec<&WriteEntry> = Vec::new();
         for w in &self.writes {
             if cf_id(&w.cf) != id {
                 continue;
             }
-            any = true;
             let key = buf_slice(&self.buf, w.key);
-            if w.is_merge() && !merged.contains(&key) {
-                merged.push(key);
+            let reachable = if w.is_range() {
+                bounds.may_cover(key, buf_slice(&self.buf, w.value))
+            } else {
+                bounds.contains(key)
+            };
+            if !reachable {
+                continue;
             }
+            if w.is_merge() {
+                let next = merged.len();
+                merged.entry(key).or_insert(next);
+            }
+            reached.push(w);
         }
-        if !any {
+        if reached.is_empty() {
             return Ok(None);
         }
         let mem = Memtable::new(cf.comparator().clone());
-        for w in &self.writes {
+        let mut chains: Vec<OverlayChain<'_>> = vec![OverlayChain::default(); merged.len()];
+        // The last write of each unmerged key: one overlay version per key, as
+        // on the plain path.
+        let mut last: HashMap<&[u8], &WriteEntry> = HashMap::new();
+        for w in reached {
             let key = buf_slice(&self.buf, w.key);
-            if cf_id(&w.cf) != id || merged.contains(&key) {
+            let value = buf_slice(&self.buf, w.value);
+            if w.is_range() {
+                // An interval, not a version of a key: it goes to the overlay's
+                // span set at `rs`, as on the plain path.
+                mem.add_range(key, value, rs);
                 continue;
             }
+            let Some(&slot) = merged.get(key) else {
+                last.insert(key, w);
+                continue;
+            };
+            let chain = &mut chains[slot];
+            chain.key = key;
+            if w.is_merge() {
+                chain.operands.push(value);
+            } else if w.tombstone() {
+                chain.base = Some(None);
+                chain.operands.clear();
+            } else {
+                chain.base = Some(Some(value));
+                chain.operands.clear();
+            }
+        }
+        // Everything unmerged replays exactly as the plain overlay does, TTL
+        // and single-delete kind included.
+        for (key, w) in last {
             mem.put_ref(key, buf_slice(&self.buf, w.value), rs, w.ttl, w.kind);
         }
-        for key in merged {
-            let chain = self
-                .buffered_chain(id, key)
-                .expect("the key came out of the buffer");
-            let committed = match chain.base {
-                Some(base) => base,
+        for OverlayChain {
+            key,
+            base,
+            operands,
+        } in chains
+        {
+            let committed = match base {
+                Some(base) => base.map(<[u8]>::to_vec),
                 // No buffered base: the chain continues into the store, which
                 // `cf.get` folds for us.
                 None => match cf.get(key, rs) {
@@ -1247,7 +1375,7 @@ impl Txn {
                     Err(e) => return Err(e),
                 },
             };
-            if chain.operands.is_empty() {
+            if operands.is_empty() {
                 // A base written *after* the last operand supersedes it.
                 match committed {
                     Some(value) => mem.put_ref(key, &value, rs, 0, crate::format::KIND_PUT),
@@ -1255,7 +1383,8 @@ impl Txn {
                 }
                 continue;
             }
-            let folded = Self::fold_buffered(cf, key, committed.as_deref(), &chain.operands)?;
+            let operands: Vec<Vec<u8>> = operands.into_iter().map(<[u8]>::to_vec).collect();
+            let folded = Self::fold_buffered(cf, key, committed.as_deref(), &operands)?;
             mem.put_ref(key, &folded, rs, 0, crate::format::KIND_PUT);
         }
         Ok(Some(mem))
@@ -2530,5 +2659,57 @@ mod tests {
             matches!(outcome, Err(OndaError::Conflict(_))),
             "committed a Serializable txn whose read of k was overwritten: {outcome:?}"
         );
+    }
+
+    /// The overlay holds only what the iterator's bounds can reach: one point
+    /// write and the one span that straddles the bounds, out of a buffer of
+    /// thousands (wavesdb f5a5dc4) — and an unbounded overlay still holds all.
+    #[test]
+    fn overlay_holds_only_reachable_writes() {
+        use std::ops::Bound;
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(Options::new(dir.path().to_str().unwrap())).unwrap();
+        db.enable_format_capabilities(crate::format::CAP_RANGE_DELETES)
+            .unwrap();
+        let cf = db
+            .create_column_family("d", ColumnFamilyConfig::default())
+            .unwrap();
+        let mut t = db.begin();
+        for i in 0..2_000u32 {
+            let k = format!("k{i:05}");
+            t.put(&cf, k.as_bytes(), b"v", Duration::ZERO).unwrap();
+        }
+        for i in 0..100u32 {
+            let (s, e) = (format!("r{i:03}a"), format!("r{i:03}b"));
+            t.delete_range(&cf, s.as_bytes(), e.as_bytes()).unwrap();
+        }
+        // Straddles the lower bound below.
+        t.delete_range(&cf, b"k01000a", b"k01000c").unwrap();
+        let bounds = OverlayBounds {
+            cmp: cf.comparator(),
+            lower: Bound::Included(b"k01000b"),
+            upper: Bound::Included(b"k01001"),
+        };
+        let mem = t.plain_overlay(&cf, cf_id(&cf), 1, &bounds).unwrap();
+        assert_eq!(mem.num_entries(), 1);
+        assert_eq!(mem.ranges().len(), 1);
+
+        let none = OverlayBounds {
+            cmp: cf.comparator(),
+            lower: Bound::Included(b"x"),
+            upper: Bound::Unbounded,
+        };
+        assert!(t.plain_overlay(&cf, cf_id(&cf), 1, &none).is_none());
+
+        let all = OverlayBounds {
+            cmp: cf.comparator(),
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let mem = t.plain_overlay(&cf, cf_id(&cf), 1, &all).unwrap();
+        assert_eq!(mem.num_entries(), 2_000);
+        assert_eq!(mem.ranges().len(), 101);
+        t.rollback().unwrap();
+        db.close().unwrap();
     }
 }
