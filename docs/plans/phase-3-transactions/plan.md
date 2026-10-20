@@ -22,6 +22,7 @@ prerequisites. Two review items remain open and both bear on 3.2:
 | --- | --- | --- | ---: | --- |
 | [3.2](features/32-two-phase-commit.md) | durable prepare/decision | architectural | 6–10 wks | 1.0 `CAP_TXN_DECISIONS` + WAL record envelopes; unified layout |
 | [3.3](features/33-pessimistic-locking.md) | point (then span) pessimistic locks | design required | 4–7 wks | new lock manager; 3.2 for the prepared×pessimistic slice; spans need 1.2 |
+| [3.4](features/34-commit-path-contention.md) | reverse the measured 3.2 and 3.3 commit-path regressions | design required | 1–2 wks (A1 alone) to 4–8 (full) | 3.2 and 3.3 landed (0.9.0) |
 
 ## Shared state machine
 

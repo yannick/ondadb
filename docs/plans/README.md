@@ -6,9 +6,13 @@ promises: a feature moves to execution only after its prerequisite design
 decisions and benchmark harness exist.
 
 Wave 0 — the August 2026 code review's corrective work — **landed in 0.8.2**
-([`../code-review-2026-08-resolution.md`](../code-review-2026-08-resolution.md)).
-Only M3 (`commit_mu` latency, deferred) and M5 (manifest rewrite cost, fixed by
-feature 2.2) remain open, and neither gates entry to a wave.
+([`../code-review-2026-08-resolution.md`](../code-review-2026-08-resolution.md));
+M5 (manifest rewrite cost) was then closed by feature 2.2 in 0.9.0. Only M3
+(`commit_mu` latency) remains open, and it no longer merely remains — 3.2
+measured its price at ~3× commit throughput under eight threads. What would
+reverse that, and 3.3's own measured regression, is
+[`phase-3-transactions/features/34-commit-path-contention.md`](phase-3-transactions/features/34-commit-path-contention.md).
+Neither gates entry to a wave.
 
 Start with:
 
@@ -25,7 +29,9 @@ Start with:
 | Runtime and observability | [`phase-0-runtime/`](phase-0-runtime/plan.md) | Nine runtime features (0.7 rejected); periodic compaction needs the capability framework | none, except 0.1/0.5's appended `ONDA*` config-blob tails (old blobs still decode) and 0.3's new `SstMeta` field behind `CAP_PERIODIC_AGE` |
 | Record semantics | [`phase-1-record-kinds/`](phase-1-record-kinds/plan.md) | strict decoding, capability-gated manifest v2, merge operands, range tombstones and excise | manifest v2 + `FORMAT_CAPS_TAG`; WAL record envelopes; `FOOTER_EXTENDED_BLOCK` (table-level); `CAP_MERGE_OPERANDS`, `CAP_RANGE_DELETES` |
 | Storage formats | [`phase-2-formats/`](phase-2-formats/plan.md) | prefix-delta data blocks and the manifest edit log | `FOOTER_PREFIX_DELTA` (table-level) under `CAP_PREFIX_DELTA`; a second manifest artifact (`ONDE` edit log) under `CAP_MANIFEST_EDITS` |
-| Transactions | [`phase-3-transactions/`](phase-3-transactions/plan.md) | durable 2PC (unified layout) and pessimistic locks | WAL control records (kinds 16–31) under `CAP_TXN_DECISIONS`; 2PC requires the unified WAL layout. 3.3 is in-memory only |
+| Transactions | [`phase-3-transactions/`](phase-3-transactions/plan.md) | durable 2PC (unified layout), pessimistic locks, and 3.4 — reversing the commit-path regressions the first two measured | WAL control records (kinds 16–31) under `CAP_TXN_DECISIONS`; 2PC requires the unified WAL layout. 3.3 and 3.4 are in-memory only |
+| wavesdb compatibility | [`phase-w-wavesdb-compat/`](phase-w-wavesdb-compat/plan.md) | read wavesdb 0.8.6 checkpoints (local + object store) through a read-only foreign format profile; import; optional live-dir replay; plus shared correctness fixes (wave S) | none to ondaDB's native format — reader-only `WAVESST2`/WVMF-v2–v4/`WVB2` profile selected per artifact |
+| yoloDB convergence (Plan C) | [`phase-c-yolodb-convergence/`](phase-c-yolodb-convergence/plan.md) | step 1: ondaDB moves to yoloDB format epoch 1 (footer magic `YOLOST01`, CRC32-C) and ports wavesdb's speed/function features; step 2: shared spec with wavesdb — common profile + native specialities as capability bits | **breaking**: new epoch; 0.9.x auto-upgraded on open (rebuild in new dir, swap) |
 
 Every capability bit, record kind, and footer flag above has a pinned value in
 [`implementation-plan.md` § Capability and kind registry](implementation-plan.md#capability-and-kind-registry);
