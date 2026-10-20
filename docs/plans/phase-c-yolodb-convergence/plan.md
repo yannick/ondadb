@@ -414,6 +414,21 @@ requirement stated.
      `feat/yolosearch-immutable-checkpoint`).
    - **After the refactor:** update the wavesdb file and line citations in this
      plan and in `../phase-w-wavesdb-compat/research/`.
+   - **Status (2026-10-20): extractions done** (wavesdb PRs #8–#10, main
+     `5459080`):
+     - entity → `internal/entity` (with `internal/errs`);
+     - object-store transfer (checkpoint upload, receipts, copy) →
+       `internal/objio`; `downloadObject` stays in root because the
+       direct-removal guard scans root only;
+     - Bloom policy → `internal/bloom` (with `internal/levels`).
+
+     **Ingest/excise stay in root:** they are `ColumnFamily`/`DB` methods over
+     `tableHandle` state, i.e. the "not a candidate" case above. Each PR was
+     gated by `scripts/refactor-fixture-diff.sh` (byte-identical, and
+     mutation-checked) and the full `go test`. The fixture now also covers
+     object-store checkpoints, restores and three Bloom policies. The research
+     citations into moved code point at `5459080`; this plan cited none.
+     Optional and not blocking 2a: the within-root reorganisation.
 1. **2a — spec and harness (≈3 wk, both teams):** `yolodb-format` repository,
    the registry, rows A–T written as spec text, the golden corpus from
    ondaDB epoch 1, and the cross-engine CI harness (ondaDB write → wavesdb
