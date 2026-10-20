@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Licensing
+
+- **`Cargo.toml` no longer declares `MPL-2.0`**, which was a leftover from the
+  initial scaffolding and was never shipped with a licence text. The crate is
+  proprietary: `license-file = "LICENSE"`, which reads "Proprietary, ask
+  Yannick for a licence."
+
 ## 0.10.1
 
 ### Transactions: read-your-own-writes no longer scans the whole buffer
