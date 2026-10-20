@@ -15,8 +15,12 @@ corpus is `tests/fixtures/epoch1/` (`tests/epoch1_golden.rs`). The ondaDB 0.9
 formats this epoch replaced are summarized in the appendix; they are read only
 by `src/legacy_onda/`.
 
-A format change requires updating this file, the registry, the golden corpus
-and a release note.
+The engine-neutral specification is `spec/epoch1.md` in the shared
+`yolodb-format` repository (`github.com/yannick/yolodb-format`), with the same
+golden corpus under `corpus/epoch1/`. This file is ondaDB's copy, plus the two
+ondaDB-only sections (upgrading a 0.9 directory, the 0.9 appendix). A format
+change lands in `yolodb-format` first (spec, registry, corpus), then here, in
+the registry mirror, in the golden corpus and in a release note.
 
 ## Internal keys (`format.rs`)
 

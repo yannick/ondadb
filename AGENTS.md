@@ -10,7 +10,7 @@ Deep documentation (read the one that matches your task):
 |---|---|
 | `docs/architecture.md` | Module map, write/read/flush/compaction/recovery data flow |
 | `docs/formats.md` | Every on-disk byte (yoloDB format epoch 1): WAL segments and frames, SSTable klog/vlog, manifest + `MANIFEST-EDITS`, config TLV, internal keys; appendix on the 0.9 formats |
-| `docs/format-registry.md` | The yoloDB registry: every magic, version, flag, capability bit, kind, codec id, TLV tag and edit op |
+| `docs/format-registry.md` | The yoloDB registry: every magic, version, flag, capability bit, kind, codec id, TLV tag and edit op. Mirror of `yolodb-format` `spec/registry.md`, which is canonical: new numbers are assigned there first |
 | `docs/concurrency-and-safety.md` | Lock inventory & ordering, MVCC, rotation protocol, S3 runtime/blocking contract, all `unsafe` contracts |
 | `docs/parts-and-tiers.md` | User-facing guide to partitions, parts and storage tiers (0.3.0): concepts, worked examples, S3 setup, operational notes |
 | `docs/performance.md` | Fast paths, benchmark methodology, known measurement artifacts |
@@ -153,7 +153,8 @@ everywhere, restart trailers on every data block, codec id 6 for LZ4 (2 and 4
 burned), a leading bloom hash tag and the correct FNV-1a-64 basis for unified
 CF ids. `src/format.rs` is the single home for every number, each pinned by a
 `const` assertion and a golden test (`tests/epoch1_golden.rs` over
-`tests/fixtures/epoch1/`); `docs/format-registry.md` is the registry. Fail
+`tests/fixtures/epoch1/`); `docs/format-registry.md` mirrors the registry,
+whose canonical copy is `spec/registry.md` in `yolodb-format`. Fail
 closed: malformed bytes are `Corruption`; an unknown version, flag, capability
 bit, codec, kind or config enum value is `UnsupportedFormat`.
 
