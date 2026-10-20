@@ -104,7 +104,10 @@ ratios between engines, not absolute numbers across sessions. See
    checkpoint/backup can pin the file set (`pause_deletions`). A bare
    `fs::remove_file` on an SST is a bug.
 7. **Comparator stability**: a CF's comparator defines its on-disk order and is
-   persisted by name in the CF config blob (TLV tag 1). The 8-byte **key-prefix compare trick**
+   persisted by name in the CF config blob (TLV tag 1); a name that is neither
+   a built-in nor registered in `Options::comparators` refuses the open
+   (`preflight_catalog_names`, before anything is written), never falls back to
+   `memcmp`. The 8-byte **key-prefix compare trick**
    (used in the memtable, merge iterator, and flush merge) is only valid when
    `Comparator::is_bytewise()` — every prefix shortcut must fall through to the
    full comparison on prefix equality and must be gated on `bytewise`.

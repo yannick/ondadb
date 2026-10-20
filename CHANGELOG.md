@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Custom comparators can be registered
+
+- **`Options::comparators` registers custom comparators by name**, as
+  `Options::merge_fns` does for merge operators. Before, a family could only
+  name one of the six built-ins: `create_column_family` refused any other
+  name, so `FnComparator` could not be attached to a family at all. A family
+  now records its comparator's name; creating or opening one whose name is
+  neither a built-in nor registered is `InvalidArgs`, and a registry with an
+  empty name, a built-in's name or a duplicate is refused at open. This closes
+  yolodb-format divergence T1 for ondaDB (wavesdb has the same registry since
+  0.8.11).
+- **A refused open writes nothing.** Every comparator, merge-operator and
+  derived-partitioner name in the catalog is now resolved before the open
+  creates anything. Under the unified layout a refused open used to leave an
+  empty new WAL generation behind (harmless, but a write by an open that
+  failed).
+
 ### Licensing
 
 - **`Cargo.toml` no longer declares `MPL-2.0`**, which was a leftover from the

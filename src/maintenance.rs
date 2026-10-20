@@ -529,10 +529,8 @@ impl DB {
             return Err(OndaError::Exists(dst.into()));
         }
         let config = src_cf.effective_config();
-        let comparator = crate::comparator::comparator_by_name(&config.comparator_name)
-            .ok_or_else(|| {
-                OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
-            })?;
+        let comparator =
+            crate::db::comparator_for(&self.inner.opts, dst, &config.comparator_name)?;
         let dst_cf = crate::column_family::ColumnFamily::create(
             self.inner.ctx.clone(),
             dst.to_string(),
