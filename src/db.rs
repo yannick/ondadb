@@ -562,6 +562,94 @@ pub mod commit_park {
     }
 }
 
+/// Test-only rendezvous on a column family's background paths, used to hold a
+/// rotation or a flush **in flight** across `drop_column_family` /
+/// `clear_column_family` (`tests/drop_rotation.rs`).
+///
+/// Keyed by the family's `Arc` address rather than its name: the test binary
+/// runs tests in parallel, and every one of them may call its family the same
+/// thing. Debug builds only, armed explicitly, fires once per arm.
+#[cfg(debug_assertions)]
+pub mod cf_park {
+    use std::sync::mpsc::{Receiver, SyncSender};
+    use std::sync::Arc;
+
+    use crate::column_family::ColumnFamily;
+
+    /// Where a background path parks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Point {
+        /// A per-CF rotation that has claimed `preparing` and released the
+        /// rotation lock, before it opens the next WAL segment.
+        RotationBeforeWalOpen,
+        /// A flush that has picked its family (per-CF job, or one slice of a
+        /// unified flush), before it writes the table.
+        FlushBeforeWrite,
+        /// A compaction job whose outputs are written, before its catalog edit.
+        CompactionBeforeInstall,
+    }
+
+    type Armed = (usize, Point, SyncSender<()>, Receiver<()>);
+
+    static ARMED: parking_lot::Mutex<Vec<Armed>> = parking_lot::Mutex::new(Vec::new());
+    static RETIRE_WAITING: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+
+    fn key(cf: &Arc<ColumnFamily>) -> usize {
+        Arc::as_ptr(cf) as usize
+    }
+
+    /// Arm `point` for `cf`. Returns `(entered, release)`: `entered.recv()`
+    /// blocks until the path is parked, `release.send(())` lets it go on.
+    #[doc(hidden)]
+    pub fn arm(cf: &Arc<ColumnFamily>, point: Point) -> (Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        ARMED.lock().push((key(cf), point, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Disarm every point of `cf`, whether or not it fired, and forget that its
+    /// retirement waited.
+    #[doc(hidden)]
+    pub fn disarm(cf: &Arc<ColumnFamily>) {
+        let k = key(cf);
+        ARMED.lock().retain(|a| a.0 != k);
+        RETIRE_WAITING.lock().retain(|&w| w != k);
+    }
+
+    /// Whether a drop/clear of `cf` has blocked waiting for its in-flight
+    /// rotation or flush. Lets a test tell "the drop is waiting for the parked
+    /// path" from "the drop ran straight past it" without a sleep.
+    #[doc(hidden)]
+    pub fn retire_waiting(cf: &Arc<ColumnFamily>) -> bool {
+        RETIRE_WAITING.lock().contains(&key(cf))
+    }
+
+    pub(crate) fn note_retire_waiting(cf: &ColumnFamily) {
+        let k = cf as *const ColumnFamily as usize;
+        let mut w = RETIRE_WAITING.lock();
+        if !w.contains(&k) {
+            w.push(k);
+        }
+    }
+
+    /// Park if `point` is armed for `cf`.
+    pub(crate) fn park_if_armed(cf: &ColumnFamily, point: Point) {
+        let k = cf as *const ColumnFamily as usize;
+        let taken = {
+            let mut armed = ARMED.lock();
+            armed
+                .iter()
+                .position(|a| a.0 == k && a.1 == point)
+                .map(|i| armed.swap_remove(i))
+        };
+        if let Some((_, _, entered, release)) = taken {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+}
+
 /// DB-wide budget for parallel compaction **span workers** (0.8).
 ///
 /// Sized independently of `num_compaction_threads`, and a coordinator consumes
@@ -1162,15 +1250,80 @@ impl DbInner {
         publish: impl FnOnce(&Publish),
         rollback: impl FnOnce(&Publish),
     ) -> Result<()> {
+        self.catalog_txn_built(|| Ok(edit), publish, rollback)
+    }
+
+    /// [`catalog_txn`](Self::catalog_txn) for an edit to `cf`'s tables, refused
+    /// with [`OndaError::NotFound`] — nothing appended, nothing published —
+    /// unless `cf` is still the registered instance of its name.
+    ///
+    /// The check runs under `manifest_mu`, the lock a drop's or clear's own
+    /// transaction unregisters the family under, so it is exact: an edit
+    /// either lands before the `DropCF` (and the drop's table list, built under
+    /// the same lock, includes its result) or is refused. Without it a
+    /// compaction, excise, part operation or ingest racing a drop appended its
+    /// `RemoveTable`/`AddTable` after the `DropCF`, and the next open failed
+    /// that record's precondition — or, once the name was reused, applied it to
+    /// the replacement family.
+    pub(crate) fn catalog_txn_for(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        edit: VersionEdit,
+        publish: impl FnOnce(&Publish),
+    ) -> Result<()> {
+        self.catalog_txn_for_with_rollback(cf, edit, publish, |_| {})
+    }
+
+    /// [`catalog_txn_for`](Self::catalog_txn_for) with a rollback, for
+    /// compaction (see [`catalog_txn_with_rollback`](Self::catalog_txn_with_rollback)).
+    pub(crate) fn catalog_txn_for_with_rollback(
+        &self,
+        cf: &Arc<ColumnFamily>,
+        edit: VersionEdit,
+        publish: impl FnOnce(&Publish),
+        rollback: impl FnOnce(&Publish),
+    ) -> Result<()> {
+        self.catalog_txn_built(
+            || {
+                let live = self
+                    .cfs
+                    .read()
+                    .get(cf.name())
+                    .is_some_and(|current| Arc::ptr_eq(current, cf));
+                if live {
+                    Ok(edit)
+                } else {
+                    Err(OndaError::NotFound)
+                }
+            },
+            publish,
+            rollback,
+        )
+    }
+
+    /// The transaction itself, with the edit built by `edit` **under
+    /// `manifest_mu`**. Building it there is what lets a caller derive it from
+    /// catalog state no other transaction can change before the append: a
+    /// drop's table list, or a liveness check. An `Err` from `edit` aborts the
+    /// transaction before anything is appended or published, and does not
+    /// fail-stop.
+    pub(crate) fn catalog_txn_built(
+        &self,
+        edit: impl FnOnce() -> Result<VersionEdit>,
+        publish: impl FnOnce(&Publish),
+        rollback: impl FnOnce(&Publish),
+    ) -> Result<()> {
         self.poison.check()?;
         if self.opts.read_only {
             // Exactly `persist_manifest`'s early return: nothing is made
             // durable. The in-memory publication still happens, so a read-only
             // handle's view stays consistent with what it just did.
+            edit()?;
             publish(&Publish::after_durable_edit());
             return Ok(());
         }
         let _mu = self.manifest_mu.lock();
+        let edit = edit()?;
         let mut st = self.edit_log.lock();
         if st.log.is_none() {
             // Pre-capability: today's publish-then-persist order, unchanged.
@@ -2865,14 +3018,34 @@ impl DB {
                  resolve it with commit_prepared or abort_prepared (see list_prepared)"
             )));
         }
+        // No rotation or flush of the family may still be in flight when its
+        // directory goes: a rotation would create its next WAL there (in the
+        // *re-created* family's directory once the name is reused, where a
+        // write through this stale handle then lands and replays), and a flush
+        // would write a table there and append an `AddTable` after the
+        // `DropCF` — naming the replacement, or failing the next open.
+        cf.begin_retire();
         // The `DropCF` edit is durable BEFORE any file is unlinked. Before 2.2
         // the directory went first, so a crash in that window left a manifest
         // naming a directory that no longer existed; this is the same shape as
         // invariant 1, applied to a drop.
-        let edit = VersionEdit::new(drop_cf_ops(name, &cf));
-        self.inner.catalog_txn(edit, |p| {
-            self.inner.unregister_cf(name, p);
-        })?;
+        //
+        // The table list is read under `manifest_mu`: a compaction or part
+        // operation publishing in between would otherwise leave it naming a
+        // table that is gone (or missing one that arrived), and the `DropCF`
+        // would fail its own precondition on replay. Anything that publishes
+        // after it is refused by `catalog_txn_for`.
+        let built = || Ok(VersionEdit::new(drop_cf_ops(name, &cf)));
+        if let Err(e) = self.inner.catalog_txn_built(
+            built,
+            |p| {
+                self.inner.unregister_cf(name, p);
+            },
+            |_| {},
+        ) {
+            cf.abort_retire();
+            return Err(e);
+        }
         cf.close_resources();
         let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
         Ok(())
@@ -2923,15 +3096,23 @@ impl DB {
         })?;
         // Never the old id: its entries are exactly what is being cleared.
         let unified_id = self.inner.choose_unified_id(name, &[old.id()]);
+        // As in `drop_column_family`: nothing of the old family may still be
+        // rotating or flushing into the directory the publish step wipes and
+        // re-creates.
+        old.begin_retire();
         // ONE edit: every table removed, the family dropped, the same name
         // re-created empty (under its new unified id). Durable before a single
-        // byte is unlinked.
-        let mut ops = drop_cf_ops(name, &old);
-        ops.push(crate::manifest_edit::Op::CreateCf {
-            name: name.to_string(),
-            config: cfg.encode(),
-        });
-        ops.extend(unified_id_op(name, unified_id));
+        // byte is unlinked. Built under `manifest_mu`, as the drop's is.
+        let config = cfg.encode();
+        let built = || {
+            let mut ops = drop_cf_ops(name, &old);
+            ops.push(crate::manifest_edit::Op::CreateCf {
+                name: name.to_string(),
+                config,
+            });
+            ops.extend(unified_id_op(name, unified_id));
+            Ok(VersionEdit::new(ops))
+        };
         // The wipe-and-recreate runs *inside* the publish step so the registry
         // never shows a gap: a concurrent `get_column_family` sees either the
         // full old family or the empty new one, which is this method's contract.
@@ -2939,7 +3120,7 @@ impl DB {
         // carried out rather than swallowed, and the durable edit already says
         // the family exists and is empty, so a reopen agrees with the catalog.
         let rebuilt: Mutex<Option<Result<Arc<ColumnFamily>>>> = Mutex::new(None);
-        self.inner.catalog_txn(VersionEdit::new(ops), |p| {
+        let publish = |p: &Publish| {
             self.inner.unregister_cf(name, p);
             old.close_resources();
             let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
@@ -2955,7 +3136,11 @@ impl DB {
                 self.inner.register_cf(cf, p);
             }
             *rebuilt.lock() = Some(made);
-        })?;
+        };
+        if let Err(e) = self.inner.catalog_txn_built(built, publish, |_| {}) {
+            old.abort_retire();
+            return Err(e);
+        }
         let cf = rebuilt
             .lock()
             .take()
@@ -2980,7 +3165,14 @@ impl DB {
 
     /// Flush a column family's active memtable to an SSTable (blocks until the
     /// flush is enqueued and drained).
+    ///
+    /// [`OndaError::NotFound`] through the handle of a family that has been
+    /// dropped or cleared (also when that happens while this call runs): its
+    /// memtable is discarded with it, never flushed.
     pub fn flush_memtable(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
+        if cf.is_dropped() {
+            return Err(OndaError::NotFound);
+        }
         // Rotation and any work this thread does on the way to it are flush
         // work, not the caller's foreground work.
         let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Flush);
@@ -2994,6 +3186,9 @@ impl DB {
         };
         while pending() > 0 {
             std::thread::sleep(Duration::from_millis(1));
+        }
+        if cf.is_dropped() {
+            return Err(OndaError::NotFound);
         }
         Ok(())
     }
@@ -3858,6 +4053,19 @@ fn schedule_compaction_after_flush(db: &DbInner, cf: &Arc<ColumnFamily>) {
 }
 
 fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>) {
+    // A family being dropped is not flushed: its memtable is discarded with it.
+    // The claim is held until the edit is appended, so a drop waits for this
+    // flush rather than removing the directory under it (`begin_retire`).
+    if !cf.begin_flush() {
+        return;
+    }
+    #[cfg(debug_assertions)]
+    cf_park::park_if_armed(&cf, cf_park::Point::FlushBeforeWrite);
+    flush_per_cf_claimed(db, &cf, imm);
+    cf.end_flush();
+}
+
+fn flush_per_cf_claimed(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, imm: Arc<ImmMemtable>) {
     match cf.flush_imm(&imm, db.next_file_id()) {
         Ok(out) => {
             // The SST is already synced by `flush_imm` (catalog_txn step 2).
@@ -3874,23 +4082,25 @@ fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>)
             }
             let table = out.table.clone();
             if db
-                .catalog_txn(edit, |p| cf.publish_flush(&imm, table, p))
+                .catalog_txn_for(cf, edit, |p| cf.publish_flush(&imm, table, p))
                 .is_ok()
             {
                 for path in out.wal_paths {
                     crate::wal::remove_wal_files(path);
                 }
             }
-            schedule_compaction_after_flush(db, &cf);
+            schedule_compaction_after_flush(db, cf);
         }
         Err(error) => {
-            // A dropped/cleared CF may disappear while its queued job runs;
-            // only a failure for the still-live instance fail-stops the DB.
+            // Only a failure for the still-live instance fail-stops the DB.
+            // The flush claim keeps a drop from removing the directory under
+            // this job, so a dropped family should not get here — kept as the
+            // backstop it always was.
             let live = db
                 .cfs
                 .read()
                 .get(cf.name())
-                .is_some_and(|current| Arc::ptr_eq(current, &cf));
+                .is_some_and(|current| Arc::ptr_eq(current, cf));
             if live {
                 db.fail_stop(format!("background flush failed: {error}"));
             }
@@ -3904,6 +4114,10 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
     let mut all_slices_flushed = true;
     let mut edit = VersionEdit::default();
     let mut staged: Vec<(Arc<ColumnFamily>, Arc<SstHandle>)> = Vec::new();
+    // Families whose flush claim this job holds, released only after the edit:
+    // a drop waits for them instead of removing a directory a slice is being
+    // written into, or appending its `DropCF` ahead of this `AddTable`.
+    let mut claimed: Vec<Arc<ColumnFamily>> = Vec::new();
     // Range tombstones are split by the same cf-id prefix the point entries
     // carry. A family that has spans but no point entry in this memtable still
     // gets a table: `slices` is the union of both splits.
@@ -3919,6 +4133,14 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
         let Some(cf) = cf else {
             continue;
         };
+        // A family being dropped (or cleared) loses its slice, as a family
+        // that is already gone does above.
+        if !cf.begin_flush() {
+            continue;
+        }
+        claimed.push(cf.clone());
+        #[cfg(debug_assertions)]
+        cf_park::park_if_armed(&cf, cf_park::Point::FlushBeforeWrite);
         let frags = ranges
             .iter_mut()
             .find(|(id, _)| *id == cf_id)
@@ -3963,6 +4185,9 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
         for cf in &published {
             schedule_compaction_after_flush(db, cf);
         }
+    }
+    for cf in &claimed {
+        cf.end_flush();
     }
     if let Some(unified) = &db.unified {
         unified.remove_imm(&imm);

@@ -1,5 +1,128 @@
 # Changelog
 
+## 0.10.1
+
+### Transactions: read-your-own-writes no longer scans the whole buffer
+
+- **`Txn::get` / `get_into` / `multi_get` and the merge-chain fold are indexed.**
+  Every point read of a transaction's own writes scanned its entire buffer
+  (and every read also walked all buffered writes looking for range deletes),
+  so writing N keys and reading them back was O(N²). A transaction whose
+  buffer holds ≥ 32 writes now builds, on its first point read, a hash index
+  of its point writes (`xxh3(cf, key bytes)` → newest write, plus a per-write
+  link to the previous write with the same hash, which the merge chain walks
+  newest first). Appends keep it current, a savepoint rollback unwinds exactly
+  the discarded writes, and commit/rollback/reset/prepare drop it. Buffered
+  range deletes are tracked in their own position list, so a point read checks
+  only the spans. Keys still match by **byte equality**, as the buffer always
+  did (also under a non-bytewise comparator); spans still use the comparator.
+  Measured (`tests/txn_index_bench.rs`, release + `unsafe-fastpath`, median of
+  5): 10k writes then 10k `get`s 138.6 ms → 0.37 ms; 50k: 3533 ms → 4.8 ms;
+  50k merge operands read back 6342 ms → 7.2 ms. Transactions of 1-8 writes
+  are unchanged (they never build the index).
+- **Fix: a buffered range delete read back as a value on a merge family.** The
+  buffered-chain scan matched a range delete whose *start* bound equalled the
+  key and returned its *end* bound as the key's value (`delete_range(a, z)`
+  then `get(a)` → `"z"`). It now skips range deletes; coverage is decided by
+  the span check, as on every other family.
+
+### A transaction iterator's overlay is bounded to the iterator's range
+
+- **Perf: `Txn::new_iterator_bounded` copies only the buffered writes its
+  bounds can reach** (port of wavesdb f5a5dc4). The overlay used to receive
+  every buffered write and range delete of the family, so each scan inside a
+  transaction of N writes paid N memtable inserts. Point writes outside
+  `[lower, upper]` and range deletes that cannot cover a key inside it are now
+  skipped, under the family's comparator, on both the plain and the
+  merge-operator paths; a merged key inside the bounds keeps its whole chain.
+  An unbounded iterator copies everything, as before. The pass over the buffer
+  is still O(buffer) — it is in write order with no key-ordered index — but an
+  unreachable write now costs a comparison, not an insert. The merge path also
+  builds its chains in one pass instead of one buffer scan per merged key.
+  Measured (`tests/txn_overlay_bench.rs`, release + `unsafe-fastpath`, median
+  of 5): 10,000 puts each followed by a one-key bounded scan 5.59 s -> 0.27 s;
+  1,000 of them 54 ms -> 9.9 ms; iterator creation over a 100,000-write buffer
+  15.8 ms -> 0.52 ms; the merge-family variant, 3,000 operands, 46.9 s ->
+  0.041 s.
+- **Fix (`unsafe-fastpath`): a key written more than once in a transaction
+  scanned backward as its first write.** Every overlay entry shares the read
+  sequence, and the arena memtable keeps an equal `(key, seq)` as a second node
+  instead of replacing the first, so a backward scan could return a superseded
+  value or resurrect a key the transaction had since deleted. The overlay now
+  holds one version per key — its last write.
+- **Fix: a transaction's own range delete on a merge family.** The merge
+  overlay replayed a buffered range delete as a point put of its end key at its
+  start key, and `Txn::get` read it the same way through the buffered chain: a
+  scan showed `start => end` and did not mask the span, and `get(start)`
+  returned the end key (`delete_range(k33, k38)` read back as `k33 => "k38"`,
+  with `k34`..`k37` still visible). Range deletes are now spans in the overlay
+  and are never part of a key's buffered chain; regression test
+  `own_range_delete_is_a_span_not_a_value` (both family kinds, both
+  directions, bounded and unbounded).
+- **Fix (debug builds): the SSTable writer's fragment-order assertion** used
+  byte order instead of the family's comparator, so flushing two range deletes
+  on a `reverse` family panicked the flush thread (and `flush_memtable` then
+  waited forever). Release builds were unaffected.
+- **Known, not fixed:** a transaction scan does not mask the committed version
+  at exactly its read sequence (the newest write when it began) under its own
+  range delete, while `Txn::get` does; see the ignored
+  `own_span_masks_the_newest_committed_write` in `tests/txn_bounded_overlay.rs`.
+
+### Fixed: dropping a column family while it rotates, flushes or compacts
+
+`drop_column_family` and `clear_column_family` did not wait for, or fence off,
+the family's background work (the bug wavesdb fixed in 63e084f). Reproduced
+deterministically in `tests/drop_rotation.rs`, each outcome on the old code:
+
+- a memtable rotation in flight created its next WAL after the drop — when the
+  name was re-created, **in the new family's directory**, so a write through
+  the stale handle succeeded and replayed into the new family on reopen;
+- the dropped memtable's flush wrote its table into the new family's directory
+  and appended an `AddTable` naming it: **the dropped data reappeared** in the
+  re-created (or cleared) family after a crash;
+- under the unified layout a flush slice of a family dropped mid-flush failed
+  and **fail-stopped the whole database**;
+- a compaction installing after the drop appended its edit after the `DropCF`,
+  and the next open refused it (`RemoveTables: table N absent`): **the database
+  no longer opened** after a crash.
+
+Now a drop or clear marks the family retiring and waits for an in-flight
+rotation or flush first; a retiring family is neither rotated nor flushed (its
+memtable goes with it); every other table edit of a family is refused unless the
+issuing handle is still the registered one (`DbInner::catalog_txn_for`), and the
+drop's table list is read under `manifest_mu`. `flush_memtable` through a
+dropped family's handle now returns `NotFound`. See
+`docs/concurrency-and-safety.md`, "Drop / clear against rotation, flush and
+table edits".
+
+### Comparators: `Equal` means byte-identical; `int64` is a total order
+
+- **`case_insensitive` breaks ties on the raw bytes.** Keys that differ only
+  in letter case used to compare `Equal`. Point reads match keys by their bytes
+  (bloom filter, memtable, table and transaction-buffer lookups), while scans
+  group keys by the comparator, so the two disagreed: `get("K10")` missed a
+  stored `k10`, a later `put("K10")` was invisible to `get("k10")`, and a scan
+  showed one entry. Case variants are now distinct, adjacent keys
+  (`"K10" < "k10"`), and `get` and scans agree. The ordering otherwise is
+  unchanged.
+- **`int64` was not transitive once key lengths mixed.** It compared two 8-byte
+  keys as signed integers and every other pair byte-wise, so `1 < "z" < -1 < 1`.
+  A table holding such keys could be misordered, and `get` missed keys a scan
+  still showed. Negative 8-byte keys now sort just below the 8-byte zero key,
+  and every other pair keeps its byte-wise order. A family whose keys are all
+  8 bytes, or that holds no negative 8-byte key, orders exactly as before.
+- **The `Comparator` contract now says it:** a comparator may return `Equal`
+  only for byte-identical keys, and must be a total order. Every built-in is
+  checked exhaustively for antisymmetry, transitivity and byte identity.
+  `tests/comparator_semantics.rs` checks that `get` agrees with a scan for
+  every built-in, in both layouts, before and after a flush.
+- **Compatibility:** no byte format changes, and the comparator names are
+  unchanged. Only data that was already misordered can be affected:
+  - a `case_insensitive` family holding two spellings of one key;
+  - an `int64` family mixing negative 8-byte keys with keys of other lengths.
+
+  Rewrite such a family (scan it into a fresh family) to be certain.
+
 ## 0.10.0 — Breaking: yoloDB format epoch 1
 
 **ondaDB moves onto yoloDB format epoch 1**, the on-disk format family ondaDB

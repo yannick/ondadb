@@ -316,7 +316,7 @@ pub(crate) fn excise_covered(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Resul
             cf: cf.name().to_string(),
             ids: ids.clone(),
         }]);
-    db.catalog_txn(edit, |p| {
+    db.catalog_txn_for(cf, edit, |p| {
         cf.remove_tables(&ids, p);
     })?;
 

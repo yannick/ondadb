@@ -1058,7 +1058,7 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
                 cf: cf.name().to_string(),
                 ids: ids.clone(),
             }]);
-        db.catalog_txn(edit, |p| cf.remove_l0_tables(&ids, p))?;
+        db.catalog_txn_for(cf, edit, |p| cf.remove_l0_tables(&ids, p))?;
         for t in &victims {
             db.remove_sst_file(&cf.klog_path(t.meta.id), t.meta.klog_size);
             db.remove_sst_file(
@@ -2645,7 +2645,10 @@ fn compact_inputs_inner(
     }
     let publish_handles = new_handles.clone();
     let rollback_handles = new_handles;
-    if let Err(error) = db.catalog_txn_with_rollback(
+    #[cfg(debug_assertions)]
+    crate::db::cf_park::park_if_armed(cf, crate::db::cf_park::Point::CompactionBeforeInstall);
+    if let Err(error) = db.catalog_txn_for_with_rollback(
+        cf,
         edit,
         |p| install_compaction_outputs(cf, &cmp, level, target, &inputs, &publish_handles, p),
         |p| rollback_compaction_outputs(cf, &cmp, &inputs, &rollback_handles, p),
@@ -2889,7 +2892,13 @@ mod tests {
             }
         );
 
-        let folded: ComparatorRef = Arc::new(CaseInsensitive);
+        // A custom comparator that calls `A` and `a` one key (built-ins may
+        // not — see the `comparator` module docs): retention must still group
+        // versions by the comparator, not by bytes.
+        let folded: ComparatorRef = Arc::new(crate::comparator::FnComparator::new(
+            "test.case_folding",
+            |a: &[u8], b: &[u8]| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+        ));
         let mut custom = VersionRetention::new(false, 10, 100, folded);
         assert!(matches!(
             custom.decide_point(b"A", 10, false, 0),
@@ -4052,11 +4061,16 @@ mod tests {
     fn plan_spans_dedupes_comparator_equal_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let (_db, cf) = picker_db(&dir, crate::config::ColumnFamilyConfig::default());
-        let folded: ComparatorRef = Arc::new(CaseInsensitive);
-        // `M` and `m` are distinct byte strings that the CF's comparator calls
-        // equal. Two spans divided at both would make the middle one empty and
-        // — worse — would put versions of one user key on either side of a
-        // boundary the merge does not believe in.
+        // `M` and `m` are distinct byte strings that this comparator calls
+        // equal. No built-in may do that any more (`comparator` module docs),
+        // but a custom comparator can, and the planner stays defensive. Two
+        // spans divided at both would make the middle one empty and — worse —
+        // would put versions of one user key on either side of a boundary the
+        // merge does not believe in.
+        let folded: ComparatorRef = Arc::new(crate::comparator::FnComparator::new(
+            "test.case_folding",
+            |a: &[u8], b: &[u8]| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+        ));
         let inputs = vec![
             handle(&cf, 1, 1, b"a", b"z", 400, 0),
             handle(&cf, 2, 2, b"a", b"f", 100, 0),

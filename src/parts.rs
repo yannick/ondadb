@@ -394,7 +394,7 @@ impl DB {
                 cf: cf.name().to_string(),
                 ids: ids.clone(),
             }]);
-        self.inner.catalog_txn(edit, |p| {
+        self.inner.catalog_txn_for(cf, edit, |p| {
             cf.remove_bottom_tables(&ids, p);
         })?;
 
@@ -569,7 +569,7 @@ impl DB {
                 meta: handle.meta.clone(),
             });
         }
-        if let Err(e) = self.inner.catalog_txn(edit, |p| {
+        if let Err(e) = self.inner.catalog_txn_for(cf, edit, |p| {
             for (handle, at_bottom) in staged {
                 if at_bottom {
                     cf.insert_bottom_sorted(handle, p);
@@ -733,7 +733,7 @@ impl DB {
                 meta: handle.meta.clone(),
             });
         }
-        self.inner.catalog_txn(edit, |p| {
+        self.inner.catalog_txn_for(cf, edit, |p| {
             for (handle, at_bottom) in staged {
                 if at_bottom {
                     cf.insert_bottom_sorted(handle, p);
@@ -1165,7 +1165,7 @@ impl crate::db::DbInner {
             });
         }
         let swap_in = new_handles;
-        self.catalog_txn(edit, |p| cf.swap_bottom_tables(swap_in, p))?;
+        self.catalog_txn_for(cf, edit, |p| cf.swap_bottom_tables(swap_in, p))?;
         observe_committed_move(
             observer,
             cf.name(),
