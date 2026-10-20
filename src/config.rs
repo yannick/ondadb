@@ -383,6 +383,25 @@ pub struct Options {
     /// open: the engine would otherwise pick one arbitrarily and fold history
     /// with it.
     pub merge_fns: Vec<Arc<dyn MergeOperator>>,
+    /// Custom comparators available to this database, resolved by
+    /// [`Comparator::name`](crate::Comparator::name).
+    ///
+    /// A column family records only its comparator's *name*
+    /// ([`comparator_name`](ColumnFamilyConfig::comparator_name)), because a
+    /// boxed ordering is not serializable. The six built-ins (`memcmp`,
+    /// `reverse`, `lexicographic`, `uint64`, `int64`, `case_insensitive`)
+    /// always resolve; any other name must be registered here, both to create
+    /// a family with it and to open a database holding one. An unregistered
+    /// name refuses the open before the family is read: reading it in another
+    /// order would make point reads miss present keys and compaction write
+    /// misordered tables.
+    ///
+    /// Registering a comparator with an empty name, a built-in's name, or the
+    /// same name twice is an error at open. The comparator must meet the
+    /// [`Comparator`](crate::Comparator) contract: a total order that returns
+    /// `Equal` only for byte-identical keys, and the same order for as long as
+    /// any family written with that name exists.
+    pub comparators: Vec<crate::comparator::ComparatorRef>,
     /// Let compaction collapse an operand chain into the value it folds to
     /// (default `true`).
     ///
@@ -933,6 +952,7 @@ impl Default for Options {
             part_mover_interval: Duration::from_secs(30),
             partition_fns: Vec::new(),
             merge_fns: Vec::new(),
+            comparators: Vec::new(),
             enable_merge_folding: true,
             admit_background_scan_blocks: false,
             background_io_bytes_per_second: 0, // unlimited: no limiter object

@@ -66,6 +66,8 @@ Full release history is in [`CHANGELOG.md`](CHANGELOG.md).
   on-disk index shallow as SSTables grow. [Details below](#btree-hybrid-klog-columnfamilyconfiguse_btree).
 - **Six comparators** (`memcmp`, `reverse`, `lexicographic`, `uint64`, `int64`,
   `case_insensitive`) plus custom comparators, persisted by name in the manifest.
+  A custom comparator is registered by name in `Options::comparators`; an open
+  that cannot resolve a family's comparator name refuses rather than guess.
 - On-disk format: **yoloDB format epoch 1** (CRC32-C everywhere, versioned
   magics on every artifact), documented byte-for-byte in
   [`docs/formats.md`](docs/formats.md) with every number registered in

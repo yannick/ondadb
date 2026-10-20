@@ -18,7 +18,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::cache::{BlockCache, FileCache};
 use crate::column_family::{CfCtx, ColumnFamily, FlushJob, ImmMemtable, SstHandle};
 use crate::compaction;
-use crate::comparator::comparator_by_name;
+use crate::comparator::{comparator_by_name, resolve_comparator, ComparatorRef};
 use crate::config::{ColumnFamilyConfig, Options};
 use crate::error::{OndaError, Result};
 use crate::manifest::{manifest_path, CfManifest, Manifest, WalLayout};
@@ -2480,9 +2480,7 @@ fn recover_column_families(
 ) -> Result<()> {
     for persisted in &manifest.cfs {
         let mut config = ColumnFamilyConfig::decode(&persisted.config)?;
-        let comparator = comparator_by_name(&config.comparator_name).ok_or_else(|| {
-            OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
-        })?;
+        let comparator = comparator_for(opts, &persisted.name, &config.comparator_name)?;
         resolve_partition_scheme(&mut config, opts, &persisted.name)?;
         resolve_merge_operator(&mut config, opts, &persisted.name)?;
         let (cf, max_seq) = ColumnFamily::load(
@@ -2500,6 +2498,62 @@ fn recover_column_families(
         inner.cfs.write().insert(persisted.name.clone(), cf);
     }
     Ok(())
+}
+
+/// Resolve every name the catalog stores (comparator, merge operator, derived
+/// partitioner) against `opts`, changing nothing, so an open that cannot
+/// resolve one refuses **before it writes anything**. `build_db_inner` creates
+/// the next unified WAL generation, and `recover_column_families`, which
+/// resolves the same names for real, runs after it; without this a refused
+/// open left an empty WAL generation behind.
+fn preflight_catalog_names(manifest: &Manifest, opts: &Options) -> Result<()> {
+    for persisted in &manifest.cfs {
+        let mut config = ColumnFamilyConfig::decode(&persisted.config)?;
+        comparator_for(opts, &persisted.name, &config.comparator_name)?;
+        resolve_partition_scheme(&mut config, opts, &persisted.name)?;
+        resolve_merge_operator(&mut config, opts, &persisted.name)?;
+    }
+    Ok(())
+}
+
+/// Reject an `Options::comparators` registry that could make a name ambiguous:
+/// an empty name, a built-in's name (the built-in would silently win), or two
+/// comparators with one name (the engine would pick one and read a family's
+/// whole history in it). Checked at open, like [`check_merge_fn_names`], so a
+/// bad registry is refused even before any family names it.
+fn check_comparator_names(opts: &Options) -> Result<()> {
+    for (i, c) in opts.comparators.iter().enumerate() {
+        let name = c.name();
+        if name.is_empty() {
+            return Err(OndaError::InvalidArgs(
+                "Options::comparators registers a comparator with an empty name".into(),
+            ));
+        }
+        if comparator_by_name(name).is_some() {
+            return Err(OndaError::InvalidArgs(format!(
+                "Options::comparators registers {name:?}, which is a built-in comparator's name"
+            )));
+        }
+        if opts.comparators[..i].iter().any(|b| b.name() == name) {
+            return Err(OndaError::InvalidArgs(format!(
+                "Options::comparators registers two comparators named {name:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The comparator for column family `cf_name`, from its stored or requested
+/// `name`: a built-in, or one registered in `Options::comparators`. Anything
+/// else is `InvalidArgs`, never a fallback to `memcmp`, which would read the
+/// family in an order it was not written in (yolodb-format divergence T1).
+pub(crate) fn comparator_for(opts: &Options, cf_name: &str, name: &str) -> Result<ComparatorRef> {
+    resolve_comparator(name, &opts.comparators).ok_or_else(|| {
+        OndaError::InvalidArgs(format!(
+            "column family {cf_name:?} names comparator {name:?}, which is not a built-in \
+             and not registered in `Options::comparators`"
+        ))
+    })
 }
 
 /// Reject an `Options::merge_fns` list holding two operators with the same
@@ -2692,6 +2746,9 @@ impl DB {
                 "a 0.9 database can only be opened read-only".into(),
             ));
         }
+        // Before anything is created or read: every open path, the read-only
+        // 0.9 one included, resolves family comparators against this registry.
+        check_comparator_names(&opts)?;
         std::fs::create_dir_all(&opts.path)?;
         let dir = opts.path.clone();
 
@@ -2723,6 +2780,7 @@ impl DB {
         };
         let requested_layout = requested_wal_layout(&opts);
         validate_wal_layout(&manifest, requested_layout)?;
+        preflight_catalog_names(&manifest, &opts)?;
         let (inner, receivers) = build_db_inner(
             &opts,
             dir,
@@ -2778,9 +2836,7 @@ impl DB {
         if self.inner.opts.read_only {
             return Err(OndaError::ReadOnly("database is read-only".into()));
         }
-        let cmp = comparator_by_name(&config.comparator_name).ok_or_else(|| {
-            OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
-        })?;
+        let cmp = comparator_for(&self.inner.opts, name, &config.comparator_name)?;
         config.validate().map_err(OndaError::InvalidArgs)?;
         let mut config = config;
         resolve_merge_operator(&mut config, &self.inner.opts, name)?;
@@ -2862,9 +2918,7 @@ impl DB {
             if name.is_empty() || name.len() > MAX_CF_NAME_LEN {
                 return Err(OndaError::InvalidArgs("invalid column family name".into()));
             }
-            comparator_by_name(&config.comparator_name).ok_or_else(|| {
-                OndaError::InvalidArgs(format!("unknown comparator {}", config.comparator_name))
-            })?;
+            comparator_for(&self.inner.opts, name, &config.comparator_name)?;
             config.validate().map_err(OndaError::InvalidArgs)?;
             resolve_merge_operator(&mut config.clone(), &self.inner.opts, name)?;
             if seen.insert(name, ()).is_some() {
@@ -2896,8 +2950,8 @@ impl DB {
         let mut created = Vec::with_capacity(specs.len());
         let mut chosen: Vec<u64> = Vec::with_capacity(specs.len());
         for (name, config) in specs {
-            let cmp =
-                comparator_by_name(&config.comparator_name).expect("comparator validated above");
+            let cmp = comparator_for(&self.inner.opts, name, &config.comparator_name)
+                .expect("comparator validated above");
             let mut config = config.clone();
             resolve_merge_operator(&mut config, &self.inner.opts, name)?;
             // Distinct within the batch too: none is registered yet.
@@ -3091,9 +3145,7 @@ impl DB {
             )));
         }
         let cfg = old.effective_config();
-        let cmp = comparator_by_name(&cfg.comparator_name).ok_or_else(|| {
-            OndaError::InvalidArgs(format!("unknown comparator {}", cfg.comparator_name))
-        })?;
+        let cmp = comparator_for(&self.inner.opts, name, &cfg.comparator_name)?;
         // Never the old id: its entries are exactly what is being cleared.
         let unified_id = self.inner.choose_unified_id(name, &[old.id()]);
         // As in `drop_column_family`: nothing of the old family may still be

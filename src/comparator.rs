@@ -16,7 +16,8 @@
 //!
 //! Six built-ins mirror: `memcmp`, `reverse`, `lexicographic`,
 //! `uint64`, `int64`, `case_insensitive`.  Custom comparators are supported via
-//! [`FnComparator`].
+//! [`FnComparator`] (or any [`Comparator`] implementation), registered by name
+//! in [`Options::comparators`](crate::Options::comparators).
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -217,6 +218,13 @@ pub fn comparator_by_name(name: &str) -> Option<ComparatorRef> {
         "case_insensitive" => Arc::new(CaseInsensitive),
         _ => return None,
     })
+}
+
+/// Resolve a persisted comparator name: a built-in first, then a comparator
+/// registered in [`Options::comparators`](crate::Options::comparators). `None`
+/// when neither answers it.
+pub(crate) fn resolve_comparator(name: &str, registry: &[ComparatorRef]) -> Option<ComparatorRef> {
+    comparator_by_name(name).or_else(|| registry.iter().find(|c| c.name() == name).cloned())
 }
 
 /// The default comparator ([`Bytewise`]).
