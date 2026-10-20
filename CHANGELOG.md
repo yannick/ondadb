@@ -9,6 +9,13 @@
   proprietary: `license-file = "LICENSE"`, which reads "Proprietary, ask
   Yannick for a licence."
 
+### Documentation
+
+- **The canonical format spec and registry now live in `yolodb-format`**
+  (`spec/epoch1.md`, `spec/registry.md`). `docs/formats.md` and
+  `docs/format-registry.md` are now ondaDB's mirrors, and a new number is
+  assigned there first.
+
 ## 0.10.1
 
 ### Transactions: read-your-own-writes no longer scans the whole buffer

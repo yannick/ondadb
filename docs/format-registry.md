@@ -13,10 +13,13 @@ are enforced, not merely documented: `src/format.rs` pins each one with a
 golden tests `format::tests::epoch1_identifiers_are_pinned` and
 `tests/epoch1_golden.rs` (a renumbering fails a test).
 
-> **Rule going forward:** assign from this page, then implement. A number that is
-> written down here and unimplemented costs nothing; a number implemented and not
-> written down here is the failure mode above. Plan C step 2 moves this page to a
-> shared `yolodb-format` repository.
+> **Canonical copy:** since plan C step 2a the registry lives in the shared
+> `yolodb-format` repository (`github.com/yannick/yolodb-format`,
+> `spec/registry.md`). This page is ondaDB's mirror of it. **Assign there, then
+> implement:** a new number lands in `yolodb-format` first, then in
+> `src/format.rs` and this page in the same ondaDB change. A number that is
+> written down and unimplemented costs nothing; a number implemented and not
+> written down is the failure mode above.
 
 ## Checksum
 

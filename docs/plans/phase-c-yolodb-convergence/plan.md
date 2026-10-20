@@ -433,6 +433,14 @@ requirement stated.
    the registry, rows A–T written as spec text, the golden corpus from
    ondaDB epoch 1, and the cross-engine CI harness (ondaDB write → wavesdb
    read and the reverse, oracle-checked).
+   - **Status (2026-10-20): started.** `yannick/yolodb-format` (private)
+     holds the spec imported from `docs/formats.md`, the registry, rows A–U
+     with the step that closes each, the semantics page (comparators, TTL),
+     the epoch-1 corpus under SHA-256 and the harness design.
+     `docs/formats.md` and `docs/format-registry.md` stay in ondaDB as
+     mirrors; new numbers are assigned in `yolodb-format` first. Writing the
+     semantics found row **T1**: wavesdb silently reopens a family whose
+     comparator name it does not know under `memcmp`.
 2. **2b — wavesdb adopts epoch 1 (≈6–8 wk, wavesdb):** row A, and its legacy
    reader and migrator. After this, both engines speak the same containers,
    and the common profile is still ondaDB-shaped.
