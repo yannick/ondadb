@@ -15,6 +15,9 @@
   (`spec/epoch1.md`, `spec/registry.md`). `docs/formats.md` and
   `docs/format-registry.md` are now ondaDB's mirrors, and a new number is
   assigned there first.
+- **Plan C records the parity release.** Once step 2d is done, ondaDB and
+  wavesdb both release 0.20.0 and share the minor version from then on;
+  until then neither releases 0.20.0 or above.
 
 ## 0.10.1
 

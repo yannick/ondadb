@@ -441,6 +441,18 @@ requirement stated.
      mirrors; new numbers are assigned in `yolodb-format` first. Writing the
      semantics found row **T1**: wavesdb silently reopens a family whose
      comparator name it does not know under `memcmp`.
+   - **Status (2026-10-20): semantics written.** T1 is fixed in wavesdb
+     0.8.11 (`Options.Comparators`); ondaDB's comparator registry is still
+     open. The semantics page now covers sequences and visibility, how a key
+     resolves, merge operators, deletes, range deletes and what compaction
+     may not change, with harness scenarios `merge` and `deletes`. Both
+     engines agree everywhere but one place, row **T2**: wavesdb ≤ 0.8.11
+     folded merge operands onto a put whose TTL was still running, so the
+     base's value outlived it (fixed in wavesdb 0.8.12). Row L's commit
+     sequence turned out to agree already: both engines make a commit visible
+     at the **last** sequence of its block, and ondaDB's "first" is only what
+     the decision frame stores. Left in 2a: refusal expectations, the
+     ondaDB comparator registry, and harness CI with access to both engines.
 2. **2b — wavesdb adopts epoch 1 (≈6–8 wk, wavesdb):** row A, and its legacy
    reader and migrator. After this, both engines speak the same containers,
    and the common profile is still ondaDB-shaped.
@@ -452,7 +464,14 @@ requirement stated.
 4. **2d — write-compat, the common profile (≈6–10 wk, split):** rows B, D,
    E, F, G, H, I, J, K, L, P, Q. After this, a compat-mode directory can be
    opened read-write by either engine, WAL and edit log included.
-5. **2e — retire legacy readers** (`legacy-onda`, `legacy-wavesdb`) after a
+5. **Parity release — both engines 0.20.0.** When 2d is done (every harness
+   scenario green in all four cells), both engines release 0.20.0 together,
+   and from then on share the minor version: equal minors implement the same
+   format version, common profile and semantics, and a change to any of
+   them is a new minor in both. Patch versions stay independent. Until then
+   neither engine releases 0.20.0 or above. The policy is in the
+   `yolodb-format` README (decided 2026-10-20).
+6. **2e — retire legacy readers** (`legacy-onda`, `legacy-wavesdb`) after a
    published deprecation window.
 
 ### 2.4 What breaks, per engine
