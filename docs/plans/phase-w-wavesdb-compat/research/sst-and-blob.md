@@ -5,6 +5,8 @@ Paths: `W:` = `/Volumes/HOME/code/storage-engines/wavesdb`, `O:` = `/Volumes/HOM
 Everything below comes from the code. Doc claims were checked against the code, and five claims were
 also checked by running scratch probes (throwaway scratch programs, not committed).
 
+> **Citations updated 2026-10-20.** The findings describe wavesdb v0.8.6, but `file:line` citations into code that the plan C 2-pre layout refactor moved (`options.go`, `checkpoint_objstore.go`, `objstore_mode.go`) now point at wavesdb `5459080` (main after 2-pre). Every other wavesdb citation is unchanged and still reads against v0.8.6.
+
 ---
 
 ## 0. Headline findings
@@ -36,7 +38,7 @@ also checked by running scratch probes (throwaway scratch programs, not committe
    - In ondaDB, ids 2 and 4 are raw LZ4 blocks (`O:src/compress.rs:28,57`).
    - So a wavesdb pre-v0.4.0 block tagged 2 or 4 fails in ondaDB as an LZ4 error. An ondaDB LZ4 block fails in wavesdb as a zstd error.
    - The registry's other claim, "Both engines default to codecs in the shared range" (`:103-104`), is also false:
-     - wavesdb v0.8.6 defaults to `{None, LZ4→tag 6, Zstd}` per level (`W:options.go:1604`).
+     - wavesdb v0.8.6 defaults to `{None, LZ4→tag 6, Zstd}` per level (`W:options.go:1605`).
      - Blob values use Zstd, and a trained dictionary once one exists (tag 7).
 4. **Blob storage has a different model.**
    - wavesdb puts a 16-byte `(blobID u64, blobOff u64)` pointer in the klog entry, plus a uvarint if grouped. The value lives in shared `<id>.blob` files with a v2 32-byte header, per-file zstd dictionaries and group frames.
@@ -137,7 +139,7 @@ wavesdb decoding profile.**
 |---|---|---|
 | Location | shared per-CF files `<cfdir>/<id>.blob`; tier variant `<stem><id>.blob`, e.g. `<object>-<blobID>.blob`. `W:internal/sst/blob.go:17-29`, `tier.go:472-479` | `<table>.vlog` next to the `.klog`, `O:mod.rs:175-181` |
 | Written by | job-scoped `BlobWriter`, rolls at 128 MiB (`blob.go:123`) | the table writer |
-| Separation threshold | `KlogValueThreshold` default **512 B** (`W:options.go:192`) | CF config |
+| Separation threshold | `KlogValueThreshold` default **512 B** (`W:options.go:193`) | CF config |
 | Pointer | `blobID u64 | blobOff u64` (absolute offset in that file) + `inGroupOff uvarint` if `FlagVlogGrouped`/`ModVlogGrouped` | `vlog_off u64` |
 
 ### 2.2 Blob file layout (format 2)
@@ -244,9 +246,9 @@ From `W:internal/compress/compress.go`.
   - Probe: pierrec `UncompressBlock` decoded an `lz4_flex::compress` block, and `lz4_flex::decompress` decoded a pierrec `CompressBlock` block. Both round-tripped exactly.
   - `lz4_flex::compress_prepend_size` would add a 4-byte length; ondaDB does not use it.
 - "Both engines default to codecs in the shared range" is **false** for wavesdb v0.8.6:
-  - L0 None, L1 **tag 6**, L2+ Zstd (3), per `W:options.go:1599-1604`.
+  - L0 None, L1 **tag 6**, L2+ Zstd (3), per `W:options.go:1600-1605`.
   - Klog index and B+tree blocks are compressed with the same per-level codec.
-  - Blob values use the deepest codec, Zstd, and switch to **tag 7** once a dict trains. `BlobZstdLevel` defaults to 7 (`options.go:1605`).
+  - Blob values use the deepest codec, Zstd, and switch to **tag 7** once a dict trains. `BlobZstdLevel` defaults to 7 (`options.go:1606`).
   - Note: `W:docs/ondadb-comparison.md:175` says the default is `{None, LZ4}`. That is stale; the code has a third Zstd entry.
 
 What ondaDB needs, per tag, when reading a wavesdb file:

@@ -8,6 +8,8 @@ modified.
 
 Citation convention: `W:` = wavesdb path, `O:` = ondaDB path, `file:line`.
 
+> **Citations updated 2026-10-20.** The findings describe wavesdb v0.8.6, but `file:line` citations into code that the plan C 2-pre layout refactor moved (`options.go`, `checkpoint_objstore.go`, `objstore_mode.go`) now point at wavesdb `5459080` (main after 2-pre). Every other wavesdb citation is unchanged and still reads against v0.8.6.
+
 ---
 
 ## 0. Bottom line
@@ -409,7 +411,7 @@ What ondaDB needs:
   only when it replayed no mutable WAL state (`checkpointSourceReady`,
   W:maintenance.go:547-577).
 - The object-store checkpoint path has the same shape: flush, then upload tables, no WAL
-  (W:checkpoint_objstore.go:146-200).
+  (W:checkpoint_objstore.go:124-178).
 
 **Backup** is different. On a *read-only* source it copies live WAL segments: per-CF
 `wal-<g>.log` (W:maintenance.go:680-694) and unified `unified-wal-<g>.log` into the backup

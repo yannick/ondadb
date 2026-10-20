@@ -9,6 +9,8 @@ work alone is enough.
 
 All citations are `file:line`. wavesdb paths are relative to the wavesdb repo; ondaDB paths are relative to the ondadb repo.
 
+> **Citations updated 2026-10-20.** The findings describe wavesdb v0.8.6, but `file:line` citations into code that the plan C 2-pre layout refactor moved (`options.go`, `checkpoint_objstore.go`, `objstore_mode.go`) now point at wavesdb `5459080` (main after 2-pre). Every other wavesdb citation is unchanged and still reads against v0.8.6.
+
 ---
 
 ## 0. Headline findings (read first)
@@ -50,7 +52,7 @@ All citations are `file:line`. wavesdb paths are relative to the wavesdb repo; o
    ondaDB accepts only 1 and 2 (`src/manifest.rs:560`). Even with the CRC fixed, a wavesdb **v2** manifest would get
    past ondaDB's version check and then be mis-parsed positionally, because the per-table blob map and per-CF blob list
    are not expected.
-3. **Different per-CF directory name**: wavesdb uses `cf_<name>` (`db.go:2069`, `checkpoint_objstore.go:108-110`) and
+3. **Different per-CF directory name**: wavesdb uses `cf_<name>` (`db.go:2069`, `checkpoint_objstore.go:86-88`) and
    ondaDB uses `cf-<name>` (`src/db.rs:1424`, `src/storage.rs:288`, `src/maintenance.rs:289`).
 4. **The CF config blob is JSON in wavesdb and a positional binary with `ONDA*` tails in ondaDB.** ondaDB's decoder is
    lenient ("unknown/short blobs fall back to defaults", `src/config.rs:1480-1486`):
@@ -66,7 +68,7 @@ All citations are `file:line`. wavesdb paths are relative to the wavesdb repo; o
      `174-180`).
    * The catalog side of this is the `BlobBytes` per table and `Blobs` per CF (see §1). The reader side is a new value
      resolver.
-   * Also, by default wavesdb compresses deep levels with Zstd (`options.go:1600-1605`) and trains blob dictionaries
+   * Also, by default wavesdb compresses deep levels with Zstd (`options.go:1601-1606`) and trains blob dictionaries
      (`DisableBlobDictionary` defaults to false). ondaDB rejects codec id 7 (`ZstdDict`) per
      `docs/format-registry.md` "Compression codec ids". So a default wavesdb database with large values is unreadable
      without zstd-dict support.
@@ -178,7 +180,7 @@ semantics; **missing** = ondaDB has no field or concept.
 | Version | 2/3/4, strict equality, unknown → `UnsupportedError` (:1012-1017) | 1/2 (:560); unknown → Corruption | **diff**: needs a wavesdb-mode decoder for v2/v3/v4. Note: wavesdb v2 ≠ ondaDB v2 |
 | NextFileID | u64 fixed (:596) | u64 (:420) | **same**. The wavesdb value also covers blob ids (blob ids come from the same allocator, `unified_flush.go:330` `sst.NewBlobWriterWith(..., cf.db.nextID, ...)`) |
 | GlobalSeq | u64 (:597). Checkpoint lowers it to max `MaxSeq` (`maintenance.go:593-611`). Managed mode: highest admitted commit | u64 (:421). Open sets `visible = global_seq`, `next = global_seq+1` (`db.rs:1798-1801`) | **same** |
-| CF count / order | uvarint; order = map iteration (Checkpoint) or name-sorted (`checkpoint_objstore.go:164`) | uvarint | **same** |
+| CF count / order | uvarint; order = map iteration (Checkpoint) or name-sorted (`checkpoint_objstore.go:139`) | uvarint | **same** |
 | CF name | bytes | bytes, UTF-8 checked (:584) | **same**. Both cap names at 128 (`options.go:228`, `db.rs:27`) |
 | CF config | opaque JSON (§5) | opaque positional binary + `ONDA*` tails | **diff**: needs a JSON → `ColumnFamilyConfig` mapper |
 | SST id, level, num_entries, num_tombstones, max_seq, klog_size, vlog_size | 7 uvarints | 7 uvarints | **same** layout. `VlogSize` in wavesdb = raw bytes the table references in blob files (`internal/sst/writer.go:751`), not a vlog file size. ondaDB `snapshot_to` skips the vlog when size is 0 (`maintenance.rs:300-302`) but would otherwise look for `<id>.vlog` |
@@ -241,7 +243,7 @@ manifests/<generation>/edits-<through>   edit-log bytes through <through>
 ```
 
 Without the edit log, the primary mirror publishes a single `MANIFEST` key by CAS or Put
-(`objstore_mode.go:257-313`). ondaDB has no equivalent; by design it keeps its manifest local-only (AGENTS.md).
+(`objstore_mode.go:244-300`). ondaDB has no equivalent; by design it keeps its manifest local-only (AGENTS.md).
 
 ---
 
@@ -313,7 +315,7 @@ The resulting directory:
 
 Manifest version in practice:
 * **v2** when the CFs are plain, per-CF WAL, no capabilities. This is the 0.8.x default: `ManifestEditLog` and
-  `UnifiedMemtable` both default to false (`options.go:442, 664`).
+  `UnifiedMemtable` both default to false (`options.go:443, 665`).
 * **v3** with unified layout, partition rules/scheme or tier rules (`partition.go:257-259` → `ForceV3`), or a
   renamed/cleared CF.
 * **v4** as soon as any capability is on: merge operator, range delete, prefix delta, edit log, periodic age, 2PC,
@@ -334,7 +336,7 @@ does.
   `checkpointToObjectStore` with `checkpointSourceReady`. The point was to publish "fully materialized immutable
   database trees" opened with `OpenReadOnlyNoLock`.
 
-### 3.3 `CheckpointToObjectStore` / `…WithReceipts` (`checkpoint_objstore.go:123-292`)
+### 3.3 `CheckpointToObjectStore` / `…WithReceipts` (`checkpoint_objstore.go:101-270`)
 
 Object keys (`objKey` :108-110, `path.Join(prefix, "cf_"+cf, "<id>.<ext>")`):
 
