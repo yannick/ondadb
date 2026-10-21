@@ -21,12 +21,16 @@ name = "yolodb"
 path = "src/bin/yolodb.rs"
 
 [features]
-default = ["legacy-onda"]
+default = ["legacy-onda", "waves08"]
 # Read-only decoders for the ondaDB 0.9.x on-disk formats (`src/legacy_onda/`):
 # what opens a pre-epoch-1 directory read-only, and what the epoch-1 auto-upgrade
 # reads its source through. Default-on; building without it makes a 0.9
 # directory a hard `UnsupportedFormat` refusal.
 legacy-onda = ["dep:crc32fast"]
+# Read-only decoders for wavesdb directories (`src/waves08/`): its epoch-1
+# containers with 0.8 bodies (plan C step 2c). Default-on; building without it
+# makes a wavesdb directory a hard `UnsupportedFormat` refusal.
+waves08 = ["dep:serde_json"]
 # Object-store (S3) support pulls in network deps; gated so the core build stays lean.
 s3 = ["dep:rust-s3", "dep:tokio"]
 # Opt-in performance fast paths that use localized `unsafe`. The default build
@@ -56,6 +60,8 @@ crc32c = "0.6"
 # CRC-32/IEEE, which every ondaDB 0.9.x artifact carries. Needed only to read
 # those, so it comes with `legacy-onda`.
 crc32fast = { version = "1.4", optional = true }
+# wavesdb stores column-family configs as JSON; read only by `waves08`.
+serde_json = { version = "1", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh3"] }
 lz4_flex = "0.11"
 zstd = "0.13"

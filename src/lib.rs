@@ -29,7 +29,9 @@
 //! bits, enabled explicitly and one-way by
 //! [`DB::enable_format_capabilities`](crate::DB::enable_format_capabilities).
 //! ondaDB 0.9.x directories are read (read-only) only through `legacy_onda`,
-//! behind the default-on `legacy-onda` feature.
+//! behind the default-on `legacy-onda` feature. wavesdb directories are
+//! decoded only by `waves08` (default-on feature `waves08`), and never opened
+//! read-write.
 
 // The default build is safe Rust.  The optional `mmap-reads` and
 // `arena-memtable` features each lift this to allow the localized `unsafe` in,
@@ -107,6 +109,8 @@ pub mod unified;
 pub mod upgrade;
 pub mod util;
 pub mod wal;
+#[cfg(feature = "waves08")]
+pub mod waves08;
 
 pub use checkpoint::{
     open_remote_checkpoint, restore_from_object_store, CheckpointTable, ObjectCheckpoint,
