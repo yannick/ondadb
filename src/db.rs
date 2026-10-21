@@ -2743,7 +2743,7 @@ impl DB {
     ) -> Result<DB> {
         if format != crate::format::FormatProfile::Epoch1 && !opts.read_only {
             return Err(OndaError::InvalidArgs(
-                "a 0.9 database can only be opened read-only".into(),
+                "a 0.9 or wavesdb database can only be opened read-only".into(),
             ));
         }
         // Before anything is created or read: every open path, the read-only
@@ -2777,6 +2777,10 @@ impl DB {
             crate::format::FormatProfile::Epoch1 => crate::manifest_edit::recover_catalog(&dir)?,
             #[cfg(feature = "legacy-onda")]
             crate::format::FormatProfile::Onda09 => crate::legacy_onda::recover_catalog(&dir)?,
+            #[cfg(feature = "waves08")]
+            crate::format::FormatProfile::Waves08 => {
+                crate::waves08::recover_catalog(&dir)?.to_manifest()?
+            }
         };
         let requested_layout = requested_wal_layout(&opts);
         validate_wal_layout(&manifest, requested_layout)?;

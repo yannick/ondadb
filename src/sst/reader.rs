@@ -346,6 +346,8 @@ impl Reader {
             FormatProfile::Epoch1 => super::decode_footer(&tail, size)?,
             #[cfg(feature = "legacy-onda")]
             FormatProfile::Onda09 => crate::legacy_onda::sst::table_footer(&tail, size)?,
+            #[cfg(feature = "waves08")]
+            FormatProfile::Waves08 => super::decode_waves08_footer(&tail, size)?,
         };
         r.num_entries = footer.num_entries;
         r.max_seq = footer.max_seq;
@@ -379,8 +381,16 @@ impl Reader {
         }
         // An epoch-1 table declares its range fragments in its capability word,
         // in both directions: fragments without the bit, or the bit without
-        // fragments, is bytes no writer produces.
-        if profile == FormatProfile::Epoch1
+        // fragments, is bytes no writer produces. wavesdb's writer holds the
+        // same rule; only a 0.9 table had no word to declare them in.
+        let declares_caps = match profile {
+            FormatProfile::Epoch1 => true,
+            #[cfg(feature = "waves08")]
+            FormatProfile::Waves08 => true,
+            #[cfg(feature = "legacy-onda")]
+            FormatProfile::Onda09 => false,
+        };
+        if declares_caps
             && (footer.caps & crate::format::CAP_RANGE_DELETES != 0) != !r.fragments.is_empty()
         {
             return Err(OndaError::Corruption(
@@ -394,6 +404,8 @@ impl Reader {
                 FormatProfile::Epoch1 => Bloom::decode(&raw)?,
                 #[cfg(feature = "legacy-onda")]
                 FormatProfile::Onda09 => crate::legacy_onda::sst::decode_bloom(&raw)?,
+                #[cfg(feature = "waves08")]
+                FormatProfile::Waves08 => Bloom::decode(&raw)?,
             });
         }
         if footer.btree {
@@ -412,9 +424,10 @@ impl Reader {
         // is owned by the Reader, so views into it live exactly as long as it.
         // A tier that reports `supports_mmap() == false` opts out entirely:
         // `klog_mmap` stays `None` and every read falls through to the buffered
-        // `pread` path below.
+        // `pread` path below. So does a wavesdb table: its blocks must be
+        // normalized before anything walks them, so none is ever read in place.
         #[cfg(feature = "mmap-reads")]
-        if r.storage.supports_mmap() {
+        if r.storage.supports_mmap() && !r.normalizes_blocks() {
             let file = f
                 .as_file()
                 .expect("a tier reporting supports_mmap() must back reads with a local file");
@@ -699,6 +712,14 @@ impl Reader {
         if alg != Compression::None {
             crate::perf::bump(|p| p.bytes_decompressed += raw.len() as u64);
         }
+        // Normalized before it is cached, so a cache hit is already in the
+        // one layout the decoders walk and the rewrite is paid once per load.
+        #[cfg(feature = "waves08")]
+        let raw = if self.normalizes_blocks() {
+            crate::waves08::block::normalize(&raw, self.bytewise)?
+        } else {
+            raw
+        };
         let arc: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
         if admit {
             self.bc
@@ -755,6 +776,13 @@ impl Reader {
             #[cfg(feature = "mmap-reads")]
             Block::Mapped { .. } => unreachable!("uncompressed mmap handled above"),
         })
+    }
+
+    /// Whether this is a wavesdb table, whose data blocks are rewritten by
+    /// `waves08::block::normalize` on load.
+    #[inline]
+    pub(crate) fn normalizes_blocks(&self) -> bool {
+        self.entry_layout == EntryLayout::Waves08
     }
 
     /// Split a data block's decompressed bytes into its entries region and its
@@ -1171,6 +1199,13 @@ impl Reader {
     /// decompressing v2 frames. `off` is the frame start, `length` the
     /// logical (uncompressed) value length.
     pub(crate) fn read_vlog_into(&self, off: u64, length: u64, out: &mut Vec<u8>) -> Result<()> {
+        if self.normalizes_blocks() {
+            // A wavesdb pointer names a shared blob file, not this table's
+            // vlog; reading `off` here would return another value's bytes.
+            return Err(OndaError::UnsupportedFormat(
+                "sst: wavesdb shared-blob values are not readable yet".into(),
+            ));
+        }
         let len = usize::try_from(length).map_err(|_| corrupt())?;
         // Consult the cache *before* the mmap attempt. A v2 frame is
         // decompressed on every mmap read — `vlog_verified` memoizes only the

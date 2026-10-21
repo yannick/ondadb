@@ -101,15 +101,23 @@ pub(crate) struct TableFooter {
 impl TableFooter {
     /// The entry layout the capability word selects.
     pub(crate) fn entry_layout(&self) -> EntryLayout {
-        if self.caps & crate::format::CAP_EXTENDED_RECORDS != 0 {
+        // Checked first: a wavesdb table may declare CAP_EXTENDED_RECORDS too,
+        // but its blocks are normalized into their own layout on load.
+        if self.caps & crate::format::wavesdb_reserved::CAP_WAVES08_BODIES != 0 {
+            EntryLayout::Waves08
+        } else if self.caps & crate::format::CAP_EXTENDED_RECORDS != 0 {
             EntryLayout::Extended
         } else {
             EntryLayout::Base
         }
     }
 
+    /// Whether the blocks the reader walks are ondaDB prefix-delta blocks.
+    /// A wavesdb table's delta blocks are expanded to full keys when they are
+    /// normalized, so for it this is false whatever the word declares.
     pub(crate) fn prefix_delta(&self) -> bool {
         self.caps & crate::format::CAP_PREFIX_DELTA != 0
+            && self.caps & crate::format::wavesdb_reserved::CAP_WAVES08_BODIES == 0
     }
 }
 
@@ -170,6 +178,53 @@ const ONDA09_FOOTER_MAGIC: u64 = 0x5741_5645_5353_5431;
 /// `UnsupportedFormat`; a database-level or dependency-violating bit:
 /// `Corruption`) and every handle's bounds (`Corruption`).
 pub(crate) fn decode_footer(tail: &[u8], file_len: u64) -> Result<TableFooter> {
+    decode_footer_with(tail, file_len, check_table_caps)
+}
+
+/// An epoch-1 table's capability word: only bits this binary implements,
+/// only table-level ones, and every record capability over the kind-bearing
+/// entry.
+fn check_table_caps(caps: u64) -> Result<()> {
+    crate::format::check_caps(caps)?;
+    if caps & !sst_footer::TABLE_CAPS != 0 {
+        return Err(OndaError::Corruption(
+            "sst footer: capability word names a database-level bit".into(),
+        ));
+    }
+    if caps & !crate::format::CAP_EXTENDED_RECORDS != 0
+        && caps & crate::format::CAP_EXTENDED_RECORDS == 0
+    {
+        // Merge operands, range fragments and prefix-delta blocks are all
+        // defined over the kind-bearing entry; no writer declares one without it.
+        return Err(OndaError::Corruption(
+            "sst footer: capability without CAP_EXTENDED_RECORDS".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a wavesdb table's footer: the same 96 bytes as epoch 1, held to
+/// wavesdb's capability rules — and it must declare the wavesdb body
+/// profile. A table without it in a wavesdb catalog names a body this binary
+/// was never told how to read.
+#[cfg(feature = "waves08")]
+pub(crate) fn decode_waves08_footer(tail: &[u8], file_len: u64) -> Result<TableFooter> {
+    decode_footer_with(tail, file_len, |caps| {
+        crate::waves08::check_table_caps(caps)?;
+        if caps & crate::format::wavesdb_reserved::CAP_WAVES08_BODIES == 0 {
+            return Err(OndaError::UnsupportedFormat(format!(
+                "wavesdb table capability word {caps:#x} lacks CAP_WAVES08_BODIES"
+            )));
+        }
+        Ok(())
+    })
+}
+
+fn decode_footer_with(
+    tail: &[u8],
+    file_len: u64,
+    check_caps: impl Fn(u64) -> Result<()>,
+) -> Result<TableFooter> {
     use sst_footer::*;
     let corrupt = |what: &str| OndaError::Corruption(format!("sst footer: {what}"));
     if tail.len() < 8 || file_len < tail.len() as u64 {
@@ -209,17 +264,7 @@ pub(crate) fn decode_footer(tail: &[u8], file_len: u64) -> Result<TableFooter> {
         )));
     }
     let caps = read_u64(&b[CAPS..]);
-    crate::format::check_caps(caps)?;
-    if caps & !TABLE_CAPS != 0 {
-        return Err(corrupt("capability word names a database-level bit"));
-    }
-    if caps & !crate::format::CAP_EXTENDED_RECORDS != 0
-        && caps & crate::format::CAP_EXTENDED_RECORDS == 0
-    {
-        // Merge operands, range fragments and prefix-delta blocks are all
-        // defined over the kind-bearing entry; no writer declares one without it.
-        return Err(corrupt("capability without CAP_EXTENDED_RECORDS"));
-    }
+    check_caps(caps)?;
     // Every handle must address bytes ahead of the footer; checking here keeps
     // a garbage length from ever becoming an allocation.
     let limit = file_len - SIZE as u64;
@@ -509,6 +554,12 @@ pub(crate) enum EntryLayout {
     /// `kind uv | modifiers uv | klen | vlen | seq | ttl? | key | value|vlog_off`
     /// (`CAP_EXTENDED_RECORDS` in the footer's capability word).
     Extended,
+    /// A wavesdb block after `waves08::block::normalize`: the extended
+    /// head, and a separated value's slot is the normalized shared-blob pointer
+    /// `blob_id u64 | blob_off u64 | uv((in_group_off << 1) | grouped)`
+    /// instead of an 8-byte vlog offset. `vlog_off` carries `blob_off`;
+    /// the rest is re-read from `val_start`. Never written to disk.
+    Waves08,
 }
 
 /// Append one data-block entry to `dst` in `layout`.
@@ -541,6 +592,7 @@ pub(crate) fn encode_entry(
             );
             dst.push(fl);
         }
+        EntryLayout::Waves08 => unreachable!("wavesdb entries are never written"),
         EntryLayout::Extended => {
             // The modifier bits are the flag bits, so an extended entry and a
             // legacy entry describe the same thing with the same numbers; the
@@ -585,7 +637,7 @@ pub(crate) fn decode_entry(
             ) as u8;
             (fl, kind, off + 1)
         }
-        EntryLayout::Extended => {
+        EntryLayout::Extended | EntryLayout::Waves08 => {
             let (kind, n) = uvarint(&raw[off..]).ok_or_else(corrupt)?;
             // A point stream, so kind 5 is refused here even though the binary
             // implements it: range fragments live in the aux section.
@@ -631,11 +683,21 @@ pub(crate) fn decode_entry(
     p += klen;
     let has_vlog = fl & flags::HAS_VLOG != 0;
     let (val_start, val_len, vlog_off, next) = if has_vlog {
-        if p + 8 > raw.len() {
-            return Err(corrupt());
+        if layout == EntryLayout::Waves08 {
+            // blob_id | blob_off | uv(group): only the offset is kept here.
+            if p + 16 > raw.len() {
+                return Err(corrupt());
+            }
+            let off = crate::encoding::read_u64(&raw[p + 8..]);
+            let (_, n) = uvarint(&raw[p + 16..]).ok_or_else(corrupt)?;
+            (p, vlen as usize, off, p + 16 + n)
+        } else {
+            if p + 8 > raw.len() {
+                return Err(corrupt());
+            }
+            let off = crate::encoding::read_u64(&raw[p..]);
+            (p, vlen as usize, off, p + 8)
         }
-        let off = crate::encoding::read_u64(&raw[p..]);
-        (p, vlen as usize, off, p + 8)
     } else {
         let vl = vlen as usize;
         if vl.checked_add(p).ok_or_else(corrupt)? > raw.len() {

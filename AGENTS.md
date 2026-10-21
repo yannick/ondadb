@@ -226,6 +226,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | 0.9 → epoch-1 upgrade (plan C §1.3) | `upgrade.rs`, `legacy_onda/`, `src/bin/yolodb.rs` | See invariant 10; crash matrix in `tests/format_upgrade.rs` (fault hook: `UpgradeObserver`) |
 | Wide-column entities (F11) | `entity.rs` | Value-level frame shared with wavesdb (`WVE1`); no engine change |
 | wavesdb catalogs, read-only (plan C 2c) | `waves08/` (`manifest.rs`, `edit_log.rs` schema 2, `config.rs` JSON) | `waves08::recover_catalog`; tests in `tests/waves08_catalog.rs` |
+| wavesdb SSTables, read-only (plan C 2c) | `waves08/block.rs`, `sst/reader.rs` (`FormatProfile::Waves08`), `sst/mod.rs` (`EntryLayout::Waves08`) | Each data block is normalized once, before the block cache, into one ondaDB-shaped layout; no mmap. Shared-blob values and wavesdb WAL replay are `UnsupportedFormat` until their 2c steps |
 
 **Cross-feature rules live in `tests/composition.rs`**, not in either feature's
 own file: a range delete is, for one key, a *deleted base at its sequence* (so a

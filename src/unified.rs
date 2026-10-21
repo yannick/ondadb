@@ -293,6 +293,15 @@ impl UnifiedStore {
                 crate::format::FormatProfile::Onda09 => {
                     crate::legacy_onda::wal::replay(&p, &mut apply)?
                 }
+                #[cfg(feature = "waves08")]
+                crate::format::FormatProfile::Waves08 => {
+                    // wavesdb's WAL layouts are decoded by a later 2c step;
+                    // until then any WAL generation is refused, never
+                    // skipped — skipping would hide committed writes.
+                    return Err(crate::error::OndaError::UnsupportedFormat(
+                        "wavesdb WAL replay is not implemented yet".into(),
+                    ));
+                }
             };
             max_seq = max_seq.max(last);
         }
