@@ -44,7 +44,7 @@ use crate::error::{OndaError, Result};
 use crate::format::manifest_file::{
     CF_KNOWN, CF_UNIFIED_ID, DB_EDIT_LOG, DB_INSTANCE_NONCE, DB_KNOWN, DB_UNIFIED_WAL, HEADER_LEN,
     MAGIC, SST_KNOWN, SST_LAST_COMPACTION_TIME, SST_MAX_ENTRY_TIME, SST_OBJECT, SST_PARTITION,
-    SST_RANGE, SST_TIER, VERSION,
+    SST_RANGE, SST_TABLE_CAPS, SST_TIER, VERSION,
 };
 
 /// WAL/memtable layout persisted for the whole database.
@@ -141,6 +141,17 @@ pub struct SstMeta {
     /// May sort **above** [`max_key`](Self::max_key), by the mirror of the rule
     /// above. The read path's gap-owner rule reads exactly this field.
     pub range_max_key: Option<Vec<u8>>,
+
+    /// The table's capability word as the **catalog** declares it (sst section
+    /// `SST_TABLE_CAPS`), or `None` when the catalog does not say.
+    ///
+    /// The footer's word is the authority; this is a cross-check. wavesdb
+    /// declares it for every table, and opening a table whose footer disagrees
+    /// is `Corruption`. ondaDB does not write it for its own tables, keeps a
+    /// declared one on a snapshot rewrite, and does not carry it through the
+    /// edit log (whose `AddTable` has no field for it), so a table added by an
+    /// edit is `None`.
+    pub table_caps: Option<u64>,
 }
 
 impl SstMeta {
@@ -552,6 +563,9 @@ fn encode_sstable(b: &mut Vec<u8>, sst: &SstMeta, caps: u64) {
     if range {
         flags |= SST_RANGE;
     }
+    if sst.table_caps.is_some() {
+        flags |= SST_TABLE_CAPS;
+    }
     append_uvarint(b, flags);
     if let Some(p) = &sst.partition {
         append_bytes(b, p.as_bytes());
@@ -574,6 +588,9 @@ fn encode_sstable(b: &mut Vec<u8>, sst: &SstMeta, caps: u64) {
         append_uvarint(b, sst.range_max_seq);
         append_bytes(b, sst.range_min_key.as_deref().unwrap_or_default());
         append_bytes(b, sst.range_max_key.as_deref().unwrap_or_default());
+    }
+    if let Some(t) = sst.table_caps {
+        append_uvarint(b, t);
     }
 }
 
@@ -633,6 +650,18 @@ fn decode_sstable(c: &mut Cursor<'_>, caps: u64) -> Result<SstMeta> {
         sst.range_max_seq = max_seq;
         sst.range_min_key = Some(min_key);
         sst.range_max_key = Some(max_key);
+    }
+    if flags & SST_TABLE_CAPS != 0 {
+        let t = c.uvar()?;
+        // A table needs no bit the database lacks: nothing writes a table
+        // using a capability before the bit is durable. Zero is a word no
+        // writer declares — it would say nothing the absence does not.
+        if t == 0 || t & !caps != 0 {
+            return Err(corrupt(&format!(
+                "table capability word {t:#x} is zero or outside the database's {caps:#x}"
+            )));
+        }
+        sst.table_caps = Some(t);
     }
     Ok(sst)
 }
@@ -749,6 +778,7 @@ mod tests {
         t.range_max_seq = 42;
         t.range_min_key = Some(b"aa".to_vec());
         t.range_max_key = Some(b"nnn".to_vec());
+        t.table_caps = Some(crate::format::CAP_EXTENDED_RECORDS | crate::format::CAP_RANGE_DELETES);
         m.cfs.push(CfManifest {
             name: "second".into(),
             config: Vec::new(),
@@ -785,6 +815,51 @@ mod tests {
             assert_same(&d, &m);
             assert_eq!(d.encode(), enc, "re-encode must be byte-identical");
         }
+    }
+
+    /// sst section 0x40 (the table capability word, which wavesdb declares for
+    /// every table): kept through a round trip, and refused when it is zero or
+    /// names a bit the database word lacks. The wavesdb-only sections stay
+    /// refused as unknown until a reader implements them.
+    #[test]
+    fn table_caps_section_is_checked() {
+        use crate::format::{manifest_file, wavesdb_reserved, CAP_EXTENDED_RECORDS, CAP_PREFIX_DELTA};
+        let mut m = sample();
+        m.caps = CAP_EXTENDED_RECORDS;
+        m.cfs[0].sstables[0].table_caps = Some(CAP_EXTENDED_RECORDS);
+        let d = Manifest::decode(&m.encode()).unwrap();
+        assert_eq!(d.cfs[0].sstables[0].table_caps, Some(CAP_EXTENDED_RECORDS));
+        assert_eq!(d.cfs[0].sstables[1].table_caps, None);
+
+        for bad in [0, CAP_EXTENDED_RECORDS | CAP_PREFIX_DELTA] {
+            m.cfs[0].sstables[0].table_caps = Some(bad);
+            let err = Manifest::decode(&m.encode()).unwrap_err();
+            assert_eq!(err.kind(), "corruption", "table caps {bad:#x}");
+            assert!(err.to_string().contains("table capability word"), "{err}");
+        }
+
+        // Each wavesdb-only section bit, set on an otherwise valid table record
+        // (the flags byte is the one after `max_key`), is refused by the mask.
+        for bit in [manifest_file::SST_MERGE_STATS, manifest_file::SST_BLOB_REFS] {
+            let mut m = sample();
+            m.cfs[0].sstables.truncate(1);
+            let enc = m.encode();
+            // A one-byte sst_flags of 0 sits right before the CRC.
+            let at = enc.len() - 5;
+            assert_eq!(enc[at], 0);
+            let mut b = enc[..at].to_vec();
+            crate::encoding::append_uvarint(&mut b, bit);
+            b.extend_from_slice(&[0; 4]);
+            assert_eq!(
+                Manifest::decode(&resealed(b)).unwrap_err().kind(),
+                "unsupported_format",
+                "sst section {bit:#x}"
+            );
+        }
+        // wavesdb's database word (bits 9 and 10) is still refused as a whole.
+        let mut m = sample();
+        m.caps = wavesdb_reserved::CAP_VALUES_SHARED_BLOBS | wavesdb_reserved::CAP_WAVES08_BODIES;
+        assert_eq!(Manifest::decode(&m.encode()).unwrap_err().kind(), "unsupported_format");
     }
 
     /// The fixed header and a minimal body, byte for byte.

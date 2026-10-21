@@ -1240,6 +1240,76 @@ fn manifest_level_above_limit_is_corruption() {
     ));
 }
 
+/// The catalog may declare a table's capability word (sst section 0x40, which
+/// wavesdb writes for every table). It is a cross-check of the footer: equal
+/// reads normally, unequal is `Corruption` the moment the table opens.
+#[test]
+fn catalog_table_caps_must_match_the_footer() {
+    use ondadb::format::{CAP_EXTENDED_RECORDS, CAP_MERGE_OPERANDS, CAP_PREFIX_DELTA};
+    use ondadb::manifest::{manifest_path, Manifest};
+
+    // A prefix-delta family's tables declare exactly EXTENDED | PREFIX_DELTA.
+    let footer = CAP_EXTENDED_RECORDS | CAP_PREFIX_DELTA;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = || Options::new(dir.path().to_str().unwrap());
+    let family = |db: &DB| db.get_column_family("pd").expect("family pd");
+    {
+        let db = DB::open(opts()).unwrap();
+        db.enable_format_capabilities(footer | CAP_MERGE_OPERANDS).unwrap();
+        let cf = db
+            .create_column_family(
+                "pd",
+                ColumnFamilyConfig {
+                    enable_prefix_delta_keys: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        db.put(&cf, b"key", b"value", ZERO).unwrap();
+        db.flush_memtable(&cf).unwrap();
+        db.close().unwrap();
+    }
+    let path = manifest_path(dir.path());
+    let declare = |caps: u64| {
+        let mut manifest = Manifest::load(&path).unwrap();
+        let table = manifest
+            .cfs
+            .iter_mut()
+            .find(|cf| cf.name == "pd")
+            .and_then(|cf| cf.sstables.first_mut())
+            .expect("fixture has one table");
+        table.table_caps = Some(caps);
+        manifest.save(&path).unwrap();
+    };
+
+    declare(footer);
+    {
+        let db = DB::open(opts()).unwrap();
+        assert_eq!(db.get(&family(&db), b"key").unwrap(), b"value");
+        db.close().unwrap();
+    }
+    // The declaration survives the reopen's own snapshot rewrite.
+    let kept = Manifest::load(&path).unwrap();
+    let declared: Vec<_> = kept
+        .cfs
+        .iter()
+        .flat_map(|cf| cf.sstables.iter().map(|t| t.table_caps))
+        .collect();
+    assert_eq!(declared, vec![Some(footer)]);
+
+    // A word the footer does not carry: inside the database's word, so the
+    // catalog decodes, but the table refuses to open.
+    declare(footer | CAP_MERGE_OPERANDS);
+    let db = DB::open(opts()).unwrap();
+    let err = db
+        .get(&family(&db), b"key")
+        .expect_err("a footer/catalog disagreement must be refused");
+    assert!(
+        matches!(err, OndaError::Corruption(ref m) if m.contains("not the catalog's")),
+        "{err:?}"
+    );
+}
+
 /// A comparable engine silently lost the level ratio passed at creation on
 /// recovery. The comparator is the highest-stakes ondaDB analog (invariant
 /// 7: a CF's comparator defines its on-disk order and is persisted by name).

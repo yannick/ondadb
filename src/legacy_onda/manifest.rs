@@ -402,6 +402,7 @@ fn decode_sstable(cursor: &mut ManifestCursor<'_>) -> Result<SstMeta> {
         range_max_seq: 0,
         range_min_key: None,
         range_max_key: None,
+        table_caps: None,
     })
 }
 

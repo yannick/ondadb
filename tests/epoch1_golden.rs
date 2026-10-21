@@ -187,6 +187,8 @@ fn sample_manifest() -> Manifest {
                 range_max_seq: 20,
                 range_min_key: Some(b"b".to_vec()),
                 range_max_key: Some(b"y".to_vec()),
+                // The corpus predates sst section 0x40 and pins its bytes.
+                table_caps: None,
             }],
             unified_id: Some(0x1111_2222_3333_4444),
         }],

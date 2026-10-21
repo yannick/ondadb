@@ -36,6 +36,11 @@ fn distinguishable_table() -> SstMeta {
         range_max_seq: 202,
         range_min_key: Some(b"rng-min".to_vec()),
         range_max_key: Some(b"rng-max".to_vec()),
+        // The one field no op carries: the catalog's copy of the footer word
+        // (sst section 0x40). This binary never sets it at runtime — it only
+        // arrives in a snapshot written elsewhere, and replay starts from that
+        // snapshot — so nothing is lost by the log not recording it.
+        table_caps: None,
     }
 }
 
@@ -73,7 +78,9 @@ fn distinguishable_manifest() -> Manifest {
 
 /// The inventory guard: 5 `Manifest` fields + 3 `CfManifest` fields + 19
 /// `SstMeta` fields, each reachable through an op, verified by rebuilding the
-/// whole catalog from `Manifest::default()` with edits alone.
+/// whole catalog from `Manifest::default()` with edits alone. The 20th
+/// `SstMeta` field, `table_caps`, is the documented exception (see
+/// `distinguishable_table`).
 ///
 /// Partition rules and tier rules are deliberately **absent** from this list:
 /// they are not manifest fields. They live inside the opaque

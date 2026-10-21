@@ -577,6 +577,8 @@ impl<'a> Cur<'a> {
             range_max_seq: self.uvar()?,
             range_min_key: self.opt_bytes()?,
             range_max_key: self.opt_bytes()?,
+            // Schema 1 has no field for it; the footer stays the authority.
+            table_caps: None,
         })
     }
 
@@ -1548,6 +1550,9 @@ mod tests {
             range_max_seq: 42,
             range_min_key: Some(b"r-min".to_vec()),
             range_max_key: Some(b"r-max".to_vec()),
+            // Not an edit-log field (schema 1 has none), so "all set" cannot
+            // include it: a round trip would drop it.
+            table_caps: None,
         }
     }
 
@@ -1572,6 +1577,7 @@ mod tests {
             range_max_seq: 0,
             range_min_key: None,
             range_max_key: None,
+            table_caps: None,
         }
     }
 

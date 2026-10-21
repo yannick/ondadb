@@ -275,6 +275,15 @@ pub mod wavesdb_reserved {
     /// Capability bit 8: wavesdb vlog compression grouping, the permission
     /// for [`FLAG_VLOG_GROUPED`].
     pub const CAP_VLOG_GROUPING: u64 = 1 << 8;
+    /// Capability bit 9: values in shared `<id>.blob` files, addressed by a
+    /// 16-byte `blob_id | offset` pointer (plan C row V). Every engine must
+    /// eventually *read* it (step 2c); writing it needs blob GC.
+    pub const CAP_VALUES_SHARED_BLOBS: u64 = 1 << 9;
+    /// Capability bit 10, **interim**: the directory or table keeps wavesdb
+    /// 0.8's bodies inside epoch-1 containers — `0xff` block headers, full-key
+    /// blocks without restarts, wavesdb's prefix-delta layout, JSON configs,
+    /// edit-log schema 2, WAL layouts 3 and 4. Retired by step 2d.
+    pub const CAP_WAVES08_BODIES: u64 = 1 << 10;
     /// Kind 19: wavesdb large-transaction spill descriptor.
     pub const KIND_SPILL_DESCRIPTOR: u64 = 19;
     /// Kind 32: wavesdb managed-sequence ownership record.
@@ -289,7 +298,16 @@ pub mod wavesdb_reserved {
 const _: () = assert!(KNOWN_ENTRY_FLAGS & wavesdb_reserved::FLAG_VLOG_GROUPED == 0);
 const _: () = assert!(modifiers::KNOWN & wavesdb_reserved::MOD_VLOG_GROUPED == 0);
 const _: () = assert!(
-    KNOWN_CAPS & (wavesdb_reserved::CAP_MANAGED_MODE | wavesdb_reserved::CAP_VLOG_GROUPING) == 0
+    KNOWN_CAPS
+        & (wavesdb_reserved::CAP_MANAGED_MODE
+            | wavesdb_reserved::CAP_VLOG_GROUPING
+            | wavesdb_reserved::CAP_VALUES_SHARED_BLOBS
+            | wavesdb_reserved::CAP_WAVES08_BODIES)
+        == 0
+);
+const _: () = assert!(
+    wavesdb_reserved::CAP_VALUES_SHARED_BLOBS == 1 << 9
+        && wavesdb_reserved::CAP_WAVES08_BODIES == 1 << 10
 );
 const _: () = assert!(wavesdb_reserved::KIND_MANAGED_DISCARD_FLOOR <= MAX_ASSIGNABLE_KIND);
 
@@ -404,10 +422,18 @@ pub mod manifest_file {
     /// Database flag: edit-log cursor, `generation u64 | applied_through u64 |
     /// next_edit_id u64`.
     pub const DB_EDIT_LOG: u32 = 1 << 2;
+    /// Database flag, **wavesdb**: managed-sequence state, `discard_seq u64 |
+    /// last_managed_commit u64` (requires `CAP_MANAGED_MODE`). Registered,
+    /// outside [`DB_KNOWN`]: refused until this binary reads managed mode.
+    pub const DB_MANAGED_STATE: u32 = 1 << 3;
     pub const DB_KNOWN: u32 = DB_UNIFIED_WAL | DB_INSTANCE_NONCE | DB_EDIT_LOG;
     /// CF flag: the unified-layout CF id, `u64` — present only when it is not
     /// FNV-1a-64 of the name (plan C, F5′).
     pub const CF_UNIFIED_ID: u64 = 1 << 0;
+    /// CF flag, **wavesdb**: the family's shared blob files, `count | (blob_id |
+    /// size | live_bytes)*` uvarints in ascending id (requires
+    /// `CAP_VALUES_SHARED_BLOBS`). Registered, outside [`CF_KNOWN`].
+    pub const CF_SHARED_BLOBS: u64 = 1 << 1;
     pub const CF_KNOWN: u64 = CF_UNIFIED_ID;
     /// SST flag: partition name.
     pub const SST_PARTITION: u64 = 1 << 0;
@@ -422,18 +448,39 @@ pub mod manifest_file {
     /// SST flag: range summary, `count | min_seq | max_seq | min_key* |
     /// max_key*` (requires `CAP_RANGE_DELETES`).
     pub const SST_RANGE: u64 = 1 << 5;
+    /// SST flag: the table's capability word, uvarint, non-zero; it must
+    /// equal the footer's word and be a subset of the database's. Common
+    /// profile, needing no bit: wavesdb writes it for every table, ondaDB
+    /// reads and keeps it but does not write it (its footers carry the word).
+    pub const SST_TABLE_CAPS: u64 = 1 << 6;
+    /// SST flag, **wavesdb**: merge statistics, `merge_count | longest_chain`
+    /// (requires `CAP_WAVES08_BODIES`). Registered, outside [`SST_KNOWN`].
+    pub const SST_MERGE_STATS: u64 = 1 << 7;
+    /// SST flag, **wavesdb**: shared blob references, `count | (blob_id |
+    /// raw_bytes)*` in ascending id (requires `CAP_VALUES_SHARED_BLOBS`).
+    /// Registered, outside [`SST_KNOWN`].
+    pub const SST_BLOB_REFS: u64 = 1 << 8;
     pub const SST_KNOWN: u64 = SST_PARTITION
         | SST_TIER
         | SST_OBJECT
         | SST_MAX_ENTRY_TIME
         | SST_LAST_COMPACTION_TIME
-        | SST_RANGE;
+        | SST_RANGE
+        | SST_TABLE_CAPS;
 }
 
 const _: () = assert!(is_printable_ascii(&manifest_file::MAGIC));
 const _: () = assert!(manifest_file::DB_KNOWN == 0x07);
 const _: () = assert!(manifest_file::CF_KNOWN == 0x01);
-const _: () = assert!(manifest_file::SST_KNOWN == 0x3F);
+const _: () = assert!(manifest_file::SST_KNOWN == 0x7F);
+// The wavesdb-only sections stay outside the masks until a reader implements
+// them: a known bit is decoded, and an undecoded known bit would desync the
+// cursor on the next field.
+const _: () = assert!(manifest_file::DB_KNOWN & manifest_file::DB_MANAGED_STATE == 0);
+const _: () = assert!(manifest_file::CF_KNOWN & manifest_file::CF_SHARED_BLOBS == 0);
+const _: () = assert!(
+    manifest_file::SST_KNOWN & (manifest_file::SST_MERGE_STATS | manifest_file::SST_BLOB_REFS) == 0
+);
 
 /// The `MANIFEST-EDITS` header (32 bytes). Records follow it with the same
 /// framing 0.9 used, under CRC32-C: `len u32 | crc32c u32 | payload`.
@@ -445,6 +492,9 @@ const _: () = assert!(manifest_file::SST_KNOWN == 0x3F);
 pub mod edit_log {
     pub const MAGIC: [u8; 8] = *b"YOLODBED";
     pub const SCHEMA: u32 = 1;
+    /// Schema 2, **wavesdb**: its 18 ops, payloads as wavesdb 0.8 encodes them
+    /// (requires `CAP_WAVES08_BODIES`). Registered; refused until step 2c.
+    pub const SCHEMA_WAVES08: u32 = 2;
     pub const HEADER_BYTES: usize = 32;
 }
 
@@ -466,11 +516,20 @@ pub mod wal_segment {
     pub const LAYOUT_PER_CF: u8 = 1;
     /// One database-wide WAL with cf-id-prefixed keys; envelope schema 2.
     pub const LAYOUT_UNIFIED: u8 = 2;
+    /// **wavesdb** 0.8, one WAL per column family, wavesdb's envelope
+    /// (requires `CAP_WAVES08_BODIES`). Registered; refused until step 2c.
+    pub const LAYOUT_WAVES08_PER_CF: u8 = 3;
+    /// **wavesdb** 0.8, unified, wavesdb's envelope with a per-record `cf_id`
+    /// (requires `CAP_WAVES08_BODIES`). Registered; refused until step 2c.
+    pub const LAYOUT_WAVES08_UNIFIED: u8 = 4;
 }
 
 const _: () = assert!(is_printable_ascii(&wal_segment::MAGIC));
 const _: () = assert!(wal_segment::HEADER_LEN == 32);
 const _: () = assert!(wal_segment::LAYOUT_PER_CF != wal_segment::LAYOUT_UNIFIED);
+const _: () = assert!(
+    wal_segment::LAYOUT_WAVES08_PER_CF == 3 && wal_segment::LAYOUT_WAVES08_UNIFIED == 4
+);
 
 /// The value-log header: 32 bytes at offset 0 of every `.vlog`. Frame offsets
 /// in klog entries are absolute, so the first frame is at [`HEADER_LEN`].
@@ -485,10 +544,22 @@ pub mod vlog_header {
     pub const MAGIC: [u8; 8] = *b"YOLODBVL";
     pub const VERSION: u32 = 1;
     pub const HEADER_LEN: usize = 32;
-    /// No flag is assigned in epoch 1; per-file dictionaries and compression
-    /// groups (plan C step 2) will take bits here.
+    /// **wavesdb** (step 2b): the file carries a trained zstd dictionary;
+    /// `dict_off u64` at 16 and `dict_len u32` at 24 locate its frame.
+    /// Registered; refused until step 2c.
+    pub const FLAG_DICTIONARY: u32 = 0x1;
+    /// **wavesdb** (step 2b, `CAP_VLOG_GROUPING`): the file holds compression
+    /// group frames. Registered; refused until step 2c.
+    pub const FLAG_GROUPED: u32 = 0x2;
+    /// The flags this binary decodes: none yet. A registered flag outside it
+    /// is `UnsupportedFormat`, like any other.
     pub const KNOWN_FLAGS: u32 = 0;
 }
+
+const _: () = assert!(vlog_header::FLAG_DICTIONARY == 0x1 && vlog_header::FLAG_GROUPED == 0x2);
+const _: () = assert!(
+    vlog_header::KNOWN_FLAGS & (vlog_header::FLAG_DICTIONARY | vlog_header::FLAG_GROUPED) == 0
+);
 
 const _: () = assert!(is_printable_ascii(&vlog_header::MAGIC));
 const _: () = assert!(vlog_header::HEADER_LEN == 32);
@@ -595,10 +666,13 @@ pub mod codec {
     pub const DEFLATE: u8 = 5;
     /// A raw LZ4 block (`lz4_flex::compress`).
     pub const LZ4: u8 = 6;
-    /// Zstd with a per-file dictionary — reserved until plan C step 2.
-    pub const RESERVED_ZSTD_DICT: u8 = 7;
-    /// Brotli — reserved (plan C row S).
-    pub const RESERVED_BROTLI: u8 = 8;
+    /// Zstd with the value file's dictionary (**wavesdb**, step 2b): value
+    /// frames only, in a file whose header sets
+    /// [`vlog_header::FLAG_DICTIONARY`]. Refused until step 2c.
+    pub const ZSTD_DICT: u8 = 7;
+    /// Brotli (**wavesdb**, plan C row S), in blocks and value frames.
+    /// Refused until step 2c.
+    pub const BROTLI: u8 = 8;
 }
 
 const _: () = assert!(codec::LZ4 != codec::BURNED_2 && codec::LZ4 != codec::BURNED_4);
@@ -829,7 +903,25 @@ mod tests {
             [2, 4],
             "burned ids stay burned"
         );
-        assert_eq!([codec::RESERVED_ZSTD_DICT, codec::RESERVED_BROTLI], [7, 8]);
+        assert_eq!([codec::ZSTD_DICT, codec::BROTLI], [7, 8]);
+        assert_eq!(edit_log::SCHEMA_WAVES08, 2);
+        assert_eq!(
+            [wal_segment::LAYOUT_WAVES08_PER_CF, wal_segment::LAYOUT_WAVES08_UNIFIED],
+            [3, 4]
+        );
+        assert_eq!(
+            [vlog_header::FLAG_DICTIONARY, vlog_header::FLAG_GROUPED],
+            [0x1, 0x2]
+        );
+        assert_eq!(
+            [
+                wavesdb_reserved::CAP_MANAGED_MODE,
+                wavesdb_reserved::CAP_VLOG_GROUPING,
+                wavesdb_reserved::CAP_VALUES_SHARED_BLOBS,
+                wavesdb_reserved::CAP_WAVES08_BODIES
+            ],
+            [1 << 7, 1 << 8, 1 << 9, 1 << 10]
+        );
         assert_eq!((BLOOM_HASH_FNV_09, BLOOM_HASH_XXH3), (0, 1));
         assert_eq!(FNV1A64_OFFSET_BASIS, 14695981039346656037);
         // The FNV-1a-64 reference vectors.
@@ -844,10 +936,14 @@ mod tests {
         use cf_config::tag::*;
         use manifest_file::*;
         assert_eq!(
-            [DB_UNIFIED_WAL, DB_INSTANCE_NONCE, DB_EDIT_LOG],
-            [0x1, 0x2, 0x4]
+            [DB_UNIFIED_WAL, DB_INSTANCE_NONCE, DB_EDIT_LOG, DB_MANAGED_STATE],
+            [0x1, 0x2, 0x4, 0x8]
         );
-        assert_eq!(CF_UNIFIED_ID, 0x1);
+        assert_eq!([CF_UNIFIED_ID, CF_SHARED_BLOBS], [0x1, 0x2]);
+        assert_eq!(
+            [SST_TABLE_CAPS, SST_MERGE_STATS, SST_BLOB_REFS],
+            [0x40, 0x80, 0x100]
+        );
         assert_eq!(
             [
                 SST_PARTITION,

@@ -806,6 +806,7 @@ impl ColumnFamily {
             vlog_cache_limit: self.opts.max_cached_vlog_value_bytes,
             io_limiter: self.ctx.io_limiter.clone(),
             format: self.ctx.format,
+            catalog_caps: meta.table_caps,
         };
         Arc::new(SstHandle {
             meta,
@@ -816,7 +817,7 @@ impl ColumnFamily {
 
     pub(crate) fn open_reader_for(&self, meta: &SstMeta) -> Result<Arc<Reader>> {
         let storage = self.ctx.tiers.storage_for(meta.tier.as_deref());
-        Reader::open_profiled(
+        let reader = Reader::open_profiled(
             &self.klog_path_for(meta),
             storage,
             self.ctx.bc.clone(),
@@ -825,7 +826,9 @@ impl ColumnFamily {
             self.opts.max_cached_vlog_value_bytes,
             self.ctx.io_limiter.clone(),
             self.ctx.format,
-        )
+        )?;
+        crate::table_cache::check_catalog_caps(&reader, meta.table_caps, meta.id)?;
+        Ok(reader)
     }
 
     /// Create a fresh column family (directory + generation-0 WAL).
@@ -965,6 +968,7 @@ impl ColumnFamily {
                 vlog_cache_limit: opts.max_cached_vlog_value_bytes,
                 io_limiter: ctx.io_limiter.clone(),
                 format: ctx.format,
+                catalog_caps: s.table_caps,
             };
             levels[s.level as usize].push(Arc::new(SstHandle {
                 meta: s.clone(),

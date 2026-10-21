@@ -44,6 +44,20 @@ version 2.
 | Value log (`.vlog`) | `YOLODBVL` | u32 = 1 | offset 0 | *(no header)* |
 | CF config blob | `YOLODBCF` | u32 = 1 | offset 0 of the blob | positional + `ONDA*` tails |
 | Format-upgrade swap journal | `YOLODBUJ` | u32 = 1 | offset 0 of `<parent>/.<name>.yolo-upgrade.journal` | *(new; states `1` swapping, `2` done)* |
+| Catalog pointer (`MANIFEST-CURRENT`, object store) | `YOLODBMC` | u32 = 1 | offset 0 | wavesdb `WDMC` (u32); wavesdb speciality, row R |
+| Large-transaction spill chunk | `WVSPILL1` | as wavesdb defines it | offset 0 of a chunk file | *reserved to wavesdb* (row O); kept as is, never in a checkpoint |
+
+The value-file magic `YOLODBVL` heads both kinds of value file: ondaDB's
+per-table `.vlog` and wavesdb's shared `<id>.blob` (`CAP_VALUES_SHARED_BLOBS`).
+Their headers and value frames are the same bytes; a klog entry's pointer says
+which file it addresses. The swap journal is shared too: wavesdb's
+legacy-to-epoch-1 migrator (step 2b) writes the same `YOLODBUJ` body as
+ondaDB's 0.9 upgrade, so either engine can resolve an interrupted swap.
+
+wavesdb's 0.8 containers (`WAVESST2` footer, `WVMF` manifest, `WDME` edit
+log, `WVB2` blob header, headerless WAL and v1 blob files) are *legacy-wavesdb*.
+In an epoch-1 position they are `UnsupportedFormat` naming wavesdb's migrator,
+exactly as 0.9 ondaDB magics are.
 
 An unknown version is `UnsupportedFormat`. A 0.9 magic in an epoch-1 position
 is `UnsupportedFormat` naming the upgrade path; any other foreign magic is
@@ -84,10 +98,17 @@ capability word — which also retires the 0.9/wavesdb collision where `0x04` an
 
 A table declares, in its footer, the capability bits a reader needs to decode
 it: a subset of `TABLE_CAPS = CAP_EXTENDED_RECORDS | CAP_MERGE_OPERANDS |
-CAP_RANGE_DELETES | CAP_PREFIX_DELTA`. A bit outside `KNOWN_CAPS` is
-`UnsupportedFormat`; a known database-level bit, a table bit without
-`CAP_EXTENDED_RECORDS`, or `CAP_RANGE_DELETES` disagreeing with the aux block's
-range section is `Corruption`.
+CAP_RANGE_DELETES | CAP_PREFIX_DELTA | CAP_VLOG_GROUPING |
+CAP_VALUES_SHARED_BLOBS | CAP_WAVES08_BODIES`. A bit outside `KNOWN_CAPS` is
+`UnsupportedFormat`; a known database-level bit, a **record-level** bit
+(`CAP_MERGE_OPERANDS`, `CAP_RANGE_DELETES`, `CAP_PREFIX_DELTA`) without
+`CAP_EXTENDED_RECORDS` — unless the word carries `CAP_WAVES08_BODIES`, whose
+blocks declare their encoding per block and which wavesdb 0.8 wrote as
+prefix-delta tables, merge operands included, without the extended bit —
+`CAP_VLOG_GROUPING` without `CAP_VALUES_SHARED_BLOBS`,
+or `CAP_RANGE_DELETES` disagreeing with the aux block's range section is
+`Corruption`. The three value and body bits do not need extended records: a
+wavesdb table of base entries can still point into shared blob files.
 
 ## Capability bits (manifest header word, table footer word)
 
@@ -102,10 +123,39 @@ range section is `Corruption`.
 | 6 | transaction decisions | `CAP_TXN_DECISIONS` | `CapTxnDecisions` |
 | 7 | managed sequence mode | *reserved to wavesdb* | `CapManagedMode` |
 | 8 | vlog compression grouping | *reserved to wavesdb* | `CapVlogGrouping` |
+| 9 | values in shared blob files | — (read in step 2c) | `CapValuesSharedBlobs` (step 2b) |
+| 10 | **interim:** wavesdb 0.8 bodies | — (refused) | `CapWaves08Bodies` (step 2b) |
 
 Bits 0–6 were assigned identically by both engines independently. 7 and 8 are
 wavesdb specialities; ondaDB reserves them so it cannot assign them to anything
 else.
+
+**Bit 9, `CAP_VALUES_SHARED_BLOBS`** (plan C row V, native speciality). A
+table's value pointers (entry flag `0x04`) address a **shared blob file**
+`<id>.blob` with a 16-byte `blob_id u64 | offset u64` pair instead of the
+table's own `.vlog` with an 8-byte offset; the catalog carries each family's
+blob list and each table's blob references (manifest sections cf `0x2`, sst
+`0x100`). Blob files are shared between tables and reclaimed by blob GC.
+Every engine must eventually **read** it (step 2c); writing it needs blob GC.
+
+**Bit 10, `CAP_WAVES08_BODIES`** (interim, step 2b → retired by step 2d). The
+directory or table keeps the bodies wavesdb 0.8 wrote inside epoch-1
+containers, because those bodies converge in later rows:
+
+- data blocks: the `0xff` block header, no restart trailer in full-key blocks,
+  wavesdb's prefix-delta entry layout with its `WDBL` trailer (rows B, C, D);
+- CF config blobs: JSON (row G);
+- merge statistics in the catalog (sst section `0x80`).
+
+The exact bytes are wavesdb's `docs/format-compatibility.md` at `657a57d`
+(v0.8.12), which this bit freezes. Everything else in such a table or
+directory is epoch 1: footer, aux block, Bloom, index, block frames, value-file
+header and frames, manifest container and sections. Only wavesdb writes it, and
+only until its writers emit the common bodies; a writer then stops setting it
+on new tables and a database whose last such table is gone clears it from its
+word. Readers keep accepting it until step 2e. An engine that does not
+implement it refuses the directory (`UnsupportedFormat`) — the cross-engine
+refusal the harness checks after step 2b.
 
 ## Manifest sections
 
@@ -118,13 +168,21 @@ each under a strict mask (unknown bit: `UnsupportedFormat`). Layout:
 | db (u32) | `0x1` | unified WAL layout | none |
 | db | `0x2` | instance nonce | `u64` |
 | db | `0x4` | edit-log cursor | `generation u64 \| applied_through u64 \| next_edit_id u64` |
+| db | `0x8` | managed-sequence state | `discard_seq u64 \| last_managed_commit u64` (requires `CAP_MANAGED_MODE`) |
 | cf (uvarint) | `0x1` | unified CF id | `u64`, only when ≠ FNV-1a-64(name) |
+| cf | `0x2` | shared blob files | `count \| (blob_id \| size \| live_bytes)*`, uvarints, ascending id (requires `CAP_VALUES_SHARED_BLOBS`) |
 | sst (uvarint) | `0x01` | partition | string |
 | sst | `0x02` | tier | string |
 | sst | `0x04` | object stem | string |
 | sst | `0x08` | `max_entry_time` | uvarint (`i64` as `u64`) |
 | sst | `0x10` | `last_compaction_time` | uvarint (requires `CAP_PERIODIC_AGE`) |
 | sst | `0x20` | range summary | `count \| min_seq \| max_seq \| min_key* \| max_key*` (requires `CAP_RANGE_DELETES`) |
+| sst | `0x40` | table capability word | uvarint, ≠ 0; must equal the footer's word and be a subset of the database's |
+| sst | `0x80` | merge statistics | `merge_count \| longest_chain` uvarints (requires `CAP_WAVES08_BODIES`; row F decides whether it joins the common profile) |
+| sst | `0x100` | shared blob references | `count \| (blob_id \| raw_bytes)*`, uvarints, ascending id (requires `CAP_VALUES_SHARED_BLOBS`) |
+
+A section that requires a bit the database word lacks is `Corruption`:
+nothing writes the section before the bit is durable.
 
 ## WAL segment layouts
 
@@ -132,6 +190,13 @@ each under a strict mask (unknown bit: `UnsupportedFormat`). Layout:
 | ---: | --- | ---: |
 | 1 | one WAL per column family | 1 |
 | 2 | unified (cf-id-prefixed keys) | 2 |
+| 3 | wavesdb 0.8, one WAL per column family | wavesdb envelope (requires `CAP_WAVES08_BODIES`) |
+| 4 | wavesdb 0.8, unified | wavesdb envelope, per-record `cf_id` (requires `CAP_WAVES08_BODIES`) |
+
+Layouts 3 and 4 carry wavesdb's base records and its `0xff | schema=1 | count |
+env_flags | …` envelope unchanged (row J converges the envelope, row L the
+control records). The segment header, its CRC and the torn-header rules are
+the same for every layout.
 
 ## Record kinds (WAL envelope, extended SST entries)
 
@@ -176,7 +241,7 @@ Stored per block frame and per vlog frame.
 | **4** | ***burned*** — LZ4-fast in ondaDB 0.9, zstd in wavesdb | never written; `UnsupportedFormat` |
 | 5 | raw deflate | written and read |
 | 6 | raw LZ4 block (`lz4_flex`) | written and read (ondaDB `Lz4` and `Lz4Fast`) |
-| 7 | zstd with a per-file dictionary | reserved until plan C step 2 |
+| 7 | zstd with a per-file dictionary | value frames only, in a value file whose header sets flag `0x1` (step 2b, wavesdb) |
 | 8 | brotli | reserved (plan C row S) |
 
 Ids 2 and 4 are permanently unassigned: each meant a different codec in each
@@ -195,9 +260,37 @@ u64 LE`, with `1 ≤ m < 2^32` and `1 ≤ k ≤ 30`.
 
 ## Value-log header flags
 
-`flags u32` at offset 12 of the vlog header: **no bit is assigned in epoch 1**
-(any bit is `UnsupportedFormat`). Reserved for per-file dictionaries and
-compression groups (plan C step 2).
+`flags u32` at offset 12 of the value-file header. An unknown bit is
+`UnsupportedFormat`; reserved bytes not claimed by a set flag must be zero
+(`Corruption`).
+
+| Bit | Meaning | Header bytes it claims |
+| --- | --- | --- |
+| `0x1` | the file carries a trained zstd dictionary | 16: `dict_off u64`, 24: `dict_len u32` — the dictionary frame's offset and dictionary length |
+| `0x2` | the file holds at least one compression-group frame | none |
+
+Both are written by wavesdb for shared blob files (step 2b, behind
+`CAP_VALUES_SHARED_BLOBS`; grouping also behind `CAP_VLOG_GROUPING`). Plan C
+row V2 opens them to per-table `.vlog` files. The frames they announce:
+
+```
+dictionary frame:  crc32c(dict) u32 | dict_len u32 | dict             (stored raw)
+group frame:       crc32c(stored) u32 | codec u8 | stored_len u32 | raw_len u32 | stored
+```
+
+A value frame tagged codec 7 is decoded against the file's dictionary; a file
+without `0x1` holding one is `Corruption`. A grouped entry (entry flag `0x08`)
+addresses a group frame and carries a uvarint in-group offset after its
+pointer. The dictionary frame sits after the frames written before training
+and is written once; `dict_off ≥ 32` and the frame must lie inside the file.
+A shared blob file's header is written when the file is created, with flags 0,
+and rewritten once, in place and fsynced, when the file is sealed — the only
+point at which the dictionary's location and the presence of groups are known.
+No entry pointing at a group or a codec-7 frame is published before the seal,
+so a reader that needs either always sees the sealed header.
+
+A wavesdb 0.8 blob header (`WVB2`) stored `dict_id u32` at offset 20; no reader
+ever read it, so epoch 1 drops it.
 
 ## Unified column-family id
 
@@ -279,6 +372,31 @@ partition, `0x10` max_entry_time, `0x20` last_compaction_time, present values in
 ascending bit order. Plan C step 2 row I merges this table with wavesdb's
 18-op `WDME` table.
 
+### Edit-log schemas
+
+The `MANIFEST-EDITS` header's `schema` word names the op table its records
+use; the header and the record framing are the same for every schema.
+
+| Schema | Op table | Writer |
+| ---: | --- | --- |
+| 1 | the table above | ondaDB |
+| 2 | wavesdb's 18 ops, payloads as wavesdb 0.8 encodes them (requires `CAP_WAVES08_BODIES`) | wavesdb (step 2b) |
+
+Schema 2's op codes, for the record (row I merges the two tables):
+
+| Code | Op | Code | Op | Code | Op |
+| ---: | --- | ---: | --- | ---: | --- |
+| 1 | `AddTable` | 7 | `CreateCF` | 13 | `SetWALLayout` |
+| 2 | `RemoveTable` | 8 | `DropCF` | 14 | `SetNonce` |
+| 3 | `UpdateTable` | 9 | `RenameCF` | 15 | `SetCapability` |
+| 4 | `AddBlob` | 10 | `SetCFConfig` | 16 | `SetManagedState` |
+| 5 | `UpdateBlob` | 11 | `SetNextFileID` | 17 | `TxnDecision` |
+| 6 | `RemoveBlob` | 12 | `SetGlobalSeq` | 18 | `SetRun` |
+
+The same code means a different op in each schema (4 is `CreateCF` in schema 1
+and `AddBlob` in schema 2), which is why a reader dispatches on the schema
+word, never on the codes.
+
 ## Aux-block section tags
 
 | Tag | Section |
@@ -294,7 +412,7 @@ value to decide whether it is one. They are registered here because both
 engines read and write the same bytes, so a number in them is as shared as any
 above.
 
-### Wide-column entity frame, version 1 (`src/entity.rs`, wavesdb `entity.go`)
+### Wide-column entity frame, version 1 (ondaDB `src/entity.rs`, wavesdb `internal/entity/entity.go`)
 
 | Offset | Size | Field | Rule |
 | --- | --- | --- | --- |
