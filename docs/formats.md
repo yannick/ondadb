@@ -771,11 +771,18 @@ off  field
                 | [0x10 SST_LAST_COMPACTION_TIME] uvarint (i64 as u64)
                 | [0x20 SST_RANGE]                range_count | range_min_seq
                                                   | range_max_seq | min_key* | max_key*
+                | [0x40 SST_TABLE_CAPS]           caps uvarint (≠ 0, equal to the
+                                                  footer's word, ⊆ the database's)
      crc32c u32
 ```
 
 (`*` = uvarint length + bytes.) `DB_UNIFIED_WAL` (`0x1`) has no payload: its
-presence is the unified WAL layout. Every optional field is a **flagged
+presence is the unified WAL layout. `SST_TABLE_CAPS` is a cross-check of the
+footer: a reader that opens the table compares the two, and a mismatch is
+`Corruption`. wavesdb writes it for every table. ondaDB reads and keeps it but
+does not write it. The wavesdb-only sections (db `0x8`, cf `0x2`, sst `0x80`
+and `0x100`) are in the registry; a reader that does not implement one refuses
+its bit as unknown. Every optional field is a **flagged
 section**, present in ascending bit order exactly when its value differs from
 the empty default — the discipline wavesdb's v3/v4 manifest proved out,
 replacing 0.9's positional tails and `ONDA*` 8-byte tagged tails (whose

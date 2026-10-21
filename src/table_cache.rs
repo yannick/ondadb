@@ -119,6 +119,29 @@ pub(crate) struct TableRef {
     /// The format family the table is decoded as (epoch 1, or a 0.9 table
     /// read through `legacy_onda`).
     pub format: crate::format::FormatProfile,
+    /// The capability word the catalog declares for this table
+    /// ([`SstMeta::table_caps`](crate::manifest::SstMeta::table_caps)), checked
+    /// against the footer when the reader opens.
+    pub catalog_caps: Option<u64>,
+}
+
+/// Refuse a table whose footer capability word disagrees with the one its
+/// catalog declares. Both are checksummed, so a disagreement is a catalog that
+/// names the wrong file (or a file swapped under it), never a torn write.
+pub(crate) fn check_catalog_caps(
+    reader: &Reader,
+    catalog_caps: Option<u64>,
+    file_id: u64,
+) -> crate::error::Result<()> {
+    match catalog_caps {
+        Some(want) if want != reader.table_caps() => {
+            Err(crate::error::OndaError::Corruption(format!(
+                "table {file_id}: footer capability word {:#x} is not the catalog's {want:#x}",
+                reader.table_caps()
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// One cached reader with its second-chance bit.
@@ -335,6 +358,7 @@ impl TableCache {
             t.io_limiter.clone(),
             t.format,
         )?;
+        check_catalog_caps(&reader, t.catalog_caps, t.file_id)?;
         self.core.opens.fetch_add(1, Ordering::Relaxed);
 
         let mut shard = self.shard(t.file_id).write();

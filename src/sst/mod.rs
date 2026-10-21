@@ -357,6 +357,9 @@ impl FileMeta {
             range_max_seq: self.range_max_seq,
             range_min_key: self.range_min_key.clone(),
             range_max_key: self.range_max_key.clone(),
+            // The footer carries this table's word; the catalog does not repeat
+            // it for tables this binary writes.
+            table_caps: None,
         }
     }
 }
