@@ -82,6 +82,8 @@ pub(crate) fn block_payload_for(
 ) -> Result<(Compression, &[u8], usize, usize)> {
     match profile {
         crate::format::FormatProfile::Epoch1 => block_payload_inner(buf, verify),
+        #[cfg(feature = "waves08")]
+        crate::format::FormatProfile::Waves08 => block_payload_inner(buf, verify),
         #[cfg(feature = "legacy-onda")]
         crate::format::FormatProfile::Onda09 => crate::legacy_onda::block_payload(buf, verify),
     }

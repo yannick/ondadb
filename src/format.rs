@@ -31,6 +31,10 @@ pub enum FormatProfile {
     /// ondaDB 0.9.x, read-only (`legacy_onda`).
     #[cfg(feature = "legacy-onda")]
     Onda09,
+    /// A wavesdb epoch-1 table (`CAP_WAVES08_BODIES`), read-only (`waves08`):
+    /// epoch-1 containers, checksums and codec ids around wavesdb 0.8 bodies.
+    #[cfg(feature = "waves08")]
+    Waves08,
 }
 
 impl FormatProfile {
@@ -39,6 +43,8 @@ impl FormatProfile {
     pub fn checksum(self, b: &[u8]) -> u32 {
         match self {
             FormatProfile::Epoch1 => crate::encoding::checksum(b),
+            #[cfg(feature = "waves08")]
+            FormatProfile::Waves08 => crate::encoding::checksum(b),
             #[cfg(feature = "legacy-onda")]
             FormatProfile::Onda09 => crate::legacy_onda::checksum_ieee(b),
         }
@@ -49,6 +55,8 @@ impl FormatProfile {
     pub fn codec(self, id: u8) -> crate::error::Result<crate::config::Compression> {
         match self {
             FormatProfile::Epoch1 => crate::config::Compression::from_codec_id(id),
+            #[cfg(feature = "waves08")]
+            FormatProfile::Waves08 => crate::config::Compression::from_codec_id(id),
             #[cfg(feature = "legacy-onda")]
             FormatProfile::Onda09 => crate::legacy_onda::codec(id).ok_or_else(|| {
                 crate::error::OndaError::Corruption(format!("0.9: unknown codec id {id}"))

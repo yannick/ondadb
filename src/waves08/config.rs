@@ -83,9 +83,15 @@ impl Fields<'_> {
         }
     }
 
+    /// A list of small integers. wavesdb declares its per-level codec list
+    /// `[]uint8`, which Go's `encoding/json` writes as a base64 string, not
+    /// an array; both spellings are accepted, as Go's decoder accepts both.
     fn u64_list(&self, key: &str) -> Result<Option<Vec<u64>>> {
         match self.0.get(key) {
             None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => base64_std(s)
+                .map(|b| Some(b.into_iter().map(u64::from).collect()))
+                .ok_or_else(|| corrupt(format!("config field {key:?} is not base64: {s:?}"))),
             Some(Value::Array(a)) => a
                 .iter()
                 .map(|v| {
@@ -98,6 +104,46 @@ impl Fields<'_> {
             Some(v) => Err(corrupt(format!("config field {key:?} is not an array: {v}"))),
         }
     }
+}
+
+/// Decode RFC 4648 standard base64 with padding, strictly — Go's
+/// `base64.StdEncoding`, which is what `encoding/json` writes for a byte slice.
+/// `None` for anything else, non-zero trailing bits included.
+fn base64_std(s: &str) -> Option<Vec<u8>> {
+    fn sextet(c: u8) -> Option<u32> {
+        Some(u32::from(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        }))
+    }
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for (i, quad) in b.as_chunks::<4>().0.iter().enumerate() {
+        let last = i + 1 == b.len() / 4;
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut word = 0u32;
+        for &c in &quad[..4 - pad] {
+            word = (word << 6) | sextet(c)?;
+        }
+        word <<= 6 * pad as u32;
+        let bytes = [(word >> 16) as u8, (word >> 8) as u8, word as u8];
+        // Bits past the last whole byte must be zero (Go rejects them too).
+        if bytes[3 - pad..].iter().any(|&x| x != 0) {
+            return None;
+        }
+        out.extend_from_slice(&bytes[..3 - pad]);
+    }
+    Some(out)
 }
 
 /// Translate a wavesdb config blob.
@@ -180,6 +226,26 @@ mod tests {
         let d = decode(br#"{"comparator":"","compression":8}"#).unwrap();
         assert_eq!(d.comparator_name, ColumnFamilyConfig::default().comparator_name);
         assert_eq!(d.compression, ColumnFamilyConfig::default().compression);
+        // Go's encoding of []uint8{0, 2, 3}, as the percf-caps fixture holds it.
+        let e = decode(br#"{"compression_per_level":"AAID"}"#).unwrap();
+        assert_eq!(
+            e.compression_per_level,
+            vec![Compression::None, Compression::Lz4, Compression::Zstd]
+        );
+        let a = decode(br#"{"compression_per_level":[0,2,3]}"#).unwrap();
+        assert_eq!(a.compression_per_level, e.compression_per_level);
+    }
+
+    #[test]
+    fn base64_is_strict() {
+        assert_eq!(base64_std("").unwrap(), b"");
+        assert_eq!(base64_std("AQ==").unwrap(), [1]);
+        assert_eq!(base64_std("AQI=").unwrap(), [1, 2]);
+        assert_eq!(base64_std("AQID").unwrap(), [1, 2, 3]);
+        assert_eq!(base64_std("+/8=").unwrap(), [0xfb, 0xff]);
+        for bad in ["A", "AQ=", "AQ", "AR==", "A===", "AQ==AQID", "AQ-_", "AQ\n="] {
+            assert!(base64_std(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
@@ -189,7 +255,8 @@ mod tests {
             b"[1,2]",
             br#"{"comparator":5}"#,
             br#"{"write_buffer_size":-1}"#,
-            br#"{"compression_per_level":"zstd"}"#,
+            br#"{"compression_per_level":"zst"}"#,
+            br#"{"compression_per_level":{"a":1}}"#,
         ] {
             assert!(
                 matches!(decode(bad), Err(OndaError::Corruption(_))),

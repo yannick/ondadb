@@ -19,6 +19,7 @@
 //! | `MANIFEST` | epoch-1 layout plus db section `0x8` (managed state), cf `0x2` (shared blobs), sst `0x80` (merge stats), `0x100` (blob refs) | [`manifest`] |
 //! | `MANIFEST-EDITS` | `YOLODBED` header, schema 2: wavesdb's 18-op table, canonical payloads | [`edit_log`] |
 //! | CF config | JSON (wavesdb's `persistedConfig`) | [`config`] |
+//! | SSTable data blocks | legacy, extended full-key and prefix-delta, chosen per block | `block` (normalized once, before the block cache) |
 //!
 //! Everything here is **decode-only**: nothing writes a wavesdb byte, and a
 //! wavesdb directory is never opened read-write.
@@ -26,6 +27,7 @@
 //! The frozen fixtures these decoders are checked against live in
 //! `tests/fixtures/wavesdb-epoch1/`, written by wavesdb itself.
 
+pub(crate) mod block;
 pub mod config;
 pub mod edit_log;
 pub mod manifest;
