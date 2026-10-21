@@ -1,0 +1,38 @@
+{
+ "cold": {
+  "rows": 200,
+  "first": "6b65793030303030",
+  "last": "6b65793030313939",
+  "sha256": "67acf7eddc03be440e5bf7508e9b151b03b5c93df28f3320f900152057050704"
+ },
+ "grouped": {
+  "rows": 200,
+  "first": "6b65793030303030",
+  "last": "6b65793030313939",
+  "sha256": "cacfdff48974fe43a582241c21fdbba0405aaf25e0d283e2df28062907c3634a"
+ },
+ "merged": {
+  "rows": 2,
+  "first": "6b6579303030",
+  "last": "6b6579303031",
+  "sha256": "62887d90dd5b4ba2f73d3fbfebffb581a8feb4e3bc61a74e9145e781766fb1b6"
+ },
+ "num": {
+  "rows": 399,
+  "first": "fffffffffffffed4",
+  "last": "0000000000000129",
+  "sha256": "3213521cc3a9c1581361ed741d4a65c9603985ff3e7a8c500a1a5e01098a0bed"
+ },
+ "plain": {
+  "rows": 197,
+  "first": "656e7430303030",
+  "last": "74746c30313938",
+  "sha256": "1934d0e7042ee9ee0b1f9d8e03edd5a05f58aa528481be52e863fe3b1308546b"
+ },
+ "rev": {
+  "rows": 199,
+  "first": "6b65793030313939",
+  "last": "6b65793030303030",
+  "sha256": "e39c22b162770f1aa6d7976cf8a405c34762d67b692cb6662209a1a71b9742fa"
+ }
+}

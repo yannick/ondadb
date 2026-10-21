@@ -1,0 +1,14 @@
+{
+ "writer": "wavesdb 4ecb9a3",
+ "unified": true,
+ "managed": false,
+ "crashed": true,
+ "containers": [
+  "YOLODBMF",
+  "YOLODBED",
+  "YOLOST01",
+  "YOLODBVL",
+  "YOLODBWL",
+  "wal-tail"
+ ]
+}
