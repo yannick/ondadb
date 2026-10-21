@@ -1735,19 +1735,20 @@ mod tests {
         append_uvarint(&mut payload, 0);
         let err = decode_payload(&payload).expect_err("an empty update mask must fail closed");
         assert_eq!(err.kind(), "corruption");
-        // A bit above the top assigned one is equally rejected.
+        // A bit above the top assigned one (0x20) is equally rejected — by the
+        // mask check, not by running out of payload: the assigned bits' values
+        // follow, so only the unknown bit can be the reason.
         let mut payload = Vec::new();
         append_u64(&mut payload, 1);
         append_uvarint(&mut payload, 1);
         append_uvarint(&mut payload, code::UPDATE_TABLE);
         append_bytes(&mut payload, b"cf");
         append_uvarint(&mut payload, 7);
-        append_uvarint(&mut payload, 0x20);
-        assert_eq!(
-            decode_payload(&payload).unwrap_err().kind(),
-            "corruption",
-            "a mask bit above 0x10 must fail closed"
-        );
+        append_uvarint(&mut payload, 0x40 | mask::LAST_COMPACTION_TIME);
+        append_opt_varint(&mut payload, Some(5));
+        let err = decode_payload(&payload).unwrap_err();
+        assert_eq!(err.kind(), "corruption", "a mask bit above 0x20 must fail closed");
+        assert!(err.to_string().contains("outside the known mask"), "{err}");
     }
 
     #[test]

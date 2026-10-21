@@ -966,14 +966,22 @@ sst_meta: id, level, num_entries, num_tombstones, max_seq, klog_size,
           vlog_size (all uvarint) | min_key* | max_key*
         | partition opt<str> | tier opt<str>
         | max_entry_time opt<varint> | object opt<str>
+        | last_compaction_time opt<varint>
+        | range_count | range_min_seq | range_max_seq (uvarint)
+        | range_min_key opt<bytes> | range_max_key opt<bytes>
 ```
 
+The range summary (`range_*`, 1.2) is written for every table, without a
+presence byte; a table with no range tombstones has `range_count` 0 and both
+keys absent.
+
 `UpdateTable`'s field mask is a uvarint bitset whose present values follow in
-**ascending bit order**; a mask of 0, or a bit above `0x10`, is `Corruption`:
+**ascending bit order**; a mask of 0, or a bit above `0x20`, is `Corruption`:
 
 ```
 0x01 Level uvarint | 0x02 Tier opt<str> | 0x04 Object opt<str>
 0x08 Partition opt<str> | 0x10 MaxEntryTime opt<varint>
+0x20 LastCompactionTime opt<varint>
 ```
 
 | code | op | payload | precondition |
