@@ -409,6 +409,16 @@ impl Manifest {
             )));
         }
         let caps = c.u64()?;
+        // The whole body profile decides, before any bit is checked on its own:
+        // a wavesdb catalog's other bits (managed mode, shared blobs) would
+        // otherwise surface as an anonymous "unknown capability".
+        if caps & crate::format::wavesdb_reserved::CAP_WAVES08_BODIES != 0 {
+            return Err(OndaError::UnsupportedFormat(
+                "manifest: a wavesdb database (CAP_WAVES08_BODIES); ondaDB never opens one \
+                 read-write"
+                    .into(),
+            ));
+        }
         crate::format::check_caps(caps)?;
         let db_flags = c.u32()?;
         if db_flags & !DB_KNOWN != 0 {
