@@ -647,6 +647,36 @@ mod tests {
         assert!(normalize(&b, true).is_err());
     }
 
+    /// The fixture generator's values carry their coordinates: a large or
+    /// grouped value starts `{round}.{i}:`, a small one is
+    /// `value-{round}-{i}`, and under a `key{i:05}` key `i` must match. A
+    /// value that resolved to the wrong frame fails this; one in neither shape
+    /// (merge operands, entities, the int64-keyed family) is not checked.
+    /// Returns whether it was.
+    fn fixture_value_matches(key: &[u8], v: &[u8], what: &str) -> bool {
+        let Some(want) = key
+            .strip_prefix(b"key")
+            .filter(|n| n.len() == 5)
+            .and_then(|n| std::str::from_utf8(n).ok()?.parse::<u64>().ok())
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(v);
+        let coords = if let Some(rest) = text.strip_prefix("value-") {
+            rest.split_once('-').map(|(r, i)| (r.to_string(), i.to_string()))
+        } else {
+            text.split_once(':')
+                .and_then(|(head, _)| head.split_once('.'))
+                .map(|(r, i)| (r.to_string(), i.to_string()))
+        };
+        let Some((round, i)) = coords else {
+            return false;
+        };
+        assert!(round.parse::<u64>().is_ok_and(|r| r < 3), "{what}: {text:.40}");
+        assert_eq!(i.parse::<u64>().ok(), Some(want), "{what}: {text:.40}");
+        true
+    }
+
     /// Every table in every wavesdb fixture, through the reader: each data
     /// block normalizes (or names a codec this binary lacks), the entries are
     /// the footer's count in internal order within the catalog's key range,
@@ -664,6 +694,7 @@ mod tests {
             .join("tests/fixtures/wavesdb-epoch1");
         let storage = LocalStorage::new(Arc::new(FileCache::new(8)), cfg!(feature = "mmap-reads"));
         let (mut tables, mut entries, mut delta_tables, mut blob_values) = (0, 0u64, 0, 0);
+        let (mut dict_values, mut grouped_values, mut checked_contents) = (0, 0, 0u64);
         let mut unsupported_codec = Vec::new();
         let mut fixtures: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
@@ -724,15 +755,25 @@ mod tests {
                             assert_eq!(r.find_block(&key, d.seq), i, "{what}: separator");
                             match r.get(&key, d.seq, 0) {
                                 Ok((v, seq, found, deleted, kind)) => {
-                                    assert!(!d.has_vlog(), "{what}");
                                     assert!(found && seq == d.seq, "{what}");
                                     assert_eq!(kind, u64::from(d.kind), "{what}");
                                     if !deleted {
-                                        assert_eq!(v.as_deref(), Some(d.inline_value(raw)), "{what}");
+                                        let v = v.unwrap();
+                                        if d.has_vlog() {
+                                            assert_eq!(v.len(), d.val_len, "{what}");
+                                            blob_values += 1;
+                                            if decode_pointer(raw, d.val_start).unwrap().2.is_some() {
+                                                grouped_values += 1;
+                                            }
+                                        } else {
+                                            assert_eq!(v, d.inline_value(raw), "{what}");
+                                        }
+                                        checked_contents += u64::from(fixture_value_matches(&key, &v, &what));
                                     }
                                 }
-                                Err(OndaError::UnsupportedFormat(_)) if d.has_vlog() => {
-                                    blob_values += 1;
+                                Err(OndaError::UnsupportedFormat(m)) if d.has_vlog() => {
+                                    assert!(m.contains("codec 7"), "{what}: {m}");
+                                    dict_values += 1;
                                 }
                                 Err(e) => panic!("{what}: {e}"),
                             }
@@ -757,7 +798,12 @@ mod tests {
         // only tables left unread are the brotli family's (codec 8), until
         // the codec lands.
         assert_eq!((tables, entries), (31, 5568));
-        assert_eq!((delta_tables, blob_values), (5, 2568));
+        assert_eq!(grouped_values, 1000);
+        // Every blob pointer resolves except the dictionary-coded frames
+        // (codec 7), which wait for their 2c step: 2381 + 187 = 2568.
+        assert_eq!(delta_tables, 5);
+        assert_eq!((blob_values, dict_values), (2381, 187));
+        assert_eq!(checked_contents, 2803);
         assert_eq!(unsupported_codec.len(), 5, "{unsupported_codec:?}");
         for m in &unsupported_codec {
             assert!(m.contains("/cold/") && m.contains("codec id 8"), "{m}");
