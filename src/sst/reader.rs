@@ -1409,6 +1409,10 @@ fn read_block_at(
 ) -> Result<(Vec<u8>, Compression)> {
     let mut buf = vec![0u8; length as usize];
     f.read_exact_at(&mut buf, off)?;
+    #[cfg(feature = "waves08")]
+    if profile == FormatProfile::Waves08 {
+        return crate::waves08::codec::read_block(&buf);
+    }
     let (alg, payload, raw_len, _total) = crate::block::block_payload_for(profile, &buf, true)?;
     let raw = crate::compress::decompress(alg, payload, raw_len)?;
     if raw.len() != raw_len {
