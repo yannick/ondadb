@@ -256,7 +256,7 @@ impl SstIterator {
             Ok((entries, restarts)) => {
                 if self.delta {
                     self.restarts.reserve(restarts.len() / 4);
-                    for c in restarts.chunks_exact(4) {
+                    for c in restarts.as_chunks::<4>().0 {
                         self.restarts.push(crate::encoding::read_u32(c));
                     }
                 }

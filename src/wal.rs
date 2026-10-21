@@ -715,8 +715,10 @@ fn decode_control_frame(payload: &[u8], count: u64) -> Result<ReplayRecord> {
             }
             let cf_ids: Vec<u64> = head
                 .b
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
                 .collect();
             let mut records = Vec::with_capacity(raws.len() - 1);
             for (r, _) in &raws[1..] {
