@@ -128,6 +128,10 @@ pub struct Reader {
     /// while an in-flight user holds a reader nothing else can reach.
     pinned_klog: OnceLock<Arc<dyn crate::storage::ReadHandle>>,
     pinned_vlog: OnceLock<Arc<dyn crate::storage::ReadHandle>>,
+    /// A wavesdb table's family blob files, which hold its separated values
+    /// in place of a vlog. `None` for every other table.
+    #[cfg(feature = "waves08")]
+    blobs: Option<crate::waves08::blob::Blobs>,
 
     #[cfg(feature = "mmap-reads")]
     klog_mmap: Option<Arc<memmap2::Mmap>>,
@@ -327,6 +331,8 @@ impl Reader {
             vlog_cache_limit,
             pinned_klog: OnceLock::new(),
             pinned_vlog: OnceLock::new(),
+            #[cfg(feature = "waves08")]
+            blobs: None,
             #[cfg(feature = "mmap-reads")]
             klog_mmap: None,
             #[cfg(feature = "mmap-reads")]
@@ -354,6 +360,10 @@ impl Reader {
         r.has_restarts = footer.restarts;
         r.vlog = footer.vlog;
         r.entry_layout = footer.entry_layout();
+        #[cfg(feature = "waves08")]
+        if r.entry_layout == EntryLayout::Waves08 {
+            r.blobs = Some(crate::waves08::blob::Blobs::beside(klog_path, r.storage.clone()));
+        }
         r.prefix_delta = footer.prefix_delta();
         r.table_caps = footer.caps;
         r.aux_handle = footer.aux;
@@ -982,7 +992,7 @@ impl Reader {
                 // Exact reservation: the value's length is known, so the one
                 // growth (if any) is to precisely what it needs.
                 out.reserve(entry.val_len);
-                self.read_vlog_into(entry.vlog_off, entry.val_len as u64, out)?;
+                self.read_separated_into(raw, &entry, out)?;
             } else {
                 out.extend_from_slice(entry.inline_value(raw));
             }
@@ -1189,10 +1199,28 @@ impl Reader {
         Ok(())
     }
 
-    pub(crate) fn read_vlog(&self, off: u64, length: u64) -> Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(length as usize);
-        self.read_vlog_into(off, length, &mut buf)?;
-        Ok(buf)
+    /// Append the separated value of entry `e` (decoded from `raw`) to
+    /// `out`: from this table's vlog, or — for a wavesdb table — from the
+    /// family blob file its pointer names. The one funnel every value read
+    /// takes, so no caller can read a blob pointer as a vlog offset.
+    pub(crate) fn read_separated_into(
+        &self,
+        raw: &[u8],
+        e: &super::DecEntry,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        #[cfg(feature = "waves08")]
+        if let Some(blobs) = &self.blobs {
+            let (id, off, group) = crate::waves08::block::decode_pointer(raw, e.val_start)?;
+            let ctx = crate::waves08::blob::ReadCtx {
+                bc: &self.bc,
+                value_cache_limit: self.vlog_cache_limit,
+                limiter: &self.limiter,
+            };
+            return blobs.read_into(&ctx, id, off, group, e.val_len, out);
+        }
+        let _ = raw;
+        self.read_vlog_into(e.vlog_off, e.val_len as u64, out)
     }
 
     /// Append a vlog value to `out`, verifying its CRC32-C frame prefix and
@@ -1202,8 +1230,10 @@ impl Reader {
         if self.normalizes_blocks() {
             // A wavesdb pointer names a shared blob file, not this table's
             // vlog; reading `off` here would return another value's bytes.
-            return Err(OndaError::UnsupportedFormat(
-                "sst: wavesdb shared-blob values are not readable yet".into(),
+            // Every value read goes through `read_separated_into`, so this
+            // is a caller that bypassed it.
+            return Err(OndaError::Corruption(
+                "sst: a wavesdb blob pointer read as a vlog offset".into(),
             ));
         }
         let len = usize::try_from(length).map_err(|_| corrupt())?;

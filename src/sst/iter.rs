@@ -793,7 +793,9 @@ impl SstIterator {
     pub fn value(&self) -> Result<Vec<u8>> {
         let e = self.cur.unwrap();
         if e.has_vlog() {
-            self.r.read_vlog(e.vlog_off, e.val_len as u64)
+            let mut v = Vec::with_capacity(e.val_len);
+            self.r.read_separated_into(self.raw(), &e, &mut v)?;
+            Ok(v)
         } else {
             Ok(e.inline_value(self.raw()).to_vec())
         }
@@ -839,7 +841,7 @@ impl SstIterator {
     pub fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
         let e = self.cur.unwrap();
         if e.has_vlog() {
-            self.r.read_vlog_into(e.vlog_off, e.val_len as u64, out)
+            self.r.read_separated_into(self.raw(), &e, out)
         } else {
             out.extend_from_slice(e.inline_value(self.raw()));
             Ok(())
