@@ -456,6 +456,24 @@ requirement stated.
 2. **2b — wavesdb adopts epoch 1 (≈6–8 wk, wavesdb):** row A, and its legacy
    reader and migrator. After this, both engines speak the same containers,
    and the common profile is still ondaDB-shaped.
+   - **Status (2026-10-21): done.** wavesdb PRs #13–#24 (main `4ecb9a3`):
+     - epoch-1 writers for every container;
+     - `UpgradeFormat` and `cmd/wavesdb-upgrade`, which convert in place,
+       format-1 blob files included;
+     - `AttachPart`, which converts a legacy part;
+     - checkpoints, which refuse a parent in the other container.
+     A new database is epoch 1 by default, and a legacy one is converted on
+     a read-write open (`FormatUpgradeAuto`, decided 2026-10-21). wavesdb
+     keeps its own bodies under `CapWaves08Bodies`.
+
+     The cross-engine harness (yolodb-format #9) now runs all four cells in
+     CI. The off-diagonal cells expect a clean `unsupported_format` refusal
+     that leaves the directory untouched, until 2c. Turning those cells on
+     found one bug: wavesdb decoded ondaDB's TLV family config as JSON, and
+     a read-write open first wrote a `MANIFEST-EDITS` into the foreign
+     directory (fixed in wavesdb #24). The 2a leftovers (refusal
+     expectations, the ondaDB comparator registry in 0.10.2, harness CI with
+     access to both engines) are closed too.
 3. **2c — read-compat for specialities (≈6–8 wk, split):**
    - ondaDB: rows V/V2 (shared-blob reader, dictionaries, groups), N, S.
    - wavesdb: rows V (per-table value files, read and write), C, M (read).
