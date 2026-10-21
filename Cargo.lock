@@ -909,6 +909,7 @@ dependencies = [
  "rust-s3",
  "rustix",
  "self_cell",
+ "serde_json",
  "sha2",
  "smallvec",
  "snap",

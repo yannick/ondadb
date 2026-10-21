@@ -22,7 +22,7 @@ cargo build                                    # default: deny unsafe; one audit
 cargo build --features unsafe-fastpath         # mmap reads + arena memtable
 cargo test                                     # must pass in ALL THREE configs
 cargo test --features unsafe-fastpath
-cargo test --no-default-features               # without legacy-onda (the 0.9 decoders)
+cargo test --no-default-features               # without legacy-onda and waves08 (the foreign decoders)
 cargo clippy --all-targets -- -D warnings      # must be clean in ALL THREE configs
 cargo clippy --all-targets --features unsafe-fastpath -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
@@ -32,7 +32,8 @@ cargo build --features s3                      # the S3 tier compiles
 **Every change must keep all three feature configurations green** — the builds
 compile different code: `memtable_arena.rs` and the mmap paths exist only under
 `unsafe-fastpath`, and `src/legacy_onda/` (read-only 0.9.x decoders, default-on
-feature `legacy-onda`) exists only with default features. CI-equivalent = the
+feature `legacy-onda`) and `src/waves08/` (read-only wavesdb decoders, default-on
+feature `waves08`) exist only with default features. CI-equivalent = the
 seven commands above.
 
 When scripting the gate, check each test binary for the *presence of*
@@ -172,6 +173,14 @@ then swapped in under a journal that the next open resolves after a crash;
 `yolodb upgrade <path>` runs it offline. Never add a 0.9 *encoder* outside a
 `#[cfg(test)]` fixture builder.
 
+A **wavesdb** directory is an epoch-1 container with wavesdb 0.8 bodies
+(`CAP_WAVES08_BODIES`, plan C step 2c). `Manifest::decode` refuses it as
+`UnsupportedFormat` naming wavesdb before checking any other bit: ondaDB never
+opens one read-write. Its decoders live in `src/waves08/` (default-on feature
+`waves08`, decode-only, checked against `tests/fixtures/wavesdb-epoch1/`, which
+wavesdb itself wrote), and dispatch is on the whole body profile, never one
+section or bit at a time. Never add a wavesdb *encoder*.
+
 ## Optional format capabilities
 
 Seven `CAP_*` bits in the manifest's capability word gate the optional
@@ -216,6 +225,7 @@ vintage produces it; an assigned kind this binary does not implement is
 | Clear under the unified layout (F5′) | `db.rs` (`clear_column_family`, `DbInner::choose_unified_id`), `unified.rs` (`holds_cf`), `manifest_edit.rs` (`SetCfUnifiedId`) | Every name→id lookup uses the family's **stored** id (`ColumnFamily::id`, `cf_by_id`); `unified::cf_id(name)` is only the default. Tests: `tests/unified_clear.rs` |
 | 0.9 → epoch-1 upgrade (plan C §1.3) | `upgrade.rs`, `legacy_onda/`, `src/bin/yolodb.rs` | See invariant 10; crash matrix in `tests/format_upgrade.rs` (fault hook: `UpgradeObserver`) |
 | Wide-column entities (F11) | `entity.rs` | Value-level frame shared with wavesdb (`WVE1`); no engine change |
+| wavesdb catalogs, read-only (plan C 2c) | `waves08/` (`manifest.rs`, `edit_log.rs` schema 2, `config.rs` JSON) | `waves08::recover_catalog`; tests in `tests/waves08_catalog.rs` |
 
 **Cross-feature rules live in `tests/composition.rs`**, not in either feature's
 own file: a range delete is, for one key, a *deleted base at its sequence* (so a
