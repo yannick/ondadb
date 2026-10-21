@@ -678,10 +678,11 @@ mod tests {
     }
 
     /// Every table in every wavesdb fixture, through the reader: each data
-    /// block normalizes (or names a codec this binary lacks), the entries are
-    /// the footer's count in internal order within the catalog's key range,
-    /// the index finds every entry in the block that holds it, and a point
-    /// read of each returns that entry — or refuses a shared-blob value.
+    /// block decodes and normalizes, the entries are the footer's count in
+    /// internal order within the catalog's key range, the index finds every
+    /// entry in the block that holds it, and a point read of each returns
+    /// that entry with its value — resolved from the family's blob files
+    /// when it is separated. Nothing is refused.
     #[test]
     fn every_fixture_table_reads_through_the_normalizer() {
         use crate::cache::{BlockCache, FileCache};
@@ -694,8 +695,7 @@ mod tests {
             .join("tests/fixtures/wavesdb-epoch1");
         let storage = LocalStorage::new(Arc::new(FileCache::new(8)), cfg!(feature = "mmap-reads"));
         let (mut tables, mut entries, mut delta_tables, mut blob_values) = (0, 0u64, 0, 0);
-        let (mut dict_values, mut grouped_values, mut checked_contents) = (0, 0, 0u64);
-        let mut unsupported_codec = Vec::new();
+        let (mut grouped_values, mut checked_contents) = (0, 0u64);
         let mut fixtures: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -731,15 +731,10 @@ mod tests {
                     }
                     let mut seen = 0u64;
                     let mut prev: Option<(Vec<u8>, u64)> = None;
-                    'blocks: for i in 0..r.data_block_count() {
-                        let block = match r.read_data_block(i) {
-                            Ok(b) => b,
-                            Err(OndaError::UnsupportedFormat(m)) => {
-                                unsupported_codec.push(format!("{what}: {m}"));
-                                break 'blocks;
-                            }
-                            Err(e) => panic!("{what} block {i}: {e}"),
-                        };
+                    for i in 0..r.data_block_count() {
+                        let block = r
+                            .read_data_block(i)
+                            .unwrap_or_else(|e| panic!("{what} block {i}: {e}"));
                         let (raw, _) = r.split_block(block.bytes()).unwrap();
                         let mut off = 0;
                         while off < raw.len() {
@@ -771,19 +766,12 @@ mod tests {
                                         checked_contents += u64::from(fixture_value_matches(&key, &v, &what));
                                     }
                                 }
-                                Err(OndaError::UnsupportedFormat(m)) if d.has_vlog() => {
-                                    assert!(m.contains("codec 7"), "{what}: {m}");
-                                    dict_values += 1;
-                                }
                                 Err(e) => panic!("{what}: {e}"),
                             }
                             prev = Some((key, d.seq));
                             seen += 1;
                             off = next;
                         }
-                    }
-                    if unsupported_codec.last().is_some_and(|m| m.starts_with(&what)) {
-                        continue;
                     }
                     assert_eq!(seen, t.meta.num_entries, "{what}");
                     let (first, last) = (r.min_key().to_vec(), r.max_key().to_vec());
@@ -794,19 +782,11 @@ mod tests {
             }
         }
         // The corpus is frozen (SHA256SUMS), so its shape is pinned exactly:
-        // a table that silently stopped being read would change a count. The
-        // only tables left unread are the brotli family's (codec 8), until
-        // the codec lands.
-        assert_eq!((tables, entries), (31, 5568));
-        assert_eq!(grouped_values, 1000);
-        // Every blob pointer resolves except the dictionary-coded frames
-        // (codec 7), which wait for their 2c step: 2381 + 187 = 2568.
+        // a table, block or value that silently stopped being read would
+        // change a count.
+        assert_eq!((tables, entries), (36, 6568));
         assert_eq!(delta_tables, 5);
-        assert_eq!((blob_values, dict_values), (2381, 187));
-        assert_eq!(checked_contents, 2803);
-        assert_eq!(unsupported_codec.len(), 5, "{unsupported_codec:?}");
-        for m in &unsupported_codec {
-            assert!(m.contains("/cold/") && m.contains("codec id 8"), "{m}");
-        }
+        assert_eq!((blob_values, grouped_values), (3068, 1000));
+        assert_eq!(checked_contents, 3940);
     }
 }

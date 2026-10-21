@@ -20,6 +20,7 @@
 //! | `MANIFEST-EDITS` | `YOLODBED` header, schema 2: wavesdb's 18-op table, canonical payloads | [`edit_log`] |
 //! | CF config | JSON (wavesdb's `persistedConfig`) | [`config`] |
 //! | Shared value files (`<id>.blob`) | YOLODBVL header with dictionary/grouped flags; value and group frames | `blob` |
+//! | Codecs 7 (zstd dictionary) and 8 (brotli) | in value frames and data blocks; ondaDB never writes either | `codec` |
 //! | SSTable data blocks | legacy, extended full-key and prefix-delta, chosen per block | `block` (normalized once, before the block cache) |
 //!
 //! Everything here is **decode-only**: nothing writes a wavesdb byte, and a
@@ -30,6 +31,7 @@
 
 pub(crate) mod blob;
 pub(crate) mod block;
+pub(crate) mod codec;
 pub mod config;
 pub mod edit_log;
 pub mod manifest;

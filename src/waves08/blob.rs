@@ -20,20 +20,22 @@
 //! checked before the codec byte is trusted, and a value must lie wholly
 //! inside the group it names.
 //!
-//! Dictionary frames (codec 7) and brotli (codec 8) are `UnsupportedFormat`
-//! until their 2c step; the header that announces a dictionary is accepted
-//! now, so a file mixing dictionary and plain frames serves the plain ones.
+//! A dictionary-coded frame (codec 7) is decoded with the file's own
+//! dictionary, loaded and prepared once per handle on the first such frame —
+//! a file that never needs it never reads it. Frame codecs, brotli included,
+//! are the codec module's (`super::codec`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cache::{BlockCache, BlockDomain};
-use crate::config::Compression;
 use crate::encoding::{checksum, read_u32, read_u64};
 use crate::error::{OndaError, Result};
 use crate::format::vlog_header::{FLAG_DICTIONARY, FLAG_GROUPED, HEADER_LEN, MAGIC, VERSION};
 use crate::storage::{ReadHandle, Storage};
+
+use super::codec::{decode, load_dict, Dict, MAX_DICT_BYTES};
 
 /// `crc | codec | stored_len`, the value frame's header.
 const VALUE_FRAME_HDR: usize = 9;
@@ -92,37 +94,44 @@ pub(crate) fn decode_header(id: u64, b: &[u8]) -> Result<Header> {
     Ok(h)
 }
 
-/// The codec a value or group frame names, once its checksum has passed.
-fn frame_codec(id: u64, codec: u8) -> Result<Compression> {
-    match codec {
-        crate::format::codec::ZSTD_DICT => Err(OndaError::UnsupportedFormat(format!(
-            "wavesdb blob file {id}: zstd-dictionary frames (codec 7) are not readable yet"
-        ))),
-        other => Compression::from_codec_id(other),
-    }
-}
-
-/// Decode `stored` (already checksummed) into exactly `raw_len` bytes.
-fn decode_stored(id: u64, codec: Compression, stored: &[u8], raw_len: usize) -> Result<Vec<u8>> {
-    if codec == Compression::None {
-        if stored.len() != raw_len {
-            return Err(corrupt(id, "raw frame length disagrees with the value"));
-        }
-        return Ok(stored.to_vec());
-    }
-    if stored.is_empty() {
-        return Err(corrupt(id, "empty compressed frame"));
-    }
-    let raw = crate::compress::decompress(codec, stored, raw_len)?;
-    if raw.len() != raw_len {
-        return Err(corrupt(id, "frame decompressed to the wrong length"));
-    }
-    Ok(raw)
-}
-
 struct Open {
     file: Arc<dyn ReadHandle>,
     header: Header,
+    /// The prepared dictionary, once a codec-7 frame has needed it. A load
+    /// that fails is not remembered, so every such frame reports it.
+    dict: parking_lot::Mutex<Option<Arc<Dict>>>,
+}
+
+impl Open {
+    /// The dictionary a frame of `codec` needs, `None` for any other codec.
+    fn dict_for(&self, id: u64, codec: u8) -> Result<Option<Arc<Dict>>> {
+        if codec != crate::format::codec::ZSTD_DICT {
+            return Ok(None);
+        }
+        let mut slot = self.dict.lock();
+        if let Some(d) = slot.as_ref() {
+            return Ok(Some(d.clone()));
+        }
+        if self.header.flags & FLAG_DICTIONARY == 0 {
+            return Err(corrupt(id, "a dictionary frame in a file without a dictionary"));
+        }
+        let len = self.header.dict_len;
+        if len > MAX_DICT_BYTES {
+            return Err(corrupt(id, format!("dictionary of {len} bytes")));
+        }
+        let mut frame = vec![0u8; 8 + len as usize];
+        self.file.read_exact_at(&mut frame, self.header.dict_off)?;
+        let d = Arc::new(load_dict(&frame, len).map_err(|e| super::prefix(e, &format!("wavesdb blob file {id}")))?);
+        *slot = Some(d.clone());
+        Ok(Some(d))
+    }
+
+    /// Decode a checksummed frame payload of `codec`.
+    fn decode(&self, id: u64, codec: u8, stored: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+        let dict = self.dict_for(id, codec)?;
+        decode(codec, stored, raw_len, dict.as_deref())
+            .map_err(|e| super::prefix(e, &format!("wavesdb blob file {id}")))
+    }
 }
 
 /// One table's view of its family's blob files: opened (and header-checked)
@@ -171,7 +180,7 @@ impl Blobs {
         // A failed header is not remembered: every read of the file fails
         // the same way, which is the point.
         let header = decode_header(id, &hdr)?;
-        let open = Arc::new(Open { file, header });
+        let open = Arc::new(Open { file, header, dict: parking_lot::Mutex::new(None) });
         Ok(self.open.lock().entry(id).or_insert(open).clone())
     }
 
@@ -243,8 +252,7 @@ impl Blobs {
         if checksum(&stored) != read_u32(&hdr) {
             return Err(corrupt(id, format!("frame at {off} checksum mismatch")));
         }
-        let codec = frame_codec(id, hdr[4])?;
-        let raw = decode_stored(id, codec, &stored, raw_len)?;
+        let raw = h.decode(id, hdr[4], &stored, raw_len)?;
         crate::perf::bump(|p| {
             p.vlog_reads += 1;
             p.vlog_read_bytes += raw_len as u64;
@@ -307,8 +315,7 @@ impl Blobs {
                 if checksum(&stored) != read_u32(&hdr) {
                     return Err(corrupt(id, format!("group at {off} checksum mismatch")));
                 }
-                let codec = frame_codec(id, hdr[4])?;
-                let raw = decode_stored(id, codec, &stored, group_len as usize)?;
+                let raw = h.decode(id, hdr[4], &stored, group_len as usize)?;
                 crate::perf::bump(|p| {
                     p.vlog_reads += 1;
                     p.vlog_read_bytes += group_len;
@@ -334,6 +341,7 @@ impl Blobs {
 mod tests {
     use super::*;
     use crate::cache::FileCache;
+    use crate::config::Compression;
     use crate::encoding::{append_u32, append_u64};
     use crate::storage::LocalStorage;
 
@@ -395,6 +403,43 @@ mod tests {
         }
     }
 
+    /// A file with a dictionary: its frames decode with it, and a damaged
+    /// dictionary fails every one of them.
+    #[test]
+    fn dictionary_frames_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples: Vec<Vec<u8>> = (0..200)
+            .map(|i| format!("{{\"id\":{i},\"city\":\"city-{}\",\"ok\":true}}", i % 17).into_bytes())
+            .collect();
+        let dict = zstd::dict::from_samples(&samples, 1024).unwrap();
+        let mut f = header(FLAG_DICTIONARY, HEADER_LEN as u64, dict.len() as u32);
+        append_u32(&mut f, checksum(&dict));
+        append_u32(&mut f, dict.len() as u32);
+        f.extend_from_slice(&dict);
+        let mut at = Vec::new();
+        for s in &samples[..5] {
+            let z = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap().compress(s).unwrap();
+            at.push(f.len() as u64);
+            f.extend(value_frame(crate::format::codec::ZSTD_DICT, &z));
+        }
+        std::fs::write(dir.path().join("4.blob"), &f).unwrap();
+        let mut damaged = f.clone();
+        damaged[HEADER_LEN + 8 + 3] ^= 1; // a dictionary byte, under its own CRC
+        std::fs::write(dir.path().join("5.blob"), &damaged).unwrap();
+
+        let storage = LocalStorage::new(Arc::new(FileCache::new(4)), false);
+        let blobs = Blobs::beside(dir.path().join("1.klog").to_str().unwrap(), storage);
+        let bc = BlockCache::new(0);
+        let ctx = ReadCtx { bc: &bc, value_cache_limit: 0, limiter: &None };
+        for (s, &off) in samples.iter().zip(&at) {
+            let mut out = Vec::new();
+            blobs.read_into(&ctx, 4, off, None, s.len(), &mut out).unwrap();
+            assert_eq!(&out, s);
+            let r = blobs.read_into(&ctx, 5, off, None, s.len(), &mut Vec::new());
+            assert!(matches!(r, Err(OndaError::Corruption(m)) if m.contains("dictionary")));
+        }
+    }
+
     /// One file with a raw value, a zstd value, a zstd group of three and a
     /// dictionary-coded frame, read through [`Blobs`].
     #[test]
@@ -446,10 +491,8 @@ mod tests {
         err(read(z_off, None, z.len() - 1)); // stored longer than the value
         err(read(g_off, Some(group_raw.len() as u64 - 1), 2)); // past the group
         err(read(4, None, 1)); // inside the header
-        assert!(matches!(
-            read(dict_off, None, 1),
-            Err(OndaError::UnsupportedFormat(_))
-        ));
+        // A dictionary frame in a file whose header declares no dictionary.
+        err(read(dict_off, None, 1));
         // A flipped stored byte is a checksum failure, never a decode.
         f[z_off as usize + VALUE_FRAME_HDR] ^= 1;
         std::fs::write(dir.path().join("8.blob"), &f).unwrap();
