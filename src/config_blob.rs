@@ -590,7 +590,7 @@ fn apply(cfg: &mut ColumnFamilyConfig, v: Val<'_>) -> Result<()> {
                 return Err(v.bad("per-level rates are not whole f64s"));
             }
             let mut rates = Vec::with_capacity(v.b.len() / 8);
-            for c in v.b.chunks_exact(8) {
+            for c in v.b.as_chunks::<8>().0 {
                 let fpr = f64::from_bits(read_u64(c));
                 // A rate no filter can realize was never written by an encoder
                 // fed a config that passed `validate`.

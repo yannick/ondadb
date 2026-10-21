@@ -124,8 +124,15 @@ fn serializable_validates_read_only_cf() {
 fn ttl_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let (db, cf) = open(dir.path());
-    db.put(&cf, b"k", b"v", Duration::from_millis(50)).unwrap();
-    assert_eq!(db.get(&cf, b"k").unwrap(), b"v");
+    // The live read is asserted only when it provably ran inside the TTL: on a
+    // loaded machine the put alone can outlast a short one.
+    let ttl = Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    db.put(&cf, b"k", b"v", ttl).unwrap();
+    let live = db.get(&cf, b"k");
+    if start.elapsed() < ttl {
+        assert_eq!(live.unwrap(), b"v");
+    }
     std::thread::sleep(Duration::from_millis(80));
     assert!(db.get(&cf, b"k").is_err(), "key should have expired");
     db.close().unwrap();

@@ -853,7 +853,7 @@ mod tests {
         for bi in 0..r.index.len() {
             let block = r.read_data_block_local(bi).unwrap();
             let (entries, restarts) = r.split_block(block.bytes()).unwrap();
-            for chunk in restarts.chunks_exact(4) {
+            for chunk in restarts.as_chunks::<4>().0 {
                 let off = crate::encoding::read_u32(chunk) as usize;
                 let (e, _) = crate::sst::decode_delta_header(entries, off).unwrap();
                 assert_eq!(e.key_shared, 0, "restart anchor at {off} shares a prefix");

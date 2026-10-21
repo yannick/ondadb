@@ -219,6 +219,9 @@ impl SpanIndex {
         drop(g);
         // The watermark ages out with the markers: once every transaction reads
         // at or above it, the window it stood for is closed.
+        // `fetch_update` is deprecated for its rename `try_update`, which is
+        // newer than the crate's MSRV (1.89).
+        #[allow(deprecated)]
         let _ = self
             .overflow_seq
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
