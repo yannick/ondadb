@@ -17,6 +17,10 @@
   prepared transactions are unresolved. Such a handle cannot resolve them
   (`commit_prepared` is `ReadOnly` there), so the refusal could never be acted
   on; the prepares stay on disk for the next writer, as before.
+- **`flush_memtable` flushes under the unified layout.** It rotated only the
+  family's own memtable, which that layout leaves empty, and returned having
+  flushed nothing. It now seals the shared memtable and waits for its flush,
+  so every family with pending writes gets its table.
 
 ## 0.10.2
 
