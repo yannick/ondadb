@@ -549,3 +549,35 @@ fn unified_range_span_never_crosses_cf_prefix() {
     }
     db.close().unwrap();
 }
+
+/// `flush_memtable` under the unified layout seals the shared memtable and
+/// waits for its flush: every family with pending writes gets its table. It
+/// used to rotate only the family's own memtable, which this layout leaves
+/// empty, and returned having flushed nothing.
+#[test]
+fn unified_flush_memtable_flushes_the_shared_memtable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let db = open_unified(path);
+    let a = db
+        .create_column_family("a", ColumnFamilyConfig::default())
+        .unwrap();
+    let b = db
+        .create_column_family("b", ColumnFamilyConfig::default())
+        .unwrap();
+    db.put(&a, b"k", b"va", Duration::ZERO).unwrap();
+    db.put(&b, b"k", b"vb", Duration::ZERO).unwrap();
+    let klogs = |cf: &str| {
+        std::fs::read_dir(dir.path().join(format!("cf-{cf}")))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".klog"))
+            .count()
+    };
+    assert_eq!((klogs("a"), klogs("b")), (0, 0));
+    db.flush_memtable(&a).unwrap();
+    assert_eq!((klogs("a"), klogs("b")), (1, 1), "one flush, a table per family");
+    assert_eq!(db.get(&a, b"k").unwrap(), b"va");
+    assert_eq!(db.get(&b, b"k").unwrap(), b"vb");
+    db.close().unwrap();
+}

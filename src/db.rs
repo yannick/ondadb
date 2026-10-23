@@ -3295,6 +3295,10 @@ impl DB {
     /// [`OndaError::NotFound`] through the handle of a family that has been
     /// dropped or cleared (also when that happens while this call runs): its
     /// memtable is discarded with it, never flushed.
+    ///
+    /// Under the unified layout a family's writes live in the one shared
+    /// memtable, so that is what is sealed and flushed: every family's
+    /// pending writes reach their tables, not only this one's.
     pub fn flush_memtable(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
         if cf.is_dropped() {
             return Err(OndaError::NotFound);
@@ -3302,7 +3306,14 @@ impl DB {
         // Rotation and any work this thread does on the way to it are flush
         // work, not the caller's foreground work.
         let _io = crate::ioctrl::scoped(crate::ioctrl::IoClass::Flush);
+        // The family's own memtable still holds whatever it took before the
+        // database switched to the unified layout.
         cf.rotate_memtable(true);
+        if let Some(unified) = &self.inner.unified {
+            if !self.inner.opts.read_only {
+                unified.rotate(true);
+            }
+        }
         let pending = || {
             if self.inner.unified.is_some() {
                 self.inner.pending_flush.load(Ordering::SeqCst)
