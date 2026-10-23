@@ -50,6 +50,16 @@ impl FormatProfile {
         }
     }
 
+    /// The directory of column family `name` in a database of this family:
+    /// [`cf_dir_name`] everywhere but wavesdb, which spells it `cf_<name>`.
+    pub fn cf_dir_name(self, name: &str) -> String {
+        match self {
+            #[cfg(feature = "waves08")]
+            FormatProfile::Waves08 => format!("cf_{name}"),
+            _ => cf_dir_name(name),
+        }
+    }
+
     /// The codec a block or vlog frame names by `id` in this family.
     #[inline]
     pub fn codec(self, id: u8) -> crate::error::Result<crate::config::Compression> {

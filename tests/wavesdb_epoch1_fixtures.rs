@@ -7,9 +7,9 @@
 //! `scripts/epoch1-fixtures.sh` in a worktree of the pinned revision. Each
 //! fixture is `db/` (the directory, LOCK removed), `meta.json` (writer,
 //! layout, whether it crashed) and `expected.json` (every family's scan, as
-//! the writer read it). The reader of wavesdb directories is checked against
-//! `expected.json` as it lands; until then this file pins the bytes, so a
-//! fixture cannot drift from the copy yolodb-format mirrors.
+//! the writer read it). `SHA256SUMS` pins the bytes, so a fixture cannot drift
+//! from the copy yolodb-format mirrors, and a read-only `DB::open` of each
+//! must scan to `expected.json`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -120,4 +120,140 @@ fn a_read_write_open_is_refused_untouched() {
         );
         assert!(before == snapshot(&dir), "{name}: the refused open changed the directory");
     }
+}
+
+/// The merge operator the `merged` families were written with: the fixture
+/// generator's append, which concatenates the operands onto the base.
+#[cfg(feature = "waves08")]
+#[derive(Debug)]
+struct Append;
+
+#[cfg(feature = "waves08")]
+impl ondadb::MergeOperator for Append {
+    fn name(&self) -> &str {
+        "fixture.append"
+    }
+
+    fn full_merge(&self, _key: &[u8], existing: Option<&[u8]>, operands: &[&[u8]]) -> Result<Vec<u8>, String> {
+        let mut out = existing.unwrap_or_default().to_vec();
+        for o in operands {
+            out.extend_from_slice(o);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "waves08")]
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(feature = "waves08")]
+fn open_read_only(dir: &Path) -> ondadb::Result<ondadb::DB> {
+    let mut opts = ondadb::Options::new(dir.to_str().unwrap());
+    opts.read_only = true;
+    opts.merge_fns = vec![std::sync::Arc::new(Append)];
+    ondadb::DB::open(opts)
+}
+
+/// Every fixture opens read-only through `DB::open` — the layout taken from
+/// the catalog, not the options — and every family scans to exactly what
+/// wavesdb read back when it wrote it: the row count, the first and last key,
+/// and the digest of `hex(key)=hex(value)\n` over the whole scan (wavesdb's
+/// `digestScan`). That covers both WAL layouts, a crashed tail, undecided and
+/// decided prepares, merge chains, a reversed comparator, grouped and shared
+/// value files, and codecs 7 and 8. Point reads agree with the scan at both
+/// ends, and the directory is byte-for-byte what was copied in, apart from
+/// the LOCK — a write on the handle is the engine's usual read-only no-op.
+#[cfg(feature = "waves08")]
+#[test]
+fn every_fixture_reads_as_wavesdb_wrote_it() {
+    for name in ["percf-caps", "percf-closed", "unified", "unified-prepared", "managed"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("db");
+        copy_dir(&fixture_root().join(name).join("db"), &dir);
+        let before = snapshot(&dir);
+        let expected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture_root().join(name).join("expected.json")).unwrap()).unwrap();
+        let expected = expected.as_object().unwrap();
+
+        let db = open_read_only(&dir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let mut families = db.list_column_families();
+        families.sort();
+        let mut want_families: Vec<_> = expected.keys().cloned().collect();
+        want_families.sort();
+        assert_eq!(families, want_families, "{name}: families");
+
+        for cf_name in &families {
+            let want = &expected[cf_name];
+            let cf = db.get_column_family(cf_name).unwrap();
+            let snap = db.snapshot();
+            let mut it = snap.new_iterator(&cf);
+            it.seek_to_first();
+            let mut h = Sha256::new();
+            let mut rows = 0u64;
+            let (mut first, mut last) = (None, None);
+            while it.valid() {
+                h.update(format!("{}={}\n", hex(it.key()), hex(it.value())));
+                if first.is_none() {
+                    first = Some((it.key().to_vec(), it.value().to_vec()));
+                }
+                last = Some((it.key().to_vec(), it.value().to_vec()));
+                rows += 1;
+                it.next();
+            }
+            assert!(it.err().is_none(), "{name}/{cf_name}: {:?}", it.err());
+            assert_eq!(rows, want["rows"].as_u64().unwrap(), "{name}/{cf_name}: rows");
+            assert_eq!(hex(&h.finalize()), want["sha256"].as_str().unwrap(), "{name}/{cf_name}: digest");
+            for (end, row) in [("first", first), ("last", last)] {
+                let (key, value) = row.unwrap_or_else(|| panic!("{name}/{cf_name}: empty"));
+                assert_eq!(hex(&key), want[end].as_str().unwrap(), "{name}/{cf_name}: {end} key");
+                assert_eq!(db.get(&cf, &key).unwrap(), value, "{name}/{cf_name}: point read of the {end} key");
+            }
+        }
+
+        let cf = db.get_column_family(&families[0]).unwrap();
+        let _ = db.put(&cf, b"x", b"y", std::time::Duration::ZERO);
+        db.close().unwrap();
+        assert!(before == snapshot(&dir), "{name}: the read-only open changed the directory");
+    }
+}
+
+/// A managed-sequence wavesdb database carries its discard floor into the
+/// handle — the catalog's, at or below everything the open made visible —
+/// and no other database has one.
+#[cfg(feature = "waves08")]
+#[test]
+fn the_managed_discard_floor_is_carried() {
+    for name in ["percf-caps", "percf-closed", "unified", "unified-prepared", "managed"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("db");
+        copy_dir(&fixture_root().join(name).join("db"), &dir);
+        let catalog = ondadb::waves08::recover_catalog(&dir).unwrap();
+        let db = open_read_only(&dir).unwrap();
+        if name == "managed" {
+            assert!(catalog.discard_seq > 0, "the managed fixture has no floor");
+            assert_eq!(db.discard_seq(), Some(catalog.discard_seq));
+            assert!(catalog.discard_seq <= db.visible_seq_for_tests(), "{name}: floor above visible");
+        } else {
+            assert_eq!(db.discard_seq(), None, "{name}");
+        }
+        db.close().unwrap();
+    }
+}
+
+/// `waves08::open_read_only` is for wavesdb directories only.
+#[cfg(feature = "waves08")]
+#[test]
+fn waves_open_refuses_other_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let epoch1 = tmp.path().join("epoch1");
+    ondadb::DB::open(ondadb::Options::new(epoch1.to_str().unwrap())).unwrap().close().unwrap();
+    let mut opts = ondadb::Options::new(epoch1.to_str().unwrap());
+    opts.read_only = true;
+    let err = match ondadb::waves08::open_read_only(opts) {
+        Ok(_) => panic!("an epoch-1 directory opened as wavesdb"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, ondadb::OndaError::InvalidArgs(_)), "{err:?}");
 }

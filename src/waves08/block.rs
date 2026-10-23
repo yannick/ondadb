@@ -712,7 +712,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("comparator {:?}", cfg.comparator_name));
                 for t in &cf.tables {
                     let what = format!("{}/{}/{}", fixture.display(), cf.name, t.meta.id);
-                    let klog = dir.join(format!("cf_{}/{}.klog", cf.name, t.meta.id));
+                    let klog = dir.join(crate::format::FormatProfile::Waves08.cf_dir_name(&cf.name)).join(format!("{}.klog", t.meta.id));
                     let r = Reader::open_profiled(
                         klog.to_str().unwrap(),
                         storage.clone(),

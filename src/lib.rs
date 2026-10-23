@@ -30,8 +30,8 @@
 //! [`DB::enable_format_capabilities`](crate::DB::enable_format_capabilities).
 //! ondaDB 0.9.x directories are read (read-only) only through `legacy_onda`,
 //! behind the default-on `legacy-onda` feature. wavesdb directories are
-//! decoded only by `waves08` (default-on feature `waves08`), and never opened
-//! read-write.
+//! decoded only by `waves08` (default-on feature `waves08`): `DB::open` with
+//! `Options::read_only` opens one, and a read-write open is refused.
 
 // The default build is safe Rust.  The optional `mmap-reads` and
 // `arena-memtable` features each lift this to allow the localized `unsafe` in,
