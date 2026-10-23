@@ -22,6 +22,7 @@
 //! | Shared value files (`<id>.blob`) | YOLODBVL header with dictionary/grouped flags; value and group frames | `blob` |
 //! | Codecs 7 (zstd dictionary) and 8 (brotli) | in value frames and data blocks; ondaDB never writes either | `codec` |
 //! | SSTable data blocks | legacy, extended full-key and prefix-delta, chosen per block | `block` (normalized once, before the block cache) |
+//! | WAL segments | layouts 3 (per family) and 4 (unified): legacy and `0xff` envelope frames; prepare bodies with named families | `wal` (prepares resolved after every generation is read) |
 //!
 //! Everything here is **decode-only**: nothing writes a wavesdb byte, and a
 //! wavesdb directory is never opened read-write.
@@ -35,6 +36,7 @@ pub(crate) mod codec;
 pub mod config;
 pub mod edit_log;
 pub mod manifest;
+pub(crate) mod wal;
 
 use std::collections::BTreeMap;
 use std::path::Path;

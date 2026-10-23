@@ -226,10 +226,15 @@ impl UnifiedStore {
         poison: Arc<crate::util::Poison>,
         wal_syncs: Arc<std::sync::atomic::AtomicU64>,
         format: crate::format::FormatProfile,
+        caps: u64,
     ) -> Result<(Arc<UnifiedStore>, u64, crate::prepared::RecoveredPrepares)> {
         let mem = Memtable::new(default_comparator());
         let mut max_seq = 0;
         let mut recovered = crate::prepared::RecoveredPrepares::default();
+        #[cfg(feature = "waves08")]
+        let mut waves_prepares = crate::waves08::wal::Prepares::default();
+        #[cfg(not(feature = "waves08"))]
+        let _ = caps;
         let mut gens = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -294,16 +299,20 @@ impl UnifiedStore {
                     crate::legacy_onda::wal::replay(&p, &mut apply)?
                 }
                 #[cfg(feature = "waves08")]
-                crate::format::FormatProfile::Waves08 => {
-                    // wavesdb's WAL layouts are decoded by a later 2c step;
-                    // until then any WAL generation is refused, never
-                    // skipped — skipping would hide committed writes.
-                    return Err(crate::error::OndaError::UnsupportedFormat(
-                        "wavesdb WAL replay is not implemented yet".into(),
-                    ));
-                }
+                crate::format::FormatProfile::Waves08 => crate::waves08::wal::replay(
+                    std::path::Path::new(&p),
+                    crate::waves08::wal::Layout::Unified,
+                    *g,
+                    caps,
+                    Some(&mut waves_prepares),
+                    &mut apply,
+                )?,
             };
             max_seq = max_seq.max(last);
+        }
+        #[cfg(feature = "waves08")]
+        if format == crate::format::FormatProfile::Waves08 {
+            recovered.waves08 = Some(waves_prepares);
         }
         let next_gen = gens.last().map(|g| g + 1).unwrap_or(0);
         let wbs = if opts.unified_memtable_write_buffer_size > 0 {
@@ -513,6 +522,24 @@ impl UnifiedStore {
     /// The `seq` field of each [`wal::RecordRef`] is ignored — a prepared
     /// record carries the `0` sentinel on disk, and its real sequence is the
     /// one the decision names.
+    /// Insert records recovery resolved after the WAL walk (a wavesdb log's
+    /// committed prepares) into the active memtable, keys and bounds already
+    /// family-prefixed, at the sequences they carry. Open-time only: nothing
+    /// else holds the store yet, so no writer span is needed.
+    #[cfg(feature = "waves08")]
+    pub(crate) fn install_replayed(&self, records: Vec<wal::ReplayRecord>) {
+        let mem = self.state.read().mem.clone();
+        for rec in records {
+            match rec {
+                wal::ReplayRecord::Point(r) => mem.put(&r.key, r.value, r.seq, r.ttl, r.kind),
+                wal::ReplayRecord::RangeDelete { start, end, seq } => mem.add_range(&start, &end, seq),
+                wal::ReplayRecord::Prepare { .. } | wal::ReplayRecord::Decision { .. } => {
+                    unreachable!("a resolved prepare installs data records only")
+                }
+            }
+        }
+    }
+
     pub(crate) fn apply_memtable_only(
         self: &Arc<Self>,
         items: &[(u64, wal::RecordRef<'_>)],
@@ -993,6 +1020,7 @@ mod tests {
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
+            0,
         )
         .unwrap();
 
@@ -1027,6 +1055,7 @@ mod tests {
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
+            0,
         )
         .unwrap();
         store
@@ -1049,6 +1078,7 @@ mod tests {
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
+            0,
         )
         .unwrap();
         store
@@ -1228,6 +1258,7 @@ mod tests {
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
+            0,
         )
         .unwrap();
 

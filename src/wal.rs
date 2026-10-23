@@ -119,7 +119,7 @@ pub(crate) const SEGMENT_HEADER_LEN: usize = crate::format::wal_segment::HEADER_
 
 /// What a segment's first bytes say.
 #[derive(Debug, PartialEq, Eq)]
-enum SegmentHead {
+pub(crate) enum SegmentHead {
     /// A valid header for the expected segment: frames follow.
     Valid,
     /// No frame can follow: a zero-length file (created, never written) or a
@@ -139,6 +139,28 @@ enum SegmentHead {
 /// `UnsupportedFormat`; a header naming a different layout or generation than
 /// the file's name and place, or a non-zero reserved byte, is `Corruption`.
 fn check_segment_head(head: &[u8], file_len: u64, expect: SegmentId) -> Result<SegmentHead> {
+    use crate::format::wal_segment::{LAYOUT_PER_CF, LAYOUT_UNIFIED};
+    check_head(
+        head,
+        file_len,
+        expect.layout_byte(),
+        expect.generation,
+        &[LAYOUT_PER_CF, LAYOUT_UNIFIED],
+    )
+}
+
+/// [`check_segment_head`] for a segment expected at layout byte `layout_want`
+/// and generation `generation_want`. `implemented` is the set of layouts the
+/// caller's body profile decodes: a layout outside it is `UnsupportedFormat`,
+/// one inside it other than `layout_want` is `Corruption`. The waves08 WAL
+/// reader shares the container rules through here, with layouts 3 and 4.
+pub(crate) fn check_head(
+    head: &[u8],
+    file_len: u64,
+    layout_want: u8,
+    generation_want: u64,
+    implemented: &[u8],
+) -> Result<SegmentHead> {
     use crate::format::wal_segment::*;
     let foreign = || {
         OndaError::UnsupportedFormat(
@@ -184,22 +206,20 @@ fn check_segment_head(head: &[u8], file_len: u64, expect: SegmentId) -> Result<S
         ));
     }
     let layout = head[12];
-    if layout != LAYOUT_PER_CF && layout != LAYOUT_UNIFIED {
+    if !implemented.contains(&layout) {
         return Err(OndaError::UnsupportedFormat(format!(
             "wal segment layout {layout} is not implemented by this binary"
         )));
     }
-    if layout != expect.layout_byte() {
+    if layout != layout_want {
         return Err(OndaError::Corruption(format!(
-            "wal segment header: layout {layout} where {} was expected",
-            expect.layout_byte()
+            "wal segment header: layout {layout} where {layout_want} was expected"
         )));
     }
     let generation = u64::from_le_bytes(head[16..24].try_into().unwrap());
-    if generation != expect.generation {
+    if generation != generation_want {
         return Err(OndaError::Corruption(format!(
-            "wal segment header: generation {generation} where {} was expected",
-            expect.generation
+            "wal segment header: generation {generation} where {generation_want} was expected"
         )));
     }
     Ok(SegmentHead::Valid)
