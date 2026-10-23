@@ -581,17 +581,24 @@ requirement stated.
    6. Hardening: negative corpus cases; a footer's bodies must match the
       directory profile.
 
-   - **Status (2026-10-23): read-compat works in both directions; wavesdb
-     hardening (PR 6) and the harness `crash`/`prepared` scenarios remain.**
+   - **Status (2026-10-23): read-compat works in both directions, and both
+     engines' PR lists are done; the harness `crash`/`prepared` scenarios
+     remain.**
      - ondaDB PRs 1–9 are done (#18–#25, harness yolodb-format #13). Fixture
        corpora for wavesdb followed: the edit log (#26), the WAL in both
        layouts (#27), and whole directories (#28,
        `tests/fixtures/ondadb-dirs/`: both layouts, closed and crashed with
        striped tails, prepares committed, aborted and undecided).
-     - wavesdb PRs 1–5 are done (#28–#32, main `1f0ea24`). An ondaDB
+     - wavesdb PRs 1–6 are done (#28–#33, main `91cbfab`). An ondaDB
        directory opens read-only and is left byte for byte as found apart
        from `LOCK`: no catalog commit, no sweep. It is refused read-write,
-       as a replica, and with a table on a tier.
+       as a replica, and with a table on a tier. Every table must declare
+       its directory's bodies in its footer (#33): before that, a table
+       swapped in from the other engine opened and scanned without an
+       error. ondaDB already refused one in both profiles, but names it
+       `UnsupportedFormat` (bit 10 is outside `SST_KNOWN`; a wavesdb table
+       without it fails `decode_waves08_footer`), where wavesdb says
+       `Corruption`. Settling one class belongs in the spec, before 2d.
      - The harness has no refusals left (yolodb-format #14). All four cells
        of every scenario are checked against the oracle.
      - Found on the way, not yet fixed:
