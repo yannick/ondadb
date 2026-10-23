@@ -515,3 +515,77 @@ fn a_pessimistic_range_delete_takes_no_point_lock() {
     older.commit().unwrap();
     db.close().unwrap();
 }
+
+/// Prepared transactions × merge operators: a WAL generation a prepare pins is
+/// replayed whole on every open, records an earlier flush already made durable
+/// included. A put replayed over its own flushed copy is the same version
+/// twice, but a merge operand must still count once — or every open of a
+/// database with an undecided prepare appends the flushed operands again.
+#[test]
+fn pinned_generation_replay_counts_a_flushed_operand_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let open = || {
+        let mut opts = Options::new(&path);
+        opts.unified_memtable = true;
+        opts.merge_fns = vec![Arc::new(Concat)];
+        DB::open(opts).unwrap()
+    };
+    {
+        let db = open();
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS)
+            .unwrap();
+        let m = db
+            .create_column_family(
+                "m",
+                ColumnFamilyConfig {
+                    merge_operator_name: Some(Concat.name().to_string()),
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        db.put(&m, b"k", b"base", Duration::ZERO).unwrap();
+        db.merge(&m, b"k", b"x").unwrap();
+        // Undecided: it pins this generation past the flush below.
+        let mut t = db.begin();
+        t.put(&m, b"held", b"v", Duration::ZERO).unwrap();
+        t.prepare(&[7; 16]).unwrap();
+        db.rotate_unified_for_tests();
+        while db.pending_flushes_for_tests() > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        db.merge(&m, b"k", b"y").unwrap();
+        db.sync_wal().unwrap();
+        drop(db);
+    }
+    for round in 0..2 {
+        let db = open();
+        let m = db.get_column_family("m").unwrap();
+        assert_eq!(db.get(&m, b"k").unwrap(), b"base|x|y", "open {round}");
+        let txn = db.begin();
+        let mut it = txn.new_iterator(&m);
+        it.seek_to_first();
+        assert!(it.valid());
+        assert_eq!((it.key(), it.value()), (&b"k"[..], &b"base|x|y"[..]), "open {round}");
+        drop(it);
+        drop(txn);
+        drop(db);
+    }
+    // The replayed memtable flushed again: two tables hold the operand at one
+    // sequence, and compaction must fold it in once.
+    let db = open();
+    let m = db.get_column_family("m").unwrap();
+    db.rotate_unified_for_tests();
+    while db.pending_flushes_for_tests() > 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(db.get(&m, b"k").unwrap(), b"base|x|y", "two tables");
+    db.compact(&m).unwrap();
+    assert_eq!(db.get(&m, b"k").unwrap(), b"base|x|y", "compacted");
+    db.abort_prepared(&[7; 16]).unwrap();
+    db.close().unwrap();
+    let db = open();
+    let m = db.get_column_family("m").unwrap();
+    assert_eq!(db.get(&m, b"k").unwrap(), b"base|x|y", "after the abort");
+    db.close().unwrap();
+}

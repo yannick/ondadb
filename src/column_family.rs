@@ -548,7 +548,16 @@ fn fold_chain(
     versions.sort_by_key(|v| std::cmp::Reverse(v.seq));
     let mut operands: Vec<&[u8]> = Vec::new();
     let mut existing: Option<&[u8]> = None;
+    let mut last_seq = None;
     for version in versions.iter() {
+        // One sequence is one version. Two sources can both hold it: a WAL
+        // generation a prepare pins is replayed whole on every open, so a
+        // version an earlier flush made durable is in the memtable again
+        // (and a wavesdb directory does the same). The newer source's copy
+        // counts; a second copy of an operand is not a second operand.
+        if last_seq.replace(version.seq) == Some(version.seq) {
+            continue;
+        }
         if version.merge {
             // A merge operand is never `None`: only a base can be deleted.
             operands.push(version.value.as_deref().unwrap_or(&[]));
