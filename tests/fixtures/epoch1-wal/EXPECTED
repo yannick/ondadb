@@ -1,0 +1,38 @@
+segment cf-x/wal-3.log
+  point kind 1 seq 1 ttl 0 key 61 value 7631
+  point kind 2 seq 2 ttl 0 key 62 value 
+  point kind 3 seq 3 ttl 0 key 63 value 
+  point kind 1 seq 4 ttl 1900000000000000000 key 74 value 74746c
+  point kind 4 seq 5 ttl 0 key 6d value 2b31
+  range seq 6 start 64 end 66
+  point kind 1 seq 7 ttl 0 key 67 value 7637
+  last_seq 7
+segment cf-x/wal-3.log.s2
+  point kind 1 seq 10 ttl 0 key 73 value 73747269706532
+  last_seq 10
+segment unified-wal-7.log
+  point kind 1 seq 20 ttl 0 key 111122223333444461 value 7561
+  point kind 1 seq 21 ttl 0 key 555566667777888862 value 7562
+  point kind 4 seq 22 ttl 0 key 55556666777788886d value 2b32
+  range seq 23 start 111122223333444463 end 111122223333444465
+  prepare id 0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a cfs 1111222233334444,5555666677778888
+    record kind 1 ttl 0 key 11112222333344447061 value 4131
+    record kind 2 ttl 0 key 55556666777788887062 value 
+  commit id 0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a seq 100 count 2
+  prepare id 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b cfs 1111222233334444
+    record kind 1 ttl 0 key 11112222333344447062 value 4231
+  abort id 0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b
+  prepare id 0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c cfs 5555666677778888
+    record kind 1 ttl 1900000000000000000 key 55556666777788887063 value 4331
+  prepare id 0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e cfs 1111222233334444
+    record kind 4 ttl 0 key 11112222333344447065 value 2b33
+  commit id 0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d seq 200 count 3
+  last_seq 23
+segment unified-wal-7.log.s1
+  commit id 0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e seq 150 count 1
+  point kind 1 seq 24 ttl 0 key 11112222333344447a value 757a
+  last_seq 24
+segment unified-wal-8.log
+  commit id 0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a seq 300 count 2
+  point kind 1 seq 25 ttl 0 key 555566667777888879 value 7579
+  last_seq 25
