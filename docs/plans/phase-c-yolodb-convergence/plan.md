@@ -581,9 +581,9 @@ requirement stated.
    6. Hardening: negative corpus cases; a footer's bodies must match the
       directory profile.
 
-   - **Status (2026-10-23): read-compat works in both directions, and both
-     engines' PR lists are done; the harness `crash`/`prepared` scenarios
-     remain.**
+   - **Status (2026-10-24): done.** Read-compat works in both directions,
+     both engines' PR lists are done, and the harness has its `crash`,
+     `prepared` and `txn` scenarios (yolodb-format #15).
      - ondaDB PRs 1–9 are done (#18–#25, harness yolodb-format #13). Fixture
        corpora for wavesdb followed: the edit log (#26), the WAL in both
        layouts (#27), and whole directories (#28,
@@ -601,15 +601,24 @@ requirement stated.
        `Corruption`. Settling one class belongs in the spec, before 2d.
      - The harness has no refusals left (yolodb-format #14). All four cells
        of every scenario are checked against the oracle.
-     - Found on the way, not yet fixed:
+     - Found on the way:
        - ondaDB's `DB::flush_memtable` flushes nothing under the unified
          layout; the fixture generator rotates through
-         `rotate_unified_for_tests` instead.
-       - wavesdb's `Close` rewrites `MANIFEST` after a read-only open of
-         its *own* snapshot-only catalog. It is guarded for ondaDB
-         directories only.
+         `rotate_unified_for_tests` instead. Open; 2d PR O1.
+       - wavesdb's `Close` rewrote `MANIFEST` after a read-only open of its
+         own crashed snapshot-only catalog. Fixed in wavesdb #34.
        - wavesdb's own fixture generator writes range-delete bounds
-         narrower than its keys, so those ranges cover nothing.
+         narrower than its keys, so those ranges cover nothing. Open.
+       - The `prepared` scenario found that ondaDB counted a flushed merge
+         operand twice on every open while an undecided prepare pinned its
+         WAL generation (`base|x` read `base|x|x`, and compaction made it
+         permanent), in its own directories and in wavesdb's. Point reads,
+         iterators and compaction now count one version per sequence. The
+         same PR lets a read-only `close` ignore unresolved prepares, which
+         it cannot resolve (ondaDB #31).
+       - A transaction across families in the per-family layout: ondaDB
+         refuses it, and wavesdb's is not crash-atomic. The harness keeps
+         such transactions to unified scenarios.
 
    On the spec side, yolodb-format gains a frozen ondaDB directory corpus
    (`corpus/epoch1-dirs/`, a crashed striped directory included) and the
@@ -618,6 +627,56 @@ requirement stated.
 4. **2d — write-compat, the common profile (≈6–10 wk, split):** rows B, D,
    E, F, G, H, I, J, K, L, P, Q. After this, a compat-mode directory can be
    opened read-write by either engine, WAL and edit log included.
+
+   **Decision (2026-10-24): the common profile is epoch 1 as specified.**
+   After 2c both engines read both body profiles, so the cheapest way to
+   one read-write profile is the one already written down: `spec/epoch1.md`,
+   that is ondaDB's bodies (no `CAP_WAVES08_BODIES`). ondaDB's format does
+   not change. wavesdb learns to write the bodies it already reads and opens
+   such a directory read-write; its own bodies stay its native mode. This
+   replaces the per-row choices above that picked wavesdb shapes:
+   - **B** no per-block header: the footer's capability word declares the
+     block encoding, as epoch 1 does;
+   - **D** ondaDB's prefix-delta entry layout;
+   - **H** `cf-<name>` in compat mode (wavesdb's native directories keep
+     `cf_`, and its object-store paths with them);
+   - **I** edit-log schema 1, ondaDB's 13 ops; wavesdb's blob, rename and
+     managed ops are refused in compat mode;
+   - **J** WAL layouts 1 and 2 with ondaDB's envelope;
+   - **L** ondaDB's control frames: 16-byte ids, the decision records the
+     block's first sequence and its count. A wavesdb compat database takes
+     only 16-byte ids;
+   - **V** per-table `.vlog` files; compaction rewrites values.
+   Rows E, F, G, K, P and Q are already epoch 1's in ondaDB.
+
+   Each wavesdb encoder is checked **byte for byte** against yolodb-format
+   `corpus/epoch1/`, whose inputs ondaDB's `tests/epoch1_golden.rs`
+   records, and the harness gains **handoff** cells: one engine writes,
+   the other opens read-write, writes more and crashes or closes, and both
+   read the result.
+
+   **wavesdb PRs** (`FormatCompat`: a new database without bits 9 and 10):
+   1. SSTables: ondaDB's three entry layouts and restart trailers, the
+      footer caps word without bit 10, values in a per-table `.vlog`; a
+      compaction of an ondaDB-bodied table copies values. Reproduces
+      `base`, `delta` and `ranges`.
+   2. TLV family config encoder (reproduces the corpus manifest's config).
+   3. The catalog: the manifest snapshot without wavesdb-only sections, and
+      edit-log schema 1 writing. Reproduces `MANIFEST` and `MANIFEST-EDITS`.
+   4. WAL layouts 1 and 2 for writing (one stripe), the ondaDB envelope,
+      unified key prefixes, and ondaDB's control frames. Reproduces
+      `wal-5.log`.
+   5. The open: an ondaDB-bodied directory opens read-write; `FormatCompat`
+      creates one; compat mode refuses what epoch 1 cannot hold (shared
+      blobs, groups, codecs 7 and 8, managed mode, spill, replicas and the
+      mirror, wavesdb's tiers and parts until mapped, non-16-byte prepare
+      ids).
+   6. Harness: the wavesdb driver writes compat mode, and the handoff cells
+      run in both directions.
+
+   **ondaDB PRs:**
+   - O1. `flush_memtable` flushes the unified memtable.
+   - O2. Whatever the handoff cells find; the format itself does not move.
 5. **Parity release — both engines 0.20.0.** When 2d is done (every harness
    scenario green in all four cells), both engines release 0.20.0 together,
    and from then on share the minor version: equal minors implement the same
