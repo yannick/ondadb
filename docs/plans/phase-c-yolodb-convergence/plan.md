@@ -581,6 +581,29 @@ requirement stated.
    6. Hardening: negative corpus cases; a footer's bodies must match the
       directory profile.
 
+   - **Status (2026-10-23): read-compat works in both directions; wavesdb
+     hardening (PR 6) and the harness `crash`/`prepared` scenarios remain.**
+     - ondaDB PRs 1–9 are done (#18–#25, harness yolodb-format #13). Fixture
+       corpora for wavesdb followed: the edit log (#26), the WAL in both
+       layouts (#27), and whole directories (#28,
+       `tests/fixtures/ondadb-dirs/`: both layouts, closed and crashed with
+       striped tails, prepares committed, aborted and undecided).
+     - wavesdb PRs 1–5 are done (#28–#32, main `1f0ea24`). An ondaDB
+       directory opens read-only and is left byte for byte as found apart
+       from `LOCK`: no catalog commit, no sweep. It is refused read-write,
+       as a replica, and with a table on a tier.
+     - The harness has no refusals left (yolodb-format #14). All four cells
+       of every scenario are checked against the oracle.
+     - Found on the way, not yet fixed:
+       - ondaDB's `DB::flush_memtable` flushes nothing under the unified
+         layout; the fixture generator rotates through
+         `rotate_unified_for_tests` instead.
+       - wavesdb's `Close` rewrites `MANIFEST` after a read-only open of
+         its *own* snapshot-only catalog. It is guarded for ondaDB
+         directories only.
+       - wavesdb's own fixture generator writes range-delete bounds
+         narrower than its keys, so those ranges cover nothing.
+
    On the spec side, yolodb-format gains a frozen ondaDB directory corpus
    (`corpus/epoch1-dirs/`, a crashed striped directory included) and the
    harness `crash` step. Survey spec drift is fixed: yolodb-format #10 and
