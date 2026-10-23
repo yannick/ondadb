@@ -448,6 +448,12 @@ pub struct DbInner {
     /// that found an epoch-1 directory.
     pub(crate) format_upgrade: Mutex<Option<crate::upgrade::UpgradeReport>>,
 
+    /// The discard floor of a managed-sequence **wavesdb** database
+    /// (`CAP_MANAGED_MODE`), for [`DB::discard_seq`]: history below it may
+    /// already be compacted away. Set once, by a read-only open of one; unset
+    /// for every other database.
+    pub(crate) discard_seq: std::sync::OnceLock<u64>,
+
     /// This database's lease on a shared
     /// [`ReadResources`](crate::read_resources::ReadResources), or `None` for
     /// private caches. Released at the end of `close()` (or on drop), which is
@@ -1758,7 +1764,7 @@ impl DbInner {
     }
 
     pub(crate) fn cf_dir(&self, name: &str) -> String {
-        format!("{}/{}", self.dir, crate::format::cf_dir_name(name))
+        format!("{}/{}", self.dir, self.ctx.format.cf_dir_name(name))
     }
 
     /// Release every thread parked on the background IO limiter and stop
@@ -2305,6 +2311,7 @@ fn build_db_inner(
         workers: Mutex::new(Vec::new()),
         lock_file: Mutex::new(Some(lock_file)),
         format_upgrade: Mutex::new(None),
+        discard_seq: std::sync::OnceLock::new(),
         read_lease: Mutex::new(read_lease),
         local_cache,
         handles: Arc::new(AtomicUsize::new(1)),
@@ -2727,6 +2734,14 @@ impl DB {
         self.inner.format_upgrade.lock().clone()
     }
 
+    /// The discard floor of a managed-sequence **wavesdb** database opened
+    /// read-only, or `None` for every other database. wavesdb may already have
+    /// compacted away history below it; every read through this handle is at
+    /// the visible sequence, which the open checked is at or above the floor.
+    pub fn discard_seq(&self) -> Option<u64> {
+        self.inner.discard_seq.get().copied()
+    }
+
     /// The epoch-1 open: everything [`open`](Self::open) does once the
     /// directory is known not to be a 0.9 one.
     pub(crate) fn open_epoch1(opts: Options) -> Result<DB> {
@@ -2766,9 +2781,10 @@ impl DB {
     /// Open a database whose files are in format family `format`.
     ///
     /// Anything but [`FormatProfile::Epoch1`](crate::format::FormatProfile)
-    /// is a 0.9 directory read through `legacy_onda`, and only ever read-only:
-    /// this binary cannot write a 0.9 byte, so a writable open of one would
-    /// produce a directory that is neither.
+    /// is a 0.9 directory read through `legacy_onda` or a wavesdb one read
+    /// through `waves08`, and only ever read-only: this binary writes neither
+    /// format, so a writable open of one would produce a directory that is
+    /// neither engine's.
     ///
     /// `lock` is a `<dir>/LOCK` handle the caller already holds (the format
     /// upgrade, which must not drop its exclusive lock between building a
@@ -2810,13 +2826,16 @@ impl DB {
         // The WAL layout is a durable database-wide choice once the catalog
         // contains a column family. Opening under the other layout would make
         // recovery consult one set of WALs while new commits write another.
-        let manifest = match format {
-            crate::format::FormatProfile::Epoch1 => crate::manifest_edit::recover_catalog(&dir)?,
+        // A managed wavesdb catalog's discard floor; ondaDB's own manifest has
+        // no field for it.
+        let (manifest, discard_seq) = match format {
+            crate::format::FormatProfile::Epoch1 => (crate::manifest_edit::recover_catalog(&dir)?, None),
             #[cfg(feature = "legacy-onda")]
-            crate::format::FormatProfile::Onda09 => crate::legacy_onda::recover_catalog(&dir)?,
+            crate::format::FormatProfile::Onda09 => (crate::legacy_onda::recover_catalog(&dir)?, None),
             #[cfg(feature = "waves08")]
             crate::format::FormatProfile::Waves08 => {
-                crate::waves08::recover_catalog(&dir)?.to_manifest()?
+                let catalog = crate::waves08::recover_catalog(&dir)?;
+                (catalog.to_manifest()?, catalog.managed_floor())
             }
         };
         let requested_layout = requested_wal_layout(&opts);
@@ -2832,6 +2851,20 @@ impl DB {
             format,
         )?;
         recover_column_families(&inner, &manifest, &opts)?;
+        if let Some(floor) = discard_seq {
+            // Every read here is at the visible sequence, so a floor at or
+            // below it is all managed mode asks of a reader. wavesdb raises
+            // the floor only to a sequence already visible, and persists it
+            // with a catalog whose global sequence covers it: a floor above
+            // everything recovered names history this directory lost.
+            let visible = inner.visible_seq();
+            if floor > visible {
+                return Err(OndaError::Corruption(format!(
+                    "wavesdb: discard floor {floor} is above the recovered visible sequence {visible}"
+                )));
+            }
+            let _ = inner.discard_seq.set(floor);
+        }
         finish_open(&inner, &manifest, receivers)?;
         Ok(DB { inner })
     }

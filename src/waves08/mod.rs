@@ -25,7 +25,8 @@
 //! | WAL segments | layouts 3 (per family) and 4 (unified): legacy and `0xff` envelope frames; prepare bodies with named families | `wal` (prepares resolved after every generation is read) |
 //!
 //! Everything here is **decode-only**: nothing writes a wavesdb byte, and a
-//! wavesdb directory is never opened read-write.
+//! wavesdb directory is never opened read-write: [`open_read_only`] is how
+//! `DB::open` reads one.
 //!
 //! The frozen fixtures these decoders are checked against live in
 //! `tests/fixtures/wavesdb-epoch1/`, written by wavesdb itself.
@@ -196,6 +197,12 @@ impl Catalog {
         self.cfs.iter_mut().find(|cf| cf.name == name)
     }
 
+    /// The discard floor of a managed-sequence catalog (`CAP_MANAGED_MODE`),
+    /// or `None` outside managed mode — where wavesdb keeps the field zero.
+    pub fn managed_floor(&self) -> Option<u64> {
+        (self.caps & CAP_MANAGED_MODE != 0).then_some(self.discard_seq)
+    }
+
     /// The catalog as ondaDB's [`Manifest`]: each config converted from JSON
     /// to the blob [`ColumnFamilyConfig::encode`] writes, everything ondaDB
     /// has no field for left on `self`.
@@ -251,6 +258,33 @@ pub fn recover_catalog(dir: impl AsRef<Path>) -> Result<Catalog> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(snapshot),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Open the wavesdb database at `opts.path` read-only through the engine
+/// ([`DB::open`](crate::DB::open) dispatches here for a read-only open of one).
+/// The WAL layout comes from the recovered catalog, as for a 0.9 directory;
+/// `Options::read_only` must be set: ondaDB cannot write a wavesdb byte, so a
+/// writable open would leave a directory that is neither engine's.
+///
+/// Refuses a directory that is not a wavesdb database with `InvalidArgs`.
+pub fn open_read_only(mut opts: crate::Options) -> Result<crate::DB> {
+    let dir = std::path::PathBuf::from(&opts.path);
+    if !is_waves_dir(&dir)? {
+        return Err(OndaError::InvalidArgs(format!(
+            "{}: not a wavesdb database (no CAP_WAVES08_BODIES MANIFEST)",
+            dir.display()
+        )));
+    }
+    if !opts.read_only {
+        return Err(OndaError::UnsupportedFormat(format!(
+            "{}: a wavesdb database; ondaDB opens one only with Options::read_only",
+            dir.display()
+        )));
+    }
+    let catalog = recover_catalog(&dir)?;
+    opts.migrate_to_unified = false;
+    opts.unified_memtable = catalog.wal_layout == WalLayout::Unified;
+    crate::DB::open_with_format(opts, crate::format::FormatProfile::Waves08, None)
 }
 
 /// Whether `dir` holds a wavesdb database: an epoch-1 `MANIFEST` whose

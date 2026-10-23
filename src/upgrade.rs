@@ -672,6 +672,12 @@ pub fn open_observed(opts: Options, observer: &dyn UpgradeObserver) -> Result<DB
     if opts.path.is_empty() {
         return DB::open_epoch1(opts);
     }
+    // A wavesdb directory is never an upgrade source or target: it opens
+    // read-only through its own decoders, or not at all.
+    #[cfg(feature = "waves08")]
+    if crate::waves08::is_waves_dir(&opts.path)? {
+        return crate::waves08::open_read_only(opts);
+    }
     let resumed = resolve_interrupted(&opts)?;
     if crate::manifest::is_onda09_dir(&opts.path)? {
         return open_legacy(opts, observer);
