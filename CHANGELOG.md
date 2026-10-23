@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **A flushed merge operand no longer counts twice after a reopen.** A
+  unified WAL generation that an undecided prepare pins is replayed whole on
+  every open, including records an earlier flush already wrote to a table.
+  For a put that is the same version twice, but a merge operand was folded in
+  once per copy: `base|x` read back as `base|x|x`, and the next flush and
+  compaction made it permanent. Point reads, iterators and compaction now
+  count one version per sequence. The same applies to a wavesdb directory read
+  read-only, whose retained WAL holds a committed prepare that is also in a
+  table. Found by the yolodb-format harness's new `prepared` scenario.
+- **`close` on a read-only handle no longer refuses with `Busy`** while
+  prepared transactions are unresolved. Such a handle cannot resolve them
+  (`commit_prepared` is `ReadOnly` there), so the refusal could never be acted
+  on; the prepares stay on disk for the next writer, as before.
+
 ## 0.10.2
 
 ### Custom comparators can be registered

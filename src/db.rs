@@ -3866,9 +3866,13 @@ impl DB {
     /// [`list_prepared`](Self::list_prepared)) and close again. Dropping the
     /// last handle closes anyway — `Drop` cannot return an error — leaving the
     /// pinned WAL files on disk for the next open to recover.
+    ///
+    /// A read-only handle closes regardless: it can resolve nothing
+    /// (`commit_prepared` is `ReadOnly` there), so a refusal could never be
+    /// acted on, and it changes nothing a later writer would need.
     pub fn close(&self) -> Result<()> {
         let unresolved = self.inner.prepared.lock().len();
-        if unresolved > 0 {
+        if unresolved > 0 && !self.inner.opts.read_only {
             return Err(OndaError::Busy(format!(
                 "{unresolved} unresolved prepared transaction(s); resolve them with \
                  commit_prepared or abort_prepared, or drop the handle to leave them \

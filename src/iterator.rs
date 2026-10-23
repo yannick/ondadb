@@ -814,7 +814,11 @@ impl Iterator {
                 // after the base is older than it and belongs to a superseded
                 // chain. Backward it arrives oldest-first, and each base clears
                 // the operands it superseded (below).
-                if seq <= self.read_seq && !(forward && visible.found) {
+                // One sequence is one version: a replayed WAL generation can
+                // put a flushed operand in a memtable again, and the merge
+                // yields the two copies back to back (see `fold_chain`).
+                let copy = self.operand_spans.last().is_some_and(|&(_, _, s)| s == seq);
+                if seq <= self.read_seq && !(forward && visible.found) && !copy {
                     self.push_operand(seq)?;
                 }
                 self.m.advance(forward);

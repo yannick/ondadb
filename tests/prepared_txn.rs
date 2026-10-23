@@ -701,6 +701,13 @@ fn list_prepared_works_read_only() {
     let list = db.list_prepared();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, id(1));
+    // Nothing here can resolve it, so close does not ask to.
+    db.close().unwrap();
+    drop(db);
+    let db = open_unified(&path);
+    assert_eq!(db.list_prepared().len(), 1, "the prepare outlived the read-only close");
+    db.abort_prepared(&id(1)).unwrap();
+    db.close().unwrap();
 }
 
 // ---- control plane --------------------------------------------------------

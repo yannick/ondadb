@@ -1898,6 +1898,13 @@ fn run_span(
     // which is every iteration for a family with no operator, and every
     // iteration of a merge family's non-merge keys.
     let mut pending: Option<PendingFold> = None;
+    // The previous input entry's key and sequence. One sequence is one
+    // version, but two inputs can both hold it: a WAL generation a prepare
+    // pins is replayed whole on every open, and its flush writes versions an
+    // earlier flush already made durable. The copies arrive back to back; the
+    // second is dropped, or an operand would fold in twice.
+    let mut prev_key: Vec<u8> = Vec::new();
+    let mut prev_seq: Option<u64> = None;
     while let Some(index) = smallest_input(&iterators, cmp)? {
         let (key, seq, tombstone, ttl, kind) = {
             let iterator = &iterators[index];
@@ -1912,6 +1919,13 @@ fn run_span(
         if past_upper(&key) {
             break;
         }
+        if prev_seq == Some(seq) && cmp.compare(&prev_key, &key).is_eq() {
+            iterators[index].next();
+            continue;
+        }
+        prev_seq = Some(seq);
+        prev_key.clear();
+        prev_key.extend_from_slice(&key);
         if frozen.cancelled() {
             // A sibling already failed; this span's outputs are removed by
             // `CompactionOutputBuilder`'s abort-on-drop.
