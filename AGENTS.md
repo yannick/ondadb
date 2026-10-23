@@ -157,7 +157,9 @@ everywhere, restart trailers on every data block, codec id 6 for LZ4 (2 and 4
 burned), a leading bloom hash tag and the correct FNV-1a-64 basis for unified
 CF ids. `src/format.rs` is the single home for every number, each pinned by a
 `const` assertion and a golden test (`tests/epoch1_golden.rs` over
-`tests/fixtures/epoch1/`); `docs/format-registry.md` mirrors the registry,
+`tests/fixtures/epoch1/`; `tests/epoch1_edit_corpus.rs` pins an edit log using
+all 13 schema-1 ops and the catalog recovery makes of it, which wavesdb
+vendors); `docs/format-registry.md` mirrors the registry,
 whose canonical copy is `spec/registry.md` in `yolodb-format`. Fail
 closed: malformed bytes are `Corruption`; an unknown version, flag, capability
 bit, codec, kind or config enum value is `UnsupportedFormat`.

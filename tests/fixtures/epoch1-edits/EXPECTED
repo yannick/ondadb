@@ -1,0 +1,12 @@
+next_file_id 21
+global_seq 500
+applied_through 10
+next_edit_id 11
+wal_unified true
+nonce =81985529216486895
+caps 0x35
+cf default unified_id - config 594f4c4f44424346010000000b0101
+  table 7 level 1 entries 70 tombstones 7 max_seq 150 klog 28672 vlog 777 min 6b3761 max 6b377a partition =p2 tier - max_entry_time - object - last_compaction_time =5 ranges 2 11 12 =7231 =7239
+  table 4 level 2 entries 40 tombstones 4 max_seq 90 klog 16384 vlog 0 min 6b3461 max 6b347a partition - tier =warm max_entry_time - object - last_compaction_time - ranges 0 0 0 - -
+  table 20 level 3 entries 200 tombstones 20 max_seq 500 klog 81920 vlog 0 min 6b323061 max 6b32307a partition - tier - max_entry_time - object - last_compaction_time - ranges 0 0 0 - -
+cf logs unified_id - config 594f4c4f44424346010000000201060b0101
