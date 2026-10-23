@@ -160,10 +160,14 @@ CF ids. `src/format.rs` is the single home for every number, each pinned by a
 `tests/fixtures/epoch1/`; `tests/epoch1_edit_corpus.rs` pins an edit log using
 all 13 schema-1 ops and the catalog recovery makes of it, and
 `tests/epoch1_wal_corpus.rs` WAL segments in both layouts with what replay
-yields; wavesdb vendors both); `docs/format-registry.md` mirrors the registry,
-whose canonical copy is `spec/registry.md` in `yolodb-format`. Fail
-closed: malformed bytes are `Corruption`; an unknown version, flag, capability
-bit, codec, kind or config enum value is `UnsupportedFormat`.
+yields; wavesdb vendors both). `tests/ondadb_dir_fixtures.rs` freezes whole
+directories (`tests/fixtures/ondadb-dirs/`: both layouts, closed and crashed
+with striped WAL tails, prepares committed, aborted and undecided) with each
+family's scan, for wavesdb's read-only open of an ondaDB directory;
+`docs/format-registry.md` mirrors the registry, whose canonical copy is
+`spec/registry.md` in `yolodb-format`. Fail closed: malformed bytes are
+`Corruption`; an unknown version, flag, capability bit, codec, kind or config
+enum value is `UnsupportedFormat`.
 
 A 0.9.x directory is **not** readable by the epoch-1 engine. The frozen 0.9
 decoders live in `src/legacy_onda/` (default-on feature `legacy-onda`,

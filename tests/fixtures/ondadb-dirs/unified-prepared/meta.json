@@ -1,0 +1,14 @@
+{
+ "writer": "ondadb 0.10.2",
+ "unified": true,
+ "crashed": true,
+ "containers": [
+  "YOLODBMF",
+  "YOLODBED",
+  "YOLOST01",
+  "YOLODBVL",
+  "YOLODBWL",
+  "wal-tail",
+  "wal-stripe"
+ ]
+}
