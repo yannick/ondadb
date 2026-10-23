@@ -485,6 +485,12 @@ pub(crate) struct RecoveredDecision {
 pub(crate) struct RecoveredPrepares {
     pub prepares: Vec<RecoveredPrepare>,
     pub decisions: Vec<RecoveredDecision>,
+    /// A wavesdb unified log's prepared transactions: string ids and batches
+    /// naming their families, so they resolve against the catalog
+    /// (`DbInner::install_waves08_prepares`), never through the 16-byte-id
+    /// path above.
+    #[cfg(feature = "waves08")]
+    pub waves08: Option<crate::waves08::wal::Prepares>,
 }
 
 impl RecoveredPrepares {

@@ -501,7 +501,7 @@ pub mod edit_log {
     pub const MAGIC: [u8; 8] = *b"YOLODBED";
     pub const SCHEMA: u32 = 1;
     /// Schema 2, **wavesdb**: its 18 ops, payloads as wavesdb 0.8 encodes them
-    /// (requires `CAP_WAVES08_BODIES`). Registered; refused until step 2c.
+    /// (requires `CAP_WAVES08_BODIES`); read by `waves08::edit_log`.
     pub const SCHEMA_WAVES08: u32 = 2;
     pub const HEADER_BYTES: usize = 32;
 }
@@ -525,10 +525,10 @@ pub mod wal_segment {
     /// One database-wide WAL with cf-id-prefixed keys; envelope schema 2.
     pub const LAYOUT_UNIFIED: u8 = 2;
     /// **wavesdb** 0.8, one WAL per column family, wavesdb's envelope
-    /// (requires `CAP_WAVES08_BODIES`). Registered; refused until step 2c.
+    /// (requires `CAP_WAVES08_BODIES`); read by `waves08::wal`.
     pub const LAYOUT_WAVES08_PER_CF: u8 = 3;
     /// **wavesdb** 0.8, unified, wavesdb's envelope with a per-record `cf_id`
-    /// (requires `CAP_WAVES08_BODIES`). Registered; refused until step 2c.
+    /// (requires `CAP_WAVES08_BODIES`); read by `waves08::wal`.
     pub const LAYOUT_WAVES08_UNIFIED: u8 = 4;
 }
 

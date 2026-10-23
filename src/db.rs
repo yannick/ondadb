@@ -1152,6 +1152,31 @@ impl DbInner {
         unified.apply_memtable_only(&items, commit_seq)
     }
 
+    /// Pass 2 for a wavesdb unified log: install every committed prepared
+    /// batch into the unified memtable at the sequences its decision fixed,
+    /// its families named in the batch and resolved against the catalog.
+    /// Aborted and undecided ones are not installed — an undecided prepare
+    /// stays invisible, and a read-only open has no writer for it to block.
+    #[cfg(feature = "waves08")]
+    fn install_waves08_prepares(
+        &self,
+        prepares: crate::waves08::wal::Prepares,
+        manifest: &Manifest,
+    ) -> Result<()> {
+        let (records, max_seq) = prepares.finish(|name| {
+            manifest
+                .cfs
+                .iter()
+                .find(|cf| cf.name == name)
+                .map(|cf| cf.effective_unified_id())
+        })?;
+        self.observe_seq(max_seq);
+        if let Some(unified) = &self.unified {
+            unified.install_replayed(records);
+        }
+        Ok(())
+    }
+
     pub(crate) fn observe_seq(&self, seq: u64) {
         if seq == 0 {
             return;
@@ -2182,6 +2207,7 @@ fn build_db_inner(
         &poison,
         &wal_syncs,
         format,
+        manifest.caps,
     )?;
     // Built once and shared: `None` unless background IO is limited, so the
     // default configuration costs one nil check at each charge point.
@@ -2292,7 +2318,16 @@ fn build_db_inner(
     // point at which `DbInner` exists — so `observe_seq` and the unified
     // memtable are both callable — and still before any worker is spawned or
     // `DB::open` returns. It invokes no application code.
+    #[cfg(feature = "waves08")]
+    let (waves_prepares, recovered_prepares) = {
+        let mut r = recovered_prepares;
+        (r.waves08.take(), r)
+    };
     inner.resolve_recovered_prepares(recovered_prepares)?;
+    #[cfg(feature = "waves08")]
+    if let Some(prepares) = waves_prepares {
+        inner.install_waves08_prepares(prepares, manifest)?;
+    }
     Ok((
         inner,
         WorkerReceivers {
@@ -2452,6 +2487,7 @@ fn open_unified_store(
     poison: &Arc<crate::util::Poison>,
     wal_syncs: &Arc<AtomicU64>,
     format: crate::format::FormatProfile,
+    caps: u64,
 ) -> Result<(
     Option<Arc<crate::unified::UnifiedStore>>,
     u64,
@@ -2469,6 +2505,7 @@ fn open_unified_store(
         poison.clone(),
         wal_syncs.clone(),
         format,
+        caps,
     )?;
     Ok((Some(store), max_seq, recovered))
 }

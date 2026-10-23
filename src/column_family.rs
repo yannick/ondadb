@@ -1021,14 +1021,14 @@ impl ColumnFamily {
                     crate::legacy_onda::wal::replay(&p, &mut apply)?
                 }
                 #[cfg(feature = "waves08")]
-                crate::format::FormatProfile::Waves08 => {
-                    // wavesdb's WAL layouts are decoded by a later 2c step;
-                    // until then any WAL generation is refused, never
-                    // skipped — skipping would hide committed writes.
-                    return Err(OndaError::UnsupportedFormat(
-                        "wavesdb WAL replay is not implemented yet".into(),
-                    ));
-                }
+                crate::format::FormatProfile::Waves08 => crate::waves08::wal::replay(
+                    std::path::Path::new(&p),
+                    crate::waves08::wal::Layout::PerCf,
+                    *g,
+                    ctx.caps.load(Ordering::Acquire),
+                    None,
+                    &mut apply,
+                )?,
             };
             max_seq = max_seq.max(last);
         }
