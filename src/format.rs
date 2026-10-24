@@ -294,13 +294,14 @@ pub mod wavesdb_reserved {
     /// for [`FLAG_VLOG_GROUPED`].
     pub const CAP_VLOG_GROUPING: u64 = 1 << 8;
     /// Capability bit 9: values in shared `<id>.blob` files, addressed by a
-    /// 16-byte `blob_id | offset` pointer (plan C row V). Every engine must
-    /// eventually *read* it (step 2c); writing it needs blob GC.
+    /// 16-byte `blob_id | offset` pointer (plan C row V). Read since step 2c,
+    /// in a read-only open of a wavesdb directory; writing it needs blob GC.
     pub const CAP_VALUES_SHARED_BLOBS: u64 = 1 << 9;
-    /// Capability bit 10, **interim**: the directory or table keeps wavesdb
-    /// 0.8's bodies inside epoch-1 containers — `0xff` block headers, full-key
-    /// blocks without restarts, wavesdb's prefix-delta layout, JSON configs,
-    /// edit-log schema 2, WAL layouts 3 and 4. Retired by step 2d.
+    /// Capability bit 10: the directory or table keeps wavesdb 0.8's bodies
+    /// inside epoch-1 containers — `0xff` block headers, full-key blocks
+    /// without restarts, wavesdb's prefix-delta layout, JSON configs, edit-log
+    /// schema 2, WAL layouts 3 and 4. Interim in step 2b; since step 2d it is
+    /// wavesdb's native profile, which ondaDB opens read-only (`waves08`).
     pub const CAP_WAVES08_BODIES: u64 = 1 << 10;
     /// Kind 19: wavesdb large-transaction spill descriptor.
     pub const KIND_SPILL_DESCRIPTOR: u64 = 19;
