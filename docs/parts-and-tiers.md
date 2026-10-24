@@ -323,7 +323,7 @@ Enable the feature (it pulls network deps; the core build stays lean):
 
 ```toml
 [dependencies]
-ondadb = { version = "0.3", features = ["s3"] }
+ondadb = { version = "0.20", features = ["s3"] }
 ```
 
 Then define the tier — `S3Config` + `TierDef::s3`. For MinIO (and any

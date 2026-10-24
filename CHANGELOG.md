@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.20.0 — yoloDB parity with wavesdb 0.20.0
+
+The parity release: ondaDB 0.20.0 and wavesdb 0.20.0 write yoloDB format
+epoch 1 as specified, open each other's directories read-write, and agree on
+every cell of the yolodb-format cross-engine harness, handoffs between the
+two included. It adds the unified WAL's replay floor, which a database with
+prepared transactions takes at its next read-write open; a binary older than
+this release refuses such a database as `UnsupportedFormat`.
 
 ### Format
 
