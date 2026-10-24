@@ -807,18 +807,26 @@ impl Iterator {
         self.cur_val = CurVal::Empty;
         self.operands.clear();
         self.operand_spans.clear();
+        // One sequence is one version: a replayed WAL generation can put a
+        // flushed version in a memtable again, and the merge yields the copies
+        // back to back, newest source first in either direction (`before`
+        // breaks the tie by child order). Only that first copy counts, WHATEVER
+        // THE KIND of a later one: compaction may have folded the chain into a
+        // put at the operand's sequence, and that put must not become the
+        // replayed operand's base (see `fold_chain`).
+        let mut last_seq = None;
         while self.top_in_group() {
+            let seq = self.m.top().seq();
+            if last_seq.replace(seq) == Some(seq) {
+                self.m.advance(forward);
+                continue;
+            }
             if self.m.top().kind() == crate::format::KIND_MERGE {
-                let seq = self.m.top().seq();
                 // Forward, the group arrives newest-first, so an operand seen
                 // after the base is older than it and belongs to a superseded
                 // chain. Backward it arrives oldest-first, and each base clears
                 // the operands it superseded (below).
-                // One sequence is one version: a replayed WAL generation can
-                // put a flushed operand in a memtable again, and the merge
-                // yields the two copies back to back (see `fold_chain`).
-                let copy = self.operand_spans.last().is_some_and(|&(_, _, s)| s == seq);
-                if seq <= self.read_seq && !(forward && visible.found) && !copy {
+                if seq <= self.read_seq && !(forward && visible.found) {
                     self.push_operand(seq)?;
                 }
                 self.m.advance(forward);

@@ -589,3 +589,81 @@ fn pinned_generation_replay_counts_a_flushed_operand_once() {
     assert_eq!(db.get(&m, b"k").unwrap(), b"base|x|y", "after the abort");
     db.close().unwrap();
 }
+
+/// The same replay, with the chain compacted before the reopen: compaction
+/// folds `base|x` into one put at `x`'s sequence, so the replayed operand `x`
+/// meets a put copy of itself. One sequence is one version whatever the copy's
+/// kind — the put must not become the operand's base, or a forward scan reads
+/// `base|x|x` while a point read and a reverse scan read `base|x`.
+#[test]
+fn pinned_generation_replay_never_bases_an_operand_on_its_folded_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let open = || {
+        let mut opts = Options::new(&path);
+        opts.unified_memtable = true;
+        opts.merge_fns = vec![Arc::new(Concat)];
+        DB::open(opts).unwrap()
+    };
+    {
+        let db = open();
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS)
+            .unwrap();
+        let m = db
+            .create_column_family(
+                "m",
+                ColumnFamilyConfig {
+                    merge_operator_name: Some(Concat.name().to_string()),
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        db.put(&m, b"j", b"base", Duration::ZERO).unwrap();
+        db.merge(&m, b"j", b"x").unwrap();
+        db.merge(&m, b"k", b"a").unwrap();
+        db.merge(&m, b"k", b"b").unwrap();
+        let mut t = db.begin();
+        t.put(&m, b"held", b"v", Duration::ZERO).unwrap();
+        t.prepare(&[7; 16]).unwrap();
+        db.rotate_unified_for_tests();
+        while db.pending_flushes_for_tests() > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        db.compact(&m).unwrap();
+        db.sync_wal().unwrap();
+        drop(db);
+    }
+    let want: [(&[u8], &[u8]); 2] = [(b"j", b"base|x"), (b"k", b"|a|b")];
+    let check = |db: &DB, stage: &str| {
+        let m = db.get_column_family("m").unwrap();
+        for (k, v) in want {
+            assert_eq!(db.get(&m, k).unwrap(), v, "{stage}: get");
+        }
+        let txn = db.begin();
+        let mut it = txn.new_iterator(&m);
+        it.seek_to_first();
+        for (k, v) in want {
+            assert!(it.valid(), "{stage}: forward");
+            assert_eq!((it.key(), it.value()), (k, v), "{stage}: forward");
+            it.next();
+        }
+        it.seek_to_last();
+        for (k, v) in want.iter().rev() {
+            assert!(it.valid(), "{stage}: reverse");
+            assert_eq!((it.key(), it.value()), (*k, *v), "{stage}: reverse");
+            it.prev();
+        }
+    };
+    let db = open();
+    check(&db, "open");
+    let m = db.get_column_family("m").unwrap();
+    db.rotate_unified_for_tests();
+    while db.pending_flushes_for_tests() > 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    check(&db, "two tables");
+    db.compact(&m).unwrap();
+    check(&db, "compacted");
+    db.abort_prepared(&[7; 16]).unwrap();
+    db.close().unwrap();
+}
