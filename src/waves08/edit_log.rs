@@ -13,7 +13,8 @@
 //! 2 RemoveTable, 3 UpdateTable, 4 AddBlob, 5 UpdateBlob, 6 RemoveBlob,
 //! 7 CreateCF, 8 DropCF, 9 RenameCF, 10 SetCFConfig, 11 SetNextFileID,
 //! 12 SetGlobalSeq, 13 SetWALLayout, 14 SetNonce, 15 SetCapability,
-//! 16 SetManagedState; 17 and 18 are reserved and refused, like any other kind.
+//! 16 SetManagedState, 19 SetWALFloor; 17 and 18 are reserved and refused, like
+//! any other unknown kind.
 //! The same numbers mean different ops in ondaDB's schema 1, which is why the
 //! schema, not the op byte, decides the table.
 //!
@@ -74,6 +75,7 @@ pub mod op {
     pub const SET_NONCE: u8 = 14;
     pub const SET_CAPABILITY: u8 = 15;
     pub const SET_MANAGED_STATE: u8 = 16;
+    pub const SET_WAL_FLOOR: u8 = 19;
 }
 
 /// UpdateTable field mask (wavesdb `Field*`), in encoding order.
@@ -244,6 +246,8 @@ pub enum Op {
     SetNonce(u64),
     SetCapability(u64),
     SetManagedState { mask: u64, discard_seq: u64, last_managed_commit: u64 },
+    /// The unified WAL's replay floor (`CAP_WAL_FLOOR`), as schema 1's op 14.
+    SetWalFloor(u64),
 }
 
 /// One complete, CRC-valid record.
@@ -445,6 +449,7 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op> {
             };
             Op::SetManagedState { mask, discard_seq, last_managed_commit }
         }
+        op::SET_WAL_FLOOR => Op::SetWalFloor(r.uvar("WAL floor")?),
         // 17 and 18 are reserved for later wavesdb features; never skip an op
         // whose meaning is unknown.
         other => return Err(corrupt(format!("edit op kind {other} is not known"))),
@@ -891,6 +896,18 @@ fn apply_op(m: &mut Catalog, op: &Op) -> std::result::Result<(), String> {
                 }
                 m.last_managed_commit = *last_managed_commit;
             }
+        }
+        Op::SetWalFloor(floor) => {
+            if m.caps & crate::format::CAP_WAL_FLOOR == 0 {
+                return Err("WAL floor without CAP_WAL_FLOOR".into());
+            }
+            if m.wal_layout != WalLayout::Unified {
+                return Err("WAL floor without the unified WAL layout".into());
+            }
+            if *floor <= m.wal_floor {
+                return Err(format!("WAL floor {floor} not above current {}", m.wal_floor));
+            }
+            m.wal_floor = *floor;
         }
     }
     Ok(())

@@ -2066,3 +2066,42 @@ fn perf_context_counts_range_sources_and_masked_keys() {
     assert_eq!(none.range_masked, 0);
     db.close().unwrap();
 }
+
+/// The same under the unified layout, where one memtable serves every family:
+/// a family whose only writes in it are spans still gets a table, beside a
+/// family that has points in the same memtable.
+#[test]
+fn unified_flush_of_a_range_only_family_produces_a_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let open = || {
+        let mut opts = Options::new(&path);
+        opts.unified_memtable = true;
+        DB::open(opts).unwrap()
+    };
+    {
+        let db = open();
+        db.enable_format_capabilities(CAP_RANGE_DELETES).unwrap();
+        let a = db.create_column_family("a", ColumnFamilyConfig::default()).unwrap();
+        let b = db.create_column_family("b", ColumnFamilyConfig::default()).unwrap();
+        for i in 0..10 {
+            db.put(&a, &key(i), b"v", Duration::ZERO).unwrap();
+            db.put(&b, &key(i), b"v", Duration::ZERO).unwrap();
+        }
+        db.flush_memtable(&a).unwrap();
+        db.delete_range(&a, &key(2), &key(5)).unwrap(); // a: spans only
+        db.put(&b, &key(20), b"v", Duration::ZERO).unwrap(); // b: points only
+        db.flush_memtable(&a).unwrap();
+        assert!(total_fragments(&a) > 0, "the span reached a table");
+        db.close().unwrap();
+    }
+    let db = open();
+    let a = db.get_column_family("a").unwrap();
+    let b = db.get_column_family("b").unwrap();
+    for i in 0..10 {
+        assert_eq!(db.get(&a, &key(i)).is_ok(), !(2..5).contains(&i), "a k{i:04}");
+        assert!(db.get(&b, &key(i)).is_ok(), "b k{i:04}");
+    }
+    assert!(db.get(&b, &key(20)).is_ok());
+    db.close().unwrap();
+}

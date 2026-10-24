@@ -149,6 +149,7 @@ fn sample_manifest() -> Manifest {
         generation: 3,
         applied_through: 17,
         next_edit_id: 18,
+        wal_floor: 0,
         wal_layout: WalLayout::Unified,
         instance_nonce: Some(0x0123_4567_89ab_cdef),
         caps: ondadb::format::CAP_EXTENDED_RECORDS

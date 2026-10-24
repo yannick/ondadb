@@ -563,7 +563,10 @@ fn fifo_ttl_evicts_aged_tables() {
             "fifo",
             ColumnFamilyConfig {
                 compaction_style: CompactionStyle::Fifo,
-                fifo_ttl: Duration::from_millis(400),
+                // FIFO age reads the real clock, so the margin is the whole
+                // test: `new` must still be younger than the TTL when the
+                // compaction runs. 400 ms evicted it under a loaded gate.
+                fifo_ttl: Duration::from_secs(2),
                 ..ColumnFamilyConfig::default()
             },
         )
@@ -571,7 +574,7 @@ fn fifo_ttl_evicts_aged_tables() {
 
     db.put(&cf, b"old", b"v", Duration::ZERO).unwrap();
     db.flush_memtable(&cf).unwrap();
-    std::thread::sleep(Duration::from_millis(600));
+    std::thread::sleep(Duration::from_millis(2_500));
     db.put(&cf, b"new", b"v", Duration::ZERO).unwrap();
     db.flush_memtable(&cf).unwrap();
 

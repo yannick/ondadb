@@ -194,6 +194,13 @@ pub const CAP_MANIFEST_EDITS: u64 = 1 << 4;
 pub const CAP_PERIODIC_AGE: u64 = 1 << 5;
 /// Persisted transaction decisions (3.2).
 pub const CAP_TXN_DECISIONS: u64 = 1 << 6;
+/// The unified WAL's replay floor (`manifest_file::DB_WAL_FLOOR`, edit op
+/// `SetWalFloor`): generations below it replay their control records only, so
+/// a generation a prepare keeps past its flush cannot bring back versions
+/// compaction has since changed. Implied by [`CAP_TXN_DECISIONS`], the only
+/// feature that keeps a flushed generation on disk. Database-level: never in a
+/// table's footer word.
+pub const CAP_WAL_FLOOR: u64 = 1 << 11;
 /// Capabilities a writer must hold before it may emit a prefix-delta table
 /// (2.1). Both, not just [`CAP_PREFIX_DELTA`]: a delta block *is* an extended
 /// block — the layout is defined only over the kind-bearing envelope — and
@@ -206,14 +213,16 @@ pub const CAPS_PREFIX_DELTA_WRITE: u64 = CAP_EXTENDED_RECORDS | CAP_PREFIX_DELTA
 /// [`CAP_EXTENDED_RECORDS`] is the permission for that envelope.
 pub const CAPS_MERGE_WRITE: u64 = CAP_EXTENDED_RECORDS | CAP_MERGE_OPERANDS;
 
-/// Mask of every capability bit this roadmap has assigned (`0x7F`).
+/// Mask of every capability bit this binary writes (`0x87F`); bits 7-10 are
+/// wavesdb's native profile ([`wavesdb_reserved`]).
 pub const KNOWN_CAPS: u64 = CAP_EXTENDED_RECORDS
     | CAP_MERGE_OPERANDS
     | CAP_RANGE_DELETES
     | CAP_PREFIX_DELTA
     | CAP_MANIFEST_EDITS
     | CAP_PERIODIC_AGE
-    | CAP_TXN_DECISIONS;
+    | CAP_TXN_DECISIONS
+    | CAP_WAL_FLOOR;
 
 /// Reject a capability word naming a bit this binary does not implement.
 pub fn check_caps(caps: u64) -> crate::error::Result<()> {
@@ -445,7 +454,11 @@ pub mod manifest_file {
     /// last_managed_commit u64` (requires `CAP_MANAGED_MODE`). Registered,
     /// outside [`DB_KNOWN`]: refused until this binary reads managed mode.
     pub const DB_MANAGED_STATE: u32 = 1 << 3;
-    pub const DB_KNOWN: u32 = DB_UNIFIED_WAL | DB_INSTANCE_NONCE | DB_EDIT_LOG;
+    /// Database flag: the unified WAL's replay floor, `generation u64`, the
+    /// lowest generation whose data records replay (requires `CAP_WAL_FLOOR`
+    /// and [`DB_UNIFIED_WAL`]; never 0, which is the absent default).
+    pub const DB_WAL_FLOOR: u32 = 1 << 4;
+    pub const DB_KNOWN: u32 = DB_UNIFIED_WAL | DB_INSTANCE_NONCE | DB_EDIT_LOG | DB_WAL_FLOOR;
     /// CF flag: the unified-layout CF id, `u64` — present only when it is not
     /// FNV-1a-64 of the name (plan C, F5′).
     pub const CF_UNIFIED_ID: u64 = 1 << 0;
@@ -489,7 +502,7 @@ pub mod manifest_file {
 }
 
 const _: () = assert!(is_printable_ascii(&manifest_file::MAGIC));
-const _: () = assert!(manifest_file::DB_KNOWN == 0x07);
+const _: () = assert!(manifest_file::DB_KNOWN == 0x17);
 const _: () = assert!(manifest_file::CF_KNOWN == 0x01);
 const _: () = assert!(manifest_file::SST_KNOWN == 0x7F);
 // The wavesdb-only sections stay outside the masks until a reader implements
@@ -955,8 +968,8 @@ mod tests {
         use cf_config::tag::*;
         use manifest_file::*;
         assert_eq!(
-            [DB_UNIFIED_WAL, DB_INSTANCE_NONCE, DB_EDIT_LOG, DB_MANAGED_STATE],
-            [0x1, 0x2, 0x4, 0x8]
+            [DB_UNIFIED_WAL, DB_INSTANCE_NONCE, DB_EDIT_LOG, DB_MANAGED_STATE, DB_WAL_FLOOR],
+            [0x1, 0x2, 0x4, 0x8, 0x10]
         );
         assert_eq!([CF_UNIFIED_ID, CF_SHARED_BLOBS], [0x1, 0x2]);
         assert_eq!(
@@ -1029,11 +1042,12 @@ mod tests {
         assert_eq!(CAP_MANIFEST_EDITS, 0x10);
         assert_eq!(CAP_PERIODIC_AGE, 0x20);
         assert_eq!(CAP_TXN_DECISIONS, 0x40);
+        assert_eq!(CAP_WAL_FLOOR, 0x800);
     }
 
     #[test]
-    fn known_caps_is_0x7f() {
-        assert_eq!(KNOWN_CAPS, 0x7F);
+    fn known_caps_is_0x87f() {
+        assert_eq!(KNOWN_CAPS, 0x87F);
         assert!(check_caps(KNOWN_CAPS).is_ok());
         let err = check_caps(1 << 7).expect_err("an unassigned capability bit must fail closed");
         assert_eq!(err.kind(), "unsupported_format");

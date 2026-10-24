@@ -77,7 +77,7 @@ pub const TABLE_CAPS: u64 = CAP_EXTENDED_RECORDS
 /// declare their own encoding per block.
 const RECORD_CAPS: u64 = CAP_MERGE_OPERANDS | CAP_RANGE_DELETES | CAP_PREFIX_DELTA;
 
-const _: () = assert!(KNOWN_CAPS == 0x7FF);
+const _: () = assert!(KNOWN_CAPS == 0xFFF);
 const _: () = assert!(TABLE_CAPS & !KNOWN_CAPS == 0);
 const _: () = assert!(
     TABLE_CAPS & (CAP_MANIFEST_EDITS | CAP_PERIODIC_AGE | CAP_TXN_DECISIONS | CAP_MANAGED_MODE)
@@ -171,6 +171,8 @@ pub struct Catalog {
     /// last caller-assigned commit; both zero outside managed mode.
     pub discard_seq: u64,
     pub last_managed_commit: u64,
+    /// The unified WAL's replay floor (`CAP_WAL_FLOOR`); 0 when absent.
+    pub wal_floor: u64,
     pub cfs: Vec<Family>,
 }
 
@@ -187,6 +189,7 @@ impl Default for Catalog {
             next_edit_id: 1,
             discard_seq: 0,
             last_managed_commit: 0,
+            wal_floor: 0,
             cfs: Vec::new(),
         }
     }
@@ -230,6 +233,7 @@ impl Catalog {
             generation: self.generation,
             applied_through: self.applied_through,
             next_edit_id: self.next_edit_id,
+            wal_floor: self.wal_floor,
         })
     }
 }

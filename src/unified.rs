@@ -227,6 +227,7 @@ impl UnifiedStore {
         wal_syncs: Arc<std::sync::atomic::AtomicU64>,
         format: crate::format::FormatProfile,
         caps: u64,
+        wal_floor: u64,
     ) -> Result<(Arc<UnifiedStore>, u64, crate::prepared::RecoveredPrepares)> {
         let mem = Memtable::new(default_comparator());
         let mut max_seq = 0;
@@ -254,8 +255,15 @@ impl UnifiedStore {
         for g in &gens {
             let p = wal_path(dir, *g);
             replay_paths.push(p.clone());
+            // Below the replay floor every data record is already in a table
+            // (or was, before compaction changed it), so only the control
+            // records are read. The returned watermark still counts the skipped
+            // records: `Wal::replay` derives it from every record it decodes.
+            let data = *g >= wal_floor;
             let mut apply = |rec| {
                 match rec {
+                    crate::wal::ReplayRecord::Point(_) | crate::wal::ReplayRecord::RangeDelete { .. }
+                        if !data => {}
                     crate::wal::ReplayRecord::Point(r) => {
                         mem.put(&r.key, r.value, r.seq, r.ttl, r.kind);
                     }
@@ -314,7 +322,11 @@ impl UnifiedStore {
         if format == crate::format::FormatProfile::Waves08 {
             recovered.waves08 = Some(waves_prepares);
         }
-        let next_gen = gens.last().map(|g| g + 1).unwrap_or(0);
+        // Never below the floor: a directory can carry one and no segment at
+        // all (a checkpoint or backup copies the catalog but no WAL), and a
+        // generation numbered below it would have its data skipped at the
+        // next replay as already flushed.
+        let next_gen = gens.last().map(|g| g + 1).unwrap_or(0).max(wal_floor);
         let wbs = if opts.unified_memtable_write_buffer_size > 0 {
             opts.unified_memtable_write_buffer_size
         } else {
@@ -540,60 +552,116 @@ impl UnifiedStore {
         }
     }
 
+    /// Take a writer slot: wait out a rotation (and the immutable-count stall),
+    /// then count this writer in. Rotation drains every slot before it swaps
+    /// the memtable/WAL pair, so everything a slot holder writes lands in one
+    /// generation and its memtable.
+    fn enter_writer(&self) {
+        let mut g = self.rot.lock();
+        loop {
+            let stalled = g.rotating
+                || (self.state.read().imm.len() >= self.stall_threshold
+                    && !self.closing.load(Ordering::Relaxed));
+            if stalled {
+                self.cond.wait(&mut g);
+            } else {
+                break;
+            }
+        }
+        g.active_writers += 1;
+    }
+
+    fn exit_writer(&self) {
+        let mut g = self.rot.lock();
+        g.active_writers -= 1;
+        self.cond.notify_all();
+    }
+
+    /// Insert `items` into `mem` at `start + slot`, cf-id prefixed.
+    fn insert_at(mem: &Memtable, items: &[(u64, wal::RecordRef<'_>)], start: u64) {
+        let total: usize = items.iter().map(|(_, r)| 8 + r.key.len()).sum();
+        let mut scratch = Vec::with_capacity(total);
+        let mut ends = Vec::with_capacity(items.len());
+        for (id, r) in items {
+            scratch.extend_from_slice(&id.to_be_bytes());
+            scratch.extend_from_slice(r.key);
+            ends.push(scratch.len());
+        }
+        let mut at = 0usize;
+        let mut recs = Vec::with_capacity(items.len());
+        for (slot, ((_, r), &end)) in items.iter().zip(&ends).enumerate() {
+            recs.push(wal::RecordRef {
+                key: &scratch[at..end],
+                seq: start + slot as u64,
+                ..*r
+            });
+            at = end;
+        }
+        mem.put_batch(&recs);
+    }
+
     pub(crate) fn apply_memtable_only(
         self: &Arc<Self>,
         items: &[(u64, wal::RecordRef<'_>)],
         start: u64,
     ) -> Result<()> {
-        {
-            let mut g = self.rot.lock();
-            loop {
-                let stalled = g.rotating
-                    || (self.state.read().imm.len() >= self.stall_threshold
-                        && !self.closing.load(Ordering::Relaxed));
-                if stalled {
-                    self.cond.wait(&mut g);
-                } else {
-                    break;
-                }
-            }
-            g.active_writers += 1;
-        }
+        self.enter_writer();
+        // No fallible step here: the memtable insert cannot fail, so the body
+        // runs straight through to the slot's release.
         let mem = self.state.read().mem.clone();
-        // No fallible step here — unlike `apply_with_ranges`, which wraps its
-        // body in a closure so a WAL append failure still reaches the
-        // `active_writers` decrement below. The memtable insert cannot fail, so
-        // the body runs straight through.
-        {
-            let total: usize = items.iter().map(|(_, r)| 8 + r.key.len()).sum();
-            let mut scratch = Vec::with_capacity(total);
-            let mut ends = Vec::with_capacity(items.len());
-            for (id, r) in items {
-                scratch.extend_from_slice(&id.to_be_bytes());
-                scratch.extend_from_slice(r.key);
-                ends.push(scratch.len());
-            }
-            let mut at = 0usize;
-            let mut recs = Vec::with_capacity(items.len());
-            for (slot, ((_, r), &end)) in items.iter().zip(&ends).enumerate() {
-                recs.push(wal::RecordRef {
-                    key: &scratch[at..end],
-                    seq: start + slot as u64,
-                    ..*r
-                });
-                at = end;
-            }
-            mem.put_batch(&recs);
-        }
-        {
-            let mut g = self.rot.lock();
-            g.active_writers -= 1;
-            self.cond.notify_all();
-        }
+        Self::insert_at(&mem, items, start);
+        self.exit_writer();
         if mem.approx_size() >= self.write_buffer_size as i64 {
             self.rotate(false);
         }
         Ok(())
+    }
+
+    /// Write a prepared transaction's decision durably and, for a commit,
+    /// install its records at `start + slot` — **under one writer slot**, so
+    /// the decision frame and the records share a generation. The replay floor
+    /// depends on it: a commit decision found below the floor installs nothing,
+    /// on the grounds that its records reached that generation's memtable,
+    /// which was flushed. A rotation between the two steps would leave the
+    /// records in the next memtable with the decision behind the floor, and a
+    /// crash after the older flush would lose a committed transaction.
+    ///
+    /// Returns the decision's generation, for the pin bookkeeping, also on
+    /// failure (`0` when the store has no WAL).
+    pub(crate) fn commit_decision(
+        self: &Arc<Self>,
+        id: &[u8; 16],
+        commit: Option<(u64, u64)>,
+        items: &[(u64, wal::RecordRef<'_>)],
+    ) -> (Result<()>, u64) {
+        self.enter_writer();
+        let (wal, gen, mem) = {
+            let s = self.state.read();
+            (s.wal.clone(), s.wal_gen, s.mem.clone())
+        };
+        let (res, gen) = match wal {
+            None => (
+                Err(crate::error::OndaError::InvalidDb("unified wal closed".into())),
+                0,
+            ),
+            Some(wal) => (
+                wal.append_decision(wal::ENVELOPE_SCHEMA_UNIFIED, id, commit)
+                    .and_then(|()| wal.sync()),
+                gen,
+            ),
+        };
+        if res.is_ok() {
+            if let Some((start, n)) = commit {
+                if n > 0 {
+                    Self::insert_at(&mem, items, start);
+                }
+            }
+        }
+        self.exit_writer();
+        if res.is_ok() && mem.approx_size() >= self.write_buffer_size as i64 {
+            self.rotate(false);
+        }
+        (res, gen)
     }
 
     /// Resolve `user_key` for column family `id`.
@@ -872,6 +940,27 @@ impl UnifiedStore {
         self.state.read().imm.clone()
     }
 
+    /// The lowest WAL generation still covered by an unflushed memtable other
+    /// than `flushing`: every other sealed immutable, and the active memtable.
+    /// It is the replay floor a flush of `flushing` may raise to. Flushes run
+    /// on several workers and finish out of order, so a newer immutable must
+    /// never move the floor past an older one still being written — hence the
+    /// minimum over what is left, never `flushing`'s newest generation + 1.
+    /// An immutable whose flush already committed but which is not yet removed
+    /// only holds the floor back until the next flush; it never lets it run
+    /// ahead.
+    pub(crate) fn lowest_unflushed_gen(&self, flushing: &Arc<UnifiedImm>) -> u64 {
+        let s = self.state.read();
+        s.imm
+            .iter()
+            .filter(|imm| !Arc::ptr_eq(imm, flushing))
+            .flat_map(|imm| imm.wal_paths.iter())
+            .chain(s.pending_wals.iter())
+            .filter_map(|p| crate::prepared::WalGenState::gen_of_path(p))
+            .min()
+            .unwrap_or(s.wal_gen)
+    }
+
     /// Remove a flushed immutable from the queue.
     pub(crate) fn remove_imm(&self, imm: &Arc<UnifiedImm>) {
         // Match the writer predicate's lock order (`rot` then `state`) so a
@@ -1021,6 +1110,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
             0,
+            0,
         )
         .unwrap();
 
@@ -1056,9 +1146,39 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
             0,
+            0,
         )
         .unwrap();
         store
+    }
+
+    /// The replay floor a flush may raise to is the lowest generation of the
+    /// memtables still unflushed — never past an older immutable when a newer
+    /// one finishes first, as flush workers allow.
+    #[test]
+    fn the_floor_never_passes_an_older_unflushed_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(&dir);
+        let gen = |s: &UnifiedStore| s.state.read().wal_gen;
+        let first = gen(&store);
+        store.apply_with_ranges(&[(7, record(b"a", 1))], &[]).unwrap();
+        store.rotate(true);
+        store.apply_with_ranges(&[(7, record(b"b", 2))], &[]).unwrap();
+        store.rotate(true);
+        let (older, newer) = {
+            let s = store.state.read();
+            assert_eq!(s.imm.len(), 2);
+            (s.imm[0].clone(), s.imm[1].clone())
+        };
+        let active = gen(&store);
+        assert_eq!(active, first + 2);
+        // The newer one finishing first: held back by the older.
+        assert_eq!(store.lowest_unflushed_gen(&newer), first);
+        // The older one: up to the newer, still unflushed.
+        assert_eq!(store.lowest_unflushed_gen(&older), first + 1);
+        store.remove_imm(&older);
+        // Then the newer one alone: up to the active memtable.
+        assert_eq!(store.lowest_unflushed_gen(&newer), active);
     }
 
     #[test]
@@ -1078,6 +1198,7 @@ mod tests {
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
+            0,
             0,
         )
         .unwrap();
@@ -1258,6 +1379,7 @@ mod tests {
             Arc::new(crate::util::Poison::new()),
             Arc::new(AtomicU64::new(0)),
             crate::format::FormatProfile::Epoch1,
+            0,
             0,
         )
         .unwrap();

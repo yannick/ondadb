@@ -90,9 +90,11 @@ own bytes use in its footer's capability word (§ Footer).
 | `1 << 3` | `CAP_PREFIX_DELTA` | 2.1 |
 | `1 << 4` | `CAP_MANIFEST_EDITS` | 2.2 |
 | `1 << 5` | `CAP_PERIODIC_AGE` | 0.3 |
-| `1 << 6` | `CAP_TXN_DECISIONS` | 3.2 — prepare/decision records; implies `CAP_EXTENDED_RECORDS` |
+| `1 << 6` | `CAP_TXN_DECISIONS` | 3.2 — prepare/decision records; implies `CAP_EXTENDED_RECORDS` and `CAP_WAL_FLOOR` |
+| `1 << 11` | `CAP_WAL_FLOOR` | the unified WAL's replay floor (§ Replay floor) |
 
-`KNOWN_CAPS = 0x7F`. The values are an interoperability contract with wavesdb:
+`KNOWN_CAPS = 0x87F` (bits 7–10 are wavesdb's native profile, in the
+registry). The values are an interoperability contract with wavesdb:
 a bit is never renumbered, only retired. Enabling is **one-way and idempotent**.
 A bit outside `KNOWN_CAPS` in a manifest or a footer is `UnsupportedFormat`.
 
@@ -758,6 +760,7 @@ off  field
  32  global_seq u64
  40  [0x2 DB_INSTANCE_NONCE]  nonce u64
      [0x4 DB_EDIT_LOG]        generation u64 | applied_through u64 | next_edit_id u64
+     [0x10 DB_WAL_FLOOR]      generation u64   (§ Replay floor; db 0x8 is wavesdb's)
      cf_count uvarint
      per CF:  cf_flags uvarint | name* | config* | [0x1 CF_UNIFIED_ID] id u64
               | sst_count uvarint
@@ -804,6 +807,7 @@ temp path is fixed, so all saves MUST be serialized by `DbInner::manifest_mu`
 | `SST_LAST_COMPACTION_TIME` without `CAP_PERIODIC_AGE`; `SST_RANGE` without `CAP_RANGE_DELETES` | `Corruption` — nothing stamps a table before the bit is durable |
 | a range summary naming zero fragments, an empty bound, or `min_seq > max_seq` | `Corruption` |
 | `CF_UNIFIED_ID` equal to FNV-1a-64 of the name | `Corruption` — the derived id is never written |
+| `DB_WAL_FLOOR` without `CAP_WAL_FLOOR` or without `DB_UNIFIED_WAL`, or at its empty default 0 | `Corruption` |
 | a table level above `u32`, invalid UTF-8 in a name | `Corruption` |
 
 The config blob is the `ColumnFamilyConfig::encode` TLV (§ Config blob);
@@ -906,6 +910,81 @@ id). Split flush strips the prefix and re-sorts each CF's slice with that CF's
 comparator. The manifest's `DB_UNIFIED_WAL` flag prevents reopening a non-empty
 database under a different WAL layout.
 
+Generations are numbered consecutively: a rotation opens `gen + 1`, and an open
+appends to `max(max(gen) + 1, wal_floor)` (§ Replay floor; 0 when there is
+neither a segment nor a floor). A memtable covers a contiguous run of generations —
+the first memtable after an open covers every replayed generation plus the new
+one — and memtables never share a generation.
+
+### Replay floor (`DB_WAL_FLOOR`, `CAP_WAL_FLOOR`)
+
+A flushed generation is normally unlinked once the flush's catalog edit is
+durable. One that holds an undecided prepare, or a decision whose prepare is
+still on disk, is kept (§ Kinds 16–18). Replaying a kept generation whole would
+put versions a flush already wrote back into the memtable, and once compaction
+has folded or dropped what shadowed them a read changes: a merge base folded
+into a put at an operand's sequence comes back as the operand alone, and a put
+whose tombstone was dropped together with it comes back to life. The floor
+records which generations' data is already in tables.
+
+- **The field.** `wal_floor` is the lowest unified generation whose data
+  records are not known to be in tables. In every generation below it, each
+  data record (kinds 1–5) is in a table, or was in one before compaction
+  removed it. Absent means 0: every generation replays whole.
+- **Writing it.** A unified flush's catalog edit carries `SetWalFloor(f)`
+  beside its `AddTable` ops, so the floor and the tables become durable in one
+  record (one snapshot without `CAP_MANIFEST_EDITS`). `f` is the lowest
+  generation covered by any memtable **other than the one being flushed** that
+  is not yet flushed — the active memtable and every other sealed one. Flushes
+  run concurrently and may finish out of order, so `f` is never "the flushed
+  memtable's newest generation + 1": a newer memtable finishing first must not
+  move the floor past an older one still being written. The edit omits the op
+  when `f` is not above the current floor, and the floor is computed and
+  appended under the lock that serializes catalog edits, so the values a log
+  holds increase strictly. A flush that publishes no edit (a failed slice)
+  moves no floor.
+- **Replay.** A generation `g < wal_floor` is read for its control records
+  only. Prepares and decisions are recovered exactly as above; a data record
+  is not installed, but its sequence still raises the recovered watermark. A
+  commit decision found in such a generation installs nothing: its records
+  reached the memtable of that generation, which has been flushed. The prepare
+  it names is still resolved as committed and its reservation released. A
+  generation at or above the floor replays as before.
+- **The writer rule this depends on.** A commit decision's frame and the
+  memtable insert of its records happen under **one writer slot** — the
+  count a rotation drains before it swaps the memtable and WAL — so both land
+  in one generation. Appending the decision, releasing the slot and inserting
+  under a second one lets a rotation fall between them: the records go into
+  the next memtable, the floor passes the decision's generation when it
+  flushes, and a crash before the next flush loses a committed transaction.
+- **An install that did not finish.** If inserting a durable commit's
+  records fails partway (an engine that streams a large transaction's records
+  from elsewhere can fail there), the decision's generation must stay on disk
+  and at or above the floor for the rest of the process, or the process must
+  stop making catalog edits. Otherwise a flush of that memtable moves the
+  floor past a decision whose records it holds only in part, and recovery,
+  finding the decision below the floor, installs nothing.
+- **Retirement** is unchanged. A generation below the floor is unlinked unless
+  a prepare or a decision pins it.
+- **Opening never appends below the floor.** A directory can hold a floor and
+  no segment at or above it: a checkpoint or backup copies the catalog but no
+  WAL. An open that numbered its generation from the segments alone would
+  start below the floor, and the next replay would skip that generation's data
+  as already flushed. The new generation is `max(max(gen) + 1, wal_floor)`.
+- **The capability.** `DB_WAL_FLOOR` and `SetWalFloor` need `CAP_WAL_FLOOR`
+  (bit 11). An engine without it refuses the database as `UnsupportedFormat`,
+  rather than replaying into the failure above. The bit is taken with
+  `CAP_TXN_DECISIONS`, which expands to include it, because only a prepare can
+  keep a flushed generation on disk. A database that holds `CAP_TXN_DECISIONS`
+  without it (written before the floor existed) takes it at its next
+  read-write open, before that open's first flush. A read-only open never takes
+  it.
+- **Databases without a floor.** Until the bit is durable such a database
+  replays every generation whole, as before. An engine logs a warning when it
+  recovers an undecided prepare from a generation older than the newest
+  without a floor, because that generation may hold versions compaction has
+  since changed. Nothing is refused.
+
 ## `MANIFEST-EDITS` (2.2)
 
 A full `MANIFEST` rewrite costs O(catalog) bytes and one fsync per structural
@@ -1006,8 +1085,9 @@ keys absent.
 | 11 | `SetCapability` | bits u64 | `KNOWN_CAPS` only |
 | 12 | `RemoveTables` | cf str, count, id × count | every id present in cf |
 | 13 | `SetCFUnifiedId` | name str, id u64 | name present; applied as "no override" when `id` is the derived FNV |
+| 14 | `SetWalFloor` | generation uvarint | `CAP_WAL_FLOOR` durable; unified layout; `value > current` (§ Replay floor) |
 
-Codes 14..63 are unassigned and reject as `Corruption` naming the code and the
+Codes 15..63 are unassigned and reject as `Corruption` naming the code and the
 op index; codes ≥ 64 are never assigned, mirroring the WAL's kind rule.
 
 Column families are **name-keyed**: `CfManifest.name` is a CF's only catalog

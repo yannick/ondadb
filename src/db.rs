@@ -342,6 +342,12 @@ pub struct DbInner {
     /// A leaf lock: flush workers take it holding nothing, and no path holds it
     /// while taking `prepared` or `commit_mu`.
     pub(crate) wal_gens: Mutex<crate::prepared::WalGenState>,
+    /// The durable replay floor of the unified WAL (`CAP_WAL_FLOOR`): the
+    /// lowest generation whose data records replay. Raised only inside a
+    /// unified flush's `catalog_txn`, whose edit closure computes it under
+    /// `manifest_mu` and whose publish stores it, so a snapshot written in the
+    /// same critical section carries the value the edit made durable.
+    pub(crate) wal_floor: AtomicU64,
 
     next_file_id: AtomicU64,
     pub(crate) closing: Arc<AtomicBool>,
@@ -1001,6 +1007,18 @@ impl DbInner {
         self.prepared_live.store(reg.len(), Ordering::Relaxed);
     }
 
+    /// The replay floor a unified flush of `imm` raises the catalog to, or
+    /// `None` when it would not rise (or the database has no floor). Called
+    /// under `manifest_mu`, which every floor write holds, so the comparison
+    /// with the durable value cannot race another flush.
+    pub(crate) fn next_wal_floor(&self, imm: &Arc<crate::unified::UnifiedImm>) -> Option<u64> {
+        if self.caps() & crate::format::CAP_WAL_FLOOR == 0 {
+            return None;
+        }
+        let floor = self.unified.as_ref()?.lowest_unflushed_gen(imm);
+        (floor > self.wal_floor.load(Ordering::SeqCst)).then_some(floor)
+    }
+
     /// Hand a flush's WAL paths to the pin registry instead of unlinking them
     /// directly, then run the sweep (3.2).
     ///
@@ -1084,7 +1102,15 @@ impl DbInner {
                     if count > 0 {
                         self.observe_seq(commit_seq + count - 1);
                     }
-                    self.apply_recovered_prepare(&p, commit_seq)?;
+                    // Below the replay floor the decision's generation was
+                    // flushed, and its records went into that generation's
+                    // memtable with it (`UnifiedStore::commit_decision`), so
+                    // they are in a table — or were, before compaction changed
+                    // them. Installing them again is the resurrection the floor
+                    // exists to prevent.
+                    if decision_gen >= self.wal_floor.load(Ordering::SeqCst) {
+                        self.apply_recovered_prepare(&p, commit_seq)?;
+                    }
                     // `record_pair`, not `resolved`: this prepare was never
                     // registered and never pinned, so releasing a pin here
                     // would take one another transaction holds on the same
@@ -1098,6 +1124,23 @@ impl DbInner {
                     self.wal_gens.lock().record_pair(p.id, p.gen, decision_gen);
                 }
                 None => {
+                    // Without a floor every generation replayed whole. One older
+                    // than the newest was flushed while this prepare kept it,
+                    // and compaction may since have changed what shadowed its
+                    // versions — the failure the floor closes from the next
+                    // flush on.
+                    if self.caps() & crate::format::CAP_WAL_FLOOR == 0 {
+                        let newest = self.unified.as_ref().map(|u| u.wal_handle().1);
+                        if newest.is_some_and(|n| p.gen + 1 < n) {
+                            crate::util::log_warn(&format!(
+                                "prepared transaction recovered from WAL generation {} in a \
+                                 database without a replay floor (CAP_WAL_FLOOR): that \
+                                 generation was replayed whole, and versions a flush already \
+                                 wrote may have reappeared if compaction changed them since",
+                                p.gen
+                            ));
+                        }
+                    }
                     let entry = recovered_entry(&p, now);
                     let mut reg = self.prepared.lock();
                     reg.register_recovered(entry);
@@ -1169,13 +1212,16 @@ impl DbInner {
         prepares: crate::waves08::wal::Prepares,
         manifest: &Manifest,
     ) -> Result<()> {
-        let (records, max_seq) = prepares.finish(|name| {
-            manifest
-                .cfs
-                .iter()
-                .find(|cf| cf.name == name)
-                .map(|cf| cf.effective_unified_id())
-        })?;
+        let (records, max_seq) = prepares.finish(
+            |name| {
+                manifest
+                    .cfs
+                    .iter()
+                    .find(|cf| cf.name == name)
+                    .map(|cf| cf.effective_unified_id())
+            },
+            manifest.wal_floor,
+        )?;
         self.observe_seq(max_seq);
         if let Some(unified) = &self.unified {
             unified.install_replayed(records);
@@ -1434,6 +1480,7 @@ impl DbInner {
             generation: st.generation,
             applied_through: st.applied_through,
             next_edit_id: st.next_edit_id,
+            wal_floor: self.wal_floor.load(Ordering::SeqCst),
         };
         for cf in cfs.values() {
             m.cfs.push(CfManifest {
@@ -1620,6 +1667,14 @@ impl DbInner {
             != 0
         {
             bits | crate::format::CAP_EXTENDED_RECORDS
+        } else {
+            bits
+        };
+        // A prepare is the only thing that keeps a flushed unified generation
+        // on disk, and replaying one without a floor brings back versions
+        // compaction has since changed. So the floor rides with the decisions.
+        let bits = if bits & crate::format::CAP_TXN_DECISIONS != 0 {
+            bits | crate::format::CAP_WAL_FLOOR
         } else {
             bits
         };
@@ -2214,6 +2269,7 @@ fn build_db_inner(
         &wal_syncs,
         format,
         manifest.caps,
+        manifest.wal_floor,
     )?;
     // Built once and shared: `None` unless background IO is limited, so the
     // default configuration costs one nil check at each charge point.
@@ -2278,6 +2334,7 @@ fn build_db_inner(
         )),
         prepared_live: AtomicUsize::new(0),
         wal_gens: Mutex::new(crate::prepared::WalGenState::default()),
+        wal_floor: AtomicU64::new(manifest.wal_floor),
         next_file_id: AtomicU64::new(manifest.next_file_id.max(1)),
         closing,
         stop,
@@ -2359,26 +2416,6 @@ fn commit_prepared_durably(
     start: u64,
     n: u64,
 ) -> (Result<()>, u64) {
-    // The handle and its generation in one acquisition, per phase rule 2: a
-    // frame written just before a rotation cannot be synced through the store's
-    // `sync_wal`, which re-clones the *current* WAL.
-    let (wal, decision_gen) = unified.wal_handle();
-    let Some(wal) = wal else {
-        return (Err(OndaError::InvalidDb("unified wal closed".into())), 0);
-    };
-    let durable = wal
-        .append_decision(
-            crate::wal::ENVELOPE_SCHEMA_UNIFIED,
-            id,
-            Some((start, n)),
-        )
-        .and_then(|()| wal.sync());
-    if let Err(error) = durable {
-        return (Err(error), decision_gen);
-    }
-    if n == 0 {
-        return (Ok(()), decision_gen);
-    }
     let items: Vec<(u64, crate::wal::RecordRef<'_>)> = entry
         .records()
         .map(|(cf_id, key, value, w)| {
@@ -2396,8 +2433,12 @@ fn commit_prepared_durably(
         .collect();
     // NOT `UnifiedStore::apply`: that writes the WAL as well, and a second full
     // copy of the writeset would leave recovery reconciling a decision against
-    // an ordinary frame. The decision above is this batch's durable record.
-    (unified.apply_memtable_only(&items, start), decision_gen)
+    // an ordinary frame. The decision is this batch's durable record, and it
+    // shares one writer slot with the memtable insert, so both land in one
+    // generation (the replay floor's premise; see `commit_decision`). The
+    // handle is synced directly, per phase rule 2: a frame written just before
+    // a rotation cannot be synced through the store's `sync_wal`.
+    unified.commit_decision(id, Some((start, n)), &items)
 }
 
 /// Deliver commit hooks for a prepared commit, rebuilding the `CommitOp` values
@@ -2495,6 +2536,7 @@ fn open_unified_store(
     wal_syncs: &Arc<AtomicU64>,
     format: crate::format::FormatProfile,
     caps: u64,
+    wal_floor: u64,
 ) -> Result<(
     Option<Arc<crate::unified::UnifiedStore>>,
     u64,
@@ -2513,6 +2555,7 @@ fn open_unified_store(
         wal_syncs.clone(),
         format,
         caps,
+        wal_floor,
     )?;
     Ok((Some(store), max_seq, recovered))
 }
@@ -2696,11 +2739,24 @@ fn finish_open(
         return Ok(());
     }
     ensure_instance_nonce(inner)?;
+    ensure_wal_floor(inner)?;
     // The sweep must run after recovery and before workers, so no move races
     // the manifest-as-source-of-truth cleanup.
     sweep_move_orphans(inner, manifest);
     spawn_workers(inner, receivers.flush, receivers.compact);
     Ok(())
+}
+
+/// A database that took `CAP_TXN_DECISIONS` before the replay floor existed
+/// takes `CAP_WAL_FLOOR` now, before this open's first flush, so that flush
+/// already records a floor. Until then its pinned generations replay whole, as
+/// they always did; recovery warned if that may have mattered.
+fn ensure_wal_floor(inner: &Arc<DbInner>) -> Result<()> {
+    let caps = inner.caps();
+    if caps & crate::format::CAP_TXN_DECISIONS == 0 || caps & crate::format::CAP_WAL_FLOOR != 0 {
+        return Ok(());
+    }
+    inner.enable_capability(crate::format::CAP_WAL_FLOOR)
 }
 
 fn ensure_instance_nonce(inner: &Arc<DbInner>) -> Result<()> {
@@ -3801,6 +3857,13 @@ impl DB {
     /// A test lever for the "crash after decision fsync, before apply" row of
     /// the 3.2 crash matrix. That window is a single unbroken sequence in
     /// production, so it can only be entered deliberately.
+    ///
+    /// The database is poisoned once the decision is durable, because the
+    /// process this models is dead: nothing after the decision may reach the
+    /// disk. Without it `Drop`'s final flush would make the catalog durable
+    /// past the decision, raising the replay floor over a decision whose
+    /// records sit in no memtable — a state `UnifiedStore::commit_decision`
+    /// rules out, since it inserts them under the decision's writer slot.
     #[doc(hidden)]
     pub fn commit_prepared_stop_after_decision_for_tests(&self, id: &[u8; 16]) -> Result<()> {
         let db = &self.inner;
@@ -3828,7 +3891,9 @@ impl DB {
             db.publish_range(start, start + n);
         }
         drop(guard);
-        durable
+        durable?;
+        db.trip_poison("stopped after the decision fsync (test lever)".into());
+        Ok(())
     }
 
     /// Append and fsync an **abort** decision for an arbitrary id, resolving
@@ -4308,12 +4373,30 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
     if all_slices_flushed {
         let published: Vec<Arc<ColumnFamily>> = staged.iter().map(|(cf, _)| cf.clone()).collect();
         let install = staged;
+        // The replay floor rides in the same edit as the tables, computed under
+        // `manifest_mu` (the edit closure) so the values the log holds increase
+        // strictly whatever order concurrent flushes commit in.
+        let raised = std::cell::Cell::new(None);
         if db
-            .catalog_txn(edit, |p| {
-                for (cf, handle) in install {
-                    cf.install_handles_l0(vec![handle], p);
-                }
-            })
+            .catalog_txn_built(
+                || {
+                    let mut edit = edit;
+                    if let Some(floor) = db.next_wal_floor(&imm) {
+                        edit.push(crate::manifest_edit::Op::SetWalFloor(floor));
+                        raised.set(Some(floor));
+                    }
+                    Ok(edit)
+                },
+                |p| {
+                    for (cf, handle) in install {
+                        cf.install_handles_l0(vec![handle], p);
+                    }
+                    if let Some(floor) = raised.get() {
+                        db.wal_floor.store(floor, Ordering::SeqCst);
+                    }
+                },
+                |_| {},
+            )
             .is_ok()
         {
             // Not a bare `remove_wal_files`: a generation holding an unresolved

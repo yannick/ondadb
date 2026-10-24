@@ -75,6 +75,7 @@ fn snapshot() -> Manifest {
         generation: 2,
         applied_through: 4,
         next_edit_id: 5,
+        wal_floor: 0,
         wal_layout: WalLayout::PerColumnFamily,
         instance_nonce: None,
         caps: CAP_EXTENDED_RECORDS | CAP_MANIFEST_EDITS,

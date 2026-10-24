@@ -2,8 +2,40 @@
 
 ## Unreleased
 
+### Format
+
+- **The unified WAL's replay floor, `CAP_WAL_FLOOR` (bit 11).** The catalog
+  records the lowest unified WAL generation whose data records replay
+  (manifest db section `0x10`, edit op 14 `SetWalFloor`), raised by every
+  unified flush in the same edit as its tables. Below it, a reopen reads only
+  prepares and decisions. `CAP_TXN_DECISIONS` implies the bit; a database that
+  took `CAP_TXN_DECISIONS` before this release takes it at its next read-write
+  open, and until then replays as before, logging a warning when it recovers a
+  prepare from an older generation. A binary without the bit refuses such a
+  database as `UnsupportedFormat`. wavesdb's native schema-2 op 19 is read
+  too. Spec: yolodb-format `epoch1.md` § Replay floor.
+
 ### Fixes
 
+- **A generation kept by a prepare no longer brings back deleted data.** A
+  unified WAL generation that an undecided prepare keeps past its flush was
+  replayed whole on every open. Where compaction had since dropped a put
+  together with the tombstone above it (whose generation was unlinked), the
+  put came back; a merge chain came back the same way, and a committed prepare
+  whose decision sat in such a generation was installed again. The replay
+  floor above ends it.
+- **A prepared commit's decision and its records share a generation.** The
+  decision was appended and synced under one writer slot and the records
+  inserted under another, so a rotation could fall between them. Harmless
+  before the replay floor; with it, a crash after the older generation's flush
+  would have lost the commit. Both steps now hold one slot.
+- **An open never appends below the replay floor.** A checkpoint or backup
+  copies the catalog, floor included, but no WAL segment, and an open numbered
+  its new generation from the segments alone — from 0, below the floor — so a
+  crash before the copy's first flush dropped its writes at replay. An open
+  now appends at `max(newest segment + 1, floor)`. The test lever that stops
+  `commit_prepared` after the decision now poisons the database, as the crash
+  it models would end it.
 - **A flushed merge operand no longer counts twice after a reopen.** A
   unified WAL generation that an undecided prepare pins is replayed whole on
   every open, including records an earlier flush already wrote to a table.
