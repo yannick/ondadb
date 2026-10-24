@@ -13,6 +13,14 @@
   count one version per sequence. The same applies to a wavesdb directory read
   read-only, whose retained WAL holds a committed prepare that is also in a
   table. Found by the yolodb-format harness's new `prepared` scenario.
+- **A replayed operand no longer takes its own folded copy as its base.**
+  When compaction had folded the chain before the reopen, the table holds the
+  version as a put (`base|x` at `x`'s sequence) while the replay puts the
+  operand `x` back in the memtable. Iterators skipped a second copy only when
+  it was an operand too, so a forward scan took the put as the base and read
+  `base|x|x`, while a point read and a reverse scan read `base|x`. Every later
+  copy of a sequence is now skipped whatever its kind; the newest source's copy
+  counts, as on the point-read path.
 - **`close` on a read-only handle no longer refuses with `Busy`** while
   prepared transactions are unresolved. Such a handle cannot resolve them
   (`commit_prepared` is `ReadOnly` there), so the refusal could never be acted
