@@ -312,8 +312,8 @@ Notes:
   is on S3, and the S3 objects are deleted through the tier afterwards, via
   the same pausable deletion path). A crash before the flip leaves the part
   where it was and its partial local copy is swept at open; a crash after it
-  leaves a stale source copy, swept at open on a local tier (not on S3 — the
-  S3 orphan gap below). Tables published on a **shared** tier never move.
+  leaves a stale source copy, swept at open on a local or S3 tier. Tables
+  published on a **shared** tier never move.
 - A partition with no tier rule stays wherever it was written (the default
   tier — compaction output always lands there).
 
@@ -613,7 +613,7 @@ opportunistic and declines rather than waits.
 
 | Situation | Behavior |
 | --- | --- |
-| Table on a **named or shared tier** | Refused. Obsolete-file deletion resolves default-tier paths only (see the S3 leak gap below), so excising a tiered table would drop it from the catalog and leak the bytes — worse than leaving it. A shared tier is additionally a delete-free publication others may reference. |
+| Table on a **named or shared tier** | Refused. Named tiers are outside excise's tested scope (deletion itself is tier-aware now, so this could be narrowed). A shared tier is a delete-free publication others may reference. |
 | Table mounted by `attach_part_by_ref` | Refused — a foreign mount is another database's publication. A foreign mount merely *overlapping* the candidate's span is also a veto. |
 | Any part operation in flight | Refused for its duration (detach / attach / freeze / export / tier move). |
 | A compaction or part operation holding an overlapping range | Refused; the lock is taken non-blocking. |
@@ -690,22 +690,27 @@ configured tier, writes a durable copy into the destination's default tier,
 and clears the copied table's tier/object metadata. Their output is therefore
 self-contained and reopens without the source tier configuration or objects.
 
-**Crash residue & the S3 leak gap.** A crash mid-move strands either a copy
-on the target tier (before the manifest flip) or the source files (after
-it). On the **default tier**, `DB::open` also deletes unreferenced SST file
-pairs left by a crash before a manifest install. On named local tiers it
-sweeps manifest-known table ids found on the wrong tier. These sweeps walk
-directories with `std::fs`, so they do **not** cover S3; likewise,
-compaction's obsolete-input deletion resolves default-tier paths, so
-compacting or re-cutting an S3-resident part strands its old objects.
-Both gaps leak *storage only* — the manifest is the source of truth, reads
-are never affected. Delete-only excise (1.2) is the one caller that opts out of
-the gap instead of widening it: it refuses any candidate that is not on the
-default tier, so it never turns a tiered table into an unreferenced object. Mitigation until in-engine GC lands: periodically audit
-the bucket, listing `<root>/cf-<name>/` and deleting any `<id>.klog`/`.vlog`
-whose id the current manifest does not place on that tier (the startup
-sweep's rule, applied externally). Do not run the audit against a manifest
-older than the bucket listing.
+**Crash residue and table retirement.** A crash mid-move strands either a
+copy on the target tier (before the manifest flip) or the source files
+(after it). At `DB::open` the sweep lists every non-shared tier through its
+backend (a directory listing locally, a LIST on S3) and deletes manifest-known
+table ids found on the wrong tier; on the **default tier** it also deletes
+unreferenced SST file pairs left by a crash before a manifest install.
+Retiring a published table — a compaction input, a FIFO eviction, a dropped
+or cleared family — deletes it on its own tier through that tier's backend,
+and never on a shared tier, whose objects a sharer may have mounted.
+
+Up to 0.20.0, both the sweep and every retirement resolved default-tier
+paths only, so compacting an S3-resident part, dropping a family with S3
+parts, or a crash mid-move stranded objects for good. One crash window still
+leaks: a crash between a compaction's catalog edit and its input delete
+leaves inputs whose ids the manifest no longer knows, and on a named tier the
+sweep deliberately leaves unknown ids alone (its root may hold files this
+database does not own). That is *storage only* — the manifest is the source
+of truth, reads are never affected. To reclaim it, audit the bucket: list
+`<root>/cf-<name>/` and delete any `<id>.klog`/`.vlog` the current manifest
+does not reference at all. Do not run the audit against a manifest older than
+the bucket listing, and never on a shared tier.
 
 **Transient network failures (0.5.0).** Every S3 request carries a bounded
 in-backend retry — 4 attempts, 25/50/100 ms backoff, transport-level errors

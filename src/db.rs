@@ -1895,6 +1895,36 @@ impl DbInner {
         self.retire_file(path, bytes, Some(storage))
     }
 
+    /// Retire both files of a table the catalog no longer names, wherever its
+    /// tier keeps them: a local tier by path, a remote one (S3) through that
+    /// tier's backend — both through the pausable, paced deletion path.
+    ///
+    /// Every removal of a *published* table goes through here (compaction
+    /// inputs, excise, FIFO eviction, a dropped or cleared family's tiered
+    /// tables). Building the default-tier path from the id alone, as those
+    /// sites once did, unlinked nothing for a tiered table and leaked its
+    /// files or objects. Nothing on a shared tier is ever deleted: a foreign
+    /// mount (`attach_part_by_ref`) belongs to the database that published
+    /// it, and this database's own publications there are delete-free
+    /// (`SPADINO-A2.md`), because any sharer may have mounted them by reference.
+    pub(crate) fn retire_table_files(&self, cf: &ColumnFamily, meta: &crate::manifest::SstMeta) {
+        if crate::compaction::is_foreign_mount(self, meta) || self.tier_is_shared(meta.tier.as_deref()) {
+            return;
+        }
+        let klog = cf.klog_path_for(meta);
+        let vlog = crate::sst::vlog_path_for(&klog);
+        if self.tier_is_local(meta.tier.as_deref()) {
+            self.remove_sst_file(&klog, meta.klog_size);
+            self.remove_sst_file(&vlog, meta.vlog_size);
+        } else {
+            let storage = cf.tiers().storage_for(meta.tier.as_deref());
+            self.remove_tier_file(storage.clone(), &klog, meta.klog_size);
+            if meta.vlog_size > 0 {
+                self.remove_tier_file(storage, &vlog, meta.vlog_size);
+            }
+        }
+    }
+
     fn retire_file(
         &self,
         path: &str,
@@ -1976,6 +2006,15 @@ pub(crate) fn unified_id_op(name: &str, id: u64) -> Option<crate::manifest_edit:
         name: name.to_string(),
         id,
     })
+}
+
+/// The tables of `cf` that live off the default tier, which removing the
+/// family's directory does not reach.
+fn tiered_tables(cf: &ColumnFamily) -> Vec<crate::manifest::SstMeta> {
+    cf.snapshot_ssts()
+        .into_iter()
+        .filter(|meta| meta.tier.is_some())
+        .collect()
 }
 
 fn drop_cf_ops(name: &str, cf: &Arc<ColumnFamily>) -> Vec<crate::manifest_edit::Op> {
@@ -3230,7 +3269,14 @@ impl DB {
             cf.abort_retire();
             return Err(e);
         }
+        let tiered = tiered_tables(&cf);
         cf.close_resources();
+        // The family directory holds its default-tier files; a part moved to a
+        // named tier lives elsewhere (an S3 tier's objects included) and goes
+        // through the tier-aware deletion path, or it would leak.
+        for meta in &tiered {
+            self.inner.retire_table_files(&cf, meta);
+        }
         let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
         Ok(())
     }
@@ -3304,7 +3350,12 @@ impl DB {
         let rebuilt: Mutex<Option<Result<Arc<ColumnFamily>>>> = Mutex::new(None);
         let publish = |p: &Publish| {
             self.inner.unregister_cf(name, p);
+            let tiered = tiered_tables(&old);
             old.close_resources();
+            // As in a drop: the directory covers the default tier only.
+            for meta in &tiered {
+                self.inner.retire_table_files(&old, meta);
+            }
             let _ = std::fs::remove_dir_all(self.inner.cf_dir(name));
             let made = ColumnFamily::create(
                 self.inner.ctx.clone(),
@@ -4083,34 +4134,34 @@ fn manifest_table_locations(cfm: &CfManifest) -> HashMap<u64, Option<String>> {
         .collect()
 }
 
+/// Sweep one family's directory on one tier, through that tier's backend: a
+/// local tier is a directory listing, an S3 tier one LIST of the family's
+/// prefix. The sweep once walked `std::fs` only, so a part copied onto an S3
+/// tier by a move that crashed before its flip stayed there for good.
 fn sweep_cf_location(
     inner: &Arc<DbInner>,
     cf_name: &str,
     manifest_tiers: &HashMap<u64, Option<String>>,
     location: Option<&str>,
 ) {
-    let dir = inner.ctx.tiers.cf_dir(location, cf_name);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let storage = inner.ctx.tiers.storage_for(location);
+    if storage.is_read_only() {
         return;
-    };
-    for entry in entries.flatten() {
-        sweep_sst_entry(&dir, &entry, manifest_tiers, location);
     }
-}
-
-fn sweep_sst_entry(
-    dir: &str,
-    entry: &std::fs::DirEntry,
-    manifest_tiers: &HashMap<u64, Option<String>>,
-    location: Option<&str>,
-) {
-    let file_name = entry.file_name();
-    let file_name = file_name.to_string_lossy();
-    let Some(id) = parse_sst_file_id(&file_name) else {
+    let dir = inner.ctx.tiers.cf_dir(location, cf_name);
+    // A missing directory (the common case on a tier nothing moved to) and an
+    // unreachable store both mean nothing to sweep this time: the orphans, if
+    // any, wait for the next open rather than fail this one.
+    let Ok(names) = storage.list(&dir) else {
         return;
     };
-    if sst_is_misplaced(manifest_tiers.get(&id), location) {
-        let _ = std::fs::remove_file(format!("{dir}/{file_name}"));
+    for name in names {
+        let Some(id) = parse_sst_file_id(&name) else {
+            continue;
+        };
+        if sst_is_misplaced(manifest_tiers.get(&id), location) {
+            let _ = storage.delete(&format!("{dir}/{name}"));
+        }
     }
 }
 

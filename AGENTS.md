@@ -300,11 +300,15 @@ critical section is RV-M3's job.
 (`storage_s3.rs`) is a no-mmap `Storage` backend that reads SSTable blocks with
 HTTP range GETs (fronted by the block cache — a cold block is one GET, a warm one
 none) and writes objects with single-shot PUTs. A `TierDef::s3(...)` tier plugs
-into the existing part-mover/flip protocol unchanged. Known gaps (future work):
-the crash-mid-move orphan sweep (`sweep_move_orphans`) and compaction's
-obsolete-input delete are still local-path only, so an S3 object orphaned by a
-crash-during-move or by compacting an S3-resident part is not GC'd (the manifest
-stays the source of truth, so reads are never affected — only storage leaks).
+into the existing part-mover/flip protocol unchanged. Every published-table
+removal (compaction inputs, FIFO eviction, drop, clear) goes through
+`DbInner::retire_table_files`, which deletes on the table's own tier through
+its `Storage` and never on a shared tier; `sweep_move_orphans` lists and
+deletes through each tier's `Storage`, so crash-mid-move residue on S3 is swept
+at open. Remaining gap: a crash between a compaction's catalog edit and its
+input delete leaves inputs whose ids the manifest no longer knows, and the sweep
+deletes unknown ids on the default tier only (a named tier's root may hold files
+this database does not own) — storage only, reads are never affected.
 ondaDB needs **no internal object CAS**: part objects use unique, never-reused ids
 (one writer per key) and the commit point is the *local* manifest's fsync+rename,
 not an S3 object — CAS on a shared S3 pointer is ayu's layer, not the engine's.

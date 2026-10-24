@@ -44,10 +44,11 @@
 //!
 //! Foreign mounts (this database must never unlink another's publication, and
 //! must not reason about one's contents), tables not on the default tier
-//! (obsolete-file deletion is default-tier-only — AGENTS.md — so excising an
-//! S3-resident table would leak the object), shared-tier tables specifically
-//! (delete-free publications), an overlapping range-lock holder, and any
-//! in-flight parts operation.
+//! (named tiers are out of excise's tested scope; obsolete-file deletion is
+//! tier-aware since `DbInner::retire_table_files`, so this veto could be
+//! narrowed to shared tiers with tests to match), shared-tier tables
+//! specifically (delete-free publications), an overlapping range-lock holder,
+//! and any in-flight parts operation.
 //!
 //! # Transaction
 //!
@@ -171,8 +172,8 @@ fn vetoed(db: &DbInner, cf: &ColumnFamily, meta: &crate::manifest::SstMeta) -> b
         return true;
     }
     // Shared tiers are delete-free publications (A2); named non-shared tiers
-    // are refused too, because obsolete-file deletion resolves default-tier
-    // paths only and would leak the object rather than reclaim it.
+    // are refused too, as out of excise's tested scope (see the module
+    // docs: deletion itself is tier-aware now).
     if meta.tier.is_some() {
         return true;
     }

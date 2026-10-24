@@ -1060,11 +1060,7 @@ fn run_fifo(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>) -> Result<()> {
             }]);
         db.catalog_txn_for(cf, edit, |p| cf.remove_l0_tables(&ids, p))?;
         for t in &victims {
-            db.remove_sst_file(&cf.klog_path(t.meta.id), t.meta.klog_size);
-            db.remove_sst_file(
-                &format!("{}/{}.vlog", cf.dir(), t.meta.id),
-                t.meta.vlog_size,
-            );
+            db.retire_table_files(cf, &t.meta);
         }
         cf.compaction_count
             .fetch_add(victims.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2530,17 +2526,14 @@ fn rollback_compaction_outputs(
 /// paced when 0.6-B pacing is configured).
 ///
 /// Called after publication, by compaction with its inputs and by delete-only
-/// excise (1.2) with the tables it dropped. Default-tier paths only, exactly as
-/// compaction's input removal has always been (AGENTS.md); excise refuses a
-/// non-default-tier candidate for that reason.
+/// excise (1.2) with the tables it dropped. Each table is retired where its
+/// tier keeps it ([`DbInner::retire_table_files`]): a tiered input — an S3
+/// object included — used to be looked for at its default-tier path, and
+/// leaked.
 pub(crate) fn retire_tables(db: &DbInner, cf: &ColumnFamily, inputs: &[Arc<SstHandle>]) {
     for table in inputs {
         table.close();
-        db.remove_sst_file(&cf.klog_path(table.meta.id), table.meta.klog_size);
-        db.remove_sst_file(
-            &format!("{}/{}.vlog", cf.dir(), table.meta.id),
-            table.meta.vlog_size,
-        );
+        db.retire_table_files(cf, &table.meta);
     }
 }
 

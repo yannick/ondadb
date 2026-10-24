@@ -823,9 +823,9 @@ know about; after it, source-side leftovers. Both are cleaned by
 `sweep_move_orphans` at the next `DB::open`: for every table id the manifest
 knows, any copy sitting in a tier directory that disagrees with the
 manifest's tier is deleted (unknown ids — in-flight flush output, WALs —
-are untouched). The sweep walks directories with `std::fs`, so it covers
-local tiers only; an S3 orphan survives as a storage leak (see
-`docs/parts-and-tiers.md`).
+are untouched). The sweep lists and deletes through each tier's `Storage`,
+so it covers S3 tiers as well as local ones; shared tiers and read-only
+backends are never swept.
 
 The pass runs on the compaction worker every `Options::part_mover_interval`
 (default 30 s; `Duration::ZERO` disables the cadence) and manually via
@@ -1024,8 +1024,8 @@ into epoch 1 and swapped into place, refused, or opened read-only through
    memtable flushes (they are listed in `pending_wals`) — and, if a prepared
    transaction pins one, until the sweep releases it.
 6. Read-write opens only: `sweep_move_orphans` deletes unreferenced default-tier
-   SST output and local tier-move residue a crash left behind (see § Part
-   mover), then the workers start — so no background move races the sweep.
+   SST output and the tier-move residue a crash left on any non-shared tier, S3
+   included (see § Part mover), then the workers start — so no background move races the sweep.
 
 ## Maintenance (`maintenance.rs`)
 
