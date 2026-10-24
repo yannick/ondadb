@@ -123,8 +123,8 @@ wavesdb table of base entries can still point into shared blob files.
 | 6 | transaction decisions | `CAP_TXN_DECISIONS` | `CapTxnDecisions` |
 | 7 | managed sequence mode | *reserved to wavesdb* | `CapManagedMode` |
 | 8 | vlog compression grouping | *reserved to wavesdb* | `CapVlogGrouping` |
-| 9 | values in shared blob files | — (read in step 2c) | `CapValuesSharedBlobs` (step 2b) |
-| 10 | **interim:** wavesdb 0.8 bodies | — (refused) | `CapWaves08Bodies` (step 2b) |
+| 9 | values in shared blob files | read-only (step 2c) | `CapValuesSharedBlobs` (step 2b) |
+| 10 | wavesdb native bodies | read-only (step 2c) | `CapWaves08Bodies` (step 2b; native profile since 2d) |
 
 Bits 0–6 were assigned identically by both engines independently. 7 and 8 are
 wavesdb specialities; ondaDB reserves them so it cannot assign them to anything
@@ -136,11 +136,12 @@ table's value pointers (entry flag `0x04`) address a **shared blob file**
 table's own `.vlog` with an 8-byte offset; the catalog carries each family's
 blob list and each table's blob references (manifest sections cf `0x2`, sst
 `0x100`). Blob files are shared between tables and reclaimed by blob GC.
-Every engine must eventually **read** it (step 2c); writing it needs blob GC.
+ondaDB **reads** it since step 2c, in a read-only open of a wavesdb directory;
+writing it needs blob GC, so the common profile never does.
 
-**Bit 10, `CAP_WAVES08_BODIES`** (interim, step 2b → retired by step 2d). The
-directory or table keeps the bodies wavesdb 0.8 wrote inside epoch-1
-containers, because those bodies converge in later rows:
+**Bit 10, `CAP_WAVES08_BODIES`** (native speciality since step 2d; introduced
+as interim in step 2b). The directory or table keeps the bodies wavesdb 0.8
+wrote inside epoch-1 containers:
 
 - data blocks: the `0xff` block header, no restart trailer in full-key blocks,
   wavesdb's prefix-delta entry layout with its `WDBL` trailer (rows B, C, D);
@@ -150,12 +151,16 @@ containers, because those bodies converge in later rows:
 The exact bytes are wavesdb's `docs/format-compatibility.md` at `657a57d`
 (v0.8.12), which this bit freezes. Everything else in such a table or
 directory is epoch 1: footer, aux block, Bloom, index, block frames, value-file
-header and frames, manifest container and sections. Only wavesdb writes it, and
-only until its writers emit the common bodies; a writer then stops setting it
-on new tables and a database whose last such table is gone clears it from its
-word. Readers keep accepting it until step 2e. An engine that does not
-implement it refuses the directory (`UnsupportedFormat`) — the cross-engine
-refusal the harness checks after step 2b.
+header and frames, manifest container and sections.
+
+Step 2d made **epoch 1 as specified** the common profile (ondaDB's bodies,
+which wavesdb writes in compat mode, `FormatCompat`), so this bit was not
+retired: it is wavesdb's **native** profile, the bodies it writes outside
+compat mode. Only wavesdb writes it. ondaDB opens such a directory
+**read-only** (step 2c) and never read-write; an engine that implements
+neither refuses it (`UnsupportedFormat`). The profile is decided once per
+directory, from the catalog, and every table's footer must agree with it: a
+table whose footer claims the other profile is `Corruption`.
 
 ## Manifest sections
 
