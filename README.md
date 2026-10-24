@@ -35,7 +35,7 @@ unsafe code denied by default, with one audited Linux coarse-clock call.
   rather than silently continuing. See
   [`docs/concurrency-and-safety.md`](docs/concurrency-and-safety.md).
 
-Full release history is in [`CHANGELOG.md`](CHANGELOG.md).
+Full release history is in [`CHANGELOG.md`](CHANGELOG.md); upgrading from 0.9.x or 0.10.x is covered in [`UPGRADE.md`](UPGRADE.md).
 
 ## Features
 
