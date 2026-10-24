@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Retired tables on named and S3 tiers are deleted where they live.**
+  Compaction inputs, FIFO evictions and the tables of a dropped or cleared
+  family were deleted at their default-tier path, which missed any table on a
+  named tier: a local tier kept the files and an S3 tier kept the objects, for
+  good. Every such removal now goes through `DbInner::retire_table_files`,
+  which deletes on the table's own tier through its `Storage` and never on a
+  shared tier (a sharer may have mounted the objects).
+- **The startup orphan sweep covers S3.** `sweep_move_orphans` walked tier
+  directories with `std::fs`, so the residue of a tier move that crashed on an
+  S3 tier was never collected. It now lists and deletes through each tier's
+  backend, skipping shared tiers and read-only backends. A crash between a
+  compaction's catalog edit and its input delete still strands the inputs on a
+  named tier (unknown ids there are left alone); see `docs/parts-and-tiers.md`.
+
 ## 0.20.0 — yoloDB parity with wavesdb 0.20.0
 
 The parity release: ondaDB 0.20.0 and wavesdb 0.20.0 write yoloDB format

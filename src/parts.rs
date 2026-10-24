@@ -1229,7 +1229,13 @@ impl crate::db::DbInner {
     /// Whether `tier` (`None` = default) keeps its files on a local filesystem,
     /// so they are addressed by path — probed with `Path::exists`, unlinked by
     /// the deletion worker, swept at open. An S3 or custom tier is not.
-    fn tier_is_local(&self, tier: Option<&str>) -> bool {
+    /// Whether `tier` is declared [`shared`](crate::TierDef::shared): its
+    /// objects are publications other databases may mount by reference.
+    pub(crate) fn tier_is_shared(&self, tier: Option<&str>) -> bool {
+        tier.is_some_and(|name| self.opts.tiers.iter().any(|t| t.name == name && t.shared))
+    }
+
+    pub(crate) fn tier_is_local(&self, tier: Option<&str>) -> bool {
         match tier {
             None => true,
             Some(name) => self

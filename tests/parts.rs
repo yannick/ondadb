@@ -1569,3 +1569,90 @@ fn startup_sweeps_the_named_tier_copy_left_by_a_crash_after_the_demote_flip() {
     assert_all_parts_read(&db, &cf);
     db.close().unwrap();
 }
+
+// Retiring a table that lives on a named tier must delete it *there*. Every
+// retirement path once built the default-tier path, so the delete missed and
+// the tier file stayed for good: the startup sweep leaves unknown ids on a
+// named tier alone, because a named tier may hold files it does not own.
+
+/// Compacting a part that sits on a named tier retires its input from that
+/// tier, not from the default root.
+#[test]
+fn compacting_a_named_tier_part_deletes_its_input_from_the_tier() {
+    let (_dir, hdd, opts) = setup_on_hdd();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let db = DB::open(opts.clone()).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+    assert_eq!(klog_count(&hdd_root), 1);
+
+    // New img data overlapping the moved part pulls it into a compaction,
+    // whose output lands on the default tier.
+    for i in 0..5u32 {
+        db.put(&cf, format!("img/{i:03}").as_bytes(), b"NEW", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    for i in 0..5u32 {
+        assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), b"NEW");
+    }
+    assert!(
+        part_files(&hdd_root).is_empty(),
+        "the compacted input must be deleted from the hdd tier: {:?}",
+        part_files(&hdd_root)
+    );
+    db.close().unwrap();
+
+    // And nothing it left behind resurfaces on reopen.
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert!(part_files(&hdd_root).is_empty());
+    assert_eq!(db.get(&cf, b"img/000").unwrap(), b"NEW");
+    db.close().unwrap();
+}
+
+/// Dropping a family removes its tables on every tier, not just its default
+/// directory.
+#[test]
+fn dropping_a_family_deletes_its_named_tier_files() {
+    let (_dir, hdd, opts) = setup_on_hdd();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let db = DB::open(opts).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+    assert!(!part_files(&hdd_root).is_empty());
+    drop(cf);
+
+    db.drop_column_family("default").unwrap();
+    assert!(
+        part_files(&hdd_root).is_empty(),
+        "drop must delete the family's hdd files: {:?}",
+        part_files(&hdd_root)
+    );
+    db.close().unwrap();
+}
+
+/// Clearing a family retires the old generation's named-tier tables too.
+#[test]
+fn clearing_a_family_deletes_its_named_tier_files() {
+    let (_dir, hdd, opts) = setup_on_hdd();
+    let hdd_root = hdd.path().to_str().unwrap().to_string();
+    let db = DB::open(opts).unwrap();
+    let cf = db.create_column_family("default", parts_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    db.move_part_to_tier(&cf, "img", "hdd").unwrap();
+    assert!(!part_files(&hdd_root).is_empty());
+    drop(cf);
+
+    let cf = db.clear_column_family("default").unwrap();
+    assert!(db.get(&cf, b"img/000").is_err());
+    assert!(
+        part_files(&hdd_root).is_empty(),
+        "clear must delete the old generation's hdd files: {:?}",
+        part_files(&hdd_root)
+    );
+    db.close().unwrap();
+}

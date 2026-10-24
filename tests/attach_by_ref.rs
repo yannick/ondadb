@@ -448,3 +448,27 @@ fn a_sharer_never_compacts_mounted_parts() {
         );
     }
 }
+
+/// Dropping the publisher's family must not delete what it published: a
+/// sharer may have mounted those objects, and a shared tier is delete-free.
+#[test]
+fn dropping_the_publishers_family_leaves_shared_objects() {
+    let shared = tempfile::tempdir().unwrap();
+    let d1 = tempfile::tempdir().unwrap();
+    let root = shared.path().to_str().unwrap();
+
+    let db = open_with_shared(d1.path().to_str().unwrap(), root);
+    let cf = db.create_column_family("default", shared_cfg()).unwrap();
+    fill_and_publish(&db, &cf, b"IMG");
+    let published = sst_files_under(shared.path());
+    assert!(!published.is_empty());
+    drop(cf);
+
+    db.drop_column_family("default").unwrap();
+    assert_eq!(
+        sst_files_under(shared.path()),
+        published,
+        "drop must never delete on a shared tier"
+    );
+    db.close().unwrap();
+}

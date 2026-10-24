@@ -454,3 +454,129 @@ fn local_disk_cache_serves_s3_blocks_across_restart() {
     db.close().unwrap();
     cleanup(&cfg, &prefix);
 }
+
+/// Every `.klog`/`.vlog` object under a prefix's `cf-default`.
+fn s3_table_objects(s3: &S3Storage, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = s3
+        .list(&format!("{prefix}/cf-default"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.ends_with(".klog") || n.ends_with(".vlog"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn opts_with_s3(dir: &tempfile::TempDir, prefix: &str, cfg: &S3Config) -> Options {
+    let mut opts = Options::new(dir.path().to_str().unwrap());
+    opts.tiers = vec![TierDef::s3("s3", prefix, cfg.clone())];
+    opts.part_mover_interval = Duration::ZERO;
+    opts
+}
+
+/// Compacting an S3-resident part retires its input objects from the bucket.
+/// They were once deleted at the default-tier path instead, which missed, and
+/// the startup sweep never listed S3, so every such compaction leaked.
+#[test]
+fn compacting_an_s3_part_deletes_its_input_objects() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 compaction-retire test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let db = DB::open(opts_with_s3(&dir, &prefix, &cfg)).unwrap();
+    let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    assert_eq!(db.run_part_mover().unwrap(), 1);
+    assert!(!s3_table_objects(&s3, &prefix).is_empty());
+
+    for i in 0..5u32 {
+        db.put(&cf, format!("img/{i:03}").as_bytes(), b"NEW", Duration::ZERO)
+            .unwrap();
+    }
+    db.flush_memtable(&cf).unwrap();
+    db.compact(&cf).unwrap();
+    for i in 0..5u32 {
+        assert_eq!(db.get(&cf, format!("img/{i:03}").as_bytes()).unwrap(), b"NEW");
+    }
+    assert!(
+        s3_table_objects(&s3, &prefix).is_empty(),
+        "the compacted input must be deleted from s3: {:?}",
+        s3_table_objects(&s3, &prefix)
+    );
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}
+
+/// Dropping a family deletes its S3 objects, not just its local directory.
+#[test]
+fn dropping_a_family_deletes_its_s3_objects() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 drop test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let s3 = S3Storage::new(&cfg).unwrap();
+    let db = DB::open(opts_with_s3(&dir, &prefix, &cfg)).unwrap();
+    let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+    materialize_parts(&db, &cf);
+    assert_eq!(db.run_part_mover().unwrap(), 1);
+    assert!(!s3_table_objects(&s3, &prefix).is_empty());
+    drop(cf);
+
+    db.drop_column_family("default").unwrap();
+    assert!(
+        s3_table_objects(&s3, &prefix).is_empty(),
+        "drop must delete the family's s3 objects: {:?}",
+        s3_table_objects(&s3, &prefix)
+    );
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}
+
+/// A demote that crashed after its flip leaves the source objects on S3 while
+/// the catalog places the part locally; the startup sweep lists the S3 tier
+/// and deletes them.
+#[test]
+fn startup_sweeps_the_s3_copy_left_by_a_crash_after_the_demote_flip() {
+    let Some(cfg) = env_s3() else {
+        eprintln!("skipping s3 sweep test: ONDADB_S3_ENDPOINT not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let dir = tempfile::tempdir().unwrap();
+    let opts = opts_with_s3(&dir, &prefix, &cfg);
+    let s3 = S3Storage::new(&cfg).unwrap();
+    {
+        let db = DB::open(opts.clone()).unwrap();
+        let cf = db.create_column_family("default", s3_mover_cfg()).unwrap();
+        materialize_parts(&db, &cf);
+        assert_eq!(db.run_part_mover().unwrap(), 1);
+        let on_s3 = s3_table_objects(&s3, &prefix);
+        assert!(!on_s3.is_empty());
+        db.move_part_to_default_tier(&cf, "img").unwrap();
+        assert!(s3_table_objects(&s3, &prefix).is_empty());
+        // Recreate the stale source a crash would have left behind.
+        let local_cf = dir.path().join("cf-default");
+        for name in &on_s3 {
+            let bytes = std::fs::read(local_cf.join(name)).unwrap();
+            s3.put_object(&format!("{prefix}/cf-default/{name}"), &bytes)
+                .unwrap();
+        }
+        assert_eq!(s3_table_objects(&s3, &prefix), on_s3);
+        db.close().unwrap();
+    }
+    let db = DB::open(opts).unwrap();
+    let cf = db.get_column_family("default").unwrap();
+    assert!(
+        s3_table_objects(&s3, &prefix).is_empty(),
+        "the stale s3 copy must be swept: {:?}",
+        s3_table_objects(&s3, &prefix)
+    );
+    assert_eq!(db.get(&cf, b"img/000").unwrap(), b"IMG");
+    db.close().unwrap();
+    cleanup(&cfg, &prefix);
+}
