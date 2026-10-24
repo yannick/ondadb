@@ -890,6 +890,8 @@ impl DB {
             generation: 0,
             applied_through: 0,
             next_edit_id: 1,
+            // Nor any WAL, so no floor.
+            wal_floor: 0,
             // A frozen slice is a standalone database with no shared tiers;
             // it mints its own nonce if it ever configures one.
             instance_nonce: None,

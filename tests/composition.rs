@@ -667,3 +667,254 @@ fn pinned_generation_replay_never_bases_an_operand_on_its_folded_copy() {
     db.abort_prepared(&[7; 16]).unwrap();
     db.close().unwrap();
 }
+
+/// Flush the shared memtable and wait for it (unified layout).
+fn flush_unified(db: &DB) {
+    db.rotate_unified_for_tests();
+    while db.pending_flushes_for_tests() > 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn open_unified(path: &str) -> DB {
+    let mut opts = Options::new(path);
+    opts.unified_memtable = true;
+    opts.merge_fns = vec![Arc::new(Concat)];
+    DB::open(opts).unwrap()
+}
+
+/// The replay floor (`CAP_WAL_FLOOR`). A prepare keeps its generation on disk
+/// past that generation's flush; replaying it whole put the flushed put back,
+/// and once compaction had dropped it together with the later tombstone —
+/// whose generation was unlinked — nothing deleted it any more.
+#[test]
+fn pinned_generation_replay_never_resurrects_a_compacted_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = open_unified(&path);
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS).unwrap();
+        assert_ne!(db.format_capabilities() & ondadb::format::CAP_WAL_FLOOR, 0, "implied");
+        let c = db.create_column_family("c", ColumnFamilyConfig::default()).unwrap();
+        db.put(&c, b"k", b"old", Duration::ZERO).unwrap();
+        let mut t = db.begin();
+        t.put(&c, b"held", b"v", Duration::ZERO).unwrap();
+        t.prepare(&[7; 16]).unwrap();
+        flush_unified(&db); // flushed, but the prepare keeps it on disk
+        db.delete(&c, b"k").unwrap();
+        flush_unified(&db); // flushed and unlinked
+        db.compact(&c).unwrap(); // the put and its tombstone are dropped
+        assert!(db.get(&c, b"k").is_err(), "before the reopen");
+        db.sync_wal().unwrap();
+        drop(db);
+    }
+    let floor = ondadb::manifest_edit::recover_catalog(&path).unwrap().wal_floor;
+    assert!(floor >= 2, "two flushes raised the floor past the pinned generation: {floor}");
+    for round in 0..2 {
+        let db = open_unified(&path);
+        let c = db.get_column_family("c").unwrap();
+        assert!(db.get(&c, b"k").is_err(), "open {round}: the deleted key came back");
+        let txn = db.begin();
+        let mut it = txn.new_iterator(&c);
+        it.seek_to_first();
+        assert!(!it.valid(), "open {round}: a scan shows the deleted key");
+        drop(it);
+        drop(txn);
+        assert_eq!(db.list_prepared().len(), 1, "open {round}: the prepare is still recovered");
+        drop(db);
+    }
+    let db = open_unified(&path);
+    db.commit_prepared(&[7; 16]).unwrap();
+    let c = db.get_column_family("c").unwrap();
+    assert_eq!(db.get(&c, b"held").unwrap(), b"v");
+    assert!(db.get(&c, b"k").is_err());
+    db.close().unwrap();
+}
+
+/// The same with a merge chain: the base and an operand sat in the pinned
+/// generation, a delete above them in an unlinked one, and compaction dropped
+/// all three. A whole replay brought the chain back as `base|x`.
+#[test]
+fn pinned_generation_replay_never_resurrects_a_compacted_operand() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = open_unified(&path);
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS).unwrap();
+        let m = db
+            .create_column_family(
+                "m",
+                ColumnFamilyConfig {
+                    merge_operator_name: Some(Concat.name().to_string()),
+                    ..ColumnFamilyConfig::default()
+                },
+            )
+            .unwrap();
+        db.put(&m, b"k", b"base", Duration::ZERO).unwrap();
+        db.merge(&m, b"k", b"x").unwrap();
+        let mut t = db.begin();
+        t.put(&m, b"held", b"v", Duration::ZERO).unwrap();
+        t.prepare(&[8; 16]).unwrap();
+        flush_unified(&db);
+        db.delete(&m, b"k").unwrap();
+        flush_unified(&db);
+        db.compact(&m).unwrap();
+        assert!(db.get(&m, b"k").is_err());
+        db.sync_wal().unwrap();
+        drop(db);
+    }
+    let db = open_unified(&path);
+    let m = db.get_column_family("m").unwrap();
+    let got = db.get(&m, b"k");
+    assert!(got.is_err(), "the flushed chain came back: {got:?}");
+    db.abort_prepared(&[8; 16]).unwrap();
+    db.close().unwrap();
+}
+
+/// A committed prepare whose decision lies in a flushed generation that
+/// another prepare keeps: its records are in a table, so a reopen must not
+/// install them again — here, over a delete compaction has since dropped
+/// together with them.
+#[test]
+fn a_commit_decision_below_the_floor_installs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = open_unified(&path);
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS).unwrap();
+        let c = db.create_column_family("c", ColumnFamilyConfig::default()).unwrap();
+        let mut keep = db.begin();
+        keep.put(&c, b"held", b"v", Duration::ZERO).unwrap();
+        keep.prepare(&[1; 16]).unwrap();
+        let mut t = db.begin();
+        t.put(&c, b"k", b"committed", Duration::ZERO).unwrap();
+        t.prepare(&[2; 16]).unwrap();
+        db.commit_prepared(&[2; 16]).unwrap();
+        flush_unified(&db); // the decision's generation, kept by [1; 16]
+        db.delete(&c, b"k").unwrap();
+        flush_unified(&db);
+        db.compact(&c).unwrap();
+        assert!(db.get(&c, b"k").is_err());
+        db.sync_wal().unwrap();
+        drop(db);
+    }
+    let db = open_unified(&path);
+    let c = db.get_column_family("c").unwrap();
+    assert!(db.get(&c, b"k").is_err(), "the committed prepare was installed again");
+    assert_eq!(db.list_prepared().len(), 1);
+    db.abort_prepared(&[1; 16]).unwrap();
+    db.close().unwrap();
+}
+
+/// Above the floor nothing changes: a crash before the flush still replays
+/// the committed prepare and the ordinary writes of the unflushed generation.
+#[test]
+fn generations_above_the_floor_replay_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = open_unified(&path);
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS).unwrap();
+        let c = db.create_column_family("c", ColumnFamilyConfig::default()).unwrap();
+        db.put(&c, b"a", b"1", Duration::ZERO).unwrap();
+        flush_unified(&db);
+        db.put(&c, b"b", b"2", Duration::ZERO).unwrap();
+        let mut t = db.begin();
+        t.put(&c, b"p", b"3", Duration::ZERO).unwrap();
+        t.prepare(&[3; 16]).unwrap();
+        db.commit_prepared(&[3; 16]).unwrap();
+        db.sync_wal().unwrap();
+        drop(db);
+    }
+    let db = open_unified(&path);
+    let c = db.get_column_family("c").unwrap();
+    for (k, v) in [(&b"a"[..], &b"1"[..]), (b"b", b"2"), (b"p", b"3")] {
+        assert_eq!(db.get(&c, k).unwrap(), v);
+    }
+    db.close().unwrap();
+}
+
+/// A crash: `drop` alone is a close, whose final flush would put the WAL's
+/// contents in a table. Poisoned, that flush makes nothing durable — no table
+/// in the catalog, no floor, no unlinked segment — so the next open has only
+/// replay to go on, as after a real crash.
+fn crash(db: DB) {
+    db.fail_stop_for_tests("simulated crash");
+    drop(db);
+}
+
+/// An open appends at the floor or above, never below it: a directory can
+/// hold a floor and no segment at all (every generation flushed and unlinked
+/// by a clean close, or a checkpoint, which copies the catalog but no WAL).
+/// Restarting the numbering at 0 there put the next writes below the floor,
+/// and a crash then dropped them at replay as already flushed.
+#[test]
+fn an_open_never_appends_below_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = open_unified(&path);
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS).unwrap();
+        let c = db.create_column_family("c", ColumnFamilyConfig::default()).unwrap();
+        for i in 0..3u8 {
+            db.put(&c, &[b'f', i], b"v", Duration::ZERO).unwrap();
+            flush_unified(&db);
+        }
+        db.close().unwrap();
+    }
+    let floor = ondadb::manifest_edit::recover_catalog(&path).unwrap().wal_floor;
+    assert!(floor > 0, "the flushes raised the floor");
+    for round in 0..2u8 {
+        {
+            let db = open_unified(&path);
+            let c = db.get_column_family("c").unwrap();
+            db.put(&c, &[b'k', round], b"after", Duration::ZERO).unwrap();
+            db.sync_wal().unwrap();
+            crash(db);
+        }
+        let db = open_unified(&path);
+        let c = db.get_column_family("c").unwrap();
+        for r in 0..=round {
+            assert_eq!(
+                db.get(&c, &[b'k', r]).unwrap(),
+                b"after",
+                "round {round}: a write after a reopen fell below the floor {floor}"
+            );
+        }
+        db.close().unwrap();
+    }
+}
+
+/// The copy case: a checkpoint carries the catalog, floor included, and no
+/// WAL segment, so its first open finds no generation to continue from.
+#[test]
+fn a_checkpoint_appends_at_its_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let copy = dir.path().join("copy").to_str().unwrap().to_string();
+    {
+        let db = open_unified(&path);
+        db.enable_format_capabilities(ondadb::format::CAP_TXN_DECISIONS).unwrap();
+        let c = db.create_column_family("c", ColumnFamilyConfig::default()).unwrap();
+        for i in 0..3u8 {
+            db.put(&c, &[b'f', i], b"v", Duration::ZERO).unwrap();
+            flush_unified(&db);
+        }
+        db.checkpoint(&copy).unwrap();
+        db.close().unwrap();
+    }
+    let floor = ondadb::manifest_edit::recover_catalog(&copy).unwrap().wal_floor;
+    assert!(floor > 0, "the checkpoint carries the floor");
+    {
+        let db = open_unified(&copy);
+        let c = db.get_column_family("c").unwrap();
+        db.put(&c, b"k", b"after", Duration::ZERO).unwrap();
+        db.sync_wal().unwrap();
+        crash(db);
+    }
+    let db = open_unified(&copy);
+    let c = db.get_column_family("c").unwrap();
+    assert_eq!(db.get(&c, b"k").unwrap(), b"after", "the write fell below the floor {floor}");
+    assert_eq!(db.get(&c, &[b'f', 2]).unwrap(), b"v");
+    db.close().unwrap();
+}

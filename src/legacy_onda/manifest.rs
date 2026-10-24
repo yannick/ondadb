@@ -102,6 +102,8 @@ pub fn decode(data: &[u8]) -> Result<Manifest> {
         generation: edits.generation,
         applied_through: edits.applied_through,
         next_edit_id: edits.next_edit_id,
+        // 0.9 had no replay floor.
+        wal_floor: 0,
     })
 }
 
@@ -1264,6 +1266,7 @@ mod tests {
             generation: 0,
             applied_through: 0,
             next_edit_id: 1,
+            wal_floor: 0,
             wal_layout: WalLayout::PerColumnFamily,
             instance_nonce: None,
             caps: 0,

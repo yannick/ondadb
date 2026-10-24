@@ -159,6 +159,7 @@ fn manifest_base() -> Manifest {
         generation: 0,
         applied_through: 0,
         next_edit_id: 1,
+        wal_floor: 0,
         wal_layout: WalLayout::PerColumnFamily,
         instance_nonce: None,
         caps: 0,

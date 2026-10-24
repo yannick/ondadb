@@ -6,6 +6,7 @@
 //!          | next_file_id u64 | global_seq u64
 //! db       0x2 nonce u64 | 0x4 edit cursor (generation, applied, next) u64×3
 //!          | 0x8 managed state: discard_seq u64 | last_managed_commit u64
+//!          | 0x10 WAL replay floor: generation u64
 //! cf*      flags uvarint | name | config (JSON) | 0x1 unified id u64
 //!          | 0x2 blobs: count | (id | size | live_bytes)* ascending
 //!          | tables: count | table*
@@ -30,16 +31,17 @@ use crate::encoding::{checksum, read_u32};
 use crate::error::{OndaError, Result};
 use crate::format::manifest_file::{
     CF_SHARED_BLOBS, CF_UNIFIED_ID, DB_EDIT_LOG, DB_INSTANCE_NONCE, DB_MANAGED_STATE,
-    DB_UNIFIED_WAL, HEADER_LEN, MAGIC, SST_BLOB_REFS, SST_LAST_COMPACTION_TIME,
+    DB_UNIFIED_WAL, DB_WAL_FLOOR, HEADER_LEN, MAGIC, SST_BLOB_REFS, SST_LAST_COMPACTION_TIME,
     SST_MAX_ENTRY_TIME, SST_MERGE_STATS, SST_OBJECT, SST_PARTITION, SST_RANGE, SST_TABLE_CAPS,
     SST_TIER, VERSION,
 };
 use crate::format::wavesdb_reserved::{CAP_MANAGED_MODE, CAP_VALUES_SHARED_BLOBS, CAP_WAVES08_BODIES};
-use crate::format::{CAP_MANIFEST_EDITS, CAP_PERIODIC_AGE, CAP_RANGE_DELETES};
+use crate::format::{CAP_MANIFEST_EDITS, CAP_PERIODIC_AGE, CAP_RANGE_DELETES, CAP_WAL_FLOOR};
 use crate::manifest::{SstMeta, WalLayout};
 
 /// The database sections wavesdb writes.
-pub const DB_KNOWN: u32 = DB_UNIFIED_WAL | DB_INSTANCE_NONCE | DB_EDIT_LOG | DB_MANAGED_STATE;
+pub const DB_KNOWN: u32 =
+    DB_UNIFIED_WAL | DB_INSTANCE_NONCE | DB_EDIT_LOG | DB_MANAGED_STATE | DB_WAL_FLOOR;
 /// The family sections wavesdb writes.
 pub const CF_KNOWN: u64 = CF_UNIFIED_ID | CF_SHARED_BLOBS;
 /// The table sections wavesdb writes.
@@ -53,7 +55,7 @@ pub const SST_KNOWN: u64 = SST_PARTITION
     | SST_MERGE_STATS
     | SST_BLOB_REFS;
 
-const _: () = assert!(DB_KNOWN == 0xF && CF_KNOWN == 0x3 && SST_KNOWN == 0x1FF);
+const _: () = assert!(DB_KNOWN == 0x1F && CF_KNOWN == 0x3 && SST_KNOWN == 0x1FF);
 
 /// Decode a wavesdb epoch-1 `MANIFEST` into a [`Catalog`].
 ///
@@ -133,6 +135,18 @@ pub fn decode(data: &[u8]) -> Result<Catalog> {
         m.last_managed_commit = r.u64("last managed commit")?;
         if m.discard_seq == 0 && m.last_managed_commit == 0 {
             return Err(corrupt("managed-sequence section at its empty default"));
+        }
+    }
+    if db_flags & DB_WAL_FLOOR != 0 {
+        if caps & CAP_WAL_FLOOR == 0 {
+            return Err(corrupt("WAL floor section without CAP_WAL_FLOOR"));
+        }
+        if db_flags & DB_UNIFIED_WAL == 0 {
+            return Err(corrupt("WAL floor section without the unified WAL layout"));
+        }
+        m.wal_floor = r.u64("WAL floor")?;
+        if m.wal_floor == 0 {
+            return Err(corrupt("WAL floor section at its empty default 0"));
         }
     }
     let cf_count = r.count("cf count")?;
@@ -380,7 +394,7 @@ mod tests {
             decode(&b).unwrap_err()
         };
         let caps = crate::encoding::read_u64(&good[12..20]);
-        assert!(matches!(with_caps(caps | 1 << 11), OndaError::UnsupportedFormat(_)));
+        assert!(matches!(with_caps(caps | 1 << 12), OndaError::UnsupportedFormat(_)));
         assert!(matches!(with_caps(caps & !CAP_WAVES08_BODIES), OndaError::InvalidArgs(_)));
         assert!(matches!(
             with_caps(caps & !CAP_MANAGED_MODE),

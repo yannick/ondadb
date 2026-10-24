@@ -261,15 +261,38 @@ its generations are unlinked. Reusing it earlier would put two prepare frames
 with one id in the replayed set, which recovery cannot disambiguate (and rejects
 as `Corruption`).
 
-**Costs the pin imposes,** accepted and documented rather than worked around: a
-pinned generation is fully re-replayed on the next open (file absence *is* the
-flushed marker — replay has no sequence floor, no generation floor and no
-manifest cross-check), which re-inflates the memtable accounting and causes a
-redundant rotation and flush after a pinned reopen. Re-insertion is
-**observably** idempotent, not structurally so, and the two backends differ:
-`SkipMap::insert` replaces at `(key, seq)`, while `ArenaShard::put` always links
-a new node that shadows identically. Reads agree; memory and `approx_size` do
-not. Every idempotency test therefore runs in **both** feature configurations.
+**The replay floor (`CAP_WAL_FLOOR`).** Before it, a pinned generation was
+re-replayed whole on the next open, and that was not merely a cost: re-inserting
+versions a flush had already written resurrected a key whose put and later
+tombstone compaction had dropped together (the tombstone's generation unlinked,
+the put's kept by the prepare), and brought back a merge chain the same way.
+Counting one version per `(key, seq)` (ondaDB #34) only covers exact copies.
+Now `DbInner::wal_floor` is the lowest generation whose data replays; below it
+`UnifiedStore::open` installs control records only, and a commit decision found
+there installs nothing (`resolve_recovered_prepares`, `Prepares::finish` for
+wavesdb logs). Three rules keep it sound:
+
+- **Computed under `manifest_mu`.** `flush_unified` builds its edit in
+  `catalog_txn_built`'s closure, where `next_wal_floor` reads the store's
+  `lowest_unflushed_gen` (a `state.read()` nested inside `manifest_mu`; no path
+  takes `manifest_mu` holding the store's state lock) and compares it with the
+  durable value. Flush workers finish out of order, so the floor is the
+  minimum over every *other* unflushed memtable, never the flushed one's newest
+  generation + 1; the publish closure stores it, before a snapshot written in
+  the same critical section reads it.
+- **One writer slot per commit decision.** `UnifiedStore::commit_decision`
+  appends the decision, fsyncs it and inserts the records under one
+  `active_writers` slot. Split across a rotation, the records would sit in the
+  next memtable while the floor passed the decision's generation.
+- **Only a flush moves it.** A flush that publishes no edit moves nothing.
+
+What remains of the cost: a pinned generation is still read on every open (for
+its control records), and above the floor it is replayed as before.
+Re-insertion there is **observably** idempotent, not structurally so, and the
+two backends differ: `SkipMap::insert` replaces at `(key, seq)`, while
+`ArenaShard::put` always links a new node that shadows identically. Reads agree;
+memory and `approx_size` do not. Every idempotency test therefore runs in
+**both** feature configurations.
 
 An abandoned prepare pins its generation forever. That is the intended
 operator-visible failure mode: `DB::list_prepared` reports id, age and bytes, and

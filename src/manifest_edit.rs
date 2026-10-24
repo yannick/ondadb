@@ -68,7 +68,7 @@ const ONDA09_EDIT_LOG_MAGIC: u32 = 0x4F4E_4445;
 // Ops
 // ---------------------------------------------------------------------------
 
-/// Op codes, pinned. 13..=63 are unassigned and reject as corruption; codes
+/// Op codes, pinned. 15..=63 are unassigned and reject as corruption; codes
 /// >= 64 are never assigned, mirroring the WAL's kind rule.
 mod code {
     pub const ADD_TABLE: u64 = 1;
@@ -84,6 +84,7 @@ mod code {
     pub const SET_CAPABILITY: u64 = 11;
     pub const REMOVE_TABLES: u64 = 12;
     pub const SET_CF_UNIFIED_ID: u64 = 13;
+    pub const SET_WAL_FLOOR: u64 = 14;
     /// Highest op code that may ever be assigned a meaning.
     pub const MAX_ASSIGNABLE: u64 = 63;
 }
@@ -104,6 +105,7 @@ const _: () = assert!(
         && code::SET_CAPABILITY == 11
         && code::REMOVE_TABLES == 12
         && code::SET_CF_UNIFIED_ID == 13
+        && code::SET_WAL_FLOOR == 14
         && code::MAX_ASSIGNABLE == 63
 );
 const _: () = assert!(
@@ -245,6 +247,10 @@ pub enum Op {
     /// the unified layout takes a fresh id, so the old id's entries are owned
     /// by nobody). Follows the `CreateCF` of the same edit.
     SetCfUnifiedId { name: String, id: u64 },
+    /// Raise the unified WAL's replay floor: the lowest generation whose data
+    /// records replay (`CAP_WAL_FLOOR`). Strictly increasing; written by a
+    /// unified flush beside its `AddTable` ops.
+    SetWalFloor(u64),
 }
 
 /// One numbered, atomically applied group of ops.
@@ -424,6 +430,10 @@ pub fn encode_op(b: &mut Vec<u8>, op: &Op) {
             append_uvarint(b, code::SET_CF_UNIFIED_ID);
             append_bytes(b, name.as_bytes());
             append_u64(b, *id);
+        }
+        Op::SetWalFloor(generation) => {
+            append_uvarint(b, code::SET_WAL_FLOOR);
+            append_uvarint(b, *generation);
         }
     }
 }
@@ -665,6 +675,7 @@ impl<'a> Cur<'a> {
                 name: self.string()?,
                 id: self.u64le()?,
             }),
+            code::SET_WAL_FLOOR => Ok(Op::SetWalFloor(self.uvar()?)),
             other => Err(corrupt(format!(
                 "manifest edit: op index {}: op code {other} is {}",
                 self.op_index,
@@ -848,6 +859,7 @@ struct Candidate<'a> {
     wal_layout: WalLayout,
     instance_nonce: Option<u64>,
     caps: u64,
+    wal_floor: u64,
 }
 
 impl<'a> Candidate<'a> {
@@ -888,6 +900,7 @@ impl<'a> Candidate<'a> {
             wal_layout: m.wal_layout,
             instance_nonce: m.instance_nonce,
             caps: m.caps,
+            wal_floor: m.wal_floor,
         }
     }
 
@@ -1112,6 +1125,23 @@ fn validate_op(c: &mut Candidate<'_>, i: usize, op: &Op) -> Result<()> {
             crate::format::check_caps(*bits)?;
             c.caps |= *bits;
         }
+        Op::SetWalFloor(generation) => {
+            // The bit and the layout are checked against the candidate, so an
+            // edit that takes the bit (or flips the layout) first may set it.
+            if c.caps & crate::format::CAP_WAL_FLOOR == 0 {
+                return Err(precondition(i, "SetWalFloor: CAP_WAL_FLOOR is not durable"));
+            }
+            if c.wal_layout != WalLayout::Unified {
+                return Err(precondition(i, "SetWalFloor: not the unified WAL layout"));
+            }
+            if *generation <= c.wal_floor {
+                return Err(precondition(
+                    i,
+                    format!("SetWalFloor: {generation} is not above the current {}", c.wal_floor),
+                ));
+            }
+            c.wal_floor = *generation;
+        }
         Op::RemoveTables { cf, ids } => {
             let st = c.cf(cf);
             for id in ids {
@@ -1182,6 +1212,7 @@ fn mutate(m: &mut Manifest, op: &Op) {
         Op::SetWalLayout(layout) => m.wal_layout = *layout,
         Op::SetNonce(nonce) => m.instance_nonce = Some(*nonce),
         Op::SetCapability(bits) => m.caps |= *bits,
+        Op::SetWalFloor(generation) => m.wal_floor = *generation,
         Op::RemoveTables { cf, ids } => {
             if let Some(i) = cf_index(m, cf) {
                 let drop: std::collections::HashSet<u64> = ids.iter().copied().collect();
@@ -1626,6 +1657,7 @@ mod tests {
                 name: "b".into(),
                 id: 0x0123_4567_89AB_CDEF,
             },
+            Op::SetWalFloor(300),
         ]
     }
 
@@ -1966,6 +1998,30 @@ mod tests {
         reject(&mut m, vec![Op::SetNextFileId(49)]);
         apply_edit(&mut m, &VersionEdit::new(vec![Op::SetNextFileId(50)]))
             .expect("equal is allowed");
+    }
+
+    /// Op 14: the bit and the unified layout first (an edit may take both
+    /// before it), then strictly increasing.
+    #[test]
+    fn set_wal_floor_needs_its_bit_the_unified_layout_and_a_rise() {
+        let mut m = seeded();
+        reject(&mut m, vec![Op::SetWalFloor(2)]);
+        apply_edit(
+            &mut m,
+            &VersionEdit::new(vec![Op::SetCapability(crate::format::CAP_WAL_FLOOR)]),
+        )
+        .unwrap();
+        reject(&mut m, vec![Op::SetWalFloor(2)]);
+        apply_edit(
+            &mut m,
+            &VersionEdit::new(vec![Op::SetWalLayout(WalLayout::Unified), Op::SetWalFloor(2)]),
+        )
+        .expect("the layout flip earlier in the same edit counts");
+        assert_eq!(m.wal_floor, 2);
+        reject(&mut m, vec![Op::SetWalFloor(2)]);
+        reject(&mut m, vec![Op::SetWalFloor(1)]);
+        apply_edit(&mut m, &VersionEdit::new(vec![Op::SetWalFloor(3)])).unwrap();
+        assert_eq!(m.wal_floor, 3);
     }
 
     #[test]

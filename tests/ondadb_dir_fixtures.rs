@@ -39,7 +39,7 @@ use ondadb::config::{ColumnFamilyConfig, Compression, SyncMode};
 use ondadb::entity::EntityColumn;
 use ondadb::format::{
     CAP_EXTENDED_RECORDS, CAP_MANIFEST_EDITS, CAP_MERGE_OPERANDS, CAP_PREFIX_DELTA,
-    CAP_RANGE_DELETES, CAP_TXN_DECISIONS,
+    CAP_RANGE_DELETES, CAP_TXN_DECISIONS, CAP_WAL_FLOOR,
 };
 use ondadb::{ColumnFamily, Options, DB};
 use sha2::{Digest, Sha256};
@@ -511,4 +511,40 @@ fn every_fixture_reopens_to_its_expected_scan() {
             db.close().unwrap();
         }
     }
+}
+
+/// `unified-prepared` predates the replay floor: it holds `CAP_TXN_DECISIONS`
+/// without `CAP_WAL_FLOOR`. A read-write open takes the bit before its first
+/// flush, still shows exactly the fixture's scan and still recovers the
+/// undecided prepare; the flush after it records a floor, and the next open
+/// reads the same.
+#[test]
+fn a_pre_floor_directory_takes_the_floor_on_a_read_write_open() {
+    let src = fixture_root().join("unified-prepared");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("db");
+    copy_dir(&src.join("db"), &dir);
+    let before = ondadb::manifest_edit::recover_catalog(&dir).unwrap();
+    assert_ne!(before.caps & CAP_TXN_DECISIONS, 0);
+    assert_eq!(before.caps & CAP_WAL_FLOOR, 0, "the fixture predates the floor");
+    let want = std::fs::read_to_string(src.join("expected.json")).unwrap();
+    {
+        let db = DB::open(options(&dir, true)).unwrap();
+        assert_ne!(db.format_capabilities() & CAP_WAL_FLOOR, 0);
+        assert_eq!(render_expected(&scan_all(&db)), want);
+        assert_eq!(
+            db.list_prepared().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![txn_id("undecided")]
+        );
+        // Under the unified layout this flushes the shared memtable.
+        db.flush_memtable(&db.get_column_family("x").unwrap()).unwrap();
+        drop(db);
+    }
+    let after = ondadb::manifest_edit::recover_catalog(&dir).unwrap();
+    assert_ne!(after.caps & CAP_WAL_FLOOR, 0);
+    assert!(after.wal_floor > 0, "the flush recorded a floor");
+    let db = DB::open(options(&dir, true)).unwrap();
+    assert_eq!(render_expected(&scan_all(&db)), want);
+    assert_eq!(db.list_prepared().len(), 1);
+    drop(db);
 }

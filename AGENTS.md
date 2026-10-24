@@ -194,7 +194,7 @@ section or bit at a time. Never add a wavesdb *encoder*.
 
 ## Optional format capabilities
 
-Seven `CAP_*` bits in the manifest's capability word gate the optional
+Eight `CAP_*` bits in the manifest's capability word gate the optional
 artifacts. Each is **opt-in and one-way**: `DB::enable_format_capabilities`
 persists the bit before the first byte using it exists, and from then on the
 database is unreadable by a binary that does not implement it. Each SSTable also
@@ -208,7 +208,8 @@ declares the subset its bytes use in its footer's capability word.
 | `1<<3` | `CAP_PREFIX_DELTA` | Prefix-delta data blocks (2.1) |
 | `1<<4` | `CAP_MANIFEST_EDITS` | The `MANIFEST-EDITS` log (2.2) |
 | `1<<5` | `CAP_PERIODIC_AGE` | Durable `last_compaction_time` (0.3) |
-| `1<<6` | `CAP_TXN_DECISIONS` | Kinds 16-18, prepared transactions (3.2); implies `CAP_EXTENDED_RECORDS` |
+| `1<<6` | `CAP_TXN_DECISIONS` | Kinds 16-18, prepared transactions (3.2); implies `CAP_EXTENDED_RECORDS` and `CAP_WAL_FLOOR` |
+| `1<<11` | `CAP_WAL_FLOOR` | The unified WAL's replay floor (manifest db section `0x10`, edit op 14); taken by an older `CAP_TXN_DECISIONS` database at its next read-write open |
 
 The values are **pinned for wavesdb compatibility** and never reused, as are
 the record kinds (1 put, 2 delete, 3 single-delete, 4 merge, 5 range delete,
@@ -271,6 +272,22 @@ reservation registry (phase rule 5 — including the single-op `put`/`delete`
 path, which took no lock before), and a unified WAL generation may not be
 unlinked while a prepare or a not-yet-durable decision lives in it. See
 `docs/concurrency-and-safety.md` § Prepared transactions.
+
+**The replay floor** (`CAP_WAL_FLOOR`, `docs/formats.md` § Replay floor)
+keeps such a kept generation from bringing back what a flush already wrote:
+replaying it whole resurrected keys whose tombstone compaction had since
+dropped. Every unified flush's catalog edit raises `wal_floor` to the lowest
+generation of any *other* unflushed memtable (computed under `manifest_mu`,
+because flushes finish out of order), and below it replay reads control
+records only. Two rules follow for the write path: a flush's edit is the only
+place the floor moves, and a commit decision and its memtable insert share
+one writer slot (`UnifiedStore::commit_decision`) — split across a rotation,
+the floor would pass the decision while its records sat in an unflushed
+memtable. An open appends at `max(newest segment + 1, wal_floor)`, never
+below the floor: a checkpoint or backup carries the floor but no segment.
+Tests: `tests/composition.rs` (`pinned_generation_replay_*`,
+`a_commit_decision_below_the_floor_installs_nothing`,
+`a_checkpoint_appends_at_its_floor`).
 
 **Known cost, measured:** rule 5 is free for a single writer but costs **~3×
 write throughput at 8 concurrent writers** (`bench-results/3.2/2026-08-30/`),

@@ -126,6 +126,9 @@ where
     F: FnMut(ReplayRecord) -> Result<()>,
 {
     let at = |e: OndaError| super::prefix(e, &path.display().to_string());
+    if let Some(t) = txns.as_deref_mut() {
+        t.generation = generation;
+    }
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -456,6 +459,9 @@ struct Txn {
     id: Vec<u8>,
     body: Body,
     decision: Option<Decision>,
+    /// The generation the newest decision was read from: a commit below the
+    /// replay floor installs nothing (`finish`).
+    decision_gen: u64,
 }
 
 /// The prepared transactions a unified log names, folded in log order and
@@ -463,6 +469,8 @@ struct Txn {
 #[derive(Debug, Default)]
 pub(crate) struct Prepares {
     txns: Vec<Txn>,
+    /// The generation [`replay`] is reading, stamped on each decision.
+    generation: u64,
 }
 
 impl Prepares {
@@ -472,6 +480,7 @@ impl Prepares {
 
     /// Fold one control record (wavesdb `replayPreparedControl`).
     fn fold(&mut self, rec: Rec) -> Result<()> {
+        let generation = self.generation;
         let id = rec.key;
         if id.is_empty() || id.len() > MAX_PREPARED_ID || id.contains(&0) {
             return Err(corrupt(
@@ -498,6 +507,7 @@ impl Prepares {
                     id,
                     body,
                     decision: None,
+                    decision_gen: 0,
                 });
             }
             _ => {
@@ -523,6 +533,7 @@ impl Prepares {
                 }
                 // A retried commit after a crash records the newest decision.
                 t.decision = Some(want);
+                t.decision_gen = generation;
             }
         }
         Ok(())
@@ -538,9 +549,14 @@ impl Prepares {
     /// of each committed batch, keyed with the family ids `family_id`
     /// resolves from the batch's names, and the highest sequence a decision
     /// published. Aborted and undecided transactions contribute nothing.
+    ///
+    /// A commit whose decision lies below `wal_floor` installs nothing: its
+    /// records are in a table, or were before compaction changed them. Its
+    /// sequences still count toward the returned watermark.
     pub(crate) fn finish(
         self,
         family_id: impl Fn(&str) -> Option<u64>,
+        wal_floor: u64,
     ) -> Result<(Vec<ReplayRecord>, u64)> {
         let mut out = Vec::new();
         let mut max_seq = 0;
@@ -568,6 +584,9 @@ impl Prepares {
                     ))
                 })?;
             max_seq = max_seq.max(commit_seq);
+            if t.decision_gen < wal_floor {
+                continue;
+            }
             let mut ids = Vec::with_capacity(b.cfs.len());
             for name in &b.cfs {
                 let id = std::str::from_utf8(name)
@@ -1173,7 +1192,7 @@ mod tests {
             }
             assert_eq!(per, [(x, 150), (y, 150)].into_iter().collect());
             assert_eq!(txns.undecided(), undecided, "{fx}");
-            let (installed, max) = txns.finish(id).unwrap();
+            let (installed, max) = txns.finish(id, 0).unwrap();
             assert_eq!(
                 max, last,
                 "{fx}: the commit decision is the newest sequence"
@@ -1238,7 +1257,7 @@ mod tests {
         assert!(data.is_empty(), "control records are never data");
         assert_eq!(last, 41, "the decision raises the watermark");
         assert_eq!(txns.undecided(), 1);
-        let (recs, max) = txns.finish(ids).unwrap();
+        let (recs, max) = txns.finish(ids, 0).unwrap();
         assert_eq!(max, 41);
         // Installed at commit_seq - span + 1 + ordinal; t2 aborted, t3 invisible.
         assert_eq!(recs.len(), 3);
@@ -1303,16 +1322,18 @@ mod tests {
             id: b"t".to_vec(),
             body: Body::Batch(decode_batch(&committed).unwrap()),
             decision: Some(Decision::Commit(41)),
+            decision_gen: 0,
         });
-        assert!(t.finish(|_| None).is_err());
+        assert!(t.finish(|_| None, 0).is_err());
         let mut t = Prepares::default();
         t.txns.push(Txn {
             id: b"s".to_vec(),
             body: Body::Spill,
             decision: Some(Decision::Commit(4)),
+            decision_gen: 0,
         });
         assert!(matches!(
-            t.finish(ids),
+            t.finish(ids, 0),
             Err(OndaError::UnsupportedFormat(_))
         ));
         let mut t = Prepares::default();
@@ -1320,7 +1341,8 @@ mod tests {
             id: b"t".to_vec(),
             body: Body::Batch(decode_batch(&committed).unwrap()),
             decision: Some(Decision::Commit(1)),
+            decision_gen: 0,
         });
-        assert!(matches!(t.finish(ids), Err(OndaError::Corruption(_))));
+        assert!(matches!(t.finish(ids, 0), Err(OndaError::Corruption(_))));
     }
 }

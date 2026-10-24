@@ -16,6 +16,7 @@
 //! 24  next_file_id u64 | 32 global_seq u64
 //! 40  [DB_INSTANCE_NONCE] nonce u64
 //!     [DB_EDIT_LOG] generation u64 | applied_through u64 | next_edit_id u64
+//!     [DB_WAL_FLOOR] generation u64
 //!     cf_count uvarint
 //!     per CF: cf_flags uvarint | name* | config* | [CF_UNIFIED_ID] id u64
 //!             | sst_count uvarint
@@ -42,7 +43,8 @@ use crate::encoding::{
 };
 use crate::error::{OndaError, Result};
 use crate::format::manifest_file::{
-    CF_KNOWN, CF_UNIFIED_ID, DB_EDIT_LOG, DB_INSTANCE_NONCE, DB_KNOWN, DB_UNIFIED_WAL, HEADER_LEN,
+    CF_KNOWN, CF_UNIFIED_ID, DB_EDIT_LOG, DB_INSTANCE_NONCE, DB_KNOWN, DB_UNIFIED_WAL, DB_WAL_FLOOR,
+    HEADER_LEN,
     MAGIC, SST_KNOWN, SST_LAST_COMPACTION_TIME, SST_MAX_ENTRY_TIME, SST_OBJECT, SST_PARTITION,
     SST_RANGE, SST_TABLE_CAPS, SST_TIER, VERSION,
 };
@@ -250,6 +252,12 @@ pub struct Manifest {
     /// to `1`, which is the same "nothing has been appended" statement a fresh
     /// database makes.
     pub next_edit_id: u64,
+    /// The unified WAL's replay floor (`CAP_WAL_FLOOR`): the lowest unified
+    /// generation whose data records replay. Every data record of a lower
+    /// generation is in a table, or was before compaction removed it, so replay
+    /// reads only its control records. `0` (the default, no section) replays
+    /// every generation whole.
+    pub wal_floor: u64,
 }
 
 impl Default for Manifest {
@@ -264,6 +272,7 @@ impl Default for Manifest {
             generation: 0,
             applied_through: 0,
             next_edit_id: 1,
+            wal_floor: 0,
         }
     }
 }
@@ -330,6 +339,9 @@ impl Manifest {
             append_u64(&mut b, self.applied_through);
             append_u64(&mut b, self.next_edit_id);
         }
+        if db_flags & DB_WAL_FLOOR != 0 {
+            append_u64(&mut b, self.wal_floor);
+        }
         append_uvarint(&mut b, self.cfs.len() as u64);
         for cf in &self.cfs {
             let unified_id = cf.stored_unified_id();
@@ -368,6 +380,9 @@ impl Manifest {
         }
         if self.generation != 0 || self.applied_through != 0 || self.next_edit_id != 1 {
             f |= DB_EDIT_LOG;
+        }
+        if self.wal_floor != 0 {
+            f |= DB_WAL_FLOOR;
         }
         f
     }
@@ -453,6 +468,20 @@ impl Manifest {
             }
             // Not coupled to CAP_MANIFEST_EDITS: a checkpoint or backup stamps
             // its snapshot generation 1 whatever the source enabled.
+        }
+        if db_flags & DB_WAL_FLOOR != 0 {
+            // Only a unified flush writes it, and only once the bit is durable;
+            // 0 is the absent default, never written.
+            if caps & crate::format::CAP_WAL_FLOOR == 0 {
+                return Err(corrupt("WAL floor section without CAP_WAL_FLOOR"));
+            }
+            if db_flags & DB_UNIFIED_WAL == 0 {
+                return Err(corrupt("WAL floor section without the unified WAL layout"));
+            }
+            m.wal_floor = c.u64()?;
+            if m.wal_floor == 0 {
+                return Err(corrupt("WAL floor section at its empty default 0"));
+            }
         }
         let cf_count = c.uvar()?;
         m.cfs = Vec::with_capacity(capacity_hint(cf_count));
@@ -726,6 +755,7 @@ mod tests {
             generation: 0,
             applied_through: 0,
             next_edit_id: 1,
+            wal_floor: 0,
             wal_layout: WalLayout::PerColumnFamily,
             instance_nonce: None,
             caps: 0,
@@ -771,8 +801,10 @@ mod tests {
         m.caps = crate::format::CAP_EXTENDED_RECORDS
             | crate::format::CAP_RANGE_DELETES
             | crate::format::CAP_PERIODIC_AGE
-            | crate::format::CAP_MANIFEST_EDITS;
+            | crate::format::CAP_MANIFEST_EDITS
+            | crate::format::CAP_WAL_FLOOR;
         m.wal_layout = WalLayout::Unified;
+        m.wal_floor = 5;
         m.instance_nonce = Some(0xdead_beef_cafe_f00d);
         m.generation = 3;
         m.applied_through = 17;
@@ -808,6 +840,7 @@ mod tests {
             (a.generation, a.applied_through, a.next_edit_id),
             (b.generation, b.applied_through, b.next_edit_id)
         );
+        assert_eq!(a.wal_floor, b.wal_floor);
         assert_eq!(a.cfs.len(), b.cfs.len());
         for (x, y) in a.cfs.iter().zip(&b.cfs) {
             assert_eq!(x.name, y.name);
@@ -1051,6 +1084,35 @@ mod tests {
         let mut m = everything();
         m.cfs[0].sstables[1].range_min_key = Some(Vec::new());
         assert_eq!(reject(&m), "corruption");
+    }
+
+    /// db section 0x10, the replay floor: present exactly when non-zero, and
+    /// refused under a valid CRC without its capability bit, without the
+    /// unified layout, or at its empty default.
+    #[test]
+    fn wal_floor_section_is_checked() {
+        let m = everything();
+        let enc = m.encode();
+        assert_ne!(read_u32(&enc[20..]) & DB_WAL_FLOOR, 0);
+        assert_eq!(Manifest::decode(&enc).unwrap().wal_floor, 5);
+        let mut none = everything();
+        none.wal_floor = 0;
+        assert_eq!(read_u32(&none.encode()[20..]) & DB_WAL_FLOOR, 0, "0 writes no section");
+        // Without the bit.
+        let mut b = enc.clone();
+        let caps = m.caps & !crate::format::CAP_WAL_FLOOR;
+        b[12..20].copy_from_slice(&caps.to_le_bytes());
+        assert_eq!(Manifest::decode(&resealed(b)).unwrap_err().kind(), "corruption");
+        // Without the unified layout: clear the flag, keeping the payload.
+        let mut b = enc.clone();
+        b[20] &= !(DB_UNIFIED_WAL as u8);
+        assert_eq!(Manifest::decode(&resealed(b)).unwrap_err().kind(), "corruption");
+        // At 0: the section sits after the nonce (8) and the edit cursor (24).
+        let mut b = enc.clone();
+        let at = HEADER_LEN + 8 + 24;
+        assert_eq!(read_u64(&b[at..]), 5);
+        b[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(Manifest::decode(&resealed(b)).unwrap_err().kind(), "corruption");
     }
 
     /// A stored unified id equal to the derived one is non-canonical.

@@ -73,6 +73,7 @@ fn distinguishable_manifest() -> Manifest {
         generation: 0,
         applied_through: 0,
         next_edit_id: 1,
+        wal_floor: 0,
     }
 }
 
@@ -556,6 +557,7 @@ fn recovery_skips_records_at_or_below_applied_through() {
         generation: 2,
         applied_through: 2,
         next_edit_id: 3,
+        wal_floor: 0,
         ..Manifest::default()
     };
     apply_edit(
@@ -1126,6 +1128,7 @@ fn shape(edit: &VersionEdit) -> Vec<String> {
             Op::SetCapability(b) => format!("SetCapability({b})"),
             Op::RemoveTables { cf, ids } => format!("RemoveTables({cf},{ids:?})"),
             Op::SetCfUnifiedId { name, id } => format!("SetCfUnifiedId({name},{id})"),
+            Op::SetWalFloor(g) => format!("SetWalFloor({g})"),
         })
         .collect()
 }

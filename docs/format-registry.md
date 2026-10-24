@@ -125,6 +125,7 @@ wavesdb table of base entries can still point into shared blob files.
 | 8 | vlog compression grouping | *reserved to wavesdb* | `CapVlogGrouping` |
 | 9 | values in shared blob files | read-only (step 2c) | `CapValuesSharedBlobs` (step 2b) |
 | 10 | wavesdb native bodies | read-only (step 2c) | `CapWaves08Bodies` (step 2b; native profile since 2d) |
+| 11 | unified WAL replay floor | `CAP_WAL_FLOOR` | `CapWALFloor` |
 
 Bits 0–6 were assigned identically by both engines independently. 7 and 8 are
 wavesdb specialities; ondaDB reserves them so it cannot assign them to anything
@@ -162,6 +163,14 @@ neither refuses it (`UnsupportedFormat`). The profile is decided once per
 directory, from the catalog, and every table's footer must agree with it: a
 table whose footer claims the other profile is `Corruption`.
 
+**Bit 11, `CAP_WAL_FLOOR`** (common profile, the 0.20 parity release). The
+database records the unified WAL's replay floor (db section `0x10`, edit op
+14 in schema 1 and 19 in schema 2): generations below it replay their
+control records only, so a generation a prepare keeps on disk past its flush
+cannot bring back versions compaction has since changed. `CAP_TXN_DECISIONS`
+implies it. Database-level only: never in a table's footer word. The rules
+are `epoch1.md` § Replay floor.
+
 ## Manifest sections
 
 The manifest's optional fields are **flagged sections** in ascending bit order,
@@ -174,6 +183,7 @@ each under a strict mask (unknown bit: `UnsupportedFormat`). Layout:
 | db | `0x2` | instance nonce | `u64` |
 | db | `0x4` | edit-log cursor | `generation u64 \| applied_through u64 \| next_edit_id u64` |
 | db | `0x8` | managed-sequence state | `discard_seq u64 \| last_managed_commit u64` (requires `CAP_MANAGED_MODE`) |
+| db | `0x10` | unified WAL replay floor | `generation u64`, the lowest generation whose data replays (requires `CAP_WAL_FLOOR` and `0x1`; never 0) |
 | cf (uvarint) | `0x1` | unified CF id | `u64`, only when ≠ FNV-1a-64(name) |
 | cf | `0x2` | shared blob files | `count \| (blob_id \| size \| live_bytes)*`, uvarints, ascending id (requires `CAP_VALUES_SHARED_BLOBS`) |
 | sst (uvarint) | `0x01` | partition | string |
@@ -370,8 +380,9 @@ out of order, and the decoder refuses an out-of-order blob.
 | 5 | `DropCF` | 11 | `SetCapability` |
 | 6 | `SetCFConfig` | 12 | `RemoveTables` |
 | | | 13 | `SetCFUnifiedId` (plan C F5′) |
+| | | 14 | `SetWalFloor` (requires `CAP_WAL_FLOOR`) |
 
-14–63 are unassigned (`Corruption` naming the op index); ≥ 64 never assigned.
+15–63 are unassigned (`Corruption` naming the op index); ≥ 64 never assigned.
 `UpdateTable` field-mask bits: `0x01` level, `0x02` tier, `0x04` object, `0x08`
 partition, `0x10` max_entry_time, `0x20` last_compaction_time, present values in
 ascending bit order. Plan C step 2 row I merges this table with wavesdb's
@@ -397,6 +408,7 @@ Schema 2's op codes, for the record (row I merges the two tables):
 | 4 | `AddBlob` | 10 | `SetCFConfig` | 16 | `SetManagedState` |
 | 5 | `UpdateBlob` | 11 | `SetNextFileID` | 17 | `TxnDecision` |
 | 6 | `RemoveBlob` | 12 | `SetGlobalSeq` | 18 | `SetRun` |
+| | | | | 19 | `SetWALFloor` (as schema 1's 14) |
 
 The same code means a different op in each schema (4 is `CreateCF` in schema 1
 and `AddBlob` in schema 2), which is why a reader dispatches on the schema
