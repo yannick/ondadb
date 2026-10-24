@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Documentation
+
+- **`UPGRADE.md`**: moving from 0.9.x or 0.10.x to 0.20.x — the one-time format
+  upgrade, API changes, one-way capabilities (`CAP_WAL_FLOOR`), rollback and
+  wavesdb interoperability.
+
 ### Fixes
 
 - **Retired tables on named and S3 tiers are deleted where they live.**
