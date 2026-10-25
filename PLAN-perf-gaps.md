@@ -129,6 +129,11 @@ Additive data-block trailer, gated by a new footer flag so old files use the old
 
 ## Task 6: WAL — exact frame size + lock-free positional append
 
+> **Outcome:** the lock-free positional append was tried and **reverted** — on
+> macOS/APFS positional writes to one file serialize in the kernel anyway and
+> lose the O_APPEND fast path (see the comment on `encode_frame` in
+> `src/wal.rs`). The unticked steps below are the original plan.
+
 **Files:** Modify `src/wal.rs`; tests in `src/wal.rs` `mod tests` (check existing ones at file bottom).
 
 - [ ] **Step 1: failing tests**:

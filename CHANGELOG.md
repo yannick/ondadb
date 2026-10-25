@@ -4,6 +4,11 @@
 
 ### Documentation
 
+- **Stale plans corrected.** `docs/plans/README.md` and `implementation-plan.md`
+  are marked historical (3.2/3.3 shipped in 0.9.0; "readable forever" was
+  superseded by format epoch 1) and point at the consolidated roadmap in
+  `yolodb-format`; plan C's status reflects parity, P9 (O_DIRECT) is recorded
+  as not implemented, and `PLAN-perf-gaps.md` task 6 records its revert.
 - **`UPGRADE.md`**: moving from 0.9.x or 0.10.x to 0.20.x — the one-time format
   upgrade, API changes, one-way capabilities (`CAP_WAL_FLOOR`), rollback and
   wavesdb interoperability.

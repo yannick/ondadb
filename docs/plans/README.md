@@ -1,5 +1,11 @@
 # ondaDB forward roadmap
 
+> **Historical (frozen at the 0.8.2 baseline).** Everything here through Wave D
+> shipped (0.9.0–0.10.x), and plan C then moved both engines onto yoloDB format
+> epoch 1 (0.20.0). The live, code-verified status of every item, for ondaDB and
+> wavesdb together, is the consolidated roadmap: `ROADMAP.md` in
+> `yolodb-format`.
+
 These documents adapt the wavesdb forward roadmap (audited 2026-08-29 at
 `1a052a4`) to **ondaDB 0.8.2** (`3afc3c1`). They are design plans, not release
 promises: a feature moves to execution only after its prerequisite design
@@ -57,5 +63,5 @@ private spill (needs 3.2's decision records), tiered/lazy-leveling compaction
 engine change — take wavesdb 4.2 as-is if wanted), WAL failover (needs a fault
 model), trace/replay and io_uring (self-contained spikes; see assessment §4).
 
-3.2 (durable 2PC) and 3.3 (pessimistic locking) are **no longer product-gated**
-— a coordinator consumer exists, so both are scheduled in Wave D.
+3.2 (durable 2PC) and 3.3 (pessimistic locking) **shipped in 0.9.0** (Wave D).
+What remains of phase 3 is 3.4, commit-path contention.

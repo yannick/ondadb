@@ -1,5 +1,11 @@
 # Forward roadmap implementation plan
 
+> **Historical (frozen at the 0.8.2 baseline).** Everything here through Wave D
+> shipped (0.9.0–0.10.x), and plan C then moved both engines onto yoloDB format
+> epoch 1 (0.20.0). The live, code-verified status of every item, for ondaDB and
+> wavesdb together, is the consolidated roadmap: `ROADMAP.md` in
+> `yolodb-format`.
+
 > **For agentic workers:** read [Execution protocol](#execution-protocol-for-agentic-workers)
 > before touching code. Each feature document is the unit of work; derive a
 > task-by-task plan from its "Implementation tasks" section, use test-driven
@@ -37,6 +43,9 @@ incorporated here rather than re-derived.
   versions/capabilities — see 1.0). `-16` is the first free code today
   (`error.rs` ends at `Poisoned` = `-15`).
 - Existing manifests (VERSION 1), WALs, and klogs remain readable forever.
+  *(Superseded in 0.10.0: plan C's format epoch 1 reads no 0.9 file directly;
+  a 0.9 directory is upgraded on open, or read through the `legacy-onda`
+  decoders, which plan C step 2e will eventually retire.)*
 - A new persisted option is wired in the same change: the `Options` /
   `ColumnFamilyConfig` field, `Default`, `validate`, the `encode`/`decode`
   config blob (append-tolerant tail, new `CONFIG_*_MAGIC` tag), docs, and a
@@ -73,7 +82,9 @@ Two review items remain open, and both are scheduled rather than gating:
 | M3 — `commit_mu` couples WAL/apply latency to validation | Deferred; no correctness failure under current locking. Dropping the lock needs write intents or a second validation/publication protocol. | Re-measured (not fixed) by 3.2's reservation check and 1.2's range commits; both must report the cost. |
 | M5 — full manifest rewrite cost at scale | Deferred; the `manifest_encoded_size_at_scale` probe is the sizing evidence. | Feature **2.2** (manifest edit log) is the fix. |
 
-The documented S3 gaps in AGENTS.md are unchanged and out of scope here:
+*(Update 2026-10-24: ondaDB #38 made table retirement and `sweep_move_orphans`
+tier-aware, S3 included; one crash window remains, see `docs/parts-and-tiers.md`.)*
+The documented S3 gaps in AGENTS.md were unchanged and out of scope here:
 `sweep_move_orphans` and compaction's obsolete-input delete
 (`remove_compaction_inputs`) are default-tier-path only, so a crash mid-move or
 a compaction of an S3-resident part leaks the object. The manifest stays
@@ -124,6 +135,8 @@ Order: **2.2** → **0.3** → **2.1** → **1.2** → **1.1**.
 Enabling one capability must never implicitly enable another.
 
 ### Wave D — transaction modes
+
+*Shipped in 0.9.0 (3.2 and 3.3).*
 
 Order: **3.2** → **3.3**.
 
@@ -270,8 +283,9 @@ never implies another.
 
 ## Execution protocol for agentic workers
 
-- **Branch:** all roadmap work lands on `roadmap/wave-a` (already checked out
-  at `3afc3c1`). Do not commit to `main`.
+- **Branch:** *(historical)* roadmap work landed on `roadmap/wave-a` (checked out
+  at `3afc3c1`); that branch no longer exists, its work is on `main`, and changes now go
+  through PRs to `main`.
 - **One feature per commit.** A commit contains the whole feature — code, its
   tests, its config wiring and its documentation updates — and nothing else. A
   feature split across slices commits per slice only when each slice is
