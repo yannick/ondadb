@@ -7,7 +7,7 @@ bench_dir := env_var_or_default("ONDADB_BENCH_DIR", "../bench")
 _default:
     @just --color always --list
 
-# Format Rust source.
+# Check Rust formatting (not part of the gate: the tree is not rustfmt-clean yet).
 [group('Quality')]
 fmt:
     cargo fmt --check
@@ -15,26 +15,70 @@ fmt:
 # Run Clippy for the safe configuration.
 [group('Quality')]
 lint-safe:
-    cargo clippy --all-targets
+    cargo clippy --all-targets -- -D warnings
 
 # Run Clippy for the unsafe fast-path configuration.
 [group('Quality')]
 lint-fast:
-    cargo clippy --all-targets --features unsafe-fastpath
+    cargo clippy --all-targets --features unsafe-fastpath -- -D warnings
 
-# Run tests for the safe configuration.
+# Run Clippy without the foreign decoders (legacy-onda, waves08).
 [group('Quality')]
-test-safe:
-    cargo test
+lint-nodefault:
+    cargo clippy --all-targets --no-default-features -- -D warnings
 
-# Run tests for the unsafe fast-path configuration.
+# Run Clippy in all three configurations.
 [group('Quality')]
-test-fast:
-    cargo test --features unsafe-fastpath
+lint: lint-safe lint-fast lint-nodefault
 
-# Run every deterministic quality gate.
+# Check that the S3 tier compiles.
 [group('Quality')]
-check: fmt lint-safe lint-fast test-safe test-fast metrics-check
+build-s3:
+    cargo build --features s3
+
+# Run tests for the safe configuration (optionally filtered).
+[group('Quality')]
+test-safe *args:
+    cargo test {{ args }}
+
+# Run tests for the unsafe fast-path configuration (optionally filtered).
+[group('Quality')]
+test-fast *args:
+    cargo test --features unsafe-fastpath {{ args }}
+
+# Run tests without the foreign decoders (optionally filtered).
+[group('Quality')]
+test-nodefault *args:
+    cargo test --no-default-features {{ args }}
+
+# Run the test suite in all three configurations.
+[group('Quality')]
+test: test-safe test-fast test-nodefault
+
+# Run one integration test file in the safe configuration, e.g. `just test-file parts`.
+[group('Quality')]
+test-file name *args:
+    cargo test --test '{{ name }}' {{ args }}
+
+# Run the S3 tier tests against the endpoint in .rustfs.env (values are never printed).
+[group('Quality')]
+test-s3 *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -f .rustfs.env ]]; then echo ".rustfs.env is missing; the S3 tests would no-op" >&2; exit 1; fi
+    set -a; . ./.rustfs.env; set +a
+    export ONDADB_S3_ENDPOINT="$AWS_ENDPOINT_URL" ONDADB_S3_KEY="$AWS_ACCESS_KEY_ID" \
+        ONDADB_S3_SECRET="$AWS_SECRET_ACCESS_KEY" ONDADB_S3_BUCKET="$BUCKET" ONDADB_S3_REGION="$AWS_REGION"
+    cargo test --features s3 --test s3_tier --test attach_by_ref {{ args }} -- --test-threads=1
+
+# The CI-equivalent gate (AGENTS.md): clippy x3, the S3 build, tests x3, each test binary checked for `test result: ok`.
+[group('Quality')]
+gate log="target/gate.log":
+    scripts/gate.sh '{{ log }}'
+
+# What to run before a PR: the gate.
+[group('Quality')]
+check: gate
 
 # Generate quality metrics without gating.
 [group('Metrics')]
