@@ -29,6 +29,10 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 cargo build --features s3                      # the S3 tier compiles
 ```
 
+`just gate` runs all seven and checks each test binary for `test result: ok`
+(`scripts/gate.sh`; `just --list` shows the narrower recipes: `test-safe`,
+`test-fast`, `test-nodefault`, `test-file <name>`, `lint`, `test-s3`).
+
 **Every change must keep all three feature configurations green** — the builds
 compile different code: `memtable_arena.rs` and the mmap paths exist only under
 `unsafe-fastpath`, and `src/legacy_onda/` (read-only 0.9.x decoders, default-on
