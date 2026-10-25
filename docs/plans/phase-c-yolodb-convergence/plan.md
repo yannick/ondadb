@@ -1,6 +1,8 @@
 # Plan C — yoloDB: one format for ondaDB and wavesdb
 
-> **Status:** proposal, 2026-09-23. Baseline ondaDB `0f4ebc6` (0.9.0), wavesdb
+> **Status:** done through step 2d and the parity release (both engines 0.20.0,
+> 2026-10); steps 2e (retiring the legacy readers) and the post-parity common-profile
+> extensions are open. Proposed 2026-09-23. Baseline ondaDB `0f4ebc6` (0.9.0), wavesdb
 > `v0.8.6` (`a26fb4c`). Evidence for every divergence named here is in
 > [`../phase-w-wavesdb-compat/research/`](../phase-w-wavesdb-compat/research/).
 > Plan C **may break compatibility**. Plan W (read-only wavesdb 0.8.6 profile)
@@ -248,7 +250,7 @@ pay.
 | P6 | User-space WAL write buffer | Coalesces single-threaded commit streams into fewer `write` syscalls. The durability contract is unchanged: a sync still flushes the buffer | 3–5 d |
 | P7 | Bloom auto-allocation (`BloomAutoAllocate`, Monkey-style per-level bits) | Fills the reserved `ONDABLM2` slot (a TLV tag in epoch 1) | 1 wk |
 | P8 | Local disk cache for object-store reads (`LocalCachePath`, `f28aecc`) | A second-tier block cache on local SSD in front of S3 range GETs | 1–1.5 wk |
-| P9 | O_DIRECT (Linux) / `F_NOCACHE` (macOS) compaction reads (`7289c76`) | Keeps compaction I/O out of the page cache. Aligned buffers need either a documented `unsafe` contract or an aligned-alloc crate, so this is behind `unsafe-fastpath`, measured, and spike-first | 1 wk |
+| P9 | O_DIRECT (Linux) / `F_NOCACHE` (macOS) compaction reads (`7289c76`) | **Not implemented (deferred; no code, no measurement as of 0.20.0).** Keeps compaction I/O out of the page cache. Aligned buffers need either a documented `unsafe` contract or an aligned-alloc crate, so this is behind `unsafe-fastpath`, measured, and spike-first | 1 wk |
 | P10 | Graduated default codecs | Defaults `{None, LZ4 (tag 6), Zstd}` per level, like wavesdb. A **defaults** change: measure ratio and speed and document it | 1 d + bench |
 
 **Function**
@@ -604,7 +606,7 @@ requirement stated.
      - Found on the way:
        - ondaDB's `DB::flush_memtable` flushes nothing under the unified
          layout; the fixture generator rotates through
-         `rotate_unified_for_tests` instead. Open; 2d PR O1.
+         `rotate_unified_for_tests` instead. Fixed in 0.20.0 (2d PR O1).
        - wavesdb's `Close` rewrote `MANIFEST` after a read-only open of its
          own crashed snapshot-only catalog. Fixed in wavesdb #34.
        - wavesdb's own fixture generator writes range-delete bounds
