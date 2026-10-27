@@ -494,6 +494,14 @@ Flush worker (`db.rs::flush_worker`):
   tombstones still produces a table: dropping it as "empty" would lose the
   deletes.
 - `Writer::finish` fsyncs klog+vlog and the CF directory.
+- **Seal order** (`ColumnFamily::await_flush_turn`; unified:
+  `UnifiedStore::await_flush_turn`): the write above runs in parallel across
+  flush workers, but a table is published only once no older sealed memtable is
+  left. Published out of order, a newer table could be compacted to the bottom
+  and drop a tombstone, and the older table would then land in L0 above it and
+  bring the deleted key back, durably. A flush that may not wait its turn (the
+  family is retiring, or the database fail-stopped) publishes nothing and keeps
+  its WAL. See `docs/concurrency-and-safety.md` § Flush publication order.
 - `catalog_txn(AddTable, publish_flush)`: the record is appended and **fsynced**,
   and only then is the table installed in L0 and the sealed memtable retired,
   under one state write-lock. **Only on `Ok`** are the imm's WAL files deleted

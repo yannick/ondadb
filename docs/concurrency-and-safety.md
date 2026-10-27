@@ -144,7 +144,7 @@ the two unexamined candidates.
 | `DbInner::publish` (Mutex) | publish cursor | short |
 | `DbInner::file_deletion.paused` | pause counter + deferred-delete list | short; `pause_deletions` returns an RAII guard. Never held across the unlink or the channel send |
 | `DbInner::file_deletion.worker.{tx,handle}` | deletion-queue sender / join handle | one unbounded `send` (never blocks) or one `take`; the join in `drain_deletions` happens with neither held |
-| `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating`, `preparing`, `retiring`, `flushes` (in-flight flush claims) | gate checks, rotation drain; a drop's/clear's `begin_retire` waits on its condvar (holding `cf_lifecycle_mu`, nothing else) for in-flight rotations and flush claims |
+| `ColumnFamily::rot` (Mutex+Condvar) | `active_writers`, `rotating`, `preparing`, `retiring`, `flushes` (in-flight flush claims) | gate checks, rotation drain; a drop's/clear's `begin_retire` waits on its condvar (holding `cf_lifecycle_mu`, nothing else) for in-flight rotations and flush claims; a flush's `await_flush_turn` waits on it (holding nothing else) for older memtables to publish. `publish_flush` takes it inside `manifest_mu` and before `state`, so nothing may take `manifest_mu` while holding `rot` |
 | `ColumnFamily::state` (RwLock) | memtable/WAL handles, imm queue, levels | read: clone handles; write: swap/install — keep short |
 | `ColumnFamily::compact_mu` (Mutex) | whole-CF compaction operations | manual compaction sweep and FIFO eviction; acquired before the whole-keyspace range lock |
 | `ColumnFamily::range_locks` | key ranges being rewritten | bounded compaction jobs use non-blocking acquisition; attach takes the whole keyspace; detach and part moves block on the affected partition span, including copy + manifest flip; delete-only excise (1.2) uses `parts::try_lock_key_span` — non-blocking over the union of its candidates' **span** bounds, held across revalidation, the catalog transaction and file retirement |
@@ -713,6 +713,30 @@ the `DropCF` and inside its list, or not at all. A compaction is *not* waited
 for: it runs to its install and is refused there. `flush_memtable` through a
 dropped handle is `NotFound`. `abort_retire` undoes the mark if the drop's own
 edit fails.
+
+### Flush publication order
+
+Flush workers (`num_flush_threads`, default 4) write sealed memtables in
+parallel, but **publish them in seal order**: before its `catalog_txn`, a flush
+waits in `ColumnFamily::await_flush_turn` (unified:
+`UnifiedStore::await_flush_turn`) until its memtable is the oldest left in the
+`imm` queue. Publishing whichever finished first resurrected deleted keys: a
+newer table holding a tombstone was published, compacted to the bottom (where
+the tombstone is dropped), and the older table holding the put then landed in
+L0 above the output. The edit log replays the same order, so a reopen kept the
+key. Regression tests: `tests/flush_order.rs`.
+
+Why it cannot deadlock: the flush queue is FIFO, so an older memtable's job is
+taken before a newer one's, and the older flush never waits on a newer one.
+Rotation is the only producer of `imm` entries and always enqueues a job; the
+publish step (`publish_flush`, `remove_imm`) is the only consumer and notifies
+the condvar under `rot`, so the waiter's check-then-wait cannot miss it. The
+two ways an older flush can end without publishing release the waiter instead:
+`retiring` (a drop or clear; the older flush skipped its memtable, and the
+waiter holds a flush claim `begin_retire` is waiting for) and a fail-stop
+(an older flush failed). Either way the waiter publishes nothing and keeps its
+WAL; its written table is an orphan the open sweeps. The fail-stop is not
+signalled on the condvar, so the wait polls it every 10 ms.
 
 Unified rotation uses the same `rot → state` lock order. Writers additionally
 wait while the sealed unified queue is at

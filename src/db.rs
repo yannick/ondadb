@@ -4325,6 +4325,12 @@ fn flush_per_cf(db: &Arc<DbInner>, cf: Arc<ColumnFamily>, imm: Arc<ImmMemtable>)
 fn flush_per_cf_claimed(db: &Arc<DbInner>, cf: &Arc<ColumnFamily>, imm: Arc<ImmMemtable>) {
     match cf.flush_imm(&imm, db.next_file_id()) {
         Ok(out) => {
+            // Publish in seal order (see `await_flush_turn`). Not publishing
+            // leaves the memtable queued and its WAL in place, so nothing is
+            // lost; the written table is an orphan the next open sweeps.
+            if !cf.await_flush_turn(&imm, || db.poison.is_poisoned()) {
+                return;
+            }
             // The SST is already synced by `flush_imm` (catalog_txn step 2).
             // Reclaim its WAL only after the edit record's fsync returned `Ok`
             // — AGENTS.md invariant 1. Note what the gate is *not*: a snapshot
@@ -4421,7 +4427,15 @@ fn flush_unified(db: &Arc<DbInner>, imm: Arc<crate::unified::UnifiedImm>) {
     // A shared WAL covers every CF slice. One failed slice must retain it even
     // if the manifest could record the successful slices; recovery needs the
     // original atomic batch. Only a full flush plus the edit's fsync delete it.
-    if all_slices_flushed {
+    //
+    // And only in seal order (see `UnifiedStore::await_flush_turn`): declining
+    // to publish is a failed flush's outcome, the WAL stays.
+    let my_turn = all_slices_flushed
+        && db
+            .unified
+            .as_ref()
+            .is_none_or(|u| u.await_flush_turn(&imm, || db.poison.is_poisoned()));
+    if my_turn {
         let published: Vec<Arc<ColumnFamily>> = staged.iter().map(|(cf, _)| cf.clone()).collect();
         let install = staged;
         // The replay floor rides in the same edit as the tables, computed under

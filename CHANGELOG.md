@@ -15,6 +15,16 @@
 
 ### Fixes
 
+- **A deleted key could come back.** Flush workers published their tables in
+  the order they finished writing, not the order the memtables were sealed. A
+  newer table holding a delete could be published first and compacted to the
+  bottom level, which drops the tombstone; the older table holding the put then
+  landed in L0 above it, and the key was readable again, also after a reopen.
+  Any database running more than one flush worker (the default is four) could
+  hit it, in both layouts, when a compaction ran between two flushes finishing
+  out of order. Flushes still write in parallel but now publish in seal order
+  (`docs/concurrency-and-safety.md` § Flush publication order). Nothing on disk
+  changes. wavesdb had the same bug and fixed it in its 0.21.0.
 - **Retired tables on named and S3 tiers are deleted where they live.**
   Compaction inputs, FIFO evictions and the tables of a dropped or cleared
   family were deleted at their default-tier path, which missed any table on a
