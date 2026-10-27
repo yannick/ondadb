@@ -961,6 +961,35 @@ impl UnifiedStore {
             .unwrap_or(s.wal_gen)
     }
 
+    /// The unified layout's
+    /// [`ColumnFamily::await_flush_turn`](crate::column_family::ColumnFamily::await_flush_turn):
+    /// wait until no sealed memtable older than `imm` is left, so every
+    /// family's slice of it is published in seal order. `remove_imm` is the
+    /// wake-up, and an older flush always reaches it, failed or not. `false`
+    /// when `stop()` says the database fail-stopped: an older flush failed, and
+    /// publishing past it would reorder.
+    pub(crate) fn await_flush_turn(&self, imm: &Arc<UnifiedImm>, stop: impl Fn() -> bool) -> bool {
+        let mut g = self.rot.lock();
+        loop {
+            if stop() {
+                return false;
+            }
+            let s = self.state.read();
+            if s.imm
+                .iter()
+                .position(|i| Arc::ptr_eq(i, imm))
+                .is_none_or(|p| p == 0)
+            {
+                return true;
+            }
+            drop(s);
+            // A fail-stop is not signalled on this condvar; the timeout bounds
+            // how long a waiter takes to notice one.
+            self.cond
+                .wait_for(&mut g, std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Remove a flushed immutable from the queue.
     pub(crate) fn remove_imm(&self, imm: &Arc<UnifiedImm>) {
         // Match the writer predicate's lock order (`rot` then `state`) so a

@@ -1465,6 +1465,9 @@ impl ColumnFamily {
         table: Option<Arc<SstHandle>>,
         _p: &crate::db::Publish,
     ) {
+        // `rot` before `state`, the rotation's order, so a flush waiting in
+        // `await_flush_turn` cannot check the queue and then miss this wake-up.
+        let _g = self.rot.lock();
         let mut s = self.state.write();
         if let Some(handle) = table {
             s.levels[0].insert(0, handle); // newest first
@@ -1472,6 +1475,48 @@ impl ColumnFamily {
         if let Some(pos) = s.imm.iter().position(|i| Arc::ptr_eq(i, imm)) {
             imm.mem.ranges().retire();
             s.imm.remove(pos);
+        }
+        drop(s);
+        self.cond.notify_all();
+    }
+
+    /// Wait until no sealed memtable older than `imm` is left, so that `imm`'s
+    /// table is published in seal order.
+    ///
+    /// Several flush workers write tables concurrently, and without this the
+    /// one that finished first published first. A newer table published ahead
+    /// of an older one can be compacted to the bottom, where a tombstone it
+    /// holds is dropped; the older table then lands in L0 above the output and
+    /// a deleted key comes back, durably, since the edit log replays the same
+    /// order. Only the publish waits: the expensive write already ran in
+    /// parallel. The flush queue is FIFO, so the older memtable's job is always
+    /// running or done before a newer one's, and it never waits on this one.
+    ///
+    /// `false` means the flush must not publish: the family is retiring (an
+    /// older flush that found it retiring skipped its memtable, so the turn
+    /// would never come), or `stop()` says the database fail-stopped (an older
+    /// flush failed, and publishing past it is exactly the reordering above).
+    pub(crate) fn await_flush_turn(&self, imm: &Arc<ImmMemtable>, stop: impl Fn() -> bool) -> bool {
+        let mut g = self.rot.lock();
+        loop {
+            if g.retiring || stop() {
+                return false;
+            }
+            let s = self.state.read();
+            // Absent means a clear already took the queue: nothing older is
+            // left to wait for.
+            if s.imm
+                .iter()
+                .position(|i| Arc::ptr_eq(i, imm))
+                .is_none_or(|p| p == 0)
+            {
+                return true;
+            }
+            drop(s);
+            // A fail-stop is not signalled on this condvar; the timeout bounds
+            // how long a waiter takes to notice one.
+            self.cond
+                .wait_for(&mut g, std::time::Duration::from_millis(10));
         }
     }
 
